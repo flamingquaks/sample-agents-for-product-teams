@@ -289,7 +289,7 @@ Resources:
       FunctionName: !Sub slack-webhook-${Stage}
       CodeUri: ../dispatch/
       Handler: slack_webhook.handler
-      Timeout: 30
+      Timeout: 10
       ReservedConcurrentExecutions: 10
       DeadLetterQueue:
         Type: SQS
