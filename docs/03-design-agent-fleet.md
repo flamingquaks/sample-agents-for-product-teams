@@ -227,6 +227,30 @@ The shared workflow also supports the `env_vars` input, which is passed through 
 
 `.dispatch/agents.yaml` advertises Slack triggers for Workitems and Docwriter, but there's no Slack event receiver in the foundation stack and the Dispatch Router has no Slack signature verifier. Adding Slack requires a `slack-webhook-${STAGE}` Lambda, a Slack app manifest, and the signing-secret path in SSM. Flagged as a gap in `skills/pdlc-agents-register-triggers`.
 
+### 4.4 Discord Integration (slash commands)
+
+Discord slash commands are supported in v1. Users invoke agents via `/workitems <instruction>`, `/docwriter <instruction>`, etc. in any Discord channel where the bot has been installed.
+
+**Inbound (via `discord-webhook-${STAGE}` Lambda):**
+- Slash commands are delivered to `POST /discord/interactions` via Discord's Interactions Endpoint.
+- Signature: Ed25519 — Discord signs `(X-Signature-Timestamp + raw body)` with the application private key. The receiver verifies against the public key stored in SSM as a plain String (public by nature, but kept in SSM for consistent config).
+- PING (type 1): echoed immediately within 3 seconds per Discord's protocol requirement.
+- APPLICATION_COMMAND (type 2): acknowledged with a deferred response (type 5, "Bot is thinking..."), then the Dispatch Router is invoked asynchronously. The agent posts its reply via `POST /webhooks/{application_id}/{interaction_token}` using `discord_post_followup`.
+- Agent is pre-resolved from the slash command name; passed to the router via the `agent_id` payload field (same pattern as the Asana receiver).
+
+**Outbound (via `agents/shared/discord_post.py` @tool functions):**
+- `discord_post_followup(application_id, interaction_token, content)` — interaction-token reply, valid 15 minutes, no auth header needed.
+- `discord_post_message(channel_id, content)` — channel post via bot token from SSM.
+- HTTP 429 handled with one bounded Retry-After retry (Discord rate limits are tighter than Slack/Asana).
+
+**Authentication:**
+- Bot token stored in SSM SecureString at `/sdlc-agents/discord-bot-token`.
+- Application public key (not a secret) stored as String at `/sdlc-agents/discord-public-key`.
+- Bootstrapped by `scripts/bootstrap_discord_app.py`.
+
+**`@mention` events (Gateway listener — roadmap):**
+Discord does not deliver `@mention` events over HTTP. To receive them, a long-lived WebSocket listener must subscribe to Discord's Gateway with `MESSAGE_CREATE` intents. A Lambda is the wrong shape for this (it cannot hold a persistent WebSocket). The intended architecture is a small Fargate task that subscribes to the Gateway and POSTs normalized events to the same `/discord/interactions` endpoint (or directly to the Dispatch Router). This is out of scope for v1; slash commands cover the primary interaction pattern.
+
 ---
 
 ## 5. Security Model

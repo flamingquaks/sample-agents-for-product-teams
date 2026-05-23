@@ -1,10 +1,10 @@
 """Post "blocked by safety filter" replies back to the originating thread.
 
 When the Dispatch Router's guardrail check blocks a request, we post a
-short note back to the GitHub issue or Asana task that originated the
-mention so the sender sees what happened (no silent failures).
+short note back to the GitHub issue, Asana task, or Discord channel that
+originated the mention so the sender sees what happened (no silent failures).
 
-Both helpers return a bool instead of raising: the block decision has
+All helpers return a bool instead of raising: the block decision has
 already been made by the time we call these, and a failed reply must
 not revert that decision. Reply failures emit a CloudWatch metric so
 operators can alarm separately (`GuardrailReplyFailed`).
@@ -12,6 +12,7 @@ operators can alarm separately (`GuardrailReplyFailed`).
 
 import logging
 import os
+import time
 from typing import Optional
 
 import boto3
@@ -22,9 +23,11 @@ logger = logging.getLogger(__name__)
 
 GITHUB_API = "https://api.github.com"
 ASANA_API = "https://app.asana.com/api/1.0"
+DISCORD_API = "https://discord.com/api/v10"
 
 GITHUB_PAT_PARAM_ENV = "GITHUB_PAT_PARAM"
 ASANA_PAT_PARAM_ENV = "ASANA_PAT_PARAM"
+DISCORD_BOT_TOKEN_PARAM_ENV = "DISCORD_BOT_TOKEN_PARAM"
 
 _ssm = boto3.client("ssm")
 
@@ -83,6 +86,61 @@ def post_asana_comment(task_gid: str, body: str) -> bool:
         return True
     except requests.RequestException as exc:
         logger.error("Failed to post Asana comment to task %s: %s", task_gid, exc)
+        return False
+
+
+def post_discord_message(
+    channel_id: str,
+    body: str,
+    message_reference: Optional[dict] = None,
+) -> bool:
+    """Post a message to a Discord channel. Returns True on success.
+
+    Reads the bot token from SSM (DISCORD_BOT_TOKEN_PARAM env var).
+    Handles HTTP 429 (rate limit) with a single bounded Retry-After retry.
+    Never raises.
+
+    Args:
+        channel_id: The Discord channel snowflake ID to post to.
+        body: Message content (up to 2000 characters per Discord limits).
+        message_reference: Optional dict for reply-style messages
+            (e.g. {"message_id": "...", "channel_id": "..."}).
+    """
+    if not channel_id:
+        logger.error("post_discord_message missing channel_id")
+        return False
+
+    token = _get_secret(
+        os.environ.get(DISCORD_BOT_TOKEN_PARAM_ENV, "/sdlc-agents/discord-bot-token")
+    )
+    if not token:
+        return False
+
+    url = f"{DISCORD_API}/channels/{channel_id}/messages"
+    payload: dict = {"content": body}
+    if message_reference:
+        payload["message_reference"] = message_reference
+
+    headers = {
+        "Authorization": f"Bot {token}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=10)
+        if response.status_code == 429:
+            retry_after = float(response.json().get("retry_after", 1))
+            # Bounded single retry: cap at 10 seconds to avoid holding the Lambda.
+            retry_after = min(retry_after, 10.0)
+            logger.warning(
+                "Discord rate-limited on channel %s; retrying after %.1fs", channel_id, retry_after
+            )
+            time.sleep(retry_after)  # nosemgrep: arbitrary-sleep -- bounded Discord rate-limit retry
+            response = requests.post(url, json=payload, headers=headers, timeout=10)
+        response.raise_for_status()
+        return True
+    except requests.RequestException as exc:
+        logger.error("Failed to post Discord message to channel %s: %s", channel_id, exc)
         return False
 
 

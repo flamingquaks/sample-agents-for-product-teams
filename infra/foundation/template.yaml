@@ -194,6 +194,7 @@ Resources:
           BEDROCK_GUARDRAIL_VERSION: DRAFT
           GITHUB_PAT_PARAM: /sdlc-agents/github-mcp-token
           ASANA_PAT_PARAM: /sdlc-agents/asana-pat
+          DISCORD_BOT_TOKEN_PARAM: /sdlc-agents/discord-bot-token
           CLOUDWATCH_NAMESPACE: SDLCAgents/Dispatch
       Policies:
         - DynamoDBCrudPolicy:
@@ -218,6 +219,7 @@ Resources:
               Resource:
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/github-mcp-token
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/asana-pat
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/discord-bot-token
             - Effect: Allow
               Action:
                 - cloudwatch:PutMetricData
@@ -274,6 +276,61 @@ Resources:
           Type: Api
           Properties:
             Path: /asana/webhook
+            Method: POST
+            RestApiId: !Ref WebhookApi
+
+
+  # ---------------------------------------------------------------------------
+  # Discord Interactions Endpoint Lambda
+  # ---------------------------------------------------------------------------
+  #
+  # Receives Discord slash commands at POST /discord/interactions.
+  # All inbound requests are Ed25519-verified against the application public
+  # key stored in SSM. PING (type 1) interactions are echoed immediately.
+  # APPLICATION_COMMAND (type 2) interactions are acknowledged with a deferred
+  # response (type 5) and routed to the Dispatch Router asynchronously.
+  #
+  # Slash commands only (v1). Discord @mention events require a long-running
+  # Gateway WebSocket listener; that is a roadmap item requiring a Fargate task,
+  # not a Lambda. See docs/03-design-agent-fleet.md section 4.4.
+  #
+  # No ssm:PutParameter is granted in steady state (mirrors AsanaWebhookFunction
+  # posture -- threat T-9). The bot token is read-only here.
+
+  DiscordWebhookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub discord-webhook-${Stage}
+      CodeUri: ../dispatch/
+      Handler: discord_webhook.handler
+      Timeout: 30
+      ReservedConcurrentExecutions: 10
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt LambdaDeadLetterQueue.Arn
+      Environment:
+        Variables:
+          DISCORD_PUBLIC_KEY_PARAM: /sdlc-agents/discord-public-key
+          DISCORD_BOT_TOKEN_PARAM: /sdlc-agents/discord-bot-token
+          DISPATCH_FUNCTION: !Ref DispatchRouterFunction
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref DispatchRouterFunction
+        - Statement:
+            # Steady-state: read the public key (String) and bot token
+            # (SecureString) for inbound request processing.
+            # ssm:PutParameter is intentionally NOT granted (threat T-9).
+            - Effect: Allow
+              Action:
+                - ssm:GetParameter
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/discord-public-key
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/discord-bot-token
+      Events:
+        DiscordInteractions:
+          Type: Api
+          Properties:
+            Path: /discord/interactions
             Method: POST
             RestApiId: !Ref WebhookApi
 
@@ -377,6 +434,24 @@ Resources:
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
 
+
+  DiscordWebhookErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub discord-webhook-errors-${Stage}
+      AlarmDescription: Discord interactions endpoint error rate
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DiscordWebhookFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
   DispatchDurationAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -469,6 +544,11 @@ Outputs:
     Value: !Ref WebhookApi
     Export:
       Name: !Sub ${AWS::StackName}-WebhookApiId
+
+
+  DiscordInteractionsEndpoint:
+    Value: !Sub https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/discord/interactions
+    Description: Discord Interactions Endpoint URL -- paste this into the Discord Developer Portal under your app's Interactions Endpoint URL field
 
   GuardrailId:
     Value: !Ref PromptInjectionGuardrail

@@ -71,6 +71,84 @@ python scripts/bootstrap_asana_webhook.py \
 
 The script prints the Asana webhook GID on success. If the handshake times out, inspect the Lambda's CloudWatch logs — the most common cause is IAM propagation lag, and a retry usually succeeds. Do NOT re-run the Asana API call by hand with a long-lived elevated Lambda role; that is exactly the posture T-9 closes off.
 
+
+### Discord
+
+#### 1. Update the webhook Lambda's environment (if needed)
+
+The Discord webhook Lambda reads `DISCORD_PUBLIC_KEY_PARAM` and `DISCORD_BOT_TOKEN_PARAM` from its environment. These are set in the foundation SAM template and should not need manual updates after a standard deploy. If you redeployed with a different stage or the env vars are missing, update them:
+
+```bash
+aws lambda update-function-configuration \
+  --function-name "discord-webhook-${STAGE}" \
+  --environment "Variables={
+    DISCORD_PUBLIC_KEY_PARAM=/sdlc-agents/discord-public-key,
+    DISCORD_BOT_TOKEN_PARAM=/sdlc-agents/discord-bot-token,
+    DISPATCH_FUNCTION=dispatch-router-${STAGE}
+    }" \
+  --region "$REGION"
+```
+
+#### 2. Redeploy the Lambda code if this is a fresh install
+
+If the foundation stack was deployed before the Discord webhook code was added, rebuild and push the Lambda zip:
+
+```bash
+cd infra/dispatch
+pip install --quiet --target /tmp/lambda-build -r requirements.txt
+cp discord_webhook.py router.py reply.py /tmp/lambda-build/
+(cd /tmp/lambda-build && zip -rq /tmp/discord-webhook.zip . -x '*.pyc' -x '__pycache__/*')
+aws lambda update-function-code \
+  --function-name "discord-webhook-${STAGE}" \
+  --zip-file fileb:///tmp/discord-webhook.zip \
+  --region "$REGION"
+```
+
+Wait for `LastUpdateStatus=Successful` before proceeding.
+
+#### 3. Register the Discord application
+
+Run `scripts/bootstrap_discord_app.py`. This stores the bot credentials in SSM and registers slash commands via the Discord REST API.
+
+Prerequisite: create a Discord application at https://discord.com/developers/applications. You will need:
+- Application ID (displayed on the General Information page)
+- Public Key (General Information page)
+- Bot Token (Bot page — click Reset Token if this is the first time)
+
+```bash
+# Global commands (up to 1 hour to propagate):
+python scripts/bootstrap_discord_app.py \
+  --stage "$STAGE" \
+  --region "$REGION" \
+  --app-id <your_discord_app_id>
+
+# Dev/guild-scoped commands (instant propagation -- recommended for testing):
+python scripts/bootstrap_discord_app.py \
+  --stage "$STAGE" \
+  --region "$REGION" \
+  --app-id <your_discord_app_id> \
+  --guild-id <your_test_guild_id>
+```
+
+#### 4. Paste the Interactions Endpoint URL into Discord
+
+The script prints the URL from the CloudFormation stack output `DiscordInteractionsEndpoint`. Copy it and:
+
+1. Open https://discord.com/developers/applications
+2. Select your application
+3. Go to **General Information**
+4. Paste the URL into the **Interactions Endpoint URL** field
+5. Click **Save Changes** -- Discord sends a PING to verify the endpoint
+
+If the save fails with "Interactions endpoint URL could not be verified", check:
+- The foundation stack is deployed and the Lambda is healthy (CloudWatch Logs)
+- The public key in SSM (`/sdlc-agents/discord-public-key`) matches your application's public key exactly
+- API Gateway has the `POST /discord/interactions` route deployed
+
+#### Slack cross-reference
+
+If the Slack integration has also landed (parallel work), both Slack and Discord bot tokens are stored in SSM and their respective webhook Lambdas are deployed from the same foundation stack. They share the Dispatch Router; no additional router changes are needed to support both.
+
 ### GitHub
 
 #### 1. Enable the agent-dispatch workflow

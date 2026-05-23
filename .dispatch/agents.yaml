@@ -4,10 +4,12 @@
 
 # authorization.users is the allowlist of principals permitted to invoke each
 # agent. Identities must be stable, non-editable values:
-#   - GitHub: the user's login (e.g. "alice")
-#   - Asana:  the user's numeric GID (e.g. "1202334567890123") — NOT the
-#             display name, which is self-editable and non-unique
-#   - Slack:  the user ID (e.g. "U0123ABCDEF")
+#   - GitHub:  the user's login (e.g. "alice")
+#   - Asana:   the user's numeric GID (e.g. "1202334567890123") — NOT the
+#              display name, which is self-editable and non-unique
+#   - Slack:   the user ID (e.g. "U0123ABCDEF")
+#   - Discord: the user's snowflake ID (e.g. "123456789012345678") — immutable,
+#              non-self-editable; appears as the "id" field in user objects
 # Fails closed: an empty list causes the Dispatch Router to return 403 for
 # every sender. Populate with the identities of operators and peer-agent bot
 # accounts before first use. Cross-agent invocation is supported — list the
@@ -23,6 +25,7 @@ agents:
       asana: [comment_mention, assignment, custom_field]
       github: [issue_comment]
       slack: [mention, slash_command]
+      discord: [slash_command]
     authorization:
       users: []
     limits:
@@ -51,6 +54,7 @@ agents:
       github: [issue_comment, pr_comment]
       asana: [comment_mention, assignment, custom_field]
       slack: [mention, slash_command]
+      discord: [slash_command]
     authorization:
       users: []
     limits:

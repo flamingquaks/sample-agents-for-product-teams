@@ -26,6 +26,7 @@ from tools.generate_release_notes import generate_release_notes
 from tools.detect_doc_gaps import detect_doc_gaps
 from tools.check_doc_freshness import check_doc_freshness
 from tools.post_results import post_results
+from shared.discord_post import discord_post_message, discord_post_followup
 from tools.github_mcp import get_github_token, GITHUB_MCP_URL
 
 logger = logging.getLogger(__name__)
@@ -94,6 +95,19 @@ def invoke(payload, context=None):
             f"Project: {source_context.get('project_name', 'unknown')} ({source_context.get('project_gid', '')})\n"
             f"Reply to: Asana task {source_context.get('task_gid', 'unknown')}\n"
         )
+    elif source_context and source == "discord":
+        dispatch_context_block = (
+            "\n\n## Current Dispatch\n\n"
+            f"Source: discord\n"
+            f"Guild ID: {source_context.get('guild_id', 'unknown')}\n"
+            f"Channel ID: {source_context.get('channel_id', 'unknown')}\n"
+            f"User ID: {source_context.get('user_id', 'unknown')}\n"
+            f"Application ID: {source_context.get('application_id', '')}\n"
+            f"Interaction Token: {source_context.get('interaction_token', '')}\n"
+            "Reply instructions: Call discord_post_followup(application_id, "
+            "interaction_token, content) for the first response. "
+            "Use discord_post_message(channel_id, content) for additional messages.\n"
+        )
 
     # Build system prompt with project context + dispatch context.
     system_prompt = SYSTEM_PROMPT.format(
@@ -104,7 +118,8 @@ def invoke(payload, context=None):
     # emit multi-file patches without hitting MaxTokensReachedException
     # mid-tool-call on a multi-file README update.
     model = build_model(max_tokens=16000)
-    tools = [generate_api_docs, generate_release_notes, detect_doc_gaps, check_doc_freshness, post_results]
+    tools = [generate_api_docs, generate_release_notes, detect_doc_gaps, check_doc_freshness, post_results,
+             discord_post_message, discord_post_followup]
 
     # Memory — optional until Memory resource is created
     if MEMORY_ID:

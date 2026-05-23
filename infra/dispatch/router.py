@@ -328,6 +328,14 @@ def _post_block_reply(source: str, source_context: dict, message: str) -> bool:
             task_gid=source_context.get("task_gid", ""),
             body=message,
         )
+    if source == "discord":
+        # For slash-command blocks, post to the originating channel.
+        # The deferred interaction token is also an option but the channel
+        # post is simpler and provides identical UX when the block fires.
+        return reply.post_discord_message(
+            channel_id=source_context.get("channel_id", ""),
+            body=message,
+        )
     logger.warning("No reply channel for source=%s — block notice not posted", source)
     return False
 
