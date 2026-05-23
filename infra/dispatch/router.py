@@ -45,6 +45,33 @@ agentcore = boto3.client(
 CLOUDWATCH_NAMESPACE = os.environ.get("CLOUDWATCH_NAMESPACE", "SDLCAgents/Dispatch")
 STAGE = os.environ.get("STAGE", "dev")
 
+# Fields in `event` and `event.context` that must be redacted before logging.
+# Bulk free-text (task notes, message bodies) is high-volume PII; short-lived
+# tokens (Discord interaction tokens, future OAuth state) are credentials.
+_REDACTED_TOP_LEVEL = {"body", "instruction"}
+_REDACTED_CONTEXT = {
+    "task_notes",
+    "issue_body",
+    "issue_comments",
+    "message_text",
+    "interaction_token",
+}
+
+
+def _redact_event_for_log(event: dict) -> dict:
+    """Return a shallow copy of `event` with sensitive fields replaced by a
+    short marker. Keeps shape and key set intact so log-based debugging still
+    works."""
+    if not isinstance(event, dict):
+        return event
+    redacted = {k: ("<redacted>" if k in _REDACTED_TOP_LEVEL else v) for k, v in event.items()}
+    ctx = event.get("context")
+    if isinstance(ctx, dict):
+        redacted["context"] = {
+            k: ("<redacted>" if k in _REDACTED_CONTEXT else v) for k, v in ctx.items()
+        }
+    return redacted
+
 BLOCKED_MESSAGE_TEMPLATE = (
     "This request was blocked by a prompt-injection safety filter"
     "{reason_suffix}. No agent was invoked. If you believe this is a "
@@ -334,7 +361,7 @@ def handler(event, context):
         }
     }
     """
-    logger.info("Dispatch event: %s", json.dumps(event))
+    logger.info("Dispatch event: %s", json.dumps(_redact_event_for_log(event)))
 
     registry = load_registry()
 
