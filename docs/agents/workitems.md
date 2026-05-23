@@ -47,6 +47,7 @@ self-assigns or self-approves.
 - GitHub MCP (official remote server at `api.githubcopilot.com/mcp/`; PAT or GitHub App token from SSM)
 - `generate_status_report`, `detect_risks`, `reconcile_sync`, `post_results`
   (custom Strands tools under `agents/workitems/tools/`)
+- `slack_post_message`, `slack_post_thread` (Slack delivery — `agents/shared/slack_post.py`)
 - AgentCore Memory (optional — honored via `AGENTCORE_MEMORY_ID` env var; no Memory resource is provisioned today)
 
 ## Guardrails

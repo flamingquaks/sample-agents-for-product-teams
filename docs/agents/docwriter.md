@@ -42,6 +42,7 @@ Docwriter's doc PRs directly — Workitems is not in that loop.
 - `generate_api_docs`, `generate_release_notes`, `check_doc_freshness`,
   `detect_doc_gaps`, `post_results` (custom Strands tools under
   `agents/docwriter/tools/`)
+- `slack_post_message`, `slack_post_thread` (Slack delivery — `agents/shared/slack_post.py`)
 - AgentCore Memory (optional — honored via `AGENTCORE_MEMORY_ID` env var; no Memory resource is provisioned today)
 
 ## Guardrails
