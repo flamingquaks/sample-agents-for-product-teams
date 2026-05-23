@@ -21,13 +21,14 @@ from strands_tools.agent_core_memory import AgentCoreMemoryToolProvider
 
 from shared.assignment import complete_assignment, fail_assignment
 from shared.bedrock import build_model
+from shared.dispatch_context import build_dispatch_context_block
 from prompts import SYSTEM_PROMPT
 from project_config import build_project_context
 from tools.status_report import generate_status_report
 from tools.risk_detection import detect_risks
 from tools.sync import reconcile_sync
 from tools.post_results import post_results
-from shared.slack_post import slack_post_message, slack_post_thread
+from shared.tools.slack_post import slack_post_message, slack_post_thread
 from tools.asana_mcp import get_access_token, ASANA_MCP_URL
 from tools.github_mcp import get_github_token, GITHUB_MCP_URL
 
@@ -79,44 +80,7 @@ def invoke(payload, context=None):
     # content as the only user-role message lets the guardrail evaluate what
     # actually came from outside the trust boundary.
     source = payload.get("source", "unknown")
-    dispatch_context_block = ""
-    if source_context and source == "asana":
-        dispatch_context_block = (
-            "\n\n## Current Dispatch\n\n"
-            f"Source: asana\n"
-            f"Task GID: {source_context.get('task_gid', 'unknown')}\n"
-            f"Task: {source_context.get('task_name', 'unknown')}\n"
-            f"Task Notes: {source_context.get('task_notes', '')}\n"
-            f"Project: {source_context.get('project_name', 'unknown')} ({source_context.get('project_gid', '')})\n"
-            f"Reply to: Asana task {source_context.get('task_gid', 'unknown')}\n"
-        )
-    elif source_context and source == "github":
-        dispatch_context_block = (
-            "\n\n## Current Dispatch\n\n"
-            f"Source: github\n"
-            f"Repository: {source_context.get('repo', 'unknown')}\n"
-            f"Issue: #{source_context.get('issue_number', 'unknown')}\n"
-            f"Issue Title: {source_context.get('issue_title', 'unknown')}\n"
-            f"Issue Body:\n{source_context.get('issue_body', '')}\n"
-            f"Comments:\n{source_context.get('issue_comments', '(not loaded)')}\n"
-            f"Reply to: GitHub issue #{source_context.get('issue_number', 'unknown')} "
-            f"on {source_context.get('repo', 'unknown')}\n"
-        )
-    elif source_context and source == "slack":
-        thread_ts = source_context.get("thread_ts", "")
-        thread_label = thread_ts if thread_ts else "(top-level)"
-        dispatch_context_block = (
-            "\n\n## Current Dispatch\n\n"
-            f"Source: slack\n"
-            f"Channel: {source_context.get('channel_id', 'unknown')}\n"
-            f"Thread: {thread_label}\n"
-            f"User ID: {source_context.get('user_id', 'unknown')}\n"
-            f"Reply to: Slack channel {source_context.get('channel_id', 'unknown')} "
-            f"in thread {thread_label}\n"
-            f"Use slack_post_message or slack_post_thread with channel="
-            f"'{source_context.get('channel_id', '')}' and thread_ts='{thread_ts}' "
-            f"to post your results.\n"
-        )
+    dispatch_context_block = build_dispatch_context_block(source, source_context)
 
     model = build_model()
     tools = [generate_status_report, detect_risks, reconcile_sync, post_results, slack_post_message, slack_post_thread]

@@ -19,6 +19,7 @@ from strands_tools.agent_core_memory import AgentCoreMemoryToolProvider
 
 from shared.assignment import complete_assignment, fail_assignment
 from shared.bedrock import build_model
+from shared.dispatch_context import build_dispatch_context_block
 from prompts import SYSTEM_PROMPT
 from project_config import build_project_context
 from tools.generate_api_docs import generate_api_docs
@@ -26,7 +27,7 @@ from tools.generate_release_notes import generate_release_notes
 from tools.detect_doc_gaps import detect_doc_gaps
 from tools.check_doc_freshness import check_doc_freshness
 from tools.post_results import post_results
-from shared.slack_post import slack_post_message, slack_post_thread
+from shared.tools.slack_post import slack_post_message, slack_post_thread
 from tools.github_mcp import get_github_token, GITHUB_MCP_URL
 
 logger = logging.getLogger(__name__)
@@ -67,49 +68,7 @@ def invoke(payload, context=None):
     # Guardrails' PROMPT_ATTACK filter because it mirrors the canonical
     # injection shape. The agent still needs this context to know which
     # PR/issue triggered it; we just deliver it via the system slot.
-    dispatch_context_block = ""
-    if source_context and source == "github":
-        is_pr = source_context.get("is_pr") == "true" or source_context.get("pr_number")
-        issue_or_pr = source_context.get("issue_number") or source_context.get("pr_number", "unknown")
-        target_type = "PR" if is_pr else "issue"
-        dispatch_context_block = (
-            "\n\n## Current Dispatch\n\n"
-            f"Source: github\n"
-            f"Repository: {source_context.get('repo', 'unknown')}\n"
-            f"{target_type}: #{issue_or_pr}\n"
-            f"Title: {source_context.get('issue_title', 'unknown')}\n"
-            f"Body:\n{source_context.get('issue_body', '')}\n"
-            f"Labels: {source_context.get('issue_labels', '')}\n"
-            f"State: {source_context.get('issue_state', '')}\n"
-            f"Comments:\n{source_context.get('issue_comments', '(not loaded)')}\n"
-            f"Reply to: GitHub {target_type} #{issue_or_pr} "
-            f"on {source_context.get('repo', 'unknown')}\n"
-        )
-    elif source_context and source == "asana":
-        dispatch_context_block = (
-            "\n\n## Current Dispatch\n\n"
-            f"Source: asana\n"
-            f"Task GID: {source_context.get('task_gid', 'unknown')}\n"
-            f"Task: {source_context.get('task_name', 'unknown')}\n"
-            f"Task Notes: {source_context.get('task_notes', '')}\n"
-            f"Project: {source_context.get('project_name', 'unknown')} ({source_context.get('project_gid', '')})\n"
-            f"Reply to: Asana task {source_context.get('task_gid', 'unknown')}\n"
-        )
-    elif source_context and source == "slack":
-        thread_ts = source_context.get("thread_ts", "")
-        thread_label = thread_ts if thread_ts else "(top-level)"
-        dispatch_context_block = (
-            "\n\n## Current Dispatch\n\n"
-            f"Source: slack\n"
-            f"Channel: {source_context.get('channel_id', 'unknown')}\n"
-            f"Thread: {thread_label}\n"
-            f"User ID: {source_context.get('user_id', 'unknown')}\n"
-            f"Reply to: Slack channel {source_context.get('channel_id', 'unknown')} "
-            f"in thread {thread_label}\n"
-            f"Use slack_post_message or slack_post_thread with channel="
-            f"'{source_context.get('channel_id', '')}' and thread_ts='{thread_ts}' "
-            f"to post your results.\n"
-        )
+    dispatch_context_block = build_dispatch_context_block(source, source_context)
 
     # Build system prompt with project context + dispatch context.
     system_prompt = SYSTEM_PROMPT.format(
