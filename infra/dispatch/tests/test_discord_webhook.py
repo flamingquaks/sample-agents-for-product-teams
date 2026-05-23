@@ -6,13 +6,16 @@ Coverage:
   - APPLICATION_COMMAND (type 2): agent resolution, option parsing, deferred ACK
   - Missing / empty SSM public-key param returns 503
   - Async router invoke shape
+  - Base64-encoded body handling (D-M1)
 """
 
+import base64
 import json
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 
+import botocore.exceptions
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -23,26 +26,49 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # ---------------------------------------------------------------------------
 
 
+def _make_ssm_not_found_error():
+    """Return a real botocore ClientError matching ParameterNotFound."""
+    return botocore.exceptions.ClientError(
+        {"Error": {"Code": "ParameterNotFound", "Message": "not found"}},
+        "GetParameter",
+    )
+
+
 @pytest.fixture(autouse=True)
 def _mock_boto3(monkeypatch):
-    """Suppress all real boto3 client creation at module import."""
-    with patch("boto3.client") as mock_client:
-        # SSM: default returns a valid public key hex
-        ssm_mock = MagicMock()
-        ssm_mock.get_parameter.return_value = {
-            "Parameter": {"Value": "a" * 64}  # 32-byte key hex
-        }
-        ssm_mock.exceptions.ParameterNotFound = Exception
-        mock_client.return_value = ssm_mock
+    """Suppress all real boto3 client creation at module import.
+
+    SSM and Lambda clients are returned as distinct mocks so tests can
+    assert on each independently (D-B2).
+    """
+    ssm_mock = MagicMock()
+    ssm_mock.get_parameter.return_value = {
+        "Parameter": {"Value": "a" * 64}  # 32-byte key hex
+    }
+    # ParameterNotFoundException is the correct boto3 attribute name (D-B1).
+    ssm_mock.exceptions.ParameterNotFoundException = botocore.exceptions.ClientError
+    lambda_mock = MagicMock()
+
+    def _client_factory(service, **kwargs):
+        if service == "ssm":
+            return ssm_mock
+        return lambda_mock
+
+    with patch("boto3.client", side_effect=_client_factory) as mock_client:
         yield mock_client
 
 
 @pytest.fixture
 def dw(monkeypatch):
-    """Import discord_webhook with all external clients mocked."""
+    """Import discord_webhook with all external clients mocked.
+
+    Resets the module-level _verify_key cache between tests so that the
+    SSM-fetch code path is exercised on every test that checks it.
+    """
     for name in ("discord_webhook",):
         sys.modules.pop(name, None)
     import discord_webhook as dw_mod
+    dw_mod._verify_key = None
     return dw_mod
 
 
@@ -90,7 +116,7 @@ class TestEd25519Verification:
         assert resp["statusCode"] == 200
 
     def test_verify_ed25519_bad_hex_returns_false(self, dw):
-        result = dw._verify_ed25519("notvalidhex!", "aabb", "12345", "{}")
+        result = dw._verify_ed25519("notvalidhex!", "aabb", "12345", b"{}")
         assert result is False
 
     def test_verify_ed25519_bad_signature_returns_false(self, dw):
@@ -105,7 +131,7 @@ class TestEd25519Verification:
         signed = signing_key.sign(b"12345{}")
         sig_hex = signed.signature.hex()
         # Now verify against different message -- should fail
-        result = dw._verify_ed25519(verify_key_hex, sig_hex, "12345", "different_body")
+        result = dw._verify_ed25519(verify_key_hex, sig_hex, "12345", b"different_body")
         assert result is False
 
     def test_verify_ed25519_valid_signature_returns_true(self, dw):
@@ -116,8 +142,8 @@ class TestEd25519Verification:
         signing_key = nacl.signing.SigningKey.generate()
         verify_key_hex = signing_key.verify_key.encode().hex()
         timestamp = "12345"
-        body = '{"type":1}'
-        message = (timestamp + body).encode()
+        body = b'{"type":1}'
+        message = timestamp.encode() + body
         signed = signing_key.sign(message)
         sig_hex = signed.signature.hex()
         result = dw._verify_ed25519(verify_key_hex, sig_hex, timestamp, body)
@@ -131,7 +157,7 @@ class TestEd25519Verification:
 
 class TestSSMFailures:
     def test_missing_public_key_param_returns_503(self, dw):
-        with patch.object(dw._ssm, "get_parameter", side_effect=dw._ssm.exceptions.ParameterNotFound):
+        with patch.object(dw._ssm, "get_parameter", side_effect=_make_ssm_not_found_error()):
             resp = dw.handler(_make_event("{}"), None)
         assert resp["statusCode"] == 503
         assert "not registered" in resp["body"]
@@ -297,3 +323,77 @@ class TestApplicationCommand:
         with patch.object(dw, "_verify_ed25519", return_value=True):
             resp = dw.handler(event, None)
         assert resp["statusCode"] == 400
+
+
+# ---------------------------------------------------------------------------
+# D-B1: ParameterNotFoundException (real botocore ClientError, not a mock alias)
+# ---------------------------------------------------------------------------
+
+
+class TestSSMParameterNotFoundException:
+    def test_parameter_not_found_raises_client_error(self, dw):
+        """ParameterNotFoundException must be a real botocore ClientError so the
+        except clause in the handler does not raise AttributeError (D-B1)."""
+        err = _make_ssm_not_found_error()
+        assert isinstance(err, botocore.exceptions.ClientError)
+
+    def test_handler_catches_client_error_as_503(self, dw):
+        """Handler catches the real botocore ClientError from ParameterNotFoundException
+        and returns 503 without raising AttributeError (D-B1 regression guard)."""
+        with patch.object(dw._ssm, "get_parameter", side_effect=_make_ssm_not_found_error()):
+            resp = dw.handler(_make_event("{}"), None)
+        assert resp["statusCode"] == 503
+        assert "not registered" in resp["body"]
+
+
+# ---------------------------------------------------------------------------
+# D-M1: Base64-encoded body from API Gateway
+# ---------------------------------------------------------------------------
+
+
+class TestBase64Body:
+    def test_base64_body_verifies_correctly(self, dw):
+        """When isBase64Encoded=True, body is decoded to bytes before signature
+        verification -- valid request must pass through to the correct handler."""
+        try:
+            import nacl.signing
+        except ImportError:
+            pytest.skip("pynacl not installed")
+
+        signing_key = nacl.signing.SigningKey.generate()
+        verify_key_hex = signing_key.verify_key.encode().hex()
+
+        timestamp = "12345"
+        body_bytes = json.dumps({"type": 1}).encode()
+        message = timestamp.encode() + body_bytes
+        signed = signing_key.sign(message)
+        sig_hex = signed.signature.hex()
+
+        # Simulate API Gateway base64-encoding the body
+        b64_body = base64.b64encode(body_bytes).decode()
+
+        event = {
+            "body": b64_body,
+            "isBase64Encoded": True,
+            "headers": {
+                "x-signature-ed25519": sig_hex,
+                "x-signature-timestamp": timestamp,
+            },
+        }
+
+        # Patch in the real key so the handler uses it without SSM
+        from nacl.signing import VerifyKey
+        dw._verify_key = VerifyKey(bytes.fromhex(verify_key_hex))
+
+        resp = dw.handler(event, None)
+        assert resp["statusCode"] == 200
+        assert json.loads(resp["body"]) == {"type": 1}
+
+    def test_non_base64_body_still_works(self, dw):
+        """Plain-text body (isBase64Encoded absent or False) continues to work."""
+        body = json.dumps({"type": 1})
+        event = _make_event(body)
+        with patch.object(dw, "_verify_ed25519", return_value=True):
+            resp = dw.handler(event, None)
+        assert resp["statusCode"] == 200
+        assert json.loads(resp["body"]) == {"type": 1}

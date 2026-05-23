@@ -21,11 +21,14 @@ SSM as a plain String (not a secret -- it is truly public, but we keep it in
 SSM for consistent config management alongside the bot token).
 """
 
+import base64
 import json
 import logging
 import os
 
 import boto3
+from nacl.exceptions import BadSignatureError
+from nacl.signing import VerifyKey
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -46,6 +49,12 @@ DISCORD_PUBLIC_KEY_PARAM = os.environ.get(
 _ssm = boto3.client("ssm")
 lambda_client = boto3.client("lambda")
 
+# Module-level VerifyKey cache. The public key is not a secret (it is truly
+# public — Discord publishes it in the Developer Portal). Caching the parsed
+# VerifyKey avoids an SSM round-trip on every invocation and keeps cold-start
+# signature verification well inside Discord's 3s PING deadline.
+_verify_key: VerifyKey | None = None
+
 
 def _get_ssm_param(name: str, with_decryption: bool = True) -> str:
     resp = _ssm.get_parameter(Name=name, WithDecryption=with_decryption)
@@ -55,7 +64,7 @@ def _get_ssm_param(name: str, with_decryption: bool = True) -> str:
 # --- Signature Verification --------------------------------------------------
 
 
-def _verify_ed25519(public_key_hex: str, signature_hex: str, timestamp: str, raw_body: str) -> bool:
+def _verify_ed25519(public_key_hex: str, signature_hex: str, timestamp: str, raw_body: bytes) -> bool:
     """Verify the Ed25519 signature Discord attaches to every inbound request.
 
     Discord signs (timestamp_bytes + raw_body_bytes) with the application's
@@ -63,18 +72,21 @@ def _verify_ed25519(public_key_hex: str, signature_hex: str, timestamp: str, raw
 
     Uses pynacl (nacl.signing.VerifyKey). Returns True on a valid signature,
     False on any mismatch or malformed input. Never raises.
+
+    No replay-window check is applied here; rationale is documented in
+    docs/threat-model.md section T-9c.
     """
     try:
-        import nacl.signing
-        import nacl.exceptions
-
-        verify_key = nacl.signing.VerifyKey(bytes.fromhex(public_key_hex))
-        message = (timestamp + raw_body).encode()
+        verify_key = VerifyKey(bytes.fromhex(public_key_hex))
+        message = timestamp.encode() + raw_body
         sig_bytes = bytes.fromhex(signature_hex)
         verify_key.verify(message, sig_bytes)
         return True
-    except Exception as exc:
+    except BadSignatureError as exc:
         logger.warning("Ed25519 signature verification failed: %s", exc)
+        return False
+    except Exception as exc:
+        logger.warning("Ed25519 signature verification error: %s", exc)
         return False
 
 
@@ -111,12 +123,11 @@ def _resolve_agent_id(command_name: str) -> str | None:
 # --- Dispatch ----------------------------------------------------------------
 
 
-def _dispatch(agent_id: str, instruction: str, sender: str, context: dict) -> None:
+def dispatch(agent_id: str, instruction: str, sender: str, context: dict) -> None:
     """Async-invoke the Dispatch Router with a pre-resolved agent_id.
 
     Passing agent_id bypasses the Router's @mention extraction -- the command
-    name already resolved the agent. This is the same pattern the Asana
-    webhook receiver uses (see router.py line ~350).
+    name already resolved the agent. Same pattern as asana_webhook.py dispatch().
     """
     payload = {
         "source": "discord",
@@ -138,7 +149,7 @@ def _dispatch(agent_id: str, instruction: str, sender: str, context: dict) -> No
 # --- Interaction Processors --------------------------------------------------
 
 
-def _process_application_command(interaction: dict, invocation_state: dict) -> dict:
+def _process_application_command(interaction: dict) -> dict:
     """Handle a type-2 APPLICATION_COMMAND interaction.
 
     1. Acknowledge with type 5 (DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE) so
@@ -211,7 +222,7 @@ def _process_application_command(interaction: dict, invocation_state: dict) -> d
     # Dispatch asynchronously before returning -- Discord requires a response
     # within 3 seconds and the agent work can take far longer.
     try:
-        _dispatch(
+        dispatch(
             agent_id=agent_id,
             instruction=instruction,
             sender=sender,
@@ -257,33 +268,44 @@ def handler(event, context):
        then async-invoke Dispatch Router.
     6. Unknown type -- 400.
     """
-    # Secrets and state live on this dict, not module globals (threat T-8).
-    invocation_state: dict = {}
+    global _verify_key
 
     headers = event.get("headers", {})
     # Normalize header keys to lowercase -- API Gateway may preserve original case.
     headers = {k.lower(): v for k, v in headers.items()}
-    raw_body = event.get("body", "") or ""
 
-    # --- Fetch Discord public key from SSM -----------------------------------
+    # API Gateway may base64-encode the body when binary content types are in
+    # play. Decode to bytes so signature verification uses the exact wire bytes.
+    raw_body_str = event.get("body", "") or ""
+    if event.get("isBase64Encoded"):
+        raw_body_bytes = base64.b64decode(raw_body_str)
+    else:
+        raw_body_bytes = raw_body_str.encode()
+
+    # --- Fetch Discord public key from SSM (cached) --------------------------
     # Hard-fail on missing param. A misconfigured stage must not silently
     # accept unsigned events. Same posture as the Asana webhook secret check.
-    try:
-        public_key_hex = _get_ssm_param(DISCORD_PUBLIC_KEY_PARAM, with_decryption=False)
-    except _ssm.exceptions.ParameterNotFound:
-        logger.error(
-            "Discord public-key parameter %s not found. Run "
-            "scripts/bootstrap_discord_app.py to register the app.",
-            DISCORD_PUBLIC_KEY_PARAM,
-        )
-        return {"statusCode": 503, "body": "discord app not registered"}
-    except Exception as exc:
-        logger.error("Failed to fetch Discord public key from SSM: %s", exc)
-        return {"statusCode": 503, "body": "could not load discord config"}
+    # The VerifyKey is cached at module scope after first successful fetch to
+    # keep cold-start signature verification inside Discord's 3s PING deadline.
+    if _verify_key is None:
+        try:
+            public_key_hex = _get_ssm_param(DISCORD_PUBLIC_KEY_PARAM, with_decryption=False)
+        except _ssm.exceptions.ParameterNotFoundException:
+            logger.error(
+                "Discord public-key parameter %s not found. Run "
+                "scripts/bootstrap_discord_app.py to register the app.",
+                DISCORD_PUBLIC_KEY_PARAM,
+            )
+            return {"statusCode": 503, "body": "discord app not registered"}
+        except Exception as exc:
+            logger.error("Failed to fetch Discord public key from SSM: %s", exc)
+            return {"statusCode": 503, "body": "could not load discord config"}
 
-    if not public_key_hex:
-        logger.error("Discord public-key parameter %s is empty.", DISCORD_PUBLIC_KEY_PARAM)
-        return {"statusCode": 503, "body": "discord app not registered"}
+        if not public_key_hex:
+            logger.error("Discord public-key parameter %s is empty.", DISCORD_PUBLIC_KEY_PARAM)
+            return {"statusCode": 503, "body": "discord app not registered"}
+
+        _verify_key = VerifyKey(bytes.fromhex(public_key_hex))
 
     # --- Ed25519 Signature Verification ---------------------------------------
     # Both headers are required. Reject early on missing headers rather than
@@ -299,13 +321,13 @@ def handler(event, context):
         )
         return {"statusCode": 401, "body": "missing signature headers"}
 
-    if not _verify_ed25519(public_key_hex, sig_header, ts_header, raw_body):
+    if not _verify_ed25519(_verify_key.encode().hex(), sig_header, ts_header, raw_body_bytes):
         logger.warning("Discord Ed25519 signature verification failed")
         return {"statusCode": 401, "body": "invalid request signature"}
 
     # --- Parse interaction ---------------------------------------------------
     try:
-        payload = json.loads(raw_body) if isinstance(raw_body, str) else raw_body
+        payload = json.loads(raw_body_bytes) if isinstance(raw_body_bytes, bytes) else raw_body_bytes
     except json.JSONDecodeError:
         return {"statusCode": 400, "body": "invalid JSON"}
 
@@ -325,7 +347,7 @@ def handler(event, context):
 
     # --- APPLICATION_COMMAND (type 2) ----------------------------------------
     if interaction_type == 2:
-        return _process_application_command(payload, invocation_state)
+        return _process_application_command(payload)
 
     # Unknown interaction type -- Discord may add new types in the future.
     logger.warning("Unhandled Discord interaction type: %s", interaction_type)
