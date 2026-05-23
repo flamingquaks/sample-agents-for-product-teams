@@ -304,6 +304,7 @@ Resources:
       CodeUri: ../dispatch/
       Handler: discord_webhook.handler
       Timeout: 30
+      MemorySize: 512
       ReservedConcurrentExecutions: 10
       DeadLetterQueue:
         Type: SQS
@@ -311,21 +312,20 @@ Resources:
       Environment:
         Variables:
           DISCORD_PUBLIC_KEY_PARAM: /sdlc-agents/discord-public-key
-          DISCORD_BOT_TOKEN_PARAM: /sdlc-agents/discord-bot-token
           DISPATCH_FUNCTION: !Ref DispatchRouterFunction
       Policies:
         - LambdaInvokePolicy:
             FunctionName: !Ref DispatchRouterFunction
         - Statement:
-            # Steady-state: read the public key (String) and bot token
-            # (SecureString) for inbound request processing.
-            # ssm:PutParameter is intentionally NOT granted (threat T-9).
+            # Steady-state: read the public key (String, not a secret) for
+            # Ed25519 signature verification. The bot token is never read by
+            # this Lambda -- only reply.py and the agent's discord_post tool
+            # need it. ssm:PutParameter is intentionally NOT granted (threat T-9).
             - Effect: Allow
               Action:
                 - ssm:GetParameter
               Resource:
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/discord-public-key
-                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/discord-bot-token
       Events:
         DiscordInteractions:
           Type: Api
