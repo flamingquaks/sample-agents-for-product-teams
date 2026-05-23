@@ -17,6 +17,7 @@ The PDLC Agent Fleet is a multi-agent system on Amazon Bedrock AgentCore Runtime
 |----|-----------|------|-------------|
 | C-1 | GitHub Actions (`agent-dispatch.yml`) | CI/CD Workflow | Extracts `@mention` from comments, assumes an OIDC-federated role, invokes Dispatch Router Lambda |
 | C-2 | Asana Webhook Lambda | AWS Lambda + API Gateway | Public HTTPS endpoint; verifies HMAC signature; forwards events to Dispatch Router |
+| C-2a | Slack Webhook Lambda | AWS Lambda + API Gateway | Public HTTPS endpoint; verifies HMAC-SHA256 Slack signature; handles app_mention and slash commands; forwards to Dispatch Router |
 | C-3 | Dispatch Router Lambda | AWS Lambda | Resolves agent, checks auth/concurrency, records assignment, invokes AgentCore Runtime |
 | C-4 | AgentCore Runtimes (×4) | Bedrock AgentCore | Containerized agents (workitems, researcher, docwriter, adr) running Strands SDK + Claude Opus 4.7 |
 | C-5 | DynamoDB (`dispatch-assignments`) | Database | Assignment state tracking with TTL-based expiry |
@@ -86,6 +87,8 @@ The PDLC Agent Fleet is a multi-agent system on Amazon Bedrock AgentCore Runtime
 | DF-3 | Asana → API Gateway | Webhook event payload (story/task changes) | HTTPS POST | HMAC-SHA256 signature |
 | DF-4 | Asana Webhook Lambda → Asana API | Task/story fetch requests | HTTPS | Bearer PAT from SSM |
 | DF-5 | Asana Webhook Lambda → Dispatch Router | Normalized event payload | Lambda async invoke | IAM execution role |
+| DF-5a | Slack Webhook Lambda → Dispatch Router | Normalized event payload (pre-resolved agent_id) | Lambda async invoke | IAM execution role |
+| DF-5b | Slack API → Slack Webhook Lambda | Signed Events API / slash-command POST | HTTPS POST | HMAC-SHA256 signature (v0=...) |
 | DF-6 | Dispatch Router → SSM | Registry fetch | AWS API | IAM execution role |
 | DF-7 | Dispatch Router → DynamoDB | Assignment create/query | AWS API | IAM execution role |
 | DF-8 | Dispatch Router → AgentCore Runtime | Instruction + context as JSON | `InvokeAgentRuntime` | IAM execution role (scoped to runtime/runtime-endpoint ARNs in this account+region) |
@@ -161,6 +164,14 @@ Wildcards (`StringLike: repo:<org>/<repo>:*`) are explicitly called out as anti-
 **T-8 (Mitigated):** `infra/dispatch/asana_webhook.py` fetches the Asana PAT on demand inside `asana_get`, caches it only on an `invocation_state` dict that goes out of scope when the handler returns, and never retains it on a module-level global. The webhook secret is likewise fetched per invocation. A memory-disclosure or verbose-log incident exposes at most the secrets used by the single request that was in flight, not the secrets used by every prior request in the same execution environment.
 
 **T-9 (Mitigated):** The asana-webhook Lambda's IAM policy grants only `ssm:GetParameter` on the Asana PAT and webhook-secret parameters in steady state — it cannot overwrite the secret. The handshake still works because registration is gated through `scripts/bootstrap_asana_webhook.py`: the operator runs the script, which attaches a temporary inline `ssm:PutParameter` policy (scoped to the single parameter) to the Lambda's execution role, calls the Asana webhooks API, polls SSM until the handshake writes the secret, and removes the inline policy. Outside that registration window, an attacker who can replay Asana's handshake receives a 403 — the Lambda logs "handshake PutParameter denied" and refuses to overwrite the stored secret.
+
+**T-8a (Mitigated — Slack signing-secret hygiene):** `infra/dispatch/slack_webhook.py` follows the same pattern as T-8: the signing secret is fetched per invocation from SSM and cached only on the `invocation_state` dict, which goes out of scope when the handler returns. No module-level secret retention. A misconfigured (missing or empty) signing secret causes the Lambda to return 503 rather than silently processing unsigned events — hard-fail posture identical to Asana's.
+
+**T-8b (Mitigated — Slack 5-minute replay window):** `_verify_slack_signature` rejects any request whose `X-Slack-Request-Timestamp` is more than 300 seconds from the current time before performing the HMAC comparison. This closes the replay window regardless of whether an attacker has captured a valid signature. The check runs before the SSM fetch to avoid wasted calls on clearly stale requests.
+
+**T-8c (Mitigated — Slack immutable sender identity):** The sender field in all Slack dispatch payloads is `event.user` — the Slack user ID (U-prefixed, e.g. `U0123ABCDEF`). User IDs are assigned by Slack and cannot be changed by the user. Display names and real names are self-editable and non-unique; using them in the `authorization.users` allowlist would be an identity bypass (threat T-4 analogue for Slack — same principle as using Asana `.gid` vs. `.name`). The webhook Lambda and the router both document this constraint.
+
+**T-9 (Mitigated — Asana only; no Slack analogue):** The Slack integration has no handshake protocol. The signing secret is a static value the operator copies from the Slack app console and stores via `scripts/bootstrap_slack_app.py`. There is no T-9 analogue because the Lambda never receives the secret over the wire and has no need for `ssm:PutParameter` — its steady-state IAM policy grants only `ssm:GetParameter`.
 
 **T-10 (Accepted):** Agents surface OAuth refresh errors in logs but there is no automated rotation or CloudWatch alarm. Operators are expected to notice failed runs and re-run `pdlc-agents-connect-asana`. Acceptable for a reference architecture; production deployments should add alarms on SSM parameter age.
 
@@ -252,8 +263,8 @@ Automated scanners (checkov, semgrep, bandit) flag several patterns in this repo
 | T-24 | **CKV_AWS_119** — DynamoDB table not encrypted with a customer-managed KMS key | `dispatch-assignments` holds operational state (mention body, assignment status, guardrail trip records) with a 30-day TTL — not long-lived PII or regulated data. AWS-owned keys meet the bar for a reference architecture, avoid key-management surface, and incur no per-request KMS cost. | Swap `SSESpecification` to `KMSMasterKeyId: !Ref <YourCmkKey>` and grant `kms:Decrypt`/`kms:GenerateDataKey` to the Dispatch Router runtime role. |
 | T-25 | **CKV_DOCKER_2** — Dockerfiles missing `HEALTHCHECK` instructions | Bedrock AgentCore Runtime manages container lifecycle via its invocation endpoint and internal liveness signals; Docker's `HEALTHCHECK` directive is not consulted by AgentCore. Adding it would give a false impression of active health management without affecting runtime behavior. | Only meaningful if you migrate agents off AgentCore to a runtime that honors Docker healthchecks (ECS, raw Kubernetes); at that point wire a Strands `/health` endpoint and add the directive. |
 | T-26 | **CKV_AWS_173** — Lambda environment variables not encrypted with a KMS CMK | The Lambda functions' env vars hold *references* to SSM parameters (names and resource ARNs), not secret values. Actual credentials are fetched from SSM SecureString at invocation time (T-8). A CMK on the env-var block would encrypt public identifiers. | If your account-level policy mandates CMK-everywhere, set `KmsKeyArn` on each `AWS::Serverless::Function` to an existing CMK and grant `kms:Decrypt` to the runtime role. |
-| T-27 | **CKV_AWS_120** — API Gateway caching not enabled on the webhook endpoint | The Asana webhook handler verifies HMAC-SHA256 on every inbound payload and routes events to the Dispatch Router asynchronously. Caching would serve cached 200s to replayed or forged payloads and defeat signature verification semantics. | Not recommended to enable. |
-| T-28 | **CKV_AWS_117** — Lambda functions not deployed inside a VPC | Both Lambdas (Dispatch Router, Asana webhook) talk only to AWS service endpoints (DynamoDB, SSM, Bedrock AgentCore, Lambda Invoke) and to external HTTPS APIs (Asana, GitHub). There are no private VPC resources to reach. A VPC attachment would add ENI management + cold-start latency with no reachability benefit. | If you introduce a private backend (RDS, internal ALB, VPC endpoint to Bedrock for egress control), attach both Lambdas to a private subnet with NAT egress and add `AWSLambdaVPCAccessExecutionRole`. |
+| T-27 | **CKV_AWS_120** — API Gateway caching not enabled on the webhook endpoint | Both the Asana and Slack webhook handlers verify HMAC-SHA256 on every inbound payload and route events to the Dispatch Router asynchronously. Caching would serve cached 200s to replayed or forged payloads and defeat signature verification semantics. | Not recommended to enable. |
+| T-28 | **CKV_AWS_117** — Lambda functions not deployed inside a VPC | All three Lambdas (Dispatch Router, Asana webhook, Slack webhook) talk only to AWS service endpoints (DynamoDB, SSM, Bedrock AgentCore, Lambda Invoke) and to external HTTPS APIs (Asana, GitHub). There are no private VPC resources to reach. A VPC attachment would add ENI management + cold-start latency with no reachability benefit. | If you introduce a private backend (RDS, internal ALB, VPC endpoint to Bedrock for egress control), attach both Lambdas to a private subnet with NAT egress and add `AWSLambdaVPCAccessExecutionRole`. |
 
 **Mitigated by this same review** (no longer exceptions): CKV_AWS_28 (DynamoDB PITR enabled), CKV_AWS_18/CKV_AWS_21 (S3 access logging + versioning), CKV_AWS_73/CKV_AWS_76 (API Gateway X-Ray + access logs), CKV_AWS_115/CKV_AWS_116 (Lambda reserved concurrency + DLQ), CKV_DOCKER_3 (non-root container user), CKV2_GHA_1 (top-level workflow `permissions: contents: read`).
 
@@ -284,7 +295,7 @@ Risk is expressed as the residual exposure given current controls. Mitigated thr
 | **Medium (Open or Partial)** | 8 | T-11, T-13, T-17, T-21 (open); T-12, T-18, T-20, T-22 (partial) |
 | **Low (Accepted with rationale)** | 5 | T-24, T-25, T-26, T-27, T-28 |
 | **Low** | 3 | T-10, T-14, T-16 |
-| **Mitigated (Not scored)** | 6 | T-4, T-6, T-7, T-8, T-9, T-19 |
+| **Mitigated (Not scored)** | 9 | T-4, T-6, T-7, T-8, T-8a, T-8b, T-8c, T-9, T-19 |
 
 ---
 
@@ -303,7 +314,7 @@ Roadmap items ordered by leverage:
 
 ## 7. Assumptions & Scope
 
-- Covers the fleet as shipped: four agents (workitems, researcher, docwriter, adr), Dispatch Router, Asana webhook. Slack integration, AgentCore Memory, AgentCore Gateway, AgentCore Identity, and Feedback/UAT agents are out of scope — they are not yet implemented.
+- Covers the fleet as shipped: four agents (workitems, researcher, docwriter, adr), Dispatch Router, Asana webhook, and Slack webhook. AgentCore Memory, AgentCore Gateway, AgentCore Identity, and Feedback/UAT agents are out of scope — they are not yet implemented.
 - Single AWS account + single region deployment. Multi-account or cross-region introduces additional trust boundaries not analyzed here.
 - LLM model behavior (hallucinations, jailbreaks, adversarial-input sensitivity) is treated as a baseline risk of using foundation models. Mitigations focus on constraining what the agent can *do*, not on preventing the model from generating bad outputs.
 - GitHub MCP and Asana MCP servers are treated as trusted third-party services. Their internal security posture is out of scope.
@@ -315,6 +326,7 @@ Roadmap items ordered by leverage:
 
 | Date | Version | Changes |
 |------|---------|---------|
+| 2026-05-23 | 1.8 | Slack integration shipped. Added C-2a (Slack Webhook Lambda), DF-5a/5b (Slack data flows), auth boundary row. Added T-8a (signing-secret hygiene), T-8b (5-minute replay window), T-8c (immutable U-ID sender). Noted absence of T-9 analogue. Updated scope. |
 | 2026-05-05 | 1.7 | Checkov / semgrep scan pass (Kai Xu review). Hardened CFN: DynamoDB PITR, S3 versioning + access logs, API Gateway X-Ray + access logs, Lambda reserved concurrency + SQS DLQ; Dockerfiles switched to non-root `agent` user; all workflows given top-level `permissions: contents: read`. New §3.8 documents T-24..T-28 — accepted scanner findings (CKV_AWS_119, CKV_DOCKER_2, CKV_AWS_173, CKV_AWS_120, CKV_AWS_117) with rationale and upgrade paths. |
 | 2026-05-05 | 1.6 | Security review fixes: T-4 Asana sender is now the user `.gid` (was the self-editable display name — a HIGH-severity auth bypass); Router rejects unresolved sender sentinels ("", "unknown") as defense-in-depth. §3.1 narrative now states the shipping guardrail posture (`InputStrength: MEDIUM`, `OutputStrength: NONE`) — prior text implied HIGH/HIGH. |
 | 2026-05-05 | 1.5 | T-1/T-2/T-3 flipped from Accepted to Partially mitigated — Bedrock Guardrails (`PROMPT_ATTACK`) enforced at the Dispatch Router edge and on every agent's `InvokeModel` call. Section 6 roadmap re-ordered: Cedar enforcement now #1. |

@@ -28,17 +28,17 @@ The PDLC Agent Fleet is a multi-agent system on **Amazon Bedrock AgentCore Runti
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                     EXTERNAL PLATFORMS                           │
-│           GitHub (Issues, PRs, Actions)  │   Asana              │
+│    GitHub (Issues, PRs, Actions)  │  Asana  │  Slack            │
 └──────────────┬──────────────────────────┴──────┬────────────────┘
                │                                 │
                ▼                                 ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                     DISPATCH LAYER                               │
 │                                                                  │
-│  GitHub Actions workflow            Asana Webhook Lambda         │
-│  (agent-dispatch.yml)               (asana-webhook-${STAGE})     │
-│         │                                    │                   │
-│         └────────────────┬───────────────────┘                   │
+│  GitHub Actions workflow  Asana Webhook Lambda  Slack Webhook    │
+│  (agent-dispatch.yml)     (asana-webhook-${STAGE}) (slack-webhook-${STAGE}) │
+│         │                        │                   │           │
+│         └────────────────┬───────┴───────────────────┘           │
 │                          ▼                                       │
 │          Dispatch Router Lambda (dispatch-router-${STAGE})       │
 │          ┌─────────────────────────────┐                         │
@@ -109,7 +109,7 @@ Asana Webhook        ├──► │  Normalize to:            │  (authorizat
                           │                              Runtime (async)
 ```
 
-The Asana webhook Lambda handles signature verification against `/sdlc-agents/asana-webhook-secret` (written on first handshake). The GitHub path arrives via the `agent-dispatch.yml` workflow, which extracts the mention and invokes the router Lambda directly — no separate GitHub webhook receiver.
+The Asana webhook Lambda handles signature verification against `/sdlc-agents/asana-webhook-secret` (written on first handshake). The Slack webhook Lambda handles HMAC-SHA256 verification against `/sdlc-agents/slack-signing-secret`, supports both `app_mention` events and slash commands, and pre-resolves the agent ID before passing it to the router. The GitHub path arrives via the `agent-dispatch.yml` workflow, which extracts the mention and invokes the router Lambda directly — no separate GitHub webhook receiver.
 
 ### 2.2 Assignment State Machine
 
@@ -223,9 +223,23 @@ The shared workflow also supports the `env_vars` input, which is passed through 
 
 **Authentication:** OAuth2 against Asana's MCP app, bootstrapped once via `scripts/bootstrap_asana_oauth.py`. Tokens refresh at runtime from `/sdlc-agents/asana-mcp-*` SSM paths.
 
-### 4.3 Slack Integration (roadmap)
+### 4.3 Slack Integration
 
-`.dispatch/agents.yaml` advertises Slack triggers for Workitems and Docwriter, but there's no Slack event receiver in the foundation stack and the Dispatch Router has no Slack signature verifier. Adding Slack requires a `slack-webhook-${STAGE}` Lambda, a Slack app manifest, and the signing-secret path in SSM. Flagged as a gap in `skills/pdlc-agents-register-triggers`.
+All four agents accept `@mention` and slash-command triggers from Slack via the `slack-webhook-${STAGE}` Lambda backed by `POST /slack/events` and `POST /slack/commands` on the shared WebhookApi.
+
+**Inbound triggers (via `slack-webhook-${STAGE}` Lambda):**
+- `app_mention` — user types `@SDLC Agents @workitems <instruction>` in any channel the bot is in → Dispatch Router
+- Slash command — user types `/workitems <instruction>`, `/docwriter <instruction>`, etc. → ephemeral ack → async Dispatch Router invoke
+
+**Outbound actions (via `agents/shared/slack_post.py`):**
+- `slack_post_message` — post to a channel at the top level or in a thread
+- `slack_post_thread` — convenience wrapper to reply in a specific thread
+
+**Authentication:** Bot token (`xoxb-…`) in SSM at `/sdlc-agents/slack-bot-token`; signing secret at `/sdlc-agents/slack-signing-secret`. Both stored by `scripts/bootstrap_slack_app.py`.
+
+**Signature verification:** HMAC-SHA256 of `v0:{timestamp}:{body}` against the signing secret, with a 5-minute replay window. The Lambda hard-fails on a missing or empty signing secret (mirrors Asana's T-8/T-9 posture).
+
+**Single-bot model:** one Slack app covers the entire fleet. Agent resolution mirrors the Asana/GitHub pattern: first `@agent` mention in the stripped message text, with the same alias map from `.dispatch/agents.yaml`.
 
 ---
 
@@ -313,6 +327,4 @@ Explicit list of things the earlier design described as load-bearing but which a
 - **AgentCore Memory (provisioned).** Agents already honor `AGENTCORE_MEMORY_ID`; what's missing is a Memory resource in the foundation stack and a story for seeding it. Upside: agents accumulate context across invocations. Downside: memory-quality governance is a non-trivial operational problem.
 - **Feedback agent.** A Haiku-based agent that watches human edits to other agents' output and writes corrections to the `/feedback/` memory namespace. Useful once Memory is provisioned; depends on it.
 - **UAT agent.** Playwright test generation and execution against staging. Depends on AgentCore Browser and a solid story for test-maintenance across UI changes.
-- **Slack dispatch.** Event receiver, signature verification, and slash commands.
-
 The [roadmap](roadmap.md) has the ordering.
