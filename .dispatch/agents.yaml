@@ -36,7 +36,6 @@ agents:
     aliases: [ba, research, analyze]
     triggers:
       asana: [comment_mention, assignment, custom_field]
-      slack: [mention, slash_command]
     authorization:
       users: []
     limits:
@@ -65,7 +64,6 @@ agents:
     aliases: [decisions, architecture]
     triggers:
       github: [issue_comment, pr_comment]
-      slack: [mention, slash_command]
     authorization:
       users: []
     limits:

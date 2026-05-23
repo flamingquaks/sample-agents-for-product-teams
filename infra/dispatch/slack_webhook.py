@@ -11,7 +11,8 @@ Two entry points share a single Lambda:
 No handshake protocol (unlike Asana). Slack verifies ownership by having the
 operator paste the endpoint URL into the app config and performing a
 url_verification echo challenge. That challenge arrives over the same POST
-/slack/events endpoint, so we handle it inline before any auth check.
+/slack/events endpoint and is verified with the same HMAC-SHA256 signature
+before echoing the challenge back.
 
 Signature verification uses HMAC-SHA256:
     v0:{X-Slack-Request-Timestamp}:{raw-body}
@@ -20,13 +21,14 @@ Requests older than 5 minutes are rejected regardless of signature validity
 to close the replay window (threat-model analogue to Asana T-8/T-9).
 
 Hard-fail on a missing or empty signing secret keeps a misconfigured stage
-from silently accepting unsigned events — mirrors Asana's posture
-(asana_webhook.py:307-321).
+from silently accepting unsigned events — mirrors the hard-fail block in
+asana_webhook.py.
 
 Single-bot model: one Slack app for the entire fleet. The target agent is
 resolved by finding the first @agent mention in the message body (app_mention
 path) or by the slash command name (slash_command path). Pre-resolved
-agent_id is passed directly to the Dispatch Router (router.py:350).
+agent_id is passed directly to the Dispatch Router via the pre-resolved
+agent_id path in router.py.
 """
 
 import hashlib
@@ -47,9 +49,6 @@ logger.setLevel(logging.INFO)
 
 DISPATCH_FUNCTION = os.environ.get("DISPATCH_FUNCTION", "dispatch-router")
 
-# Secrets fetched per invocation, not at cold start. Retaining the bot token
-# or signing secret on module-level globals widens the exposure window of a
-# memory-disclosure or verbose-log incident (threat T-8 analogue).
 _ssm = boto3.client("ssm")
 
 SLACK_BOT_TOKEN_PARAM = os.environ.get("SLACK_BOT_TOKEN_PARAM", "/sdlc-agents/slack-bot-token")
@@ -57,13 +56,33 @@ SLACK_SIGNING_SECRET_PARAM = os.environ.get("SLACK_SIGNING_SECRET_PARAM", "/sdlc
 
 lambda_client = boto3.client("lambda")
 
+REPLAY_WINDOW_SECONDS = 300
+
+# Per-container signing-secret cache with a 5-minute TTL. The cache avoids
+# an SSM fetch on every request in the steady state (hot-path latency).
+# The TTL is rotation tolerance only — a rotated secret is picked up within
+# 5 minutes. The hard-fail on an empty secret (see _verify_slack_signature)
+# remains unchanged: a cached empty string will still raise ValueError.
+_SIGNING_SECRET_TTL_SECONDS = 300
+_cached_signing_secret: str | None = None
+_cached_signing_secret_at: float = 0.0
+
+
+def _get_signing_secret() -> str:
+    global _cached_signing_secret, _cached_signing_secret_at
+    now = time.time()
+    if _cached_signing_secret is None or now - _cached_signing_secret_at > _SIGNING_SECRET_TTL_SECONDS:
+        _cached_signing_secret = _get_ssm_param(SLACK_SIGNING_SECRET_PARAM)
+        _cached_signing_secret_at = now
+    return _cached_signing_secret
+
 # --- Agent Resolution --------------------------------------------------------
 
 # Canonical agent names plus aliases, matching the registry's alias map.
 # The router's resolve_agent() does the authoritative lookup; this is the
 # initial match to catch the first @name token before dispatching.
 MENTION_PATTERN = re.compile(
-    r"@(workitems|pm|status|plan|docwriter|docs|doc|writer|researcher|ba|research|analyze|adr|decisions|architecture)\b",
+    r"@(workitems|pm|status|plan|docwriter|docs|doc|writer)\b",
     re.IGNORECASE,
 )
 
@@ -74,15 +93,10 @@ ALIAS_MAP = {
     "docs": "docwriter",
     "doc": "docwriter",
     "writer": "docwriter",
-    "ba": "researcher",
-    "research": "researcher",
-    "analyze": "researcher",
-    "decisions": "adr",
-    "architecture": "adr",
 }
 
 # Slash commands map directly by stripping the leading "/".
-SLASH_COMMAND_AGENTS = {"workitems", "docwriter", "researcher", "adr"}
+SLASH_COMMAND_AGENTS = {"workitems", "docwriter"}
 
 
 def _resolve_mention(text: str) -> tuple[str | None, str]:
@@ -141,17 +155,18 @@ def _verify_slack_signature(raw_body: str, timestamp: str, signature: str, invoc
         return False
 
     now = int(time.time())
-    if abs(now - ts_int) > 300:
+    if abs(now - ts_int) > REPLAY_WINDOW_SECONDS:
         logger.warning(
-            "Slack request timestamp %s is outside the 5-minute window (now=%s)",
+            "Slack request timestamp %s is outside the %s-second window (now=%s)",
             timestamp,
+            REPLAY_WINDOW_SECONDS,
             now,
         )
         return False
 
     signing_secret = invocation_state.get("signing_secret")
     if signing_secret is None:
-        signing_secret = _get_ssm_param(SLACK_SIGNING_SECRET_PARAM)
+        signing_secret = _get_signing_secret()
         invocation_state["signing_secret"] = signing_secret
 
     if not signing_secret:
@@ -160,6 +175,10 @@ def _verify_slack_signature(raw_body: str, timestamp: str, signature: str, invoc
             SLACK_SIGNING_SECRET_PARAM,
         )
         raise ValueError("signing secret is empty")
+
+    if not signature.startswith("v0="):
+        logger.warning("Slack signature missing required v0= prefix: %r", signature[:10])
+        return False
 
     sig_basestring = f"v0:{timestamp}:{raw_body}"
     computed = "v0=" + hmac.new(
@@ -174,7 +193,7 @@ def _verify_slack_signature(raw_body: str, timestamp: str, signature: str, invoc
 # --- Dispatch ----------------------------------------------------------------
 
 
-def _dispatch_async(agent_id: str, trigger_type: str, instruction: str, context: dict, sender: str) -> None:
+def dispatch(agent_id: str, trigger_type: str, instruction: str, context: dict, sender: str) -> None:
     """Forward a resolved event to the Dispatch Router Lambda (fire-and-forget)."""
     payload = {
         "source": "slack",
@@ -237,7 +256,7 @@ def _process_app_mention(event: dict) -> dict:
         "message_text": raw_text,
     }
 
-    _dispatch_async(
+    dispatch(
         agent_id=agent_id,
         trigger_type="mention",
         instruction=instruction,
@@ -298,7 +317,7 @@ def _process_slash_command(form_data: dict) -> dict:
     }
 
     try:
-        _dispatch_async(
+        dispatch(
             agent_id=agent_id,
             trigger_type="slash_command",
             instruction=instruction,
@@ -306,7 +325,7 @@ def _process_slash_command(form_data: dict) -> dict:
             sender=user_id,
         )
     except Exception as exc:
-        logger.exception("Failed to dispatch slash command /%s: %s", command, exc)
+        logger.exception("Failed to dispatch slash command /%s", command)
         ack["text"] = f"Failed to dispatch `/{command}`: {exc}. Please try again."
 
     return {
@@ -336,27 +355,13 @@ def handler(event, context):
     raw_body = event.get("body", "") or ""
     path = event.get("path", event.get("rawPath", ""))
 
-    # --- URL verification (Slack challenge) ----------------------------------
-    # Slack sends this when the operator saves the endpoint URL in the app
-    # config. It is a plain JSON POST with no X-Slack-Signature header and
-    # must echo back the challenge value before Slack accepts the URL. Handle
-    # it before the signature check so the operator can wire up the app even
-    # before the signing secret lands in SSM.
-    try:
-        body_json = json.loads(raw_body) if isinstance(raw_body, str) else raw_body
-    except (json.JSONDecodeError, TypeError):
-        body_json = {}
-
-    if isinstance(body_json, dict) and body_json.get("type") == "url_verification":
-        challenge = body_json.get("challenge", "")
-        logger.info("Slack URL verification challenge received")
-        return {
-            "statusCode": 200,
-            "headers": {"Content-Type": "application/json"},
-            "body": json.dumps({"challenge": challenge}),
-        }
-
     # --- Signature verification ----------------------------------------------
+    # Runs first on every request — including url_verification challenges.
+    # Slack signs challenge requests with the same HMAC-SHA256 scheme, so
+    # verifying before echoing the challenge is both safe and required.
+    # Hard-fail on a missing or empty signing secret (503) so a misconfigured
+    # stage never silently processes unsigned events (see the hard-fail block
+    # in asana_webhook.py).
     timestamp = headers.get("x-slack-request-timestamp", "")
     signature = headers.get("x-slack-signature", "")
 
@@ -385,8 +390,26 @@ def handler(event, context):
         return _process_slash_command(form_data)
 
     # Default path: /slack/events (Events API)
+    try:
+        body_json = json.loads(raw_body) if isinstance(raw_body, str) else raw_body
+    except (json.JSONDecodeError, TypeError):
+        body_json = {}
+
     if not isinstance(body_json, dict):
         return {"statusCode": 400, "body": "invalid JSON"}
+
+    # --- URL verification (Slack challenge) ----------------------------------
+    # Slack sends this when the operator saves the endpoint URL in the app
+    # config. The challenge is signed with the same HMAC-SHA256 scheme, so
+    # signature verification above already validated the request.
+    if body_json.get("type") == "url_verification":
+        challenge = body_json.get("challenge", "")
+        logger.info("Slack URL verification challenge received")
+        return {
+            "statusCode": 200,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"challenge": challenge}),
+        }
 
     event_type = body_json.get("type")
 
