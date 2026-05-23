@@ -207,6 +207,7 @@ Under `scripts/`:
 - `bootstrap_asana_oauth.py` — one-shot OAuth 2.0 dance for the Asana MCP server; stores the refresh token in SSM
 - `bootstrap_jira_oauth.py` — same thing for Atlassian/Jira (3LO)
 - `bootstrap_asana_webhook.py` — operator-run webhook registration; attaches a temporary `ssm:PutParameter` policy to the webhook Lambda's role so the Asana handshake can persist the shared secret, then removes the policy
+- `bootstrap_discord_app.py` — bootstraps the Discord application; stores bot token and public key in SSM, registers slash commands (use `--guild-id` for instant dev propagation), and prints the Interactions Endpoint URL and bot install link
 - `sync_registry.py` — resolves runtime ARNs in `.dispatch/agents.yaml` and pushes the registry to SSM so the Dispatch Router can read it
 
 Run these only for the integrations you actually use.
