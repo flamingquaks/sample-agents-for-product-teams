@@ -64,7 +64,7 @@ import requests
 import yaml
 from botocore.exceptions import ClientError
 
-DISCORD_API = "https://discord.com/api/v10"
+DISCORD_API = "https://discord.com/api/v10"  # also defined in infra/dispatch/reply.py and agents/shared/discord_post.py
 DISCORD_BOT_TOKEN_PARAM = "/sdlc-agents/discord-bot-token"  # nosec B105 -- SSM param name
 DISCORD_PUBLIC_KEY_PARAM = "/sdlc-agents/discord-public-key"
 

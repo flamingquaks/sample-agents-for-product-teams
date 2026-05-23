@@ -32,7 +32,7 @@ from strands import tool
 
 logger = logging.getLogger(__name__)
 
-DISCORD_API = "https://discord.com/api/v10"
+DISCORD_API = "https://discord.com/api/v10"  # also defined in infra/dispatch/reply.py and scripts/bootstrap_discord_app.py
 DISCORD_BOT_TOKEN_PARAM = os.environ.get(
     "DISCORD_BOT_TOKEN_PARAM", "/sdlc-agents/discord-bot-token"
 )

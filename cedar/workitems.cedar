@@ -32,7 +32,7 @@ permit(
     // Slack — write (post only)
     resource.toolName == "slack_post_message" ||
     resource.toolName == "slack_post_thread" ||
-    // Discord -- write (post only)
+    // Discord — write (post only)
     resource.toolName == "discord_post_message" ||
     resource.toolName == "discord_post_followup"
 };

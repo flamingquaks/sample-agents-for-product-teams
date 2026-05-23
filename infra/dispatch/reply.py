@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 GITHUB_API = "https://api.github.com"
 ASANA_API = "https://app.asana.com/api/1.0"
-DISCORD_API = "https://discord.com/api/v10"
+DISCORD_API = "https://discord.com/api/v10"  # also defined in agents/shared/discord_post.py and scripts/bootstrap_discord_app.py
 
 GITHUB_PAT_PARAM_ENV = "GITHUB_PAT_PARAM"
 ASANA_PAT_PARAM_ENV = "ASANA_PAT_PARAM"
