@@ -194,6 +194,7 @@ Resources:
           BEDROCK_GUARDRAIL_VERSION: DRAFT
           GITHUB_PAT_PARAM: /sdlc-agents/github-mcp-token
           ASANA_PAT_PARAM: /sdlc-agents/asana-pat
+          SLACK_BOT_TOKEN_PARAM: /sdlc-agents/slack-bot-token
           CLOUDWATCH_NAMESPACE: SDLCAgents/Dispatch
       Policies:
         - DynamoDBCrudPolicy:
@@ -218,6 +219,7 @@ Resources:
               Resource:
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/github-mcp-token
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/asana-pat
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/slack-bot-token
             - Effect: Allow
               Action:
                 - cloudwatch:PutMetricData
@@ -277,6 +279,56 @@ Resources:
             Method: POST
             RestApiId: !Ref WebhookApi
 
+  # ---------------------------------------------------------------------------
+  # Slack Webhook Receiver Lambda
+  # ---------------------------------------------------------------------------
+
+  SlackWebhookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub slack-webhook-${Stage}
+      CodeUri: ../dispatch/
+      Handler: slack_webhook.handler
+      Timeout: 30
+      ReservedConcurrentExecutions: 10
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt LambdaDeadLetterQueue.Arn
+      Environment:
+        Variables:
+          SLACK_BOT_TOKEN_PARAM: /sdlc-agents/slack-bot-token
+          SLACK_SIGNING_SECRET_PARAM: /sdlc-agents/slack-signing-secret
+          DISPATCH_FUNCTION: !Ref DispatchRouterFunction
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref DispatchRouterFunction
+        - Statement:
+            # Steady-state permissions: read the bot token (for future outbound
+            # use) and the signing secret to verify inbound HMAC signatures.
+            # No ssm:PutParameter — there is no handshake protocol for Slack
+            # (the signing secret is set manually via bootstrap_slack_app.py),
+            # so there is no T-9 analogue. Defensive posture: no write access
+            # in steady state regardless.
+            - Effect: Allow
+              Action:
+                - ssm:GetParameter
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/slack-bot-token
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/slack-signing-secret
+      Events:
+        SlackEvents:
+          Type: Api
+          Properties:
+            Path: /slack/events
+            Method: POST
+            RestApiId: !Ref WebhookApi
+        SlackCommands:
+          Type: Api
+          Properties:
+            Path: /slack/commands
+            Method: POST
+            RestApiId: !Ref WebhookApi
+
   WebhookApiAccessLogs:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -287,7 +339,7 @@ Resources:
     Type: AWS::Serverless::Api
     Properties:
       StageName: !Ref Stage
-      Description: Asana webhook endpoint for agent dispatch
+      Description: Webhook endpoint for agent dispatch (Asana and Slack)
       TracingEnabled: true
       MethodSettings:
         - ResourcePath: "/*"
@@ -370,6 +422,23 @@ Resources:
       Dimensions:
         - Name: FunctionName
           Value: !Ref AsanaWebhookFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  SlackWebhookErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub slack-webhook-errors-${Stage}
+      AlarmDescription: Slack webhook receiver error rate
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SlackWebhookFunction
       Statistic: Sum
       Period: 300
       EvaluationPeriods: 2
@@ -464,6 +533,14 @@ Outputs:
   WebhookEndpoint:
     Value: !Sub https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/asana/webhook
     Description: Asana webhook URL — register this in Asana webhook subscriptions
+
+  SlackEventsEndpoint:
+    Value: !Sub https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/slack/events
+    Description: Slack Events API URL — paste into the app's Event Subscriptions Request URL field
+
+  SlackCommandsEndpoint:
+    Value: !Sub https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/slack/commands
+    Description: Slack slash-command URL — paste into each slash command's Request URL field
 
   WebhookApiId:
     Value: !Ref WebhookApi
