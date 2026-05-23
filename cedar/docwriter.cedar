@@ -32,5 +32,6 @@ permit(
     resource.toolName == "asana_add_comment" ||
     resource.toolName == "asana_create_task" ||
     // Slack — write (doc notifications)
-    resource.toolName == "slack_post_message"
+    resource.toolName == "slack_post_message" ||
+    resource.toolName == "slack_post_thread"
 };
