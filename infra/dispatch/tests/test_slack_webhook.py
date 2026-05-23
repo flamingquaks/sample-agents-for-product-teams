@@ -1,8 +1,8 @@
 """Unit tests for the Slack Webhook Receiver Lambda.
 
 Covers the cases specified in the deliverable:
-- Signature verification: valid, bad HMAC, expired timestamp
-- URL verification echo (Slack challenge)
+- Signature verification: valid, bad HMAC, expired timestamp, missing v0= prefix
+- URL verification echo (Slack challenge) — now requires valid signature
 - app_mention parsing with <@BOT_ID> prefix stripping
 - Slash-command form parsing and ephemeral ack shape
 - Async dispatch invokes the router with the right payload shape
@@ -21,6 +21,19 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import slack_webhook  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Reset module-level signing-secret cache between tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def reset_signing_secret_cache():
+    """Clear the module-level signing-secret cache before each test."""
+    slack_webhook._cached_signing_secret = None
+    slack_webhook._cached_signing_secret_at = 0.0
+    yield
 
 
 # ---------------------------------------------------------------------------
@@ -62,13 +75,9 @@ def _ssm_mock(secret: str = "test-secret") -> MagicMock:
 
 class TestUrlVerification:
     def test_echoes_challenge(self):
-        """Slack's url_verification challenge must be echoed verbatim."""
+        """Slack signs url_verification challenges; handler must verify before echoing."""
         body = json.dumps({"type": "url_verification", "challenge": "abc123"})
-        event = {
-            "path": "/slack/events",
-            "headers": {},
-            "body": body,
-        }
+        event = _make_event(body)
         with patch.object(slack_webhook, "_ssm", _ssm_mock()):
             resp = slack_webhook.handler(event, {})
         assert resp["statusCode"] == 200
@@ -76,11 +85,19 @@ class TestUrlVerification:
 
     def test_echoes_empty_challenge(self):
         body = json.dumps({"type": "url_verification", "challenge": ""})
-        event = {"path": "/slack/events", "headers": {}, "body": body}
+        event = _make_event(body)
         with patch.object(slack_webhook, "_ssm", _ssm_mock()):
             resp = slack_webhook.handler(event, {})
         assert resp["statusCode"] == 200
         assert json.loads(resp["body"])["challenge"] == ""
+
+    def test_challenge_without_signature_rejected(self):
+        """url_verification without a valid signature must be rejected (S-B3)."""
+        body = json.dumps({"type": "url_verification", "challenge": "abc123"})
+        event = {"path": "/slack/events", "headers": {}, "body": body}
+        with patch.object(slack_webhook, "_ssm", _ssm_mock()):
+            resp = slack_webhook.handler(event, {})
+        assert resp["statusCode"] == 401
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +171,24 @@ class TestSignatureVerification:
             resp = slack_webhook.handler(event, {})
         assert resp["statusCode"] == 503
 
+    def test_signature_without_v0_prefix_rejected(self):
+        """Signatures lacking the v0= prefix must be rejected with 401 (S-M2)."""
+        body = json.dumps({"type": "event_callback", "event": {}})
+        ts = str(int(time.time()))
+        sig_base = f"v0:{ts}:{body}"
+        digest = hmac.new("test-secret".encode(), sig_base.encode(), hashlib.sha256).hexdigest()
+        event = {
+            "path": "/slack/events",
+            "headers": {
+                "x-slack-request-timestamp": ts,
+                "x-slack-signature": digest,  # missing v0= prefix
+            },
+            "body": body,
+        }
+        with patch.object(slack_webhook, "_ssm", _ssm_mock()):
+            resp = slack_webhook.handler(event, {})
+        assert resp["statusCode"] == 401
+
 
 # ---------------------------------------------------------------------------
 # app_mention parsing
@@ -226,17 +261,35 @@ class TestAppMention:
 
     def test_dispatch_payload_shape(self):
         """Router receives source=slack, trigger_type=mention, and context dict."""
-        event = self._mention_event("<@U123> @researcher analyze backlog", user="UABC", channel="CXYZ")
+        event = self._mention_event("<@U123> @workitems update backlog", user="UABC", channel="CXYZ")
         with patch.object(slack_webhook, "_ssm", _ssm_mock()), \
              patch.object(slack_webhook, "lambda_client") as mock_lc:
             slack_webhook.handler(event, {})
         payload = json.loads(mock_lc.invoke.call_args.kwargs["Payload"])
         assert payload["source"] == "slack"
         assert payload["trigger_type"] == "mention"
-        assert payload["agent_id"] == "researcher"
+        assert payload["agent_id"] == "workitems"
         assert payload["context"]["channel_id"] == "CXYZ"
         assert payload["sender"] == "UABC"
         assert mock_lc.invoke.call_args.kwargs["InvocationType"] == "Event"
+
+    def test_researcher_mention_not_dispatched(self):
+        """researcher has no Slack triggers; mention must be silently ignored (S-B1)."""
+        event = self._mention_event("<@U123BOT> @researcher analyze backlog")
+        with patch.object(slack_webhook, "_ssm", _ssm_mock()), \
+             patch.object(slack_webhook, "lambda_client") as mock_lc:
+            resp = slack_webhook.handler(event, {})
+        assert resp["statusCode"] == 200
+        mock_lc.invoke.assert_not_called()
+
+    def test_adr_mention_not_dispatched(self):
+        """adr has no Slack triggers; mention must be silently ignored (S-B1)."""
+        event = self._mention_event("<@U123BOT> @adr review pr")
+        with patch.object(slack_webhook, "_ssm", _ssm_mock()), \
+             patch.object(slack_webhook, "lambda_client") as mock_lc:
+            resp = slack_webhook.handler(event, {})
+        assert resp["statusCode"] == 200
+        mock_lc.invoke.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
