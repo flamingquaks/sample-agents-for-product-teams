@@ -27,6 +27,7 @@ from tools.status_report import generate_status_report
 from tools.risk_detection import detect_risks
 from tools.sync import reconcile_sync
 from tools.post_results import post_results
+from shared.slack_post import slack_post_message, slack_post_thread
 from tools.asana_mcp import get_access_token, ASANA_MCP_URL
 from tools.github_mcp import get_github_token, GITHUB_MCP_URL
 
@@ -101,9 +102,24 @@ def invoke(payload, context=None):
             f"Reply to: GitHub issue #{source_context.get('issue_number', 'unknown')} "
             f"on {source_context.get('repo', 'unknown')}\n"
         )
+    elif source_context and source == "slack":
+        thread_ts = source_context.get("thread_ts", "")
+        thread_label = thread_ts if thread_ts else "(top-level)"
+        dispatch_context_block = (
+            "\n\n## Current Dispatch\n\n"
+            f"Source: slack\n"
+            f"Channel: {source_context.get('channel_id', 'unknown')}\n"
+            f"Thread: {thread_label}\n"
+            f"User ID: {source_context.get('user_id', 'unknown')}\n"
+            f"Reply to: Slack channel {source_context.get('channel_id', 'unknown')} "
+            f"in thread {thread_label}\n"
+            f"Use slack_post_message or slack_post_thread with channel="
+            f"'{source_context.get('channel_id', '')}' and thread_ts='{thread_ts}' "
+            f"to post your results.\n"
+        )
 
     model = build_model()
-    tools = [generate_status_report, detect_risks, reconcile_sync, post_results]
+    tools = [generate_status_report, detect_risks, reconcile_sync, post_results, slack_post_message, slack_post_thread]
 
     # Memory — optional until Memory resource is created
     if MEMORY_ID:

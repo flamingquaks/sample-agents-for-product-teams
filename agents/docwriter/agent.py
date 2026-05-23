@@ -26,6 +26,7 @@ from tools.generate_release_notes import generate_release_notes
 from tools.detect_doc_gaps import detect_doc_gaps
 from tools.check_doc_freshness import check_doc_freshness
 from tools.post_results import post_results
+from shared.slack_post import slack_post_message, slack_post_thread
 from tools.github_mcp import get_github_token, GITHUB_MCP_URL
 
 logger = logging.getLogger(__name__)
@@ -94,6 +95,21 @@ def invoke(payload, context=None):
             f"Project: {source_context.get('project_name', 'unknown')} ({source_context.get('project_gid', '')})\n"
             f"Reply to: Asana task {source_context.get('task_gid', 'unknown')}\n"
         )
+    elif source_context and source == "slack":
+        thread_ts = source_context.get("thread_ts", "")
+        thread_label = thread_ts if thread_ts else "(top-level)"
+        dispatch_context_block = (
+            "\n\n## Current Dispatch\n\n"
+            f"Source: slack\n"
+            f"Channel: {source_context.get('channel_id', 'unknown')}\n"
+            f"Thread: {thread_label}\n"
+            f"User ID: {source_context.get('user_id', 'unknown')}\n"
+            f"Reply to: Slack channel {source_context.get('channel_id', 'unknown')} "
+            f"in thread {thread_label}\n"
+            f"Use slack_post_message or slack_post_thread with channel="
+            f"'{source_context.get('channel_id', '')}' and thread_ts='{thread_ts}' "
+            f"to post your results.\n"
+        )
 
     # Build system prompt with project context + dispatch context.
     system_prompt = SYSTEM_PROMPT.format(
@@ -104,7 +120,7 @@ def invoke(payload, context=None):
     # emit multi-file patches without hitting MaxTokensReachedException
     # mid-tool-call on a multi-file README update.
     model = build_model(max_tokens=16000)
-    tools = [generate_api_docs, generate_release_notes, detect_doc_gaps, check_doc_freshness, post_results]
+    tools = [generate_api_docs, generate_release_notes, detect_doc_gaps, check_doc_freshness, post_results, slack_post_message, slack_post_thread]
 
     # Memory — optional until Memory resource is created
     if MEMORY_ID:
