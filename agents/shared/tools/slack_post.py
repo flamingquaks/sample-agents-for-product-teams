@@ -19,9 +19,11 @@ provisioning; see skills/sdlc-agents-provision-aws/SKILL.md).
 
 import logging
 import os
+import time
 
 import boto3
 import requests
+from botocore.exceptions import BotoCoreError, ClientError
 from strands import tool
 
 logger = logging.getLogger(__name__)
@@ -30,27 +32,39 @@ SLACK_API = "https://slack.com/api"
 _PARAM_NAME = os.environ.get("SLACK_BOT_TOKEN_PARAM", "/sdlc-agents/slack-bot-token")
 
 # --- Token init --------------------------------------------------------------
-# Fetched once per container startup. AgentCore runtimes are long-lived; the
-# module-level cache is intentional here (unlike the webhook Lambda, where
-# per-invocation fetch limits cross-request secret exposure). The container is
-# isolated to this agent's execution environment, so the exposure window is
-# bounded by the container's lifetime rather than a shared Lambda environment.
+# Cached per container with a 1-hour TTL. AgentCore runtimes are long-lived;
+# the module-level cache avoids per-call SSM latency. The TTL provides
+# rotation tolerance — a rotated token is picked up within an hour. It is not
+# a security boundary; the container is isolated to this agent's execution
+# environment and already bounds the exposure window.
+
+_TOKEN_TTL_SECONDS = 3600
 
 _bot_token: str | None = None
+_bot_token_fetched_at: float = 0.0
 
 
 def _get_bot_token() -> str:
-    global _bot_token
-    if _bot_token is None:
-        ssm = boto3.client("ssm")
-        resp = ssm.get_parameter(Name=_PARAM_NAME, WithDecryption=True)
-        _bot_token = resp["Parameter"]["Value"]
+    global _bot_token, _bot_token_fetched_at
+    now = time.time()
+    if _bot_token is None or now - _bot_token_fetched_at > _TOKEN_TTL_SECONDS:
+        try:
+            ssm = boto3.client("ssm")
+            resp = ssm.get_parameter(Name=_PARAM_NAME, WithDecryption=True)
+            _bot_token = resp["Parameter"]["Value"]
+            _bot_token_fetched_at = now
+        except (ClientError, BotoCoreError) as exc:
+            logger.error("Failed to fetch Slack bot token from SSM: %s", exc)
+            raise
     return _bot_token
 
 
 def _post_message(channel: str, text: str, thread_ts: str = "") -> str:
     """Internal: call chat.postMessage and return a result string for the LLM."""
-    token = _get_bot_token()
+    try:
+        token = _get_bot_token()
+    except (ClientError, BotoCoreError) as exc:
+        return f"Error: could not retrieve Slack bot token: {exc}"
     payload: dict = {"channel": channel, "text": text}
     if thread_ts:
         payload["thread_ts"] = thread_ts
