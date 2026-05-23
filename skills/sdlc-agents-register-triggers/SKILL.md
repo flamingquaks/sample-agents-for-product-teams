@@ -90,20 +90,74 @@ Add a line for each agent in `.sdlc-agents/selection.yaml`. Commit.
 
 The trust policy for the deploy role is created manually (or via `sdlc-agents-provision-aws`) when you first set up the account — see `docs/aws-deploy.md` §1.3. It should use `StringEquals` on `sub` with two explicit subjects: `repo:<ORG>/<REPO>:ref:refs/heads/main` (covers deploy workflows on `push` to main AND the dispatch workflow's `issue_comment` / `pull_request_review_comment` events, which run in the default-branch context) and `repo:<ORG>/<REPO>:pull_request` (covers `claude-code.yml`'s `pull_request: [opened, synchronize]` trigger — the only true "pull request event" in OIDC terms). If the user is bringing a brand-new repo, the role's trust policy was scoped to a different `<ORG>/<REPO>` — update the role directly (`aws iam update-assume-role-policy`) to add their repo's two subjects, or create a fresh role for them.
 
-### Slack (gap — not yet supported end-to-end)
+### Slack
 
-Slack triggers aren't wired up in the foundation stack or the Dispatch Router yet. If the user has Slack in their toolchain and selected agents that advertise Slack triggers in `.dispatch/agents.yaml`, tell them:
+#### 1. Update the webhook Lambda's environment (if needed)
 
-> Slack triggers aren't implemented in this fleet yet. The registry advertises the trigger shape but the foundation stack has no Slack event receiver, and the router has no signature verifier. You can still use your selected agents via Asana/GitHub; the Slack path can be added later.
+The Slack webhook Lambda reads its token and signing-secret SSM paths from environment variables. In most cases the defaults baked into the SAM template are correct (`/sdlc-agents/slack-bot-token`, `/sdlc-agents/slack-signing-secret`). If the user stored their credentials at different paths, update the Lambda:
 
-When support lands, this section should cover:
+```bash
+aws lambda update-function-configuration \
+  --function-name "slack-webhook-${STAGE}" \
+  --environment "Variables={
+    SLACK_BOT_TOKEN_PARAM=/sdlc-agents/slack-bot-token,
+    SLACK_SIGNING_SECRET_PARAM=/sdlc-agents/slack-signing-secret,
+    DISPATCH_FUNCTION=dispatch-router-${STAGE}
+    }" \
+  --region "$REGION"
+```
 
-- Creating a Slack app from a manifest (scopes: `app_mentions:read`, `chat:write`; events: `app_mention`)
-- Installing to the workspace and storing the bot token at `/sdlc-agents/slack-bot-token`
-- Storing `SLACK_SIGNING_SECRET` for inbound event verification
-- Pointing event subscriptions at a new `slack-webhook-${STAGE}` Lambda URL (not yet in the foundation stack)
+#### 2. Redeploy the Lambda code if this is a fresh install
 
-Don't try to paper over the gap by writing a partial integration — leave it clean so the user knows what does and doesn't work.
+If the foundation stack was deployed before the Slack Lambda code existed, push the latest zip:
+
+```bash
+cd infra/dispatch
+pip install --quiet --target /tmp/lambda-build -r requirements.txt
+cp slack_webhook.py router.py reply.py /tmp/lambda-build/
+(cd /tmp/lambda-build && zip -rq /tmp/slack-webhook.zip . -x '*.pyc' -x '__pycache__/*')
+aws lambda update-function-code \
+  --function-name "slack-webhook-${STAGE}" \
+  --zip-file fileb:///tmp/slack-webhook.zip \
+  --region "$REGION"
+```
+
+Wait for `LastUpdateStatus=Successful` before proceeding.
+
+#### 3. Run bootstrap_slack_app.py
+
+`scripts/bootstrap_slack_app.py` generates the Slack app manifest, walks through app creation, prompts for the bot token and signing secret, and stores both in SSM. It then prints the endpoint URLs to paste into the app config.
+
+Unlike the Asana bootstrap, there is no handshake protocol — the signing secret is a static value from the Slack app's Basic Information page. The Lambda has no `ssm:PutParameter` in steady state (no T-9 analogue exists for Slack, but the defensive posture is the same: write access is not granted unless actually needed).
+
+```bash
+python scripts/bootstrap_slack_app.py \
+  --stage "$STAGE" \
+  --region "$REGION"
+```
+
+The script reads `.dispatch/agents.yaml` to determine which agents get slash commands in the manifest. Run it from the fleet repository root.
+
+#### 4. Paste endpoint URLs into the app config
+
+The script prints two URLs at the end (also available as CloudFormation stack outputs):
+
+- **SlackEventsEndpoint** → paste into the app's **Event Subscriptions → Request URL** field, then save. Slack sends a `url_verification` challenge; the Lambda echoes it back automatically.
+- **SlackCommandsEndpoint** → paste into each slash command's **Request URL** field (under **Slash Commands** in the app config).
+
+If the manifest used placeholder URLs (stack wasn't deployed when you ran the script), update the app config manually via https://api.slack.com/apps.
+
+#### 5. Re-install the app to the workspace if scopes changed
+
+Any time you add new OAuth scopes (e.g. adding `commands` after the initial install), click **Install to Workspace** again on the app's **Install App** page. Slack requires a fresh install to activate scope changes.
+
+To verify the integration is working, mention the bot in a channel it belongs to:
+
+```
+@SDLC Agents @workitems what are the open high-priority items?
+```
+
+Check CloudWatch logs for `slack-webhook-${STAGE}` — you should see `Dispatching to workitems (mention) from Slack` followed by a Lambda invoke entry.
 
 ## Verify the pipeline
 
