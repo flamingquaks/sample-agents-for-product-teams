@@ -26,7 +26,8 @@ from tools.generate_release_notes import generate_release_notes
 from tools.detect_doc_gaps import detect_doc_gaps
 from tools.check_doc_freshness import check_doc_freshness
 from tools.post_results import post_results
-from shared.discord_post import discord_post_message, discord_post_followup
+from shared.dispatch_context import build_dispatch_context_block
+from shared.discord_post import discord_post_message, make_discord_followup_tool
 from tools.github_mcp import get_github_token, GITHUB_MCP_URL
 
 logger = logging.getLogger(__name__)
@@ -67,47 +68,7 @@ def invoke(payload, context=None):
     # Guardrails' PROMPT_ATTACK filter because it mirrors the canonical
     # injection shape. The agent still needs this context to know which
     # PR/issue triggered it; we just deliver it via the system slot.
-    dispatch_context_block = ""
-    if source_context and source == "github":
-        is_pr = source_context.get("is_pr") == "true" or source_context.get("pr_number")
-        issue_or_pr = source_context.get("issue_number") or source_context.get("pr_number", "unknown")
-        target_type = "PR" if is_pr else "issue"
-        dispatch_context_block = (
-            "\n\n## Current Dispatch\n\n"
-            f"Source: github\n"
-            f"Repository: {source_context.get('repo', 'unknown')}\n"
-            f"{target_type}: #{issue_or_pr}\n"
-            f"Title: {source_context.get('issue_title', 'unknown')}\n"
-            f"Body:\n{source_context.get('issue_body', '')}\n"
-            f"Labels: {source_context.get('issue_labels', '')}\n"
-            f"State: {source_context.get('issue_state', '')}\n"
-            f"Comments:\n{source_context.get('issue_comments', '(not loaded)')}\n"
-            f"Reply to: GitHub {target_type} #{issue_or_pr} "
-            f"on {source_context.get('repo', 'unknown')}\n"
-        )
-    elif source_context and source == "asana":
-        dispatch_context_block = (
-            "\n\n## Current Dispatch\n\n"
-            f"Source: asana\n"
-            f"Task GID: {source_context.get('task_gid', 'unknown')}\n"
-            f"Task: {source_context.get('task_name', 'unknown')}\n"
-            f"Task Notes: {source_context.get('task_notes', '')}\n"
-            f"Project: {source_context.get('project_name', 'unknown')} ({source_context.get('project_gid', '')})\n"
-            f"Reply to: Asana task {source_context.get('task_gid', 'unknown')}\n"
-        )
-    elif source_context and source == "discord":
-        dispatch_context_block = (
-            "\n\n## Current Dispatch\n\n"
-            f"Source: discord\n"
-            f"Guild ID: {source_context.get('guild_id', 'unknown')}\n"
-            f"Channel ID: {source_context.get('channel_id', 'unknown')}\n"
-            f"User ID: {source_context.get('user_id', 'unknown')}\n"
-            f"Application ID: {source_context.get('application_id', '')}\n"
-            f"Interaction Token: {source_context.get('interaction_token', '')}\n"
-            "Reply instructions: Call discord_post_followup(application_id, "
-            "interaction_token, content) for the first response. "
-            "Use discord_post_message(channel_id, content) for additional messages.\n"
-        )
+    dispatch_context_block = build_dispatch_context_block(source, source_context)
 
     # Build system prompt with project context + dispatch context.
     system_prompt = SYSTEM_PROMPT.format(
@@ -118,8 +79,16 @@ def invoke(payload, context=None):
     # emit multi-file patches without hitting MaxTokensReachedException
     # mid-tool-call on a multi-file README update.
     model = build_model(max_tokens=16000)
-    tools = [generate_api_docs, generate_release_notes, detect_doc_gaps, check_doc_freshness, post_results,
-             discord_post_message, discord_post_followup]
+    tools = [generate_api_docs, generate_release_notes, detect_doc_gaps, check_doc_freshness, post_results]
+    if source == "discord":
+        # Bind application_id and interaction_token into the tool at invoke time
+        # so the 15-minute write credential never appears in the system prompt or
+        # OTel traces. The LLM sees only a `content` parameter.
+        tools.append(make_discord_followup_tool(
+            application_id=source_context.get("application_id", ""),
+            interaction_token=source_context.get("interaction_token", ""),
+        ))
+        tools.append(discord_post_message)
 
     # Memory — optional until Memory resource is created
     if MEMORY_ID:

@@ -116,6 +116,35 @@ def discord_post_followup(
         return f"error: {exc}"
 
 
+def make_discord_followup_tool(application_id: str, interaction_token: str):
+    """Return a @tool function with application_id and interaction_token pre-bound.
+
+    The LLM sees only a `content` parameter — the 15-minute write credential
+    (interaction_token) never enters the system prompt or the model context.
+    Use this instead of discord_post_followup directly when source == "discord".
+    """
+    @tool
+    def discord_post_followup_bound(content: str) -> str:
+        """Post a follow-up message to the Discord slash command that triggered this agent.
+
+        The interaction token is pre-bound by the runtime and is not exposed to the model.
+        Use this as the primary reply; use discord_post_message for subsequent posts.
+
+        Args:
+            content: The message text (up to 2000 characters).
+
+        Returns:
+            "ok" on success, an error description on failure.
+        """
+        return discord_post_followup(
+            application_id=application_id,
+            interaction_token=interaction_token,
+            content=content,
+        )
+
+    return discord_post_followup_bound
+
+
 @tool
 def discord_post_message(channel_id: str, content: str) -> str:
     """Post a message to a Discord channel using the bot token.
