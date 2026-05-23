@@ -1,10 +1,11 @@
 """Post "blocked by safety filter" replies back to the originating thread.
 
 When the Dispatch Router's guardrail check blocks a request, we post a
-short note back to the GitHub issue or Asana task that originated the
-mention so the sender sees what happened (no silent failures).
+short note back to the GitHub issue, Asana task, or Slack channel/thread
+that originated the mention so the sender sees what happened (no silent
+failures).
 
-Both helpers return a bool instead of raising: the block decision has
+All helpers return a bool instead of raising: the block decision has
 already been made by the time we call these, and a failed reply must
 not revert that decision. Reply failures emit a CloudWatch metric so
 operators can alarm separately (`GuardrailReplyFailed`).
@@ -22,9 +23,11 @@ logger = logging.getLogger(__name__)
 
 GITHUB_API = "https://api.github.com"
 ASANA_API = "https://app.asana.com/api/1.0"
+SLACK_API = "https://slack.com/api"
 
 GITHUB_PAT_PARAM_ENV = "GITHUB_PAT_PARAM"
 ASANA_PAT_PARAM_ENV = "ASANA_PAT_PARAM"
+SLACK_BOT_TOKEN_PARAM_ENV = "SLACK_BOT_TOKEN_PARAM"
 
 _ssm = boto3.client("ssm")
 
@@ -83,6 +86,46 @@ def post_asana_comment(task_gid: str, body: str) -> bool:
         return True
     except requests.RequestException as exc:
         logger.error("Failed to post Asana comment to task %s: %s", task_gid, exc)
+        return False
+
+
+def post_slack_message(channel: str, body: str, thread_ts: str | None = None) -> bool:
+    """Post a message to a Slack channel or thread. Returns True on success.
+
+    Reads the bot token from the SSM parameter named by the
+    SLACK_BOT_TOKEN_PARAM env var (default /sdlc-agents/slack-bot-token).
+    Calls chat.postMessage with a 10-second timeout. Never raises.
+    """
+    if not channel:
+        logger.error("post_slack_message missing channel")
+        return False
+
+    token = _get_secret(os.environ.get(SLACK_BOT_TOKEN_PARAM_ENV, "/sdlc-agents/slack-bot-token"))
+    if not token:
+        return False
+
+    payload: dict = {"channel": channel, "text": body}
+    if thread_ts:
+        payload["thread_ts"] = thread_ts
+
+    try:
+        response = requests.post(
+            f"{SLACK_API}/chat.postMessage",
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not data.get("ok"):
+            logger.error("Slack chat.postMessage returned error: %s", data.get("error"))
+            return False
+        return True
+    except requests.RequestException as exc:
+        logger.error("Failed to post Slack message to channel %s: %s", channel, exc)
         return False
 
 
