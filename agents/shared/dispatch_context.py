@@ -30,17 +30,28 @@ def _asana(ctx: Mapping) -> str:
 
 
 def _github(ctx: Mapping) -> str:
-    return (
-        _HEADER
-        + "Source: github\n"
-        f"Repository: {ctx.get('repo', 'unknown')}\n"
-        f"Issue: #{ctx.get('issue_number', 'unknown')}\n"
-        f"Issue Title: {ctx.get('issue_title', 'unknown')}\n"
-        f"Issue Body:\n{ctx.get('issue_body', '')}\n"
-        f"Comments:\n{ctx.get('issue_comments', '(not loaded)')}\n"
-        f"Reply to: GitHub issue #{ctx.get('issue_number', 'unknown')} "
+    is_pr = ctx.get("is_pr") == "true" or bool(ctx.get("pr_number"))
+    number = ctx.get("issue_number") or ctx.get("pr_number", "unknown")
+    target_type = "PR" if is_pr else "issue"
+
+    lines = [
+        _HEADER,
+        "Source: github\n",
+        f"Repository: {ctx.get('repo', 'unknown')}\n",
+        f"{target_type}: #{number}\n",
+        f"Title: {ctx.get('issue_title', 'unknown')}\n",
+        f"Body:\n{ctx.get('issue_body', '')}\n",
+    ]
+    if ctx.get("issue_labels"):
+        lines.append(f"Labels: {ctx['issue_labels']}\n")
+    if ctx.get("issue_state"):
+        lines.append(f"State: {ctx['issue_state']}\n")
+    lines.append(f"Comments:\n{ctx.get('issue_comments', '(not loaded)')}\n")
+    lines.append(
+        f"Reply to: GitHub {target_type} #{number} "
         f"on {ctx.get('repo', 'unknown')}\n"
     )
+    return "".join(lines)
 
 
 def _slack(ctx: Mapping) -> str:
