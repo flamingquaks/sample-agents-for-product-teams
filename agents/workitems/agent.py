@@ -29,6 +29,7 @@ from tools.risk_detection import detect_risks
 from tools.sync import reconcile_sync
 from tools.post_results import post_results
 from shared.tools.slack_post import slack_post_message, slack_post_thread
+from shared.discord_post import discord_post_message, make_discord_followup_tool
 from tools.asana_mcp import get_access_token, ASANA_MCP_URL
 from tools.github_mcp import get_github_token, GITHUB_MCP_URL
 
@@ -84,6 +85,12 @@ def invoke(payload, context=None):
 
     model = build_model()
     tools = [generate_status_report, detect_risks, reconcile_sync, post_results, slack_post_message, slack_post_thread]
+    if source == "discord":
+        tools.append(make_discord_followup_tool(
+            application_id=source_context.get("application_id", ""),
+            interaction_token=source_context.get("interaction_token", ""),
+        ))
+        tools.append(discord_post_message)
 
     # Memory — optional until Memory resource is created
     if MEMORY_ID:

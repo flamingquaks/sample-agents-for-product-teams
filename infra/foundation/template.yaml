@@ -195,6 +195,7 @@ Resources:
           GITHUB_PAT_PARAM: /sdlc-agents/github-mcp-token
           ASANA_PAT_PARAM: /sdlc-agents/asana-pat
           SLACK_BOT_TOKEN_PARAM: /sdlc-agents/slack-bot-token
+          DISCORD_BOT_TOKEN_PARAM: /sdlc-agents/discord-bot-token
           CLOUDWATCH_NAMESPACE: SDLCAgents/Dispatch
       Policies:
         - DynamoDBCrudPolicy:
@@ -220,6 +221,7 @@ Resources:
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/github-mcp-token
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/asana-pat
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/slack-bot-token
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/discord-bot-token
             - Effect: Allow
               Action:
                 - cloudwatch:PutMetricData
@@ -303,12 +305,6 @@ Resources:
         - LambdaInvokePolicy:
             FunctionName: !Ref DispatchRouterFunction
         - Statement:
-            # Steady-state permissions: read the bot token (for future outbound
-            # use) and the signing secret to verify inbound HMAC signatures.
-            # No ssm:PutParameter — there is no handshake protocol for Slack
-            # (the signing secret is set manually via bootstrap_slack_app.py),
-            # so there is no T-9 analogue. Defensive posture: no write access
-            # in steady state regardless.
             - Effect: Allow
               Action:
                 - ssm:GetParameter
@@ -329,6 +325,43 @@ Resources:
             Method: POST
             RestApiId: !Ref WebhookApi
 
+  # ---------------------------------------------------------------------------
+  # Discord Interactions Endpoint Lambda
+  # ---------------------------------------------------------------------------
+
+  DiscordWebhookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub discord-webhook-${Stage}
+      CodeUri: ../dispatch/
+      Handler: discord_webhook.handler
+      Timeout: 30
+      MemorySize: 512
+      ReservedConcurrentExecutions: 10
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt LambdaDeadLetterQueue.Arn
+      Environment:
+        Variables:
+          DISCORD_PUBLIC_KEY_PARAM: /sdlc-agents/discord-public-key
+          DISPATCH_FUNCTION: !Ref DispatchRouterFunction
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref DispatchRouterFunction
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ssm:GetParameter
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/discord-public-key
+      Events:
+        DiscordInteractions:
+          Type: Api
+          Properties:
+            Path: /discord/interactions
+            Method: POST
+            RestApiId: !Ref WebhookApi
+
   WebhookApiAccessLogs:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -339,7 +372,7 @@ Resources:
     Type: AWS::Serverless::Api
     Properties:
       StageName: !Ref Stage
-      Description: Webhook endpoint for agent dispatch (Asana and Slack)
+      Description: Webhook endpoint for agent dispatch (Asana, Slack, Discord)
       TracingEnabled: true
       MethodSettings:
         - ResourcePath: "/*"
@@ -439,6 +472,23 @@ Resources:
       Dimensions:
         - Name: FunctionName
           Value: !Ref SlackWebhookFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  DiscordWebhookErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub discord-webhook-errors-${Stage}
+      AlarmDescription: Discord interactions endpoint error rate
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DiscordWebhookFunction
       Statistic: Sum
       Period: 300
       EvaluationPeriods: 2
@@ -546,6 +596,11 @@ Outputs:
     Value: !Ref WebhookApi
     Export:
       Name: !Sub ${AWS::StackName}-WebhookApiId
+
+
+  DiscordInteractionsEndpoint:
+    Value: !Sub https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/discord/interactions
+    Description: Discord Interactions Endpoint URL -- paste this into the Discord Developer Portal under your app's Interactions Endpoint URL field
 
   GuardrailId:
     Value: !Ref PromptInjectionGuardrail

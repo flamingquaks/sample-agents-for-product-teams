@@ -334,6 +334,11 @@ def _post_block_reply(source: str, source_context: dict, message: str) -> bool:
             body=message,
             thread_ts=source_context.get("thread_ts") or None,
         )
+    if source == "discord":
+        return reply.post_discord_message(
+            channel_id=source_context.get("channel_id", ""),
+            body=message,
+        )
     logger.warning("No reply channel for source=%s — block notice not posted", source)
     return False
 
@@ -348,10 +353,11 @@ def handler(event, context):
     - GitHub Actions (via AWS CLI lambda invoke)
     - Asana webhook receiver Lambda (via direct invoke)
     - Slack Events API (via API Gateway)
+    - Discord webhook receiver Lambda (via direct invoke)
 
     Expected event shape:
     {
-        "source": "github" | "asana" | "slack",
+        "source": "github" | "asana" | "slack" | "discord",
         "trigger_type": "comment_mention" | "assignment" | "custom_field" | "slash_command",
         "body": "the comment/message text",
         "sender": "username",
@@ -361,9 +367,13 @@ def handler(event, context):
             "issue_number": "123",          // github
             "task_gid": "12345",            // asana
             "task_name": "...",             // asana
-            "task_notes": "...",            // asana
-            "channel_id": "C123",           // slack
+            "task_notes": "...",            // asana (redacted in logs)
+            "channel_id": "C123",           // slack / discord
             "thread_ts": "...",             // slack
+            "guild_id": "...",              // discord
+            "application_id": "...",        // discord
+            "interaction_token": "...",     // discord (redacted in logs -- 15-min write credential)
+            "user_id": "...",              // discord
         }
     }
     """

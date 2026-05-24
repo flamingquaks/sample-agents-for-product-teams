@@ -31,5 +31,8 @@ permit(
     resource.toolName == "asana_add_comment" ||
     // Slack — write (post only)
     resource.toolName == "slack_post_message" ||
-    resource.toolName == "slack_post_thread"
+    resource.toolName == "slack_post_thread" ||
+    // Discord — write (post only)
+    resource.toolName == "discord_post_message" ||
+    resource.toolName == "discord_post_followup"
 };

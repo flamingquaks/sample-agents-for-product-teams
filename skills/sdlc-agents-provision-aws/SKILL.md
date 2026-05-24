@@ -118,9 +118,9 @@ Plus per-agent (shipping agents only):
 
 | Agent | Additional inline policies (name: resources read) |
 |---|---|
-| `workitems` | `ssm-read-asana-mcp` (`/sdlc-agents/asana-mcp-*`), `ssm-read-asana-pat` (`/sdlc-agents/asana-pat`), `ssm-read-github-mcp` (`/sdlc-agents/github-mcp-*`), `ssm-read-slack-bot-token` (`/sdlc-agents/slack-bot-token`) |
+| `workitems` | `ssm-read-asana-mcp` (`/sdlc-agents/asana-mcp-*`), `ssm-read-asana-pat` (`/sdlc-agents/asana-pat`), `ssm-read-github-mcp` (`/sdlc-agents/github-mcp-*`), `ssm-read-slack-bot-token` (`/sdlc-agents/slack-bot-token`). **If Discord is enabled:** also `ssm-read-discord-bot-token` (`/sdlc-agents/discord-bot-token`). |
 | `researcher` | `ssm-read-asana-mcp`, `ssm-read-tavily` (`/sdlc-agents/researcher-tavily-api-key`), `ssm-read-slack-bot-token` (`/sdlc-agents/slack-bot-token`) |
-| `docwriter` | `ssm-read-asana-mcp`, `ssm-read-github-mcp`, `ssm-read-slack-bot-token` (`/sdlc-agents/slack-bot-token`) |
+| `docwriter` | `ssm-read-asana-mcp`, `ssm-read-github-mcp`, `ssm-read-slack-bot-token` (`/sdlc-agents/slack-bot-token`). **If Discord is enabled:** also `ssm-read-discord-bot-token` (`/sdlc-agents/discord-bot-token`). |
 | `adr` | `ssm-read-github-mcp`, `ssm-read-slack-bot-token` (`/sdlc-agents/slack-bot-token`) |
 
 Author each policy inline from the scopes above — don't guess at resource ARNs if the agent reads something else. If `sdlc-agents-select` proposed an agent that isn't in this table, stop and tell the user (it means the agent is planned but not shipping, and shouldn't have been selected).

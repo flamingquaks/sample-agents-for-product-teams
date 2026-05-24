@@ -2,7 +2,7 @@
 
 **Role:** Technical writer — API docs, user guides, release notes
 **Status:** Shipped — live on AgentCore Runtime
-**Trigger:** `@docwriter` mention in GitHub, Asana, or Slack; PR merge events
+**Trigger:** `@docwriter` mention in GitHub or Asana; `/docwriter` Discord slash command; PR merge events
 **Code:** [`agents/docwriter/`](../../agents/docwriter/)
 **Spec:** [`docs/specs/docwriter-agent-spec.md`](../specs/docwriter-agent-spec.md)
 
@@ -42,7 +42,8 @@ Docwriter's doc PRs directly — Workitems is not in that loop.
 - `generate_api_docs`, `generate_release_notes`, `check_doc_freshness`,
   `detect_doc_gaps`, `post_results` (custom Strands tools under
   `agents/docwriter/tools/`)
-- `slack_post_message`, `slack_post_thread` (Slack delivery — `agents/shared/slack_post.py`)
+- `slack_post_message`, `slack_post_thread` (Slack delivery — `agents/shared/tools/slack_post.py`)
+- `discord_post_message`, `discord_post_followup` (Discord delivery — `agents/shared/discord_post.py`)
 - AgentCore Memory (optional — honored via `AGENTCORE_MEMORY_ID` env var; no Memory resource is provisioned today)
 
 ## Guardrails

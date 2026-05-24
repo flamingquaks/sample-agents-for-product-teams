@@ -6,7 +6,7 @@ This guide is written for an AI agent tasked with deploying this fleet into a ne
 
 ## Step 0 — Understand what this fleet is
 
-This repo contains autonomous AI agents for the software development lifecycle, deployed as containers on **Amazon Bedrock AgentCore Runtime**. A **Dispatch Router** Lambda receives `@mention` events from GitHub, Asana, and Slack, resolves them to agents, and invokes the appropriate AgentCore Runtime.
+This repo contains autonomous AI agents for the software development lifecycle, deployed as containers on **Amazon Bedrock AgentCore Runtime**. A **Dispatch Router** Lambda receives `@mention` events from GitHub, Asana, and Discord, resolves them to agents, and invokes the appropriate AgentCore Runtime.
 
 **Agents available:**
 

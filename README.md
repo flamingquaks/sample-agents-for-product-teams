@@ -22,9 +22,9 @@ they'll be listed here once their code ships.
 
 | Agent | Role | Trigger |
 |-------|------|---------|
-| [**Workitems**](docs/agents/workitems.md) | PO/PM — work decomposition, status reports, risk detection, sync | `@workitems` in Asana/GitHub/Slack |
+| [**Workitems**](docs/agents/workitems.md) | PO/PM — work decomposition, status reports, risk detection, sync | `@workitems` in Asana/GitHub/Slack; `/workitems` in Discord |
 | [**Researcher**](docs/agents/researcher.md) | Business analyst — research synthesis, competitive intel | `@researcher` |
-| [**Docwriter**](docs/agents/docwriter.md) | Technical writer — API docs, user guides, release notes | `@docwriter` |
+| [**Docwriter**](docs/agents/docwriter.md) | Technical writer — API docs, user guides, release notes | `@docwriter` in Asana/GitHub/Slack; `/docwriter` in Discord |
 | [**Adr**](docs/agents/adr.md) | ADR linker — tags issues and reviews PRs against the repo's ADR library | `@adr` on a GitHub issue or PR |
 
 ![Workitems decomposing an Asana task after an @mention](docs/assets/at-workitems-mention-asana.png)
@@ -33,7 +33,7 @@ they'll be listed here once their code ships.
 
 ## How It Works
 
-1. A user assigns work via `@agent` mention in Asana, GitHub, or Slack
+1. A user assigns work via `@agent` mention in Asana, GitHub, or Slack, or via `/agent` slash command in Discord
 2. The **Dispatch Router** resolves the mention, checks authorization, and routes to the agent
 3. The agent runs on **AgentCore Runtime**, using **Gateway** for GitHub/Asana/Slack access
 4. Results are posted back to the originating platform
@@ -208,6 +208,7 @@ Under `scripts/`:
 - `bootstrap_jira_oauth.py` — same thing for Atlassian/Jira (3LO)
 - `bootstrap_asana_webhook.py` — operator-run webhook registration; attaches a temporary `ssm:PutParameter` policy to the webhook Lambda's role so the Asana handshake can persist the shared secret, then removes the policy
 - `bootstrap_slack_app.py` — generates a Slack app manifest from `agents.yaml`, walks you through app creation, stores the bot token and signing secret in SSM, and prints the event/command endpoint URLs to paste back into the Slack console
+- `bootstrap_discord_app.py` — bootstraps the Discord application; stores bot token and public key in SSM, registers slash commands (use `--guild-id` for instant dev propagation), and prints the Interactions Endpoint URL and bot install link
 - `sync_registry.py` — resolves runtime ARNs in `.dispatch/agents.yaml` and pushes the registry to SSM so the Dispatch Router can read it
 
 Run these only for the integrations you actually use.

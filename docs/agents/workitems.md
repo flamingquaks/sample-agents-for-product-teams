@@ -2,7 +2,7 @@
 
 **Role:** PO/PM — work decomposition, status reports, risk detection, bidirectional sync
 **Status:** Shipped — live on AgentCore Runtime
-**Trigger:** `@workitems` mention in Asana, GitHub, or Slack; Asana task assignment; scheduled runs
+**Trigger:** `@workitems` mention in Asana or GitHub; `/workitems` Discord slash command; Asana task assignment; scheduled runs
 **Code:** [`agents/workitems/`](../../agents/workitems/)
 **Spec:** [`docs/specs/workitems-agent-plan.md`](../specs/workitems-agent-plan.md)
 
@@ -47,7 +47,8 @@ self-assigns or self-approves.
 - GitHub MCP (official remote server at `api.githubcopilot.com/mcp/`; PAT or GitHub App token from SSM)
 - `generate_status_report`, `detect_risks`, `reconcile_sync`, `post_results`
   (custom Strands tools under `agents/workitems/tools/`)
-- `slack_post_message`, `slack_post_thread` (Slack delivery — `agents/shared/slack_post.py`)
+- `slack_post_message`, `slack_post_thread` (Slack delivery — `agents/shared/tools/slack_post.py`)
+- `discord_post_message`, `discord_post_followup` (Discord delivery — `agents/shared/discord_post.py`)
 - AgentCore Memory (optional — honored via `AGENTCORE_MEMORY_ID` env var; no Memory resource is provisioned today)
 
 ## Guardrails

@@ -28,6 +28,7 @@ from tools.detect_doc_gaps import detect_doc_gaps
 from tools.check_doc_freshness import check_doc_freshness
 from tools.post_results import post_results
 from shared.tools.slack_post import slack_post_message, slack_post_thread
+from shared.discord_post import discord_post_message, make_discord_followup_tool
 from tools.github_mcp import get_github_token, GITHUB_MCP_URL
 
 logger = logging.getLogger(__name__)
@@ -80,6 +81,12 @@ def invoke(payload, context=None):
     # mid-tool-call on a multi-file README update.
     model = build_model(max_tokens=16000)
     tools = [generate_api_docs, generate_release_notes, detect_doc_gaps, check_doc_freshness, post_results, slack_post_message, slack_post_thread]
+    if source == "discord":
+        tools.append(make_discord_followup_tool(
+            application_id=source_context.get("application_id", ""),
+            interaction_token=source_context.get("interaction_token", ""),
+        ))
+        tools.append(discord_post_message)
 
     # Memory — optional until Memory resource is created
     if MEMORY_ID:
