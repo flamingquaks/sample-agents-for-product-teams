@@ -301,6 +301,12 @@ def _post_block_reply(source: str, source_context: dict, message: str) -> bool:
             task_gid=source_context.get("task_gid", ""),
             body=message,
         )
+    if source == "slack":
+        return reply.post_slack_message(
+            channel_id=source_context.get("channel_id", ""),
+            body=message,
+            thread_ts=source_context.get("thread_ts", ""),
+        )
     logger.warning("No reply channel for source=%s — block notice not posted", source)
     return False
 

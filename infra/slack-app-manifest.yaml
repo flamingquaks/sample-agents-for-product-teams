@@ -1,0 +1,102 @@
+# Slack App Manifest for SDLC Agent Fleet
+#
+# Use this manifest to create the Slack app via api.slack.com/apps or
+# programmatically via apps.manifest.create.
+#
+# Replace <EVENTS_URL> with your deployed API Gateway endpoint:
+#   https://<api-id>.execute-api.<region>.amazonaws.com/<stage>/slack/events
+# Replace <SLASH_URL> with:
+#   https://<api-id>.execute-api.<region>.amazonaws.com/<stage>/slack/slash
+
+display_information:
+  name: SDLC Agent Fleet
+  description: Autonomous AI agents for the software development lifecycle — work decomposition, status reports, research, documentation, and architecture decisions.
+  background_color: "#1a1a2e"
+  long_description: |
+    The SDLC Agent Fleet plants an autonomous AI agent in each role's seat so
+    operational work (decomposition, status, docs, ADR tagging) runs itself and
+    humans stay focused on the product.
+
+    Available agents:
+    - Workitems: PO/PM — work decomposition, status reports, risk detection
+    - Researcher: Business analyst — research synthesis, competitive intel
+    - Docwriter: Technical writer — API docs, user guides, release notes
+    - Adr: ADR linker — tags issues and reviews PRs against architecture decisions
+
+features:
+  app_home:
+    home_tab_enabled: true
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
+  bot_user:
+    display_name: SDLC Agents
+    always_online: true
+  assistant:
+    enabled: true
+    suggested_prompts:
+      - title: Sprint Status
+        message: Generate a status report for the current sprint
+      - title: Risk Scan
+        message: Detect risks and blockers in active work
+      - title: Research Topic
+        message: "@researcher analyze competitive landscape for [topic]"
+      - title: Generate Docs
+        message: "@docwriter generate release notes for the latest changes"
+  slash_commands:
+    - command: /workitems
+      description: Invoke the Workitems agent (PO/PM)
+      url: <SLASH_URL>
+      usage_hint: "[instruction] — e.g., generate a status report"
+      should_escape: false
+    - command: /researcher
+      description: Invoke the Researcher agent (Business analyst)
+      url: <SLASH_URL>
+      usage_hint: "[instruction] — e.g., analyze competitors for [topic]"
+      should_escape: false
+    - command: /docwriter
+      description: Invoke the Docwriter agent (Technical writer)
+      url: <SLASH_URL>
+      usage_hint: "[instruction] — e.g., generate release notes"
+      should_escape: false
+    - command: /adr
+      description: Invoke the ADR agent (Architecture decisions)
+      url: <SLASH_URL>
+      usage_hint: "[instruction] — e.g., review PR #42 against ADRs"
+      should_escape: false
+    - command: /fleet
+      description: Fleet management and status
+      url: <SLASH_URL>
+      usage_hint: "status | health | budget [agent]"
+      should_escape: false
+
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read
+      - assistant:write
+      - channels:history
+      - channels:read
+      - chat:write
+      - chat:write.public
+      - commands
+      - im:history
+      - im:read
+      - im:write
+      - reactions:read
+      - reactions:write
+      - users:read
+
+settings:
+  event_subscriptions:
+    request_url: <EVENTS_URL>
+    bot_events:
+      - app_home_opened
+      - app_mention
+      - assistant_thread_started
+      - message.im
+  interactivity:
+    is_enabled: true
+    request_url: <EVENTS_URL>
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false

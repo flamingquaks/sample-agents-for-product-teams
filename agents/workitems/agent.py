@@ -29,6 +29,7 @@ from tools.sync import reconcile_sync
 from tools.post_results import post_results
 from tools.asana_mcp import get_access_token, ASANA_MCP_URL
 from tools.github_mcp import get_github_token, GITHUB_MCP_URL
+from shared.tools.slack_mcp import get_slack_token, SLACK_MCP_URL
 
 # --- Logging -----------------------------------------------------------------
 # Configure root logger to emit to stdout so AgentCore's OTel sidecar captures
@@ -101,6 +102,17 @@ def invoke(payload, context=None):
             f"Reply to: GitHub issue #{source_context.get('issue_number', 'unknown')} "
             f"on {source_context.get('repo', 'unknown')}\n"
         )
+    elif source_context and source == "slack":
+        dispatch_context_block = (
+            "\n\n## Current Dispatch\n\n"
+            f"Source: slack\n"
+            f"Channel: {source_context.get('channel_id', 'unknown')}\n"
+            f"Thread: {source_context.get('thread_ts', 'none')}\n"
+            f"Team: {source_context.get('team_id', 'unknown')}\n"
+            f"Reply to: Slack channel {source_context.get('channel_id', 'unknown')}"
+            + (f" thread {source_context.get('thread_ts')}" if source_context.get('thread_ts') else "")
+            + "\n"
+        )
 
     model = build_model()
     tools = [generate_status_report, detect_risks, reconcile_sync, post_results]
@@ -133,16 +145,26 @@ def invoke(payload, context=None):
         )
     )
 
-    with asana_client, github_client:
+    # Slack MCP — for reading/writing Slack messages and channels (optional)
+    slack_token = get_slack_token()
+    slack_client = MCPClient(
+        lambda: streamablehttp_client(
+            SLACK_MCP_URL,
+            headers={"Authorization": f"Bearer {slack_token}"},
+        )
+    )
+
+    with asana_client, github_client, slack_client:
         asana_tools = asana_client.list_tools_sync()
         github_tools = github_client.list_tools_sync()
+        slack_tools = slack_client.list_tools_sync()
 
         # Drop GitHub tools that collide with Asana tool names
         # (e.g. both servers expose get_me — keep the Asana version)
         asana_names = {t.tool_name for t in asana_tools}
         github_tools = [gt for gt in github_tools if gt.tool_name not in asana_names]
 
-        all_tools = [*asana_tools, *github_tools, *tools]
+        all_tools = [*asana_tools, *github_tools, *slack_tools, *tools]
 
         system_prompt = SYSTEM_PROMPT.format(project_context=build_project_context()) + dispatch_context_block
 

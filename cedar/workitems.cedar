@@ -29,7 +29,14 @@ permit(
     resource.toolName == "asana_update_task" ||
     resource.toolName == "asana_create_project_status" ||
     resource.toolName == "asana_add_comment" ||
-    // Slack — write (post only)
+    // Slack — read
+    resource.toolName == "slack_get_channel_history" ||
+    resource.toolName == "slack_get_thread" ||
+    resource.toolName == "slack_list_channels" ||
+    resource.toolName == "slack_get_user_info" ||
+    // Slack — write (post only, no delete/edit)
     resource.toolName == "slack_post_message" ||
-    resource.toolName == "slack_post_thread"
+    resource.toolName == "slack_post_thread" ||
+    resource.toolName == "slack_add_reaction" ||
+    resource.toolName == "slack_set_status"
 };

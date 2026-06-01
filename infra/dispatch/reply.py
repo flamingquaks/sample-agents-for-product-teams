@@ -86,6 +86,72 @@ def post_asana_comment(task_gid: str, body: str) -> bool:
         return False
 
 
+def post_slack_message(channel_id: str, body: str, thread_ts: str = "", blocks: list | None = None) -> bool:
+    """Post a message to a Slack channel or thread. Returns True on success."""
+    if not channel_id:
+        logger.error("post_slack_message missing channel_id")
+        return False
+
+    token = _get_secret(os.environ.get("SLACK_BOT_TOKEN_PARAM", "/sdlc-agents/slack-bot-token"))
+    if not token:
+        return False
+
+    payload: dict = {"channel": channel_id, "text": body}
+    if thread_ts:
+        payload["thread_ts"] = thread_ts
+    if blocks:
+        payload["blocks"] = blocks
+
+    try:
+        response = requests.post(
+            "https://slack.com/api/chat.postMessage",
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            timeout=10,
+        )
+        data = response.json()
+        if not data.get("ok"):
+            logger.error("Slack API error in chat.postMessage: %s", data.get("error"))
+            return False
+        return True
+    except requests.RequestException as exc:
+        logger.error("Failed to post Slack message to %s: %s", channel_id, exc)
+        return False
+
+
+def add_slack_reaction(channel_id: str, timestamp: str, name: str) -> bool:
+    """Add an emoji reaction to a Slack message. Returns True on success."""
+    if not channel_id or not timestamp:
+        logger.error("add_slack_reaction missing channel_id or timestamp")
+        return False
+
+    token = _get_secret(os.environ.get("SLACK_BOT_TOKEN_PARAM", "/sdlc-agents/slack-bot-token"))
+    if not token:
+        return False
+
+    try:
+        response = requests.post(
+            "https://slack.com/api/reactions.add",
+            json={"channel": channel_id, "timestamp": timestamp, "name": name},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            timeout=10,
+        )
+        data = response.json()
+        if not data.get("ok") and data.get("error") != "already_reacted":
+            logger.error("Slack API error in reactions.add: %s", data.get("error"))
+            return False
+        return True
+    except requests.RequestException as exc:
+        logger.error("Failed to add Slack reaction: %s", exc)
+        return False
+
+
 def _get_secret(param_name: str) -> Optional[str]:
     try:
         resp = _ssm.get_parameter(Name=param_name, WithDecryption=True)

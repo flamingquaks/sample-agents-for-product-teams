@@ -27,6 +27,7 @@ from tools.detect_doc_gaps import detect_doc_gaps
 from tools.check_doc_freshness import check_doc_freshness
 from tools.post_results import post_results
 from tools.github_mcp import get_github_token, GITHUB_MCP_URL
+from shared.tools.slack_mcp import get_slack_token, SLACK_MCP_URL
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +95,17 @@ def invoke(payload, context=None):
             f"Project: {source_context.get('project_name', 'unknown')} ({source_context.get('project_gid', '')})\n"
             f"Reply to: Asana task {source_context.get('task_gid', 'unknown')}\n"
         )
+    elif source_context and source == "slack":
+        dispatch_context_block = (
+            "\n\n## Current Dispatch\n\n"
+            f"Source: slack\n"
+            f"Channel: {source_context.get('channel_id', 'unknown')}\n"
+            f"Thread: {source_context.get('thread_ts', 'none')}\n"
+            f"Team: {source_context.get('team_id', 'unknown')}\n"
+            f"Reply to: Slack channel {source_context.get('channel_id', 'unknown')}"
+            + (f" thread {source_context.get('thread_ts')}" if source_context.get('thread_ts') else "")
+            + "\n"
+        )
 
     # Build system prompt with project context + dispatch context.
     system_prompt = SYSTEM_PROMPT.format(
@@ -125,9 +137,19 @@ def invoke(payload, context=None):
         )
     )
 
-    with github_client:
+    # Slack MCP — for reading/writing Slack messages and channels (optional)
+    slack_token = get_slack_token()
+    slack_client = MCPClient(
+        lambda: streamablehttp_client(
+            SLACK_MCP_URL,
+            headers={"Authorization": f"Bearer {slack_token}"},
+        )
+    )
+
+    with github_client, slack_client:
         github_tools = github_client.list_tools_sync()
-        all_tools = [*github_tools, *tools]
+        slack_tools = slack_client.list_tools_sync()
+        all_tools = [*github_tools, *slack_tools, *tools]
 
         agent = Agent(
             model=model,
