@@ -23,7 +23,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 logger = logging.getLogger(__name__)
 
-SLACK_MCP_URL = os.environ.get("SLACK_MCP_URL", "https://api.slack.com/mcp")
+SLACK_MCP_URL = os.environ.get("SLACK_MCP_URL", "")
 
 _ssm = None
 _cached_token: str | None = None
@@ -36,12 +36,14 @@ def _get_ssm():
     return _ssm
 
 
-def get_slack_token() -> str:
+def get_slack_token() -> str | None:
     """Get the Slack Bot User OAuth Token.
 
     Checks SLACK_BOT_TOKEN env var first (local dev), then falls back to
     SSM Parameter Store (production). Token is cached for the lifetime
     of the process.
+
+    Returns None if the token is unavailable (Slack integration not configured).
     """
     global _cached_token
     if _cached_token:
@@ -58,5 +60,5 @@ def get_slack_token() -> str:
         _cached_token = resp["Parameter"]["Value"]
         return _cached_token
     except (ClientError, BotoCoreError) as exc:
-        logger.error("Failed to fetch Slack bot token from SSM (%s): %s", param_name, exc)
-        raise RuntimeError(f"Cannot load Slack bot token from {param_name}") from exc
+        logger.warning("Slack bot token unavailable from SSM (%s): %s", param_name, exc)
+        return None

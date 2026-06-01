@@ -23,6 +23,10 @@ permit(
     resource.toolName == "github_remove_label" ||
     resource.toolName == "github_add_comment" ||
     resource.toolName == "github_add_pr_review_comment" ||
+    // Slack — write (post results only, no delete/edit)
+    resource.toolName == "slack_post_message" ||
+    resource.toolName == "slack_post_thread" ||
+    resource.toolName == "slack_add_reaction" ||
     // Bedrock for semantic matching
     resource.toolName == "bedrock_invoke_model"
 };

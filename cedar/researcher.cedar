@@ -19,6 +19,10 @@ permit(
     resource.toolName == "asana_create_task" ||
     resource.toolName == "asana_update_task" ||
     resource.toolName == "asana_add_comment" ||
+    // Slack — write (post results only, no delete/edit)
+    resource.toolName == "slack_post_message" ||
+    resource.toolName == "slack_post_thread" ||
+    resource.toolName == "slack_add_reaction" ||
     // Web search — competitive intelligence and market research
     resource.toolName == "web_search"
 };

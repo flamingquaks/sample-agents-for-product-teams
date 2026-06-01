@@ -7,6 +7,7 @@ Deployed to Amazon Bedrock AgentCore Runtime.
 Uses Claude Opus 4.7 via Bedrock and GitHub's official remote MCP server.
 """
 
+import contextlib
 import logging
 import os
 import sys
@@ -26,6 +27,7 @@ from tools.match_adrs import match_issue_to_adrs, match_pr_to_adrs
 from tools.find_linked_issues import find_linked_issues
 from tools.format_rationale import format_tag_issue_comment, format_pr_review_summary
 from tools.github_mcp import get_github_token, GITHUB_MCP_URL
+from shared.tools.slack_mcp import get_slack_token, SLACK_MCP_URL
 
 # --- Logging -----------------------------------------------------------------
 logging.basicConfig(
@@ -85,6 +87,17 @@ def invoke(payload, context=None):
             f"Reply to: GitHub {'PR' if is_pr else 'issue'} #{issue_or_pr_number} "
             f"on {source_context.get('repo', 'unknown')}\n"
         )
+    elif source_context and source == "slack":
+        dispatch_context_block = (
+            "\n\n## Current Dispatch\n\n"
+            f"Source: slack\n"
+            f"Channel: {source_context.get('channel_id', 'unknown')}\n"
+            f"Thread: {source_context.get('thread_ts', 'none')}\n"
+            f"Team: {source_context.get('team_id', 'unknown')}\n"
+            f"Reply to: Slack channel {source_context.get('channel_id', 'unknown')}"
+            + (f" thread {source_context.get('thread_ts')}" if source_context.get('thread_ts') else "")
+            + "\n"
+        )
 
     system_prompt = SYSTEM_PROMPT.format(project_context=build_project_context()) + dispatch_context_block
 
@@ -115,9 +128,30 @@ def invoke(payload, context=None):
         )
     )
 
-    with github_client:
+    # Slack MCP — optional, for posting results to Slack
+    slack_token = get_slack_token()
+    slack_client = None
+    if slack_token and SLACK_MCP_URL:
+        slack_client = MCPClient(
+            lambda: streamablehttp_client(
+                SLACK_MCP_URL,
+                headers={"Authorization": f"Bearer {slack_token}"},
+            )
+        )
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(github_client)
+        if slack_client:
+            stack.enter_context(slack_client)
+
         github_tools = github_client.list_tools_sync()
-        all_tools = [*github_tools, *tools]
+        slack_tools = slack_client.list_tools_sync() if slack_client else []
+
+        # Drop Slack tools that collide with GitHub tool names
+        github_names = {t.tool_name for t in github_tools}
+        slack_tools = [st for st in slack_tools if st.tool_name not in github_names]
+
+        all_tools = [*github_tools, *slack_tools, *tools]
 
         agent = Agent(
             model=model,

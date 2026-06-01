@@ -133,46 +133,21 @@ def strip_bot_mention(text: str) -> str:
 
 
 # --- Agent Resolution from Message Text --------------------------------------
-
-AGENT_MENTION_PATTERN = re.compile(
-    r"@(workitems|researcher|docwriter|adr|pm|status|plan|ba|research|analyze|docs|doc|writer|decisions|architecture)\b",
-    re.IGNORECASE,
-)
-
-ALIAS_MAP = {
-    "pm": "workitems",
-    "status": "workitems",
-    "plan": "workitems",
-    "ba": "researcher",
-    "research": "researcher",
-    "analyze": "researcher",
-    "docs": "docwriter",
-    "doc": "docwriter",
-    "writer": "docwriter",
-    "decisions": "adr",
-    "architecture": "adr",
-}
-
-
-def resolve_agent_from_text(text: str) -> tuple[str | None, str]:
-    """Extract @agent mention and instruction from message text.
-
-    Returns (agent_id, instruction) or (None, "") if no agent found.
-    """
-    match = AGENT_MENTION_PATTERN.search(text)
-    if not match:
-        return None, ""
-    agent_id = match.group(1).lower()
-    agent_id = ALIAS_MAP.get(agent_id, agent_id)
-    instruction = text[match.end():].strip()
-    return agent_id, instruction
+# Agent resolution is delegated to the Dispatch Router (which loads the live
+# registry from SSM). The Slack receiver only strips the <@BOT_ID> prefix and
+# passes the raw body text. The Router's extract_mention_and_instruction()
+# resolves @mentions against the registry, ensuring new agents added to
+# .dispatch/agents.yaml work on Slack without code changes here.
+#
+# The one exception: slash commands, where the command name directly maps to
+# an agent_id (handled separately in process_slash_command).
 
 
 # --- Dispatch ----------------------------------------------------------------
 
 
 def dispatch(agent_id: str, trigger_type: str, instruction: str, sender: str, context: dict):
-    """Forward a normalized event to the Dispatch Router Lambda."""
+    """Forward a pre-resolved agent event to the Dispatch Router Lambda."""
     payload = {
         "source": "slack",
         "trigger_type": trigger_type,
@@ -192,11 +167,40 @@ def dispatch(agent_id: str, trigger_type: str, instruction: str, sender: str, co
     )
 
 
+def dispatch_to_router(trigger_type: str, body: str, sender: str, context: dict):
+    """Forward an event to the Dispatch Router for @mention resolution.
+
+    Unlike dispatch(), this does NOT pre-resolve agent_id. The Router will
+    parse @mentions from body against the live registry.
+    """
+    payload = {
+        "source": "slack",
+        "trigger_type": trigger_type,
+        "body": body,
+        "sender": sender,
+        "context": context,
+    }
+
+    logger.info("Dispatching (router-resolved) via %s from sender %s", trigger_type, sender)
+
+    _lambda.invoke(
+        FunctionName=DISPATCH_FUNCTION,
+        InvocationType="Event",
+        Payload=json.dumps(payload).encode(),
+    )
+
+
 # --- Event Processors --------------------------------------------------------
 
 
 def process_app_mention(event: dict, token: str):
-    """Handle an app_mention event — user @mentioned the bot in a channel."""
+    """Handle an app_mention event — user @mentioned the bot in a channel.
+
+    Agent resolution is delegated to the Dispatch Router, which loads the
+    live registry from SSM. We pass the stripped text as 'body' without
+    pre-resolving agent_id, so the Router's extract_mention_and_instruction()
+    handles it against the current registry.
+    """
     text = event.get("text", "")
     channel = event.get("channel", "")
     user = event.get("user", "")
@@ -204,25 +208,16 @@ def process_app_mention(event: dict, token: str):
     message_ts = event.get("ts", "")
     team = event.get("team", "")
 
-    # Strip the <@BOT_ID> prefix to get the actual instruction
-    instruction = strip_bot_mention(text)
-
-    # Try to resolve a specific agent from the remaining text
-    agent_id, agent_instruction = resolve_agent_from_text(instruction)
-
-    if agent_id:
-        instruction = agent_instruction or instruction
-    else:
-        # Default to workitems if no specific agent mentioned after bot mention
-        agent_id = "workitems"
+    # Strip the <@BOT_ID> prefix; leave @agent mentions for the Router to parse
+    body = strip_bot_mention(text)
 
     # Acknowledge with reaction
     add_reaction(token, channel, message_ts, "eyes")
 
-    dispatch(
-        agent_id=agent_id,
+    # Don't pre-resolve agent_id — let the Router parse @mentions from body
+    dispatch_to_router(
         trigger_type="mention",
-        instruction=instruction,
+        body=body,
         sender=user,
         context={
             "channel_id": channel,
@@ -235,7 +230,13 @@ def process_app_mention(event: dict, token: str):
 
 
 def process_assistant_thread(event: dict, token: str):
-    """Handle a message in an assistant DM thread."""
+    """Handle a message in an assistant DM thread.
+
+    For DMs, the Router will attempt @mention resolution from the body text.
+    If no @agent mention is found, the Router returns 400 ("no recognized
+    @agent mention"). To handle the common case of plain DM messages without
+    an @mention, we default to workitems as the agent_id.
+    """
     text = event.get("text", "")
     channel = event.get("channel", "")
     user = event.get("user", "")
@@ -245,18 +246,12 @@ def process_assistant_thread(event: dict, token: str):
     # Set typing indicator for the Assistants API
     set_typing_indicator(token, channel, thread_ts)
 
-    # Try to resolve agent from text; default to workitems for DMs
-    agent_id, agent_instruction = resolve_agent_from_text(text)
-    if agent_id:
-        instruction = agent_instruction or text
-    else:
-        agent_id = "workitems"
-        instruction = text
-
+    # For DMs, default to workitems if no @agent mention present.
+    # Use pre-resolved dispatch since DM users may not include @mentions.
     dispatch(
-        agent_id=agent_id,
+        agent_id="workitems",
         trigger_type="assistant_thread",
-        instruction=instruction,
+        instruction=text,
         sender=user,
         context={
             "channel_id": channel,

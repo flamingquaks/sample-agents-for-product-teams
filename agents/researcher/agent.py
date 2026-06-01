@@ -7,6 +7,7 @@ Deployed to Amazon Bedrock AgentCore Runtime.
 Uses Claude Opus 4.7 via Bedrock and Asana's official MCP server.
 """
 
+import contextlib
 import logging
 import os
 import sys
@@ -29,6 +30,7 @@ from tools.draft_user_stories import draft_user_stories
 from tools.post_results import post_results
 from tools.web_search import web_search
 from tools.asana_mcp import get_access_token, ASANA_MCP_URL
+from shared.tools.slack_mcp import get_slack_token, SLACK_MCP_URL
 
 # --- Logging -----------------------------------------------------------------
 # Configure root logger to emit to stdout so AgentCore's OTel sidecar captures
@@ -87,6 +89,17 @@ def invoke(payload, context=None):
             f"Project: {source_context.get('project_name', 'unknown')} ({source_context.get('project_gid', '')})\n"
             f"Reply to: Asana task {source_context.get('task_gid', 'unknown')}\n"
         )
+    elif source_context and source == "slack":
+        dispatch_context_block = (
+            "\n\n## Current Dispatch\n\n"
+            f"Source: slack\n"
+            f"Channel: {source_context.get('channel_id', 'unknown')}\n"
+            f"Thread: {source_context.get('thread_ts', 'none')}\n"
+            f"Team: {source_context.get('team_id', 'unknown')}\n"
+            f"Reply to: Slack channel {source_context.get('channel_id', 'unknown')}"
+            + (f" thread {source_context.get('thread_ts')}" if source_context.get('thread_ts') else "")
+            + "\n"
+        )
 
     # Build system prompt with project context + dispatch context.
     system_prompt = SYSTEM_PROMPT.format(
@@ -114,7 +127,7 @@ def invoke(payload, context=None):
         )
         tools.extend(memory_provider.tools)
 
-    # Asana MCP — official server with OAuth (Researcher's only external platform)
+    # Asana MCP — official server with OAuth (Researcher's primary platform)
     asana_token = get_access_token()
     asana_client = MCPClient(
         lambda: streamablehttp_client(
@@ -123,9 +136,30 @@ def invoke(payload, context=None):
         )
     )
 
-    with asana_client:
+    # Slack MCP — optional, for posting results to Slack
+    slack_token = get_slack_token()
+    slack_client = None
+    if slack_token and SLACK_MCP_URL:
+        slack_client = MCPClient(
+            lambda: streamablehttp_client(
+                SLACK_MCP_URL,
+                headers={"Authorization": f"Bearer {slack_token}"},
+            )
+        )
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(asana_client)
+        if slack_client:
+            stack.enter_context(slack_client)
+
         asana_tools = asana_client.list_tools_sync()
-        all_tools = [*asana_tools, *tools]
+        slack_tools = slack_client.list_tools_sync() if slack_client else []
+
+        # Drop Slack tools that collide with Asana tool names
+        asana_names = {t.tool_name for t in asana_tools}
+        slack_tools = [st for st in slack_tools if st.tool_name not in asana_names]
+
+        all_tools = [*asana_tools, *slack_tools, *tools]
 
         agent = Agent(
             model=model,

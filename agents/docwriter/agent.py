@@ -8,6 +8,7 @@ Uses Claude Opus 4.7 via Bedrock and GitHub's official remote MCP server.
 GitHub-only — the Workitems agent owns Asana side of the loop.
 """
 
+import contextlib
 import logging
 import os
 
@@ -137,18 +138,30 @@ def invoke(payload, context=None):
         )
     )
 
-    # Slack MCP — for reading/writing Slack messages and channels (optional)
+    # Slack MCP — for reading/writing Slack messages and channels (optional).
+    # Only connect if token is available; agent still functions without Slack.
     slack_token = get_slack_token()
-    slack_client = MCPClient(
-        lambda: streamablehttp_client(
-            SLACK_MCP_URL,
-            headers={"Authorization": f"Bearer {slack_token}"},
+    slack_client = None
+    if slack_token and SLACK_MCP_URL:
+        slack_client = MCPClient(
+            lambda: streamablehttp_client(
+                SLACK_MCP_URL,
+                headers={"Authorization": f"Bearer {slack_token}"},
+            )
         )
-    )
 
-    with github_client, slack_client:
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(github_client)
+        if slack_client:
+            stack.enter_context(slack_client)
+
         github_tools = github_client.list_tools_sync()
-        slack_tools = slack_client.list_tools_sync()
+        slack_tools = slack_client.list_tools_sync() if slack_client else []
+
+        # Drop Slack tools that collide with GitHub tool names
+        github_names = {t.tool_name for t in github_tools}
+        slack_tools = [st for st in slack_tools if st.tool_name not in github_names]
+
         all_tools = [*github_tools, *slack_tools, *tools]
 
         agent = Agent(
