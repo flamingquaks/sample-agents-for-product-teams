@@ -18,6 +18,11 @@ Parameters:
     Type: String
     Description: Asana custom field GID for the "Agent" dropdown
 
+  WorkitemsGitHubBotLogin:
+    Type: String
+    Default: ""
+    Description: GitHub login of the Workitems bot account (issue assignments to it dispatch to @workitems)
+
 Globals:
   Function:
     Runtime: python3.12
@@ -289,7 +294,7 @@ Resources:
     Type: AWS::Serverless::Api
     Properties:
       StageName: !Ref Stage
-      Description: Webhook endpoint for agent dispatch (Asana, Slack)
+      Description: Webhook endpoint for agent dispatch (Asana, Slack, GitHub)
       TracingEnabled: true
       MethodSettings:
         - ResourcePath: "/*"
@@ -346,6 +351,48 @@ Resources:
           Type: Api
           Properties:
             Path: /slack/slash
+            Method: POST
+            RestApiId: !Ref WebhookApi
+
+  # ---------------------------------------------------------------------------
+  # GitHub PM Webhook Receiver Lambda
+  # ---------------------------------------------------------------------------
+
+  GitHubWebhookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub github-webhook-${Stage}
+      CodeUri: ../dispatch/
+      Handler: github_webhook.handler
+      Timeout: 30
+      ReservedConcurrentExecutions: 10
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt LambdaDeadLetterQueue.Arn
+      Environment:
+        Variables:
+          GITHUB_WEBHOOK_SECRET_PARAM: /sdlc-agents/github-webhook-secret
+          DISPATCH_FUNCTION: !Ref DispatchRouterFunction
+          WORKITEMS_GH_BOT_LOGIN: !Ref WorkitemsGitHubBotLogin
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref DispatchRouterFunction
+        - Statement:
+            # Steady-state permissions: read only the webhook secret to verify
+            # inbound HMAC signatures. The secret is written out-of-band by the
+            # operator running scripts/bootstrap_github_webhook.py (GitHub lets
+            # the webhook creator choose the secret), so unlike the Asana
+            # receiver this Lambda never needs ssm:PutParameter at all.
+            - Effect: Allow
+              Action:
+                - ssm:GetParameter
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/github-webhook-secret
+      Events:
+        Webhook:
+          Type: Api
+          Properties:
+            Path: /github/webhook
             Method: POST
             RestApiId: !Ref WebhookApi
 
@@ -433,6 +480,23 @@ Resources:
       Dimensions:
         - Name: FunctionName
           Value: !Ref SlackEventsFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  GitHubWebhookErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub github-webhook-errors-${Stage}
+      AlarmDescription: GitHub webhook receiver error rate
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref GitHubWebhookFunction
       Statistic: Sum
       Period: 300
       EvaluationPeriods: 2
@@ -535,6 +599,10 @@ Outputs:
   SlackSlashEndpoint:
     Value: !Sub https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/slack/slash
     Description: Slack Slash Commands URL — configure in Slack app Slash Commands
+
+  GitHubWebhookEndpoint:
+    Value: !Sub https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/github/webhook
+    Description: GitHub webhook URL — register this as a repo/org webhook (config.url)
 
   WebhookApiId:
     Value: !Ref WebhookApi

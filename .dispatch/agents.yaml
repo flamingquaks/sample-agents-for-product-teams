@@ -21,7 +21,10 @@ agents:
     aliases: [pm, status, plan]
     triggers:
       asana: [comment_mention, assignment, custom_field]
-      github: [issue_comment]
+      # `assignment` and `project_item` require the GitHub PM webhook
+      # (github-webhook-${STAGE} Lambda, route /github/webhook). The
+      # agent-dispatch.yml Actions workflow only carries issue_comment.
+      github: [issue_comment, assignment, project_item]
       slack: [mention, slash_command, assistant_thread]
     authorization:
       users: []

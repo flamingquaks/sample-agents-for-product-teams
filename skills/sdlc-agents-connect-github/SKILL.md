@@ -121,6 +121,102 @@ github:
 
 (`owner/repo/default_branch` are used by `docwriter` and `adr`, and by any future agent that opens PRs.)
 
+## Use GitHub for PM too? (Issues + Projects V2)
+
+Everything above wires GitHub for **source control / dev** (Contents, Issues,
+PRs). GitHub can *also* be the **project-management backend** for `workitems`
+— GitHub Issues + Projects V2 instead of Asana. Do this section only when the
+user picked GitHub as their PM tool during selection (`toolchain.pm == github`
+in `.sdlc-agents/selection.yaml`). If they're on Asana, skip this entirely; the
+SCM setup above is all GitHub needs.
+
+This is additive to the SCM credential — you reuse the **same** PAT or App,
+just with added scopes and a couple of runtime env vars.
+
+### 1. Set the PM runtime env vars
+
+When GitHub is the PM backend, the workitems agent runs with `PM_BACKEND=github`
+(`project_config.py` reads it; default is `asana`). In github mode it reads **no**
+Asana vars and instead requires:
+
+- `PM_BACKEND=github`
+- `GITHUB_REPO` — `owner/repo` of the repository whose issues are tracked
+- `GITHUB_PROJECT_NUMBER` — the Projects V2 board number (see step 3)
+- `GITHUB_PROJECT_OWNER` — **only if** the board owner differs from the repo
+  owner (e.g. an org-level board over a repo in a different namespace). If the
+  board lives under the same owner as the repo, omit it.
+
+Set these on the workitems AgentCore runtime (the same place the runtime's other
+environment is configured). They are configuration, not secrets — no SSM needed.
+
+### 2. Add the Projects scopes to the token
+
+The PM path needs the GitHub Projects V2 API, which is **not** covered by the
+Contents/Issues/PRs scopes from the SCM setup. Add:
+
+- **Classic PAT:** add `read:project` (read) and `project` (read + write) scopes.
+- **Fine-grained PAT / GitHub App:** add the **Projects** permission —
+  **Read** for read-only, **Read and write** to let the agent move cards /
+  update status. (These are *in addition to* the Contents/Issues/PRs/Metadata
+  permissions above.)
+
+GitHub's remote MCP server exposes Projects V2 through an opt-in `projects`
+toolset. The agent enables it per-connection by sending the header
+`X-MCP-Toolsets: default,projects` — **it does this automatically**. The operator
+only has to make sure the token carries the Projects scope above; no MCP-side
+config is required.
+
+### 3. Identify the Projects V2 board number and owner
+
+Open the board in GitHub and read the number straight out of the URL:
+
+- Org-owned board: `https://github.com/orgs/<org>/projects/<number>` →
+  `GITHUB_PROJECT_NUMBER=<number>`, `GITHUB_PROJECT_OWNER=<org>`.
+- User-owned board: `https://github.com/users/<user>/projects/<number>` →
+  `GITHUB_PROJECT_NUMBER=<number>`, `GITHUB_PROJECT_OWNER=<user>`.
+
+The owner is the org or user in the URL path. Set `GITHUB_PROJECT_OWNER` only
+when it differs from the repo owner (step 1).
+
+### 4. Register the GitHub PM webhook
+
+Issue-comment events already flow through the `agent-dispatch.yml` Actions
+workflow. The PM backend additionally needs **issue-assignment** and **board
+status-change** events, which that workflow does not carry — they come from the
+GitHub PM webhook (`github-webhook-${STAGE}` Lambda, route `/github/webhook`,
+delivering `issues.assigned` and `projects_v2_item` events). Register it:
+
+```bash
+python scripts/bootstrap_github_webhook.py \
+  --region "$REGION" --stage "$STAGE" --repo <owner>/<repo>
+```
+
+Also set the bot-login env var **`WORKITEMS_GH_BOT_LOGIN`** on the workitems
+runtime to the GitHub login the agent posts as. Issue-assignment triggers
+resolve to `workitems` by matching the assignee against this login — without it,
+assignment events won't route to the agent.
+
+### 5. Record the PM backend in selection.yaml
+
+Append a top-level `pm:` block to `.sdlc-agents/selection.yaml` (and ensure
+`toolchain.pm: github` is set):
+
+```yaml
+pm:
+  backend: github
+  github_project_number: 7        # the Projects V2 board number
+  github_project_owner: my-org    # org or user that owns the board
+```
+
+### Production note (T-11)
+
+The added `project` scope widens a PAT even further — a classic PAT with
+`project` can read and write **every** Projects V2 board its owner can reach,
+not just this one. Consistent with the threat model's **T-11** guidance (prefer
+a scoped GitHub App over a broad PAT), steer production users to the **GitHub
+App** path with the Projects permission scoped to the target org/repos rather
+than a broad classic PAT.
+
 ## What this skill does NOT do
 
 - Configure the `agent-dispatch.yml` workflow triggers. That's `sdlc-agents-register-triggers`.

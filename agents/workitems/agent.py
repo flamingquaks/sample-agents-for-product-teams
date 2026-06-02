@@ -1,12 +1,16 @@
 """Workitems — PO/PM autonomous agent.
 
-Bridges Asana (planning) and GitHub (development). Assigned work via Asana
-tasks, reasons about decomposition, proposes plans for approval, then creates
-GitHub issues on approval.
+The PM (planning) backend is selectable via PM_BACKEND:
+- "asana"  (default): bridges Asana (planning) and GitHub (development).
+- "github": GitHub is both surfaces — Issues are work items and a Projects V2
+  board is the planning/roadmap surface. No Asana connection is made.
+
+Assigned work via the planning surface, reasons about decomposition, proposes
+plans for approval, then creates GitHub issues on approval.
 
 Deployed to Amazon Bedrock AgentCore Runtime.
-Uses Claude Opus 4.6 via Bedrock, Asana's official MCP server, and
-GitHub's official remote MCP server.
+Uses Claude Opus via Bedrock, GitHub's official remote MCP server, and
+(in asana mode) Asana's official MCP server.
 """
 
 import logging
@@ -21,8 +25,8 @@ from strands_tools.agent_core_memory import AgentCoreMemoryToolProvider
 
 from shared.assignment import complete_assignment, fail_assignment
 from shared.bedrock import build_model
-from prompts import SYSTEM_PROMPT
-from project_config import build_project_context
+from prompts import get_system_prompt
+from project_config import build_project_context, PM_BACKEND
 from tools.status_report import generate_status_report
 from tools.risk_detection import detect_risks
 from tools.sync import reconcile_sync
@@ -30,6 +34,13 @@ from tools.post_results import post_results
 from tools.asana_mcp import get_access_token, ASANA_MCP_URL
 from tools.github_mcp import get_github_token, GITHUB_MCP_URL
 from shared.tools.slack_post import slack_post_message, slack_add_reaction
+
+# When GitHub is the PM backend we need the (opt-in) Projects V2 toolset in
+# addition to the default issues/repos/pull_requests tools. The remote GitHub
+# MCP server selects toolsets via this header; a comma-separated list keeps the
+# default tools AND adds projects. (The /x/projects URL path form is
+# single-toolset only and would drop the issues tools, so we use the header.)
+GITHUB_PM_TOOLSETS = "default,projects"
 
 # --- Logging -----------------------------------------------------------------
 # Configure root logger to emit to stdout so AgentCore's OTel sidecar captures
@@ -102,6 +113,20 @@ def invoke(payload, context=None):
             f"Reply to: GitHub issue #{source_context.get('issue_number', 'unknown')} "
             f"on {source_context.get('repo', 'unknown')}\n"
         )
+    elif source_context and source == "github" and source_context.get("trigger_type") == "project_item":
+        dispatch_context_block = (
+            "\n\n## Current Dispatch\n\n"
+            f"Source: github (Projects V2 board)\n"
+            f"Repository: {source_context.get('repo', 'unknown')}\n"
+            f"Project: #{source_context.get('project_number', 'unknown')}\n"
+            f"Board item: {source_context.get('item_id', 'unknown')}\n"
+            f"Linked issue: #{source_context.get('issue_number', 'unknown')}\n"
+            f"Status change: {source_context.get('status_change', 'unknown')}\n"
+            f"Reply to: GitHub issue #{source_context.get('issue_number', 'unknown')} "
+            f"on {source_context.get('repo', 'unknown')}, and update board item "
+            f"{source_context.get('item_id', 'unknown')} on project "
+            f"#{source_context.get('project_number', 'unknown')}\n"
+        )
     elif source_context and source == "slack":
         dispatch_context_block = (
             "\n\n## Current Dispatch\n\n"
@@ -120,11 +145,14 @@ def invoke(payload, context=None):
     tools = [
         generate_status_report,
         detect_risks,
-        reconcile_sync,
         post_results,
         slack_post_message,
         slack_add_reaction,
     ]
+    # reconcile_sync reconciles Asana <-> GitHub drift; it's meaningless when
+    # GitHub is the single source of truth, so only load it in asana mode.
+    if PM_BACKEND == "asana":
+        tools.append(reconcile_sync)
 
     # Memory — optional until Memory resource is created
     if MEMORY_ID:
@@ -136,7 +164,37 @@ def invoke(payload, context=None):
         )
         tools.extend(memory_provider.tools)
 
-    # Asana MCP — official server with OAuth (required)
+    system_prompt = (
+        get_system_prompt(PM_BACKEND).format(project_context=build_project_context())
+        + dispatch_context_block
+    )
+
+    # Build the MCP client set for the selected PM backend.
+    #
+    # - asana mode:  Asana MCP (planning) + GitHub MCP default toolset (dev).
+    # - github mode: a single GitHub MCP client with the projects toolset added
+    #   so the agent can read/write the Projects V2 board AND issues/PRs.
+    github_token = get_github_token()
+
+    if PM_BACKEND == "github":
+        github_client = MCPClient(
+            lambda: streamablehttp_client(
+                GITHUB_MCP_URL,
+                headers={
+                    "Authorization": f"Bearer {github_token}",
+                    "X-MCP-Toolsets": GITHUB_PM_TOOLSETS,
+                },
+            )
+        )
+        with github_client:
+            github_tools = github_client.list_tools_sync()
+            all_tools = [*github_tools, *tools]
+            result = _run_agent(
+                model, system_prompt, all_tools, user_input, assignment_id
+            )
+        return {"result": str(result)}
+
+    # asana mode (default)
     asana_token = get_access_token()
     asana_client = MCPClient(
         lambda: streamablehttp_client(
@@ -144,9 +202,6 @@ def invoke(payload, context=None):
             headers={"Authorization": f"Bearer {asana_token}"},
         )
     )
-
-    # GitHub MCP — official remote server with OAuth (required)
-    github_token = get_github_token()
     github_client = MCPClient(
         lambda: streamablehttp_client(
             GITHUB_MCP_URL,
@@ -164,25 +219,28 @@ def invoke(payload, context=None):
         github_tools = [gt for gt in github_tools if gt.tool_name not in asana_names]
 
         all_tools = [*asana_tools, *github_tools, *tools]
-
-        system_prompt = SYSTEM_PROMPT.format(project_context=build_project_context()) + dispatch_context_block
-
-        agent = Agent(
-            model=model,
-            system_prompt=system_prompt,
-            tools=all_tools,
-        )
-        try:
-            result = agent(user_input)
-        except Exception as agent_error:
-            try:
-                fail_assignment(assignment_id, error=str(agent_error))
-            except Exception:
-                logger.exception("fail_assignment also failed for %s", assignment_id)
-            raise
-        complete_assignment(assignment_id, result_summary=str(result)[:500])
+        result = _run_agent(model, system_prompt, all_tools, user_input, assignment_id)
 
     return {"result": str(result)}
+
+
+def _run_agent(model, system_prompt, all_tools, user_input, assignment_id):
+    """Construct and run the agent, recording assignment completion/failure."""
+    agent = Agent(
+        model=model,
+        system_prompt=system_prompt,
+        tools=all_tools,
+    )
+    try:
+        result = agent(user_input)
+    except Exception as agent_error:
+        try:
+            fail_assignment(assignment_id, error=str(agent_error))
+        except Exception:
+            logger.exception("fail_assignment also failed for %s", assignment_id)
+        raise
+    complete_assignment(assignment_id, result_summary=str(result)[:500])
+    return result
 
 
 if __name__ == "__main__":

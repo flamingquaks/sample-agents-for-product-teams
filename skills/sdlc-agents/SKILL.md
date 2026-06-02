@@ -5,7 +5,7 @@ description: Use when the user wants to install, configure, or onboard the SDLC 
 
 # Install SDLC Agent Fleet in a new project
 
-The SDLC Agent Fleet is a set of autonomous agents that cover the software development lifecycle — project management, documentation, business analysis, and ADR linking. Each agent runs on Amazon Bedrock AgentCore. Shipping agents integrate with **Asana** (PM), **GitHub** (SCM), and **Slack** (chat); additional tools (Jira, GitLab, Salesforce, Datadog) are planned but not yet supported end-to-end.
+The SDLC Agent Fleet is a set of autonomous agents that cover the software development lifecycle — project management, documentation, business analysis, and ADR linking. Each agent runs on Amazon Bedrock AgentCore. Shipping agents integrate with **Asana** or **GitHub Issues + Projects V2** (PM), **GitHub** (SCM), and **Slack** (chat) — a GitHub-only team can use GitHub for both SCM and PM. Additional tools (Jira, GitLab, Salesforce, Datadog) are planned but not yet supported end-to-end.
 
 **Not every customer uses every agent.** Your job is to have a conversation that:
 
@@ -33,7 +33,7 @@ Never assume the cwd is the target. The `/sdlc-agents` slash command resolves a 
 
 Ask, don't scan. Start with the minimum viable set of questions:
 
-1. What do you use for project management? (Asana / Jira / Linear / Trello / Aha! / other / none) — only Asana is supported today
+1. What do you use for project management? (Asana / GitHub Issues + Projects V2 / Jira / Linear / Trello / Aha! / other / none) — **Asana and GitHub (Issues + Projects V2) are supported today**; Jira/Linear/Trello/Aha! and others are not yet supported. If the user picks GitHub for **both** source control and project management, that's fine — one tool covers both roles.
 2. What do you use for source control? (GitHub / GitLab / Bitbucket / other) — only GitHub is supported today
 3. What do you use for team chat? (Slack / Microsoft Teams / none) — only Slack is supported today
 4. What AWS account and region do you want the fleet to live in?

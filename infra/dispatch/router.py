@@ -325,13 +325,17 @@ def handler(event, context):
     Expected event shape:
     {
         "source": "github" | "asana" | "slack",
-        "trigger_type": "comment_mention" | "assignment" | "custom_field" | "slash_command",
+        "trigger_type": "comment_mention" | "assignment" | "project_item"
+                        | "custom_field" | "slash_command",
         "body": "the comment/message text",
         "sender": "username",
         "context": {
             // source-specific context
             "repo": "owner/repo",           // github
             "issue_number": "123",          // github
+            "project_number": "7",          // github (project_item)
+            "item_id": "...",               // github (project_item)
+            "status_change": "Todo → Done", // github (project_item)
             "task_gid": "12345",            // asana
             "task_name": "...",             // asana
             "task_notes": "...",            // asana
@@ -339,6 +343,12 @@ def handler(event, context):
             "thread_ts": "...",             // slack
         }
     }
+
+    For the github source, trigger_type is "assignment" when an issue is
+    assigned to a bot login and "project_item" when a Projects V2 board item's
+    status changes; both arrive with a pre-resolved agent_id. The github
+    "project_item" context carries repo + issue_number, so the reply path in
+    _post_block_reply works unchanged for board-move events.
     """
     logger.info("Dispatch event: %s", json.dumps(event))
 

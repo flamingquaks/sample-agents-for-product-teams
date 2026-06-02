@@ -25,7 +25,7 @@ def generate_status_report(
     Args:
         project_name: The project to report on (matches Asana project name)
         audience: One of 'team', 'leadership', 'stakeholder' — controls detail level
-        format: Output format — 'markdown', 'slack', 'asana'
+        format: Output format — 'markdown', 'slack', 'asana', 'github'
 
     Returns:
         Instructions for the agent to follow when generating the report.
@@ -50,6 +50,11 @@ def generate_status_report(
         "markdown": "Use markdown with headers, bullet points, and tables.",
         "slack": "Use Slack Block Kit formatting. Keep under 3000 chars.",
         "asana": "Use Asana-compatible rich text. Post as a project status update.",
+        "github": (
+            "Use GitHub markdown. Post as a Projects V2 status update "
+            "(projects_write → create_project_status_update) for a roadmap-level "
+            "summary, or as an issue comment when reporting on a specific issue."
+        ),
     }
 
     return (

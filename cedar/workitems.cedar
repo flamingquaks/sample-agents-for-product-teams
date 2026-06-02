@@ -29,6 +29,16 @@ permit(
     resource.toolName == "asana_update_task" ||
     resource.toolName == "asana_create_project_status" ||
     resource.toolName == "asana_add_comment" ||
+    // GitHub Projects V2 (PM backend = github) — read board, items, fields
+    resource.toolName == "projects_get" ||
+    resource.toolName == "projects_list" ||
+    // GitHub Projects V2 — write. projects_write covers add_project_item,
+    // update_project_item, and create_project_status_update. The agent must
+    // NOT call delete_project_item (removing work from the board), consistent
+    // with the "never close issues / delete tasks" rule — that restriction is
+    // enforced in the system prompt; the MCP server exposes delete under the
+    // same projects_write tool, so cedar cannot split it at the tool level.
+    resource.toolName == "projects_write" ||
     // Slack — write (post and react only, via direct Web API tools)
     resource.toolName == "slack_post_message" ||
     resource.toolName == "slack_add_reaction"
