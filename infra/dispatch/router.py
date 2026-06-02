@@ -27,6 +27,7 @@ from botocore.config import Config
 
 import guardrail
 import reply
+import slack_blocks
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -302,10 +303,15 @@ def _post_block_reply(source: str, source_context: dict, message: str) -> bool:
             body=message,
         )
     if source == "slack":
+        # Render the block-notice as Block Kit so the Slack reply is structured
+        # (shield header + context) rather than plain text. `message` already
+        # embeds the assignment id, so pass "" to avoid duplicating it.
+        blocks = slack_blocks.format_guardrail_block(message, assignment_id="")
         return reply.post_slack_message(
             channel_id=source_context.get("channel_id", ""),
-            body=message,
+            body=message,  # text fallback for notifications / no-blocks clients
             thread_ts=source_context.get("thread_ts", ""),
+            blocks=blocks,
         )
     logger.warning("No reply channel for source=%s — block notice not posted", source)
     return False

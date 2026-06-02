@@ -182,26 +182,29 @@ def process_projects_v2_item(payload: dict):
         return
 
     item = payload.get("projects_v2_item", {}) or {}
-    # Org/user that owns the project; GitHub sends `organization` and/or `sender`.
-    org = (payload.get("organization", {}) or {}).get("login", "")
+    # Org/user that owns the project. We deliberately do NOT fall back to the
+    # org login for `repo`: a Projects V2 board is org/user-owned and can span
+    # repos, so the webhook usually omits `repository`. Aliasing org -> repo
+    # would produce a bare "acme" (not "acme/web") and break the reply path's
+    # /repos/{owner}/{repo}/issues URL. Leave repo empty when GitHub omits it;
+    # the agent resolves the issue via the board item's content node instead.
     repo = (payload.get("repository", {}) or {}).get("full_name", "")
-    # Project items don't always carry repo; fall back to org/"" per the contract.
-    if not repo and org:
-        repo = org
 
     project_number = item.get("project_number", "") or (
         payload.get("projects_v2", {}) or {}
     ).get("number", "")
     item_id = item.get("node_id") or item.get("id", "")
 
-    # If the item's content is an issue, surface its number so the agent (and
-    # the Router's reply path) can comment back on the issue.
+    # GitHub's projects_v2_item webhook carries content_type + content_node_id
+    # (a GraphQL node id string), NOT a nested content.number. We pass the node
+    # id through so the agent can resolve the issue number via MCP/GraphQL when
+    # it needs to comment on the issue. issue_number is only populated on the
+    # rare payload variant that does include an explicit number.
+    content_node_id = item.get("content_node_id", "") if item.get("content_type") == "Issue" else ""
+    content = item.get("content")
     issue_number = ""
-    content = item.get("content_node_id") or {}
-    if item.get("content_type") == "Issue":
-        # Newer payloads nest the issue under `content`; older ones only give
-        # content_node_id. Prefer an explicit number if present.
-        issue_number = (item.get("content", {}) or {}).get("number", "")
+    if item.get("content_type") == "Issue" and isinstance(content, dict):
+        issue_number = content.get("number", "")
 
     sender = (payload.get("sender", {}) or {}).get("login", "")
     status_change = _describe_status_change(payload.get("changes", {}) or {})
@@ -219,6 +222,7 @@ def process_projects_v2_item(payload: dict):
             "project_number": project_number,
             "item_id": item_id,
             "issue_number": issue_number,
+            "content_node_id": content_node_id,
             "status_change": status_change,
             # The Phase 1 agent keys its project-item branch on
             # source_context.get("trigger_type") == "project_item".
@@ -266,20 +270,24 @@ def process_issue_comment(payload: dict):
 def _is_status_change(changes: dict) -> bool:
     """Return True when the `changes` payload describes a status field move.
 
-    A Projects V2 status column move arrives as a `field_value` change whose
-    field is a single-select (GitHub renders status columns as a single-select
-    field, conventionally named "Status"). We accept the change when:
-      - the field_type is "single_select", OR
-      - the field_name (case-insensitive) is "status".
-    Everything else (text/number/date/iteration edits, reorders that arrive as
-    other change keys) is ignored to avoid dispatch storms.
+    A Projects V2 status column move arrives as a `field_value` change on the
+    single-select field named "Status". We key PRIMARILY on the field name so
+    that edits to OTHER single-select fields (Priority, Size, Team, ...) do not
+    each trigger a full agent run — a board with several single-selects would
+    otherwise cause dispatch storms (and burn the receiver's reserved
+    concurrency). We fall back to the single_select type only when the field
+    name is genuinely absent from the payload.
+    Everything else (text/number/date/iteration edits, reorders) is ignored.
     """
     field_value = changes.get("field_value")
     if not isinstance(field_value, dict):
         return False
     field_type = (field_value.get("field_type") or "").lower()
     field_name = (field_value.get("field_name") or "").lower()
-    return field_type == "single_select" or field_name == "status"
+    if field_name:
+        return field_name == "status"
+    # No field name in the payload — fall back to the single-select heuristic.
+    return field_type == "single_select"
 
 
 def _describe_status_change(changes: dict) -> str:
@@ -310,6 +318,17 @@ def handler(event, context):
     # Normalize header keys to lowercase
     headers = {k.lower(): v for k, v in headers.items()}
     body = event.get("body", "") or ""
+    # API Gateway may base64-encode the delivered body. GitHub signs the raw
+    # bytes, so decode to the exact bytes GitHub signed before computing the
+    # HMAC; verifying over the base64 wrapper would reject every such delivery.
+    raw_body_bytes = None
+    if event.get("isBase64Encoded"):
+        import base64
+        try:
+            raw_body_bytes = base64.b64decode(body)
+            body = raw_body_bytes.decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return {"statusCode": 400, "body": "invalid body encoding"}
 
     # --- Verify webhook signature ---
     # Hard-fail on missing/unavailable secret. SecureString rejects empty
@@ -335,8 +354,11 @@ def handler(event, context):
         return {"statusCode": 503, "body": "webhook not registered"}
 
     signature = headers.get("x-hub-signature-256", "")
+    # HMAC over the exact bytes GitHub signed: the decoded bytes when the body
+    # arrived base64-encoded, otherwise the UTF-8 encoding of the string body.
+    body_bytes = raw_body_bytes if raw_body_bytes is not None else body.encode("utf-8")
     expected = "sha256=" + hmac.new(
-        webhook_secret.encode(), body.encode(), hashlib.sha256
+        webhook_secret.encode(), body_bytes, hashlib.sha256
     ).hexdigest()
     if not hmac.compare_digest(signature, expected):
         logger.warning("Invalid GitHub webhook signature")

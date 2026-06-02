@@ -101,6 +101,44 @@ def invoke(payload, context=None):
             f"Project: {source_context.get('project_name', 'unknown')} ({source_context.get('project_gid', '')})\n"
             f"Reply to: Asana task {source_context.get('task_gid', 'unknown')}\n"
         )
+    elif source_context and source == "github" and source_context.get("trigger_type") == "project_item":
+        # NOTE: this branch MUST precede the generic `source == "github"` branch
+        # below — both match a github source, and the first matching elif wins.
+        #
+        # A Projects V2 board item may not carry a resolvable issue number (the
+        # webhook delivers a content_node_id, not always an issue number), and
+        # the board can span repos so `repo` may be empty. Render those fields
+        # conditionally and tell the agent how to resolve them via the board.
+        issue_number = source_context.get("issue_number", "")
+        content_node_id = source_context.get("content_node_id", "")
+        repo = source_context.get("repo", "")
+        linked_issue_line = (
+            f"Linked issue: #{issue_number}\n" if issue_number
+            else f"Linked content node: {content_node_id or 'unknown'} "
+                 "(resolve the issue via the board item if you need to comment)\n"
+        )
+        if issue_number and repo:
+            reply_target = (
+                f"Reply to: GitHub issue #{issue_number} on {repo}, and update "
+                f"board item {source_context.get('item_id', 'unknown')} on project "
+                f"#{source_context.get('project_number', 'unknown')}\n"
+            )
+        else:
+            reply_target = (
+                "Reply to: post a project status update on project "
+                f"#{source_context.get('project_number', 'unknown')} (and comment on "
+                "the linked issue if you can resolve it from the board item)\n"
+            )
+        dispatch_context_block = (
+            "\n\n## Current Dispatch\n\n"
+            f"Source: github (Projects V2 board)\n"
+            f"Repository: {repo or '(board spans repos / not specified)'}\n"
+            f"Project: #{source_context.get('project_number', 'unknown')}\n"
+            f"Board item: {source_context.get('item_id', 'unknown')}\n"
+            f"{linked_issue_line}"
+            f"Status change: {source_context.get('status_change', 'unknown')}\n"
+            f"{reply_target}"
+        )
     elif source_context and source == "github":
         dispatch_context_block = (
             "\n\n## Current Dispatch\n\n"
@@ -112,20 +150,6 @@ def invoke(payload, context=None):
             f"Comments:\n{source_context.get('issue_comments', '(not loaded)')}\n"
             f"Reply to: GitHub issue #{source_context.get('issue_number', 'unknown')} "
             f"on {source_context.get('repo', 'unknown')}\n"
-        )
-    elif source_context and source == "github" and source_context.get("trigger_type") == "project_item":
-        dispatch_context_block = (
-            "\n\n## Current Dispatch\n\n"
-            f"Source: github (Projects V2 board)\n"
-            f"Repository: {source_context.get('repo', 'unknown')}\n"
-            f"Project: #{source_context.get('project_number', 'unknown')}\n"
-            f"Board item: {source_context.get('item_id', 'unknown')}\n"
-            f"Linked issue: #{source_context.get('issue_number', 'unknown')}\n"
-            f"Status change: {source_context.get('status_change', 'unknown')}\n"
-            f"Reply to: GitHub issue #{source_context.get('issue_number', 'unknown')} "
-            f"on {source_context.get('repo', 'unknown')}, and update board item "
-            f"{source_context.get('item_id', 'unknown')} on project "
-            f"#{source_context.get('project_number', 'unknown')}\n"
         )
     elif source_context and source == "slack":
         dispatch_context_block = (

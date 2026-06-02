@@ -119,6 +119,15 @@ def set_typing_indicator(token: str, channel_id: str, thread_ts: str = ""):
 
 BOT_MENTION_PATTERN = re.compile(r"<@[A-Z0-9]+>\s*")
 
+# A textual "@agent" mention in DM body text (after the <@BOT_ID> Slack mention
+# is stripped). We don't enumerate agent names here — the Router resolves the
+# name against the live registry; this only detects that a mention is present so
+# we know whether to pre-resolve to the default agent or delegate to the Router.
+_DM_MENTION_PATTERN = re.compile(r"(?<!<)@\w+")
+
+# Default agent for plain DM messages with no @agent mention.
+DM_DEFAULT_AGENT = os.environ.get("DM_DEFAULT_AGENT", "workitems")
+
 SLASH_COMMAND_AGENT_MAP = {
     "/workitems": "workitems",
     "/researcher": "researcher",
@@ -246,22 +255,35 @@ def process_assistant_thread(event: dict, token: str):
     # Set typing indicator for the Assistants API
     set_typing_indicator(token, channel, thread_ts)
 
-    # For DMs, default to workitems if no @agent mention present.
-    # Use pre-resolved dispatch since DM users may not include @mentions.
-    dispatch(
-        agent_id="workitems",
-        trigger_type="assistant_thread",
-        instruction=text,
-        sender=user,
-        context={
-            "channel_id": channel,
-            "thread_ts": thread_ts,
-            "message_ts": event.get("ts", ""),
-            "team_id": team,
-            "user_id": user,
-            "is_dm": True,
-        },
-    )
+    context = {
+        "channel_id": channel,
+        "thread_ts": thread_ts,
+        "message_ts": event.get("ts", ""),
+        "team_id": team,
+        "user_id": user,
+        "is_dm": True,
+    }
+
+    # If the DM text contains an @agent mention, let the Router resolve it
+    # against the live registry (so "@researcher ..." reaches researcher, not
+    # workitems). Only when there's no recognized mention do we default to the
+    # PM agent — the common "just talk to the assistant" case. Resolution stays
+    # in one place (the Router); we only decide whether to pre-resolve.
+    if _DM_MENTION_PATTERN.search(text):
+        dispatch_to_router(
+            trigger_type="assistant_thread",
+            body=text,
+            sender=user,
+            context=context,
+        )
+    else:
+        dispatch(
+            agent_id=DM_DEFAULT_AGENT,
+            trigger_type="assistant_thread",
+            instruction=text,
+            sender=user,
+            context=context,
+        )
 
 
 def process_slash_command(command: str, text: str, user_id: str, channel_id: str, response_url: str, trigger_id: str):
@@ -447,6 +469,17 @@ def handler(event, context):
     headers = event.get("headers", {})
     headers = {k.lower(): v for k, v in headers.items()}
     body = event.get("body", "")
+    # API Gateway base64-encodes the body for some content types (notably the
+    # form-encoded slash-command POSTs). Slack signs the RAW request bytes, so we
+    # must decode to the exact string Slack signed BEFORE computing the HMAC —
+    # otherwise verification runs over the base64 wrapper and every such request
+    # 401s (and parse_qs later sees garbage).
+    if event.get("isBase64Encoded"):
+        import base64
+        try:
+            body = base64.b64decode(body).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return {"statusCode": 400, "body": "invalid body encoding"}
     path = event.get("path", event.get("requestContext", {}).get("path", ""))
 
     # --- Fetch signing secret ---
@@ -454,6 +487,12 @@ def handler(event, context):
         signing_secret = _get_ssm_param(SLACK_SIGNING_SECRET_PARAM)
     except Exception as exc:
         logger.error("Failed to fetch signing secret: %s", exc)
+        return {"statusCode": 503, "body": "signing secret unavailable"}
+    # Hard-fail on an empty secret rather than verifying against "" — matches the
+    # asana/github receivers and keeps a misconfigured stage from accepting
+    # unsigned requests that happen to also send an empty signature.
+    if not signing_secret:
+        logger.error("Slack signing secret is empty; refusing to process events.")
         return {"statusCode": 503, "body": "signing secret unavailable"}
 
     # --- Verify request signature ---

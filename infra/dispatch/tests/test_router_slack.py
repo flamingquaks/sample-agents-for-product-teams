@@ -73,11 +73,16 @@ def test_post_block_reply_slack_calls_post_slack_message(router):
             "blocked",
         )
     assert ok is True
-    mock_post.assert_called_once_with(
-        channel_id="C1",
-        body="blocked",
-        thread_ts="170.1",
-    )
+    # The block reply now renders Block Kit (format_guardrail_block) and passes
+    # it alongside the plain-text fallback.
+    assert mock_post.call_count == 1
+    kwargs = mock_post.call_args.kwargs
+    assert kwargs["channel_id"] == "C1"
+    assert kwargs["body"] == "blocked"
+    assert kwargs["thread_ts"] == "170.1"
+    blocks = kwargs["blocks"]
+    assert isinstance(blocks, list) and blocks[0]["type"] == "section"
+    assert "Request Blocked" in blocks[0]["text"]["text"]
 
 
 # --- Case 8: guardrail block on a slack event -------------------------------

@@ -166,6 +166,29 @@ def test_process_assistant_thread_dispatches_workitems_dm(mod):
     assert kwargs["context"]["is_dm"] is True
 
 
+def test_process_assistant_thread_with_mention_delegates_to_router(mod):
+    # A DM that names a specific agent must NOT be hard-routed to workitems —
+    # it goes to the Router (no pre-resolved agent_id) for registry resolution.
+    event = {
+        "text": "@researcher analyze the competitive landscape",
+        "channel": "D1",
+        "user": "U5",
+        "ts": "333.3",
+        "team": "T2",
+    }
+    with patch.object(mod, "set_typing_indicator"), \
+         patch.object(mod, "dispatch") as mock_dispatch, \
+         patch.object(mod, "dispatch_to_router") as mock_router:
+        mod.process_assistant_thread(event, "tok")
+
+    mock_dispatch.assert_not_called()  # not pre-resolved to workitems
+    mock_router.assert_called_once()
+    kwargs = mock_router.call_args.kwargs
+    assert kwargs["trigger_type"] == "assistant_thread"
+    assert kwargs["body"] == "@researcher analyze the competitive landscape"
+    assert kwargs["context"]["is_dm"] is True
+
+
 # --- process_slash_command ---------------------------------------------------
 
 
@@ -279,6 +302,38 @@ def test_handler_non_event_callback_returns_ok(mod):
         resp = mod.handler(_signed_event(mod, body), None)
     assert resp["statusCode"] == 200
     assert resp["body"] == "ok"
+
+
+def test_handler_empty_signing_secret_returns_503(mod):
+    # An empty secret must hard-fail, not verify against "".
+    mod._ssm.get_parameter.return_value = {"Parameter": {"Value": ""}}
+    body = json.dumps({"type": "url_verification", "challenge": "x"})
+    resp = mod.handler(_signed_event(mod, body), None)
+    assert resp["statusCode"] == 503
+
+
+def test_handler_base64_encoded_body_is_decoded_before_verify(mod):
+    # API Gateway base64-encodes some bodies. The handler must decode to the raw
+    # bytes Slack signed BEFORE verifying, so a correctly-signed base64 request
+    # passes and the challenge round-trips.
+    import base64
+    mod._ssm.get_parameter.return_value = {"Parameter": {"Value": SIGNING_SECRET}}
+    raw = json.dumps({"type": "url_verification", "challenge": "deadbeef"})
+    ts = str(int(time.time()))
+    sig = _sign(SIGNING_SECRET, ts, raw)  # signature over the RAW (decoded) body
+    event = {
+        "headers": {
+            "X-Slack-Request-Timestamp": ts,
+            "X-Slack-Signature": sig,
+            "Content-Type": "application/json",
+        },
+        "body": base64.b64encode(raw.encode()).decode(),
+        "isBase64Encoded": True,
+        "path": "/slack/events",
+    }
+    resp = mod.handler(event, None)
+    assert resp["statusCode"] == 200
+    assert json.loads(resp["body"])["challenge"] == "deadbeef"
 
 
 def test_handler_app_mention_invokes_processor(mod):

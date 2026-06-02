@@ -195,6 +195,45 @@ def test_projects_v2_status_by_field_name_even_if_type_differs(gh):
     assert gh.lambda_client.invoke.called
 
 
+def test_projects_v2_realistic_payload_carries_node_id_not_fake_number(gh):
+    # GitHub's real projects_v2_item payload has content_node_id + content_type,
+    # NOT a nested content.number. issue_number must be empty (not invented), the
+    # content_node_id must be carried for downstream resolution, and repo must
+    # NOT be aliased to the org login (which would break the reply URL).
+    body = _project_item_body()
+    body["projects_v2_item"]["content_type"] = "Issue"
+    body["projects_v2_item"]["content_node_id"] = "I_kwDOabc123"
+    body["organization"] = {"login": "acme-org"}
+    body.pop("repository", None)  # board spans repos — no repository in payload
+    resp = gh.handler(_signed_event(gh, body, "projects_v2_item"), None)
+    assert resp["statusCode"] == 200
+    ctx = _last_dispatch(gh)["context"]
+    assert ctx["issue_number"] == ""            # not fabricated
+    assert ctx["content_node_id"] == "I_kwDOabc123"
+    assert ctx["repo"] == ""                     # NOT "acme-org"
+
+
+def test_projects_v2_explicit_content_number_is_used(gh):
+    # The rare payload variant that DOES nest content.number should populate it.
+    body = _project_item_body()
+    body["projects_v2_item"]["content_type"] = "Issue"
+    body["projects_v2_item"]["content"] = {"number": 99}
+    resp = gh.handler(_signed_event(gh, body, "projects_v2_item"), None)
+    assert resp["statusCode"] == 200
+    assert _last_dispatch(gh)["context"]["issue_number"] == 99
+
+
+def test_projects_v2_draft_content_has_no_issue_number(gh):
+    body = _project_item_body()
+    body["projects_v2_item"]["content_type"] = "DraftIssue"
+    body["projects_v2_item"]["content_node_id"] = "DI_abc"
+    resp = gh.handler(_signed_event(gh, body, "projects_v2_item"), None)
+    assert resp["statusCode"] == 200
+    ctx = _last_dispatch(gh)["context"]
+    assert ctx["issue_number"] == ""
+    assert ctx["content_node_id"] == ""  # only set for content_type == "Issue"
+
+
 # --- issue_comment mention pass-through --------------------------------------
 
 

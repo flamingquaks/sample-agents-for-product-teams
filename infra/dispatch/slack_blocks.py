@@ -67,8 +67,19 @@ def format_error(message: str, assignment_id: str = "") -> list[dict]:
     return blocks
 
 
-def format_guardrail_block(message: str, assignment_id: str) -> list[dict]:
-    """Block notice for guardrail-intercepted requests."""
+def format_guardrail_block(message: str, assignment_id: str = "") -> list[dict]:
+    """Block notice for guardrail-intercepted requests.
+
+    assignment_id is optional: when the caller's `message` already embeds the
+    assignment id (as the Router's block templates do), pass "" to avoid
+    rendering an empty/duplicate `Assignment:` line.
+    """
+    context_elements = []
+    if assignment_id:
+        context_elements.append({"type": "mrkdwn", "text": f"Assignment: `{assignment_id}`"})
+    context_elements.append(
+        {"type": "mrkdwn", "text": "If you believe this is a false positive, contact an operator."}
+    )
     return [
         {
             "type": "section",
@@ -79,10 +90,7 @@ def format_guardrail_block(message: str, assignment_id: str) -> list[dict]:
         },
         {
             "type": "context",
-            "elements": [
-                {"type": "mrkdwn", "text": f"Assignment: `{assignment_id}`"},
-                {"type": "mrkdwn", "text": "If you believe this is a false positive, contact an operator."},
-            ],
+            "elements": context_elements,
         },
     ]
 

@@ -77,7 +77,14 @@ oauth_config:
       - channels:history
       - channels:read
       - chat:write
-      - chat:write.public
+      # chat:write.public is intentionally NOT requested. It would let the bot
+      # post to ANY public channel without being a member — and since the
+      # agent's slack_post_message tool takes an arbitrary channel_id, a
+      # prompt-injected agent could exfiltrate context to a channel it was never
+      # invited to (widens threat T-15). With chat:write alone the bot can only
+      # post to channels it has been added to. If you have a concrete need to
+      # post to un-joined public channels, add `chat:write.public` here and
+      # document it as an accepted T-15 widening.
       - commands
       - im:history
       - im:read
