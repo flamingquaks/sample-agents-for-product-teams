@@ -23,7 +23,7 @@ Only agents with `Status: shipping` have working code and can be installed today
 
 | Agent | Status | What it does | Hard requirements | Nice-to-have |
 |---|---|---|---|---|
-| `workitems` | shipping | PO/PM. Decomposes feature asks into tracker issues; status reports; risk detection. | PM tool **and** source control | Slack for weekly status |
+| `workitems` | shipping | PO/PM. Decomposes feature asks into tracker issues; status reports; risk detection. | PM tool **and** source control | Slack (supported) for weekly status — any agent can also post results there |
 | `researcher` | shipping | Business analyst. Research synthesis, competitive intel, backlog analysis. | PM tool | Web search (Tavily, SerpAPI, Perplexity) |
 | `docwriter` | shipping | Technical writer. API docs, release notes, doc PRs. | Source control | PM tool for feature context |
 | `adr` | shipping | Tags issues + reviews PRs against the ADRs that govern the work. | Source control **and** an ADR directory that already exists | - |
@@ -53,6 +53,8 @@ The agent has no fallback behavior for "no ADRs" — it's not useful without the
    > - **researcher** — synthesizes customer research into Asana stories
    >
    > Optional add-ons that fit your stack: `adr` (if you have an ADR library).
+
+   If the user has Slack, note that any selected agent can be reached from and post results to Slack once they run `sdlc-agents-connect-slack`.
 
 3. Ask the user which to install. Accept three answers:
    - "just the recommended" → select the Recommended list

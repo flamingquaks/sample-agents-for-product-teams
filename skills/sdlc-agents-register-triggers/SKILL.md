@@ -90,20 +90,46 @@ Add a line for each agent in `.sdlc-agents/selection.yaml`. Commit.
 
 The trust policy for the deploy role is created manually (or via `sdlc-agents-provision-aws`) when you first set up the account — see `docs/aws-deploy.md` §1.3. It should use `StringEquals` on `sub` with two explicit subjects: `repo:<ORG>/<REPO>:ref:refs/heads/main` (covers deploy workflows on `push` to main AND the dispatch workflow's `issue_comment` / `pull_request_review_comment` events, which run in the default-branch context) and `repo:<ORG>/<REPO>:pull_request` (covers `claude-code.yml`'s `pull_request: [opened, synchronize]` trigger — the only true "pull request event" in OIDC terms). If the user is bringing a brand-new repo, the role's trust policy was scoped to a different `<ORG>/<REPO>` — update the role directly (`aws iam update-assume-role-policy`) to add their repo's two subjects, or create a fresh role for them.
 
-### Slack (gap — not yet supported end-to-end)
+### Slack
 
-Slack triggers aren't wired up in the foundation stack or the Dispatch Router yet. If the user has Slack in their toolchain and selected agents that advertise Slack triggers in `.dispatch/agents.yaml`, tell them:
+Slack is supported end-to-end. The foundation stack ships a `slack-events-${STAGE}` Lambda behind API Gateway (`/slack/events` and `/slack/slash`) that verifies request signatures and forwards normalized events to the Dispatch Router, which resolves @mentions from the live SSM registry. So wiring Slack triggers is registry work, not infrastructure work — no new Lambda, no app creation here.
 
-> Slack triggers aren't implemented in this fleet yet. The registry advertises the trigger shape but the foundation stack has no Slack event receiver, and the router has no signature verifier. You can still use your selected agents via Asana/GitHub; the Slack path can be added later.
+**Prerequisite:** the user must have already run `sdlc-agents-connect-slack`, which creates the Slack app, stores the signing secret and bot token in SSM, verifies the Events URL, and records `slack.authorized_users` (Slack user IDs like `U0123ABCDEF`) and `slack.team_id` in `.sdlc-agents/selection.yaml`. If those aren't in place, send the user to `sdlc-agents-connect-slack` first — this section can't do anything useful without them.
 
-When support lands, this section should cover:
+#### 1. Populate `authorization.users` in `.dispatch/agents.yaml`
 
-- Creating a Slack app from a manifest (scopes: `app_mentions:read`, `chat:write`; events: `app_mention`)
-- Installing to the workspace and storing the bot token at `/sdlc-agents/slack-bot-token`
-- Storing `SLACK_SIGNING_SECRET` for inbound event verification
-- Pointing event subscriptions at a new `slack-webhook-${STAGE}` Lambda URL (not yet in the foundation stack)
+For each selected agent that advertises a `slack:` trigger in its registry entry, add the Slack user IDs from `selection.yaml` → `slack.authorized_users` to that agent's `authorization.users` list. The identities **must be Slack user IDs** (e.g. `U0123ABCDEF`), never display names — the comment at the top of `agents.yaml` explains why (display names are self-editable and non-unique). The router fails closed: an agent with an empty `users` list returns 403 for every sender.
 
-Don't try to paper over the gap by writing a partial integration — leave it clean so the user knows what does and doesn't work.
+```yaml
+agents:
+  workitems:
+    triggers:
+      slack: [mention, slash_command, assistant_thread]
+    authorization:
+      users:
+        - U0123ABCDEF   # Slack user IDs from selection.yaml → slack.authorized_users
+        - U0456DEF789
+```
+
+If a sender's GitHub login or Asana GID is already listed for the same agent, just append the Slack IDs — `users` is a single allowlist shared across all of that agent's trigger sources.
+
+#### 2. Sync the registry to SSM
+
+The Dispatch Router reads the registry from SSM, **not** from the file on disk, so your `agents.yaml` edits don't take effect until you push them:
+
+```bash
+python scripts/sync_registry.py --stage "$STAGE" --region "$REGION"
+```
+
+This is required: without it the router keeps enforcing the old authorization list and won't recognize the newly-authorized Slack users.
+
+#### 3. Verify the Events URL is still Verified
+
+In the Slack app's **Event Subscriptions** page, confirm the Request URL still shows **Verified**. A stale or rotated signing secret breaks signature verification and the URL flips to a red error. If it does, inspect `/aws/lambda/slack-events-${STAGE}` in CloudWatch — a 401 means signature mismatch (the secret in SSM doesn't match the app's actual secret), a 503 means the Lambda couldn't read the signing secret from SSM.
+
+#### 4. No Lambda env-var surgery needed
+
+Unlike the Asana section above, there's nothing to patch on the `slack-events-${STAGE}` Lambda. It reads the signing secret and bot token from SSM and resolves @mentions against the live registry, so adding agents or authorizing users requires no function-configuration changes — just the registry sync in step 2.
 
 ## Verify the pipeline
 
@@ -113,4 +139,5 @@ Run `sdlc-agents-verify` to smoke-test each enabled trigger path.
 
 - Create Asana bot accounts (those are users, not API resources — user has to invite them manually)
 - Configure Asana's "Agent" custom field enum options (that was done in `sdlc-agents-connect-asana`)
+- Create the Slack app or store its secrets — that's `sdlc-agents-connect-slack`
 - Wire up webhooks for tools the user doesn't have (skip non-selected integrations cleanly)

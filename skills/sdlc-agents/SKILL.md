@@ -5,7 +5,7 @@ description: Use when the user wants to install, configure, or onboard the SDLC 
 
 # Install SDLC Agent Fleet in a new project
 
-The SDLC Agent Fleet is a set of autonomous agents that cover the software development lifecycle — project management, documentation, business analysis, and ADR linking. Each agent runs on Amazon Bedrock AgentCore. Shipping agents integrate with **Asana** (PM) and **GitHub** (SCM); additional tools (Jira, GitLab, Slack, Salesforce, Datadog) are planned but not yet supported end-to-end.
+The SDLC Agent Fleet is a set of autonomous agents that cover the software development lifecycle — project management, documentation, business analysis, and ADR linking. Each agent runs on Amazon Bedrock AgentCore. Shipping agents integrate with **Asana** (PM), **GitHub** (SCM), and **Slack** (chat); additional tools (Jira, GitLab, Salesforce, Datadog) are planned but not yet supported end-to-end.
 
 **Not every customer uses every agent.** Your job is to have a conversation that:
 
@@ -35,7 +35,8 @@ Ask, don't scan. Start with the minimum viable set of questions:
 
 1. What do you use for project management? (Asana / Jira / Linear / Trello / Aha! / other / none) — only Asana is supported today
 2. What do you use for source control? (GitHub / GitLab / Bitbucket / other) — only GitHub is supported today
-3. What AWS account and region do you want the fleet to live in?
+3. What do you use for team chat? (Slack / Microsoft Teams / none) — only Slack is supported today
+4. What AWS account and region do you want the fleet to live in?
 
 Record answers. If the user names a tool that doesn't have a shipping connect skill (e.g. Jira, GitLab), tell them so immediately — don't let the conversation go ten questions deep before surfacing that their PM or SCM isn't supported yet.
 
@@ -62,8 +63,9 @@ For each tool the customer uses, invoke the matching connect skill:
 
 - Asana → **sdlc-agents-connect-asana** (OAuth app setup, MCP vs API app, PAT for webhook Lambda)
 - GitHub → **sdlc-agents-connect-github** (GitHub App or fine-grained PAT for MCP, deploy-role OIDC for CI)
+- Slack → **sdlc-agents-connect-slack** (Slack app from manifest, signing secret + bot token in SSM, event subscriptions, slash commands)
 
-Other tools (Jira, GitLab, Slack, Salesforce, Datadog) don't have connect skills yet — the shipping agents all work against Asana + GitHub. If the user picked one of those other tools during discovery, tell them honestly that the connect path isn't written yet and point them at the vendor's remote MCP docs; don't fabricate setup steps.
+Other tools (Jira, GitLab, Salesforce, Datadog) don't have connect skills yet — the shipping agents work against Asana, GitHub, and Slack. If the user picked one of those other tools during discovery, tell them honestly that the connect path isn't written yet and point them at the vendor's remote MCP docs; don't fabricate setup steps.
 
 Each connect skill knows the specific pitfalls of its tool (Asana's MCP-app-vs-API-app distinction is the classic one) and walks past them.
 
