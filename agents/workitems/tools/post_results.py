@@ -34,9 +34,9 @@ def post_results(
         "asana": f"Use asana_add_comment on task '{target_id}' with this message.",
         "github": f"Use github_add_comment on issue/PR #{target_id} with this message.",
         "slack": (
-            f"Use slack_post_message to channel '{target_id}'"
-            + (f" in thread '{thread_id}'" if thread_id else "")
-            + " with this message."
+            f"Use the slack_post_message tool with channel_id='{target_id}'"
+            + (f" and thread_ts='{thread_id}'" if thread_id else "")
+            + " to post this message."
         ),
     }
 

@@ -31,12 +31,7 @@ permit(
     // Asana — write (doc status comments, doc tasks)
     resource.toolName == "asana_add_comment" ||
     resource.toolName == "asana_create_task" ||
-    // Slack — read (thread context)
-    resource.toolName == "slack_get_channel_history" ||
-    resource.toolName == "slack_get_thread" ||
-    resource.toolName == "slack_list_channels" ||
-    // Slack — write (doc notifications, no delete/edit)
+    // Slack — write (doc notifications via direct Web API tools, no delete/edit)
     resource.toolName == "slack_post_message" ||
-    resource.toolName == "slack_post_thread" ||
     resource.toolName == "slack_add_reaction"
 };

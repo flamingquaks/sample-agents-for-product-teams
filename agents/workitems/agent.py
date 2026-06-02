@@ -9,7 +9,6 @@ Uses Claude Opus 4.6 via Bedrock, Asana's official MCP server, and
 GitHub's official remote MCP server.
 """
 
-import contextlib
 import logging
 import os
 import sys
@@ -30,7 +29,7 @@ from tools.sync import reconcile_sync
 from tools.post_results import post_results
 from tools.asana_mcp import get_access_token, ASANA_MCP_URL
 from tools.github_mcp import get_github_token, GITHUB_MCP_URL
-from shared.tools.slack_mcp import get_slack_token, SLACK_MCP_URL
+from shared.tools.slack_post import slack_post_message, slack_add_reaction
 
 # --- Logging -----------------------------------------------------------------
 # Configure root logger to emit to stdout so AgentCore's OTel sidecar captures
@@ -116,7 +115,16 @@ def invoke(payload, context=None):
         )
 
     model = build_model()
-    tools = [generate_status_report, detect_risks, reconcile_sync, post_results]
+    # Slack posting is a pair of cheap function tools (direct Web API), so they
+    # are always available regardless of trigger source — no live connection.
+    tools = [
+        generate_status_report,
+        detect_risks,
+        reconcile_sync,
+        post_results,
+        slack_post_message,
+        slack_add_reaction,
+    ]
 
     # Memory — optional until Memory resource is created
     if MEMORY_ID:
@@ -146,36 +154,16 @@ def invoke(payload, context=None):
         )
     )
 
-    # Slack MCP — for reading/writing Slack messages and channels (optional).
-    # Only connect if token is available; agents still function without Slack.
-    slack_token = get_slack_token()
-    slack_client = None
-    if slack_token and SLACK_MCP_URL:
-        slack_client = MCPClient(
-            lambda: streamablehttp_client(
-                SLACK_MCP_URL,
-                headers={"Authorization": f"Bearer {slack_token}"},
-            )
-        )
-
-    with contextlib.ExitStack() as stack:
-        stack.enter_context(asana_client)
-        stack.enter_context(github_client)
-        if slack_client:
-            stack.enter_context(slack_client)
-
+    with asana_client, github_client:
         asana_tools = asana_client.list_tools_sync()
         github_tools = github_client.list_tools_sync()
-        slack_tools = slack_client.list_tools_sync() if slack_client else []
 
         # Drop tools that collide with earlier-priority tool names
         # (e.g. both servers expose get_me — keep the Asana version)
         asana_names = {t.tool_name for t in asana_tools}
         github_tools = [gt for gt in github_tools if gt.tool_name not in asana_names]
-        used_names = asana_names | {t.tool_name for t in github_tools}
-        slack_tools = [st for st in slack_tools if st.tool_name not in used_names]
 
-        all_tools = [*asana_tools, *github_tools, *slack_tools, *tools]
+        all_tools = [*asana_tools, *github_tools, *tools]
 
         system_prompt = SYSTEM_PROMPT.format(project_context=build_project_context()) + dispatch_context_block
 

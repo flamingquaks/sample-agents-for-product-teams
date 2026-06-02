@@ -8,7 +8,6 @@ Uses Claude Opus 4.7 via Bedrock and GitHub's official remote MCP server.
 GitHub-only — the Workitems agent owns Asana side of the loop.
 """
 
-import contextlib
 import logging
 import os
 
@@ -28,7 +27,7 @@ from tools.detect_doc_gaps import detect_doc_gaps
 from tools.check_doc_freshness import check_doc_freshness
 from tools.post_results import post_results
 from tools.github_mcp import get_github_token, GITHUB_MCP_URL
-from shared.tools.slack_mcp import get_slack_token, SLACK_MCP_URL
+from shared.tools.slack_post import slack_post_message, slack_add_reaction
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +116,15 @@ def invoke(payload, context=None):
     # emit multi-file patches without hitting MaxTokensReachedException
     # mid-tool-call on a multi-file README update.
     model = build_model(max_tokens=16000)
-    tools = [generate_api_docs, generate_release_notes, detect_doc_gaps, check_doc_freshness, post_results]
+    tools = [
+        generate_api_docs,
+        generate_release_notes,
+        detect_doc_gaps,
+        check_doc_freshness,
+        post_results,
+        slack_post_message,
+        slack_add_reaction,
+    ]
 
     # Memory — optional until Memory resource is created
     if MEMORY_ID:
@@ -138,31 +145,14 @@ def invoke(payload, context=None):
         )
     )
 
-    # Slack MCP — for reading/writing Slack messages and channels (optional).
-    # Only connect if token is available; agent still functions without Slack.
-    slack_token = get_slack_token()
-    slack_client = None
-    if slack_token and SLACK_MCP_URL:
-        slack_client = MCPClient(
-            lambda: streamablehttp_client(
-                SLACK_MCP_URL,
-                headers={"Authorization": f"Bearer {slack_token}"},
-            )
-        )
+    # Slack posting is handled by direct Web API tools (slack_post_message,
+    # slack_add_reaction) already in `tools` — no live MCP connection needed,
+    # so the agent can post to Slack regardless of trigger source.
 
-    with contextlib.ExitStack() as stack:
-        stack.enter_context(github_client)
-        if slack_client:
-            stack.enter_context(slack_client)
-
+    with github_client:
         github_tools = github_client.list_tools_sync()
-        slack_tools = slack_client.list_tools_sync() if slack_client else []
 
-        # Drop Slack tools that collide with GitHub tool names
-        github_names = {t.tool_name for t in github_tools}
-        slack_tools = [st for st in slack_tools if st.tool_name not in github_names]
-
-        all_tools = [*github_tools, *slack_tools, *tools]
+        all_tools = [*github_tools, *tools]
 
         agent = Agent(
             model=model,
