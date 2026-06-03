@@ -14,7 +14,7 @@ permit(
     resource.toolName == "github_list_milestones" ||
     // GitHub — write (create and comment only)
     resource.toolName == "github_create_issue" ||
-    resource.toolName == "github_add_comment" ||
+    resource.toolName == "add_issue_comment" ||
     resource.toolName == "github_add_label" ||
     resource.toolName == "github_update_issue" ||
     // Asana — read
@@ -28,7 +28,7 @@ permit(
     resource.toolName == "asana_create_task" ||
     resource.toolName == "asana_update_task" ||
     resource.toolName == "asana_create_project_status" ||
-    resource.toolName == "asana_add_comment" ||
+    resource.toolName == "add_comment" ||
     // GitHub Projects V2 (PM backend = github) — read board, items, fields
     resource.toolName == "projects_get" ||
     resource.toolName == "projects_list" ||

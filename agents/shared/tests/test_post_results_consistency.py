@@ -89,8 +89,8 @@ def test_all_three_expose_same_parameter_names_in_order():
         # the right tool. (See the per-branch tests below for the full check.)
         for name, tool in ALL_TOOLS.items():
             assert "slack_post_message" in tool(platform="slack", target_id="C1", message="m")
-            assert "asana_add_comment" in tool(platform="asana", target_id="1", message="m")
-            assert "github_add_comment" in tool(platform="github", target_id="2", message="m")
+            assert "add_comment" in tool(platform="asana", target_id="1", message="m")
+            assert "add_issue_comment" in tool(platform="github", target_id="2", message="m")
 
 
 # --- Case 2: slack branch, no thread ----------------------------------------
@@ -120,7 +120,7 @@ def test_slack_branch_references_thread_id(name, tool):
 @pytest.mark.parametrize("name,tool", list(ALL_TOOLS.items()))
 def test_asana_branch_mentions_tool_and_target(name, tool):
     out = tool(platform="asana", target_id="999", message="done")
-    assert "asana_add_comment" in out
+    assert "add_comment" in out
     assert "999" in out
 
 
@@ -130,7 +130,7 @@ def test_asana_branch_mentions_tool_and_target(name, tool):
 @pytest.mark.parametrize("name,tool", list(ALL_TOOLS.items()))
 def test_github_branch_mentions_tool_and_target(name, tool):
     out = tool(platform="github", target_id="42", message="done")
-    assert "github_add_comment" in out
+    assert "add_issue_comment" in out
     assert "42" in out
 
 

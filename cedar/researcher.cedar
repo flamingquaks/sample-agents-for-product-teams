@@ -18,7 +18,7 @@ permit(
     // Asana — write (create, update, comment only)
     resource.toolName == "asana_create_task" ||
     resource.toolName == "asana_update_task" ||
-    resource.toolName == "asana_add_comment" ||
+    resource.toolName == "add_comment" ||
     // Slack — write (post results only, no delete/edit)
     resource.toolName == "slack_post_message" ||
     resource.toolName == "slack_add_reaction" ||

@@ -31,8 +31,8 @@ def post_results(
         Instruction for the agent to use the appropriate Gateway tool to post.
     """
     tool_map = {
-        "asana": f"Use asana_add_comment on task '{target_id}' with this message.",
-        "github": f"Use github_add_comment on issue/PR #{target_id} with this message.",
+        "asana": f"Use the add_comment tool on task '{target_id}' with this message.",
+        "github": f"Use the add_issue_comment tool on issue/PR #{target_id} with this message.",
         "slack": (
             f"Use the slack_post_message tool with channel_id='{target_id}'"
             + (f" and thread_ts='{thread_id}'" if thread_id else "")

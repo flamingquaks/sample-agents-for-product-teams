@@ -21,7 +21,7 @@ permit(
     // GitHub — write (labels + comments only; no merges, no closes)
     resource.toolName == "github_add_label" ||
     resource.toolName == "github_remove_label" ||
-    resource.toolName == "github_add_comment" ||
+    resource.toolName == "add_issue_comment" ||
     resource.toolName == "github_add_pr_review_comment" ||
     // Slack — write (post results only, no delete/edit)
     resource.toolName == "slack_post_message" ||

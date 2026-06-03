@@ -21,7 +21,7 @@ permit(
     // GitHub — write (doc PRs, issues, comments only)
     resource.toolName == "github_create_pr" ||
     resource.toolName == "github_create_issue" ||
-    resource.toolName == "github_add_comment" ||
+    resource.toolName == "add_issue_comment" ||
     resource.toolName == "github_add_label" ||
     // Asana — read (feature context)
     resource.toolName == "asana_get_task" ||
@@ -29,7 +29,7 @@ permit(
     resource.toolName == "asana_get_task_stories" ||
     resource.toolName == "asana_search" ||
     // Asana — write (doc status comments, doc tasks)
-    resource.toolName == "asana_add_comment" ||
+    resource.toolName == "add_comment" ||
     resource.toolName == "asana_create_task" ||
     // Slack — write (doc notifications via direct Web API tools, no delete/edit)
     resource.toolName == "slack_post_message" ||
