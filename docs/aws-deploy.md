@@ -70,8 +70,11 @@ Enabled in the Bedrock console → Model access. Required in the same region as 
 Passed to `sam deploy --parameter-overrides`:
 
 - **`Stage`** — `dev` / `staging` / `prod`. Embedded in every resource name.
-- **`WorkitemsBotGID`** — Asana user GID that tasks are assigned to to trigger Workitems.
-- **`AgentFieldGID`** — Asana custom field GID for the "Agent" dropdown (optional — empty string is fine if you're not using custom-field triggers).
+- **`WorkitemsBotGID`** — Asana user GID that tasks are assigned to to trigger Workitems. **Optional** (defaults to empty). Required only for the Asana PM backend; omit it for a GitHub-PM-only or Slack-only deployment.
+- **`AgentFieldGID`** — Asana custom field GID for the "Agent" dropdown. **Optional** (defaults to empty); set it only if you use Asana custom-field triggers.
+- **`WorkitemsGitHubBotLogin`** — GitHub login of the Workitems bot. Optional (defaults to empty). Set it for the GitHub PM backend so issue assignments to that login dispatch to `@workitems`.
+
+All three default to empty strings, so a GitHub-PM-only deploy can run `sam deploy` with just `Stage` (and, under `--guided`, accept the empty defaults for the rest).
 
 ### 2.4 SSM SecureString parameters (populated by connect skills)
 

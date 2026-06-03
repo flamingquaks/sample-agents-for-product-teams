@@ -12,11 +12,19 @@ Parameters:
 
   WorkitemsBotGID:
     Type: String
-    Description: Asana user GID for the Workitems bot account
+    Default: ""
+    Description: >
+      Asana user GID for the Workitems bot account. Required only for the Asana
+      PM backend (assignment triggers). Leave empty for a GitHub-PM-only or
+      Slack-only deployment — the Asana webhook simply won't match any bot.
 
   AgentFieldGID:
     Type: String
-    Description: Asana custom field GID for the "Agent" dropdown
+    Default: ""
+    Description: >
+      Asana custom field GID for the "Agent" dropdown. Required only for the
+      Asana PM backend (custom-field triggers). Leave empty for a GitHub-PM-only
+      or Slack-only deployment.
 
   WorkitemsGitHubBotLogin:
     Type: String
