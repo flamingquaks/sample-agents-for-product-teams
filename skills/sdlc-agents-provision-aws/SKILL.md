@@ -163,14 +163,39 @@ All `gh` commands in this step target the **target repo** — run them inside `$
 
 #### Variables
 
+The deploy workflows for `workitems`, `researcher`, and `docwriter` build their
+runtime env from the **PM_BACKEND** repo variable in a `prepare` job, so you only
+set the variables relevant to the chosen backend — a GitHub-PM deploy needs no
+`ASANA_*` variable, and an Asana deploy needs no `GITHUB_PROJECT_*`.
+
+**Set this first — it drives which other variables are required:**
+
+| Variable | Source | Consumed by | Required? |
+|---|---|---|---|
+| `PM_BACKEND` | `selection.yaml → toolchain.pm` (`asana` or `github`) | `workitems`, `researcher` deploy workflows | Set to `github` for a GitHub-PM fleet; defaults to `asana` if unset |
+
+**Common (both backends):**
+
 | Variable | Source | Consumed by | Required? |
 |---|---|---|---|
 | `AWS_REGION` | `selection.yaml → aws.region` | All deploy workflows, `agent-dispatch.yml` | Yes |
-| `TARGET_REPO` | `github.yaml → owner` + `repo` (joined as `<owner>/<repo>`) — baked into the runtime as env var `GITHUB_REPO` | `workitems`, `docwriter`, `adr` | Yes, if any of those agents are selected |
-| `ASANA_WORKSPACE_GID` | `asana.yaml → workspace_gid` | `workitems`, `docwriter`, `researcher` | Yes, if any of those agents are selected |
-| `ASANA_PROJECT_GID` | `asana.yaml → project_gid` | same | Yes, if any of those agents are selected |
-| `ASANA_PROJECT_NAME` | `asana.yaml → project_name` | same (cosmetic, shown in prompts) | No |
+| `TARGET_REPO` | `github → owner`+`repo` as `<owner>/<repo>` — baked as env var `GITHUB_REPO` | `workitems`, `docwriter`, `adr` always; `researcher` only in github mode | Yes when any consuming agent is selected |
 | `CLAUDE_CODE_AWS_REGION` | operator preference (defaults to `us-east-1`) | `claude-code.yml` | No |
+
+**`PM_BACKEND=asana` only** (for `workitems` / `researcher`; `docwriter` may set these optionally for feature context):
+
+| Variable | Source | Consumed by | Required? |
+|---|---|---|---|
+| `ASANA_WORKSPACE_GID` | `asana → workspace_gid` | `workitems`, `researcher` (asana mode); `docwriter` (optional) | Yes in asana mode |
+| `ASANA_PROJECT_GID` | `asana → project_gid` | same | Yes in asana mode |
+| `ASANA_PROJECT_NAME` | `asana → project_name` | same (cosmetic) | No |
+
+**`PM_BACKEND=github` only** (for `workitems` / `researcher`):
+
+| Variable | Source | Consumed by | Required? |
+|---|---|---|---|
+| `GITHUB_PROJECT_NUMBER` | `selection.yaml → pm.github_project_number` | `workitems`, `researcher` (github mode) | Yes in github mode |
+| `GITHUB_PROJECT_OWNER` | `selection.yaml → pm.github_project_owner` | same | Only if the board owner differs from the repo owner |
 
 Why `TARGET_REPO` (not `GITHUB_REPO`) is the variable name: GitHub reserves the `GITHUB_` prefix and silently rejects user-defined variables that start with it. Setting a variable named `GITHUB_REPO` with `gh variable set` fails with `422 Variable names cannot start with GITHUB_`. The deploy workflows read `vars.TARGET_REPO` and pass it through to the container as `GITHUB_REPO=...` — the agent Python still reads `os.environ["GITHUB_REPO"]` at runtime.
 

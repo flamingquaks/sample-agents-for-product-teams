@@ -4,18 +4,24 @@ name: Deploy Workitems Agent
 # variables → Actions → Variables). These are baked into the AgentCore
 # Runtime as environment variables — see agents/workitems/project_config.py
 # for what each one means.
-#   TARGET_REPO             <owner>/<repo> the agent should act on
-#                             (baked into the runtime as env var GITHUB_REPO —
-#                             the repo variable itself can't be named
-#                             GITHUB_REPO because GitHub reserves the GITHUB_
-#                             prefix for user-defined variables)
-#   ASANA_PROJECT_GID       Asana project the agent reads from
-#   ASANA_WORKSPACE_GID     Asana workspace containing that project
 #
-# Optional: ASANA_PROJECT_NAME — cosmetic label used in system prompts. If you
-# want it, extend the env_vars line below to include
-# `ASANA_PROJECT_NAME=${{ vars.ASANA_PROJECT_NAME }}` — but only if the
-# variable is actually set, since the workflow rejects empty values.
+# Workitems supports two PM backends, selected by the PM_BACKEND repo variable:
+#
+#   PM_BACKEND = asana  (default if unset)
+#     TARGET_REPO          <owner>/<repo> the agent acts on (baked as GITHUB_REPO;
+#                            the variable can't be named GITHUB_REPO because GitHub
+#                            reserves the GITHUB_ prefix for user-defined variables)
+#     ASANA_PROJECT_GID    Asana project the agent reads from
+#     ASANA_WORKSPACE_GID  Asana workspace containing that project
+#
+#   PM_BACKEND = github   (GitHub Issues + Projects V2 as the PM backend)
+#     TARGET_REPO          <owner>/<repo> (baked as GITHUB_REPO)
+#     GITHUB_PROJECT_NUMBER  Projects V2 board number
+#     GITHUB_PROJECT_OWNER   (optional) board owner if different from the repo owner
+#
+# Optional in both modes: ASANA_PROJECT_NAME (cosmetic). The prepare job below
+# only emits vars relevant to the selected backend, so a GitHub-PM deploy does
+# NOT require any ASANA_* variable.
 
 on:
   push:
@@ -29,9 +35,45 @@ permissions:
   id-token: write    # required so the reusable callee (deploy-agent.yml) can assume the OIDC deploy role
 
 jobs:
+  # Build the env_vars string for the selected PM backend. Doing this in a
+  # prepare job (rather than a static `with:` line) lets a GitHub-PM deploy omit
+  # the Asana vars entirely and add PM_BACKEND / GITHUB_PROJECT_* instead.
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      env_vars: ${{ steps.build.outputs.env_vars }}
+    steps:
+      - name: Build env_vars for PM backend
+        id: build
+        env:
+          PM_BACKEND: ${{ vars.PM_BACKEND }}
+          TARGET_REPO: ${{ vars.TARGET_REPO }}
+          ASANA_PROJECT_GID: ${{ vars.ASANA_PROJECT_GID }}
+          ASANA_WORKSPACE_GID: ${{ vars.ASANA_WORKSPACE_GID }}
+          GITHUB_PROJECT_NUMBER: ${{ vars.GITHUB_PROJECT_NUMBER }}
+          GITHUB_PROJECT_OWNER: ${{ vars.GITHUB_PROJECT_OWNER }}
+        run: |
+          set -euo pipefail
+          BACKEND="${PM_BACKEND:-asana}"
+          # GITHUB_REPO (from the TARGET_REPO variable) is required in both modes.
+          PAIRS="GITHUB_REPO=${TARGET_REPO}"
+          if [ "$BACKEND" = "github" ]; then
+            PAIRS="${PAIRS},PM_BACKEND=github,GITHUB_PROJECT_NUMBER=${GITHUB_PROJECT_NUMBER}"
+            # GITHUB_PROJECT_OWNER is optional — only append when set, since the
+            # reusable workflow rejects KEY= with an empty value.
+            if [ -n "${GITHUB_PROJECT_OWNER}" ]; then
+              PAIRS="${PAIRS},GITHUB_PROJECT_OWNER=${GITHUB_PROJECT_OWNER}"
+            fi
+          else
+            PAIRS="${PAIRS},PM_BACKEND=asana,ASANA_PROJECT_GID=${ASANA_PROJECT_GID},ASANA_WORKSPACE_GID=${ASANA_WORKSPACE_GID}"
+          fi
+          echo "Resolved PM backend: ${BACKEND}"
+          echo "env_vars=${PAIRS}" >> "$GITHUB_OUTPUT"
+
   deploy:
+    needs: prepare
     uses: ./.github/workflows/deploy-agent.yml
     with:
       agent_name: workitems
-      env_vars: "GITHUB_REPO=${{ vars.TARGET_REPO }},ASANA_PROJECT_GID=${{ vars.ASANA_PROJECT_GID }},ASANA_WORKSPACE_GID=${{ vars.ASANA_WORKSPACE_GID }}"
+      env_vars: ${{ needs.prepare.outputs.env_vars }}
     secrets: inherit

@@ -1,18 +1,19 @@
 name: Deploy Docwriter Agent
 
 # Required GitHub Actions repository variables (Settings → Secrets and
-# variables → Actions → Variables). These are baked into the AgentCore
-# Runtime as environment variables — see agents/docwriter/project_config.py
-# for what each one means.
-#   TARGET_REPO             <owner>/<repo> the agent should act on
-#                             (baked into the runtime as env var GITHUB_REPO —
-#                             see deploy-workitems.yml for why the variable
-#                             name itself can't start with GITHUB_)
-#   ASANA_PROJECT_GID       Asana project the agent reads from
-#   ASANA_WORKSPACE_GID     Asana workspace containing that project
+# variables → Actions → Variables). Baked into the AgentCore Runtime as
+# environment variables — see agents/docwriter/project_config.py.
 #
-# Optional: ASANA_PROJECT_NAME (cosmetic) — see deploy-workitems.yml for how
-# to add optional vars without tripping the missing-value guard.
+# Docwriter is source-control-native:
+#   TARGET_REPO            <owner>/<repo> the agent acts on (baked as GITHUB_REPO;
+#                            the variable can't be named GITHUB_REPO — GitHub
+#                            reserves that prefix for user-defined variables).
+#                            REQUIRED.
+#
+# Asana is OPTIONAL supplementary feature context. Set these only if you want
+# docwriter to pull feature context from Asana; a GitHub-only / Slack-only
+# deploy omits them and docwriter operates purely against GitHub:
+#   ASANA_PROJECT_GID, ASANA_WORKSPACE_GID, ASANA_PROJECT_NAME (cosmetic)
 
 on:
   push:
@@ -26,9 +27,35 @@ permissions:
   id-token: write    # required so the reusable callee (deploy-agent.yml) can assume the OIDC deploy role
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      env_vars: ${{ steps.build.outputs.env_vars }}
+    steps:
+      - name: Build env_vars (Asana optional)
+        id: build
+        env:
+          TARGET_REPO: ${{ vars.TARGET_REPO }}
+          ASANA_PROJECT_GID: ${{ vars.ASANA_PROJECT_GID }}
+          ASANA_WORKSPACE_GID: ${{ vars.ASANA_WORKSPACE_GID }}
+        run: |
+          set -euo pipefail
+          # GITHUB_REPO is always required. Append the Asana pair only when BOTH
+          # GIDs are set — they go together, and the reusable workflow rejects
+          # any KEY= with an empty value.
+          PAIRS="GITHUB_REPO=${TARGET_REPO}"
+          if [ -n "${ASANA_PROJECT_GID}" ] && [ -n "${ASANA_WORKSPACE_GID}" ]; then
+            PAIRS="${PAIRS},ASANA_PROJECT_GID=${ASANA_PROJECT_GID},ASANA_WORKSPACE_GID=${ASANA_WORKSPACE_GID}"
+            echo "Asana feature context: enabled"
+          else
+            echo "Asana feature context: disabled (GitHub-only docwriter)"
+          fi
+          echo "env_vars=${PAIRS}" >> "$GITHUB_OUTPUT"
+
   deploy:
+    needs: prepare
     uses: ./.github/workflows/deploy-agent.yml
     with:
       agent_name: docwriter
-      env_vars: "GITHUB_REPO=${{ vars.TARGET_REPO }},ASANA_PROJECT_GID=${{ vars.ASANA_PROJECT_GID }},ASANA_WORKSPACE_GID=${{ vars.ASANA_WORKSPACE_GID }}"
+      env_vars: ${{ needs.prepare.outputs.env_vars }}
     secrets: inherit

@@ -1,14 +1,25 @@
 name: Deploy Researcher Agent
 
 # Required GitHub Actions repository variables (Settings → Secrets and
-# variables → Actions → Variables). These are baked into the AgentCore
-# Runtime as environment variables — see agents/researcher/project_config.py
-# for what each one means.
-#   ASANA_PROJECT_GID       Asana project the agent reads from
-#   ASANA_WORKSPACE_GID     Asana workspace containing that project
+# variables → Actions → Variables). Baked into the AgentCore Runtime as
+# environment variables — see agents/researcher/project_config.py.
 #
-# Optional: ASANA_PROJECT_NAME (cosmetic) — see deploy-workitems.yml for how
-# to add optional vars without tripping the missing-value guard.
+# Researcher supports two PM backends, selected by the PM_BACKEND repo variable:
+#
+#   PM_BACKEND = asana  (default if unset)
+#     ASANA_PROJECT_GID    Asana project the agent reads from
+#     ASANA_WORKSPACE_GID  Asana workspace containing that project
+#
+#   PM_BACKEND = github   (GitHub Issues + Projects V2 as the PM backend)
+#     TARGET_REPO          <owner>/<repo> (baked as GITHUB_REPO; the variable
+#                            can't be named GITHUB_REPO — GitHub reserves that
+#                            prefix for user-defined variables)
+#     GITHUB_PROJECT_NUMBER  Projects V2 board number
+#     GITHUB_PROJECT_OWNER   (optional) board owner if different from repo owner
+#
+# Optional in both modes: ASANA_PROJECT_NAME (cosmetic). The prepare job emits
+# only the vars relevant to the selected backend, so a GitHub-PM deploy needs
+# no ASANA_* variable.
 
 on:
   push:
@@ -22,9 +33,40 @@ permissions:
   id-token: write    # required so the reusable callee (deploy-agent.yml) can assume the OIDC deploy role
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      env_vars: ${{ steps.build.outputs.env_vars }}
+    steps:
+      - name: Build env_vars for PM backend
+        id: build
+        env:
+          PM_BACKEND: ${{ vars.PM_BACKEND }}
+          TARGET_REPO: ${{ vars.TARGET_REPO }}
+          ASANA_PROJECT_GID: ${{ vars.ASANA_PROJECT_GID }}
+          ASANA_WORKSPACE_GID: ${{ vars.ASANA_WORKSPACE_GID }}
+          GITHUB_PROJECT_NUMBER: ${{ vars.GITHUB_PROJECT_NUMBER }}
+          GITHUB_PROJECT_OWNER: ${{ vars.GITHUB_PROJECT_OWNER }}
+        run: |
+          set -euo pipefail
+          BACKEND="${PM_BACKEND:-asana}"
+          if [ "$BACKEND" = "github" ]; then
+            # github mode: GitHub is the only workspace researcher connects to.
+            PAIRS="PM_BACKEND=github,GITHUB_REPO=${TARGET_REPO},GITHUB_PROJECT_NUMBER=${GITHUB_PROJECT_NUMBER}"
+            if [ -n "${GITHUB_PROJECT_OWNER}" ]; then
+              PAIRS="${PAIRS},GITHUB_PROJECT_OWNER=${GITHUB_PROJECT_OWNER}"
+            fi
+          else
+            # asana mode: Asana is the only workspace (no GITHUB_REPO needed).
+            PAIRS="PM_BACKEND=asana,ASANA_PROJECT_GID=${ASANA_PROJECT_GID},ASANA_WORKSPACE_GID=${ASANA_WORKSPACE_GID}"
+          fi
+          echo "Resolved PM backend: ${BACKEND}"
+          echo "env_vars=${PAIRS}" >> "$GITHUB_OUTPUT"
+
   deploy:
+    needs: prepare
     uses: ./.github/workflows/deploy-agent.yml
     with:
       agent_name: researcher
-      env_vars: "ASANA_PROJECT_GID=${{ vars.ASANA_PROJECT_GID }},ASANA_WORKSPACE_GID=${{ vars.ASANA_WORKSPACE_GID }}"
+      env_vars: ${{ needs.prepare.outputs.env_vars }}
     secrets: inherit
