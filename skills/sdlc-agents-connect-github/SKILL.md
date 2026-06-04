@@ -137,19 +137,25 @@ just with added scopes and a couple of runtime env vars.
 
 When GitHub is the PM backend, the `workitems` and `researcher` agents run with
 `PM_BACKEND=github` (`project_config.py` reads it; default is `asana`). In github
-mode they read **no** Asana vars and instead require:
+mode the agent reads **no** Asana vars and instead reads these runtime env keys:
+`PM_BACKEND`, `GITHUB_REPO`, `GITHUB_PROJECT_NUMBER`, and optionally
+`GITHUB_PROJECT_OWNER`.
 
-- `PM_BACKEND=github`
-- `GITHUB_REPO` — `owner/repo` of the repository whose issues are tracked
-- `GITHUB_PROJECT_NUMBER` — the Projects V2 board number (see step 3)
-- `GITHUB_PROJECT_OWNER` — **only if** the board owner differs from the repo
-  owner (e.g. an org-level board over a repo in a different namespace). If the
-  board lives under the same owner as the repo, omit it.
+You don't set those runtime keys directly — the deploy workflow's `prepare` job
+bakes them from **GitHub Actions repository variables**. Because GitHub rejects
+variable names starting with `GITHUB_` (422), the board number/owner are stored
+under un-prefixed names (same workaround as `TARGET_REPO` → `GITHUB_REPO`):
 
-Set these on **each** PM-capable agent's AgentCore runtime that you deployed
-(`workitems`, and `researcher` if selected) — the same place the runtime's
-other environment is configured. They are configuration, not secrets — no SSM
-needed. (`docwriter` and `adr` don't use `PM_BACKEND`; leave it unset for them.)
+| Set this repo variable | Becomes runtime env | Notes |
+|---|---|---|
+| `PM_BACKEND=github` | `PM_BACKEND` | selects the backend |
+| `TARGET_REPO=<owner>/<repo>` | `GITHUB_REPO` | repo whose issues are tracked |
+| `TARGET_PROJECT_NUMBER=<n>` | `GITHUB_PROJECT_NUMBER` | Projects V2 board number (step 3) |
+| `TARGET_PROJECT_OWNER=<org/user>` | `GITHUB_PROJECT_OWNER` | **only if** the board owner differs from the repo owner |
+
+Set them once per repo with `gh variable set` (the deploy workflows for
+`workitems` and `researcher` read them). `docwriter` and `adr` don't use
+`PM_BACKEND`; leave it unset for them.
 
 ### 2. Add the Projects scopes to the token
 
@@ -173,12 +179,13 @@ config is required.
 Open the board in GitHub and read the number straight out of the URL:
 
 - Org-owned board: `https://github.com/orgs/<org>/projects/<number>` →
-  `GITHUB_PROJECT_NUMBER=<number>`, `GITHUB_PROJECT_OWNER=<org>`.
+  `TARGET_PROJECT_NUMBER=<number>`, `TARGET_PROJECT_OWNER=<org>`.
 - User-owned board: `https://github.com/users/<user>/projects/<number>` →
-  `GITHUB_PROJECT_NUMBER=<number>`, `GITHUB_PROJECT_OWNER=<user>`.
+  `TARGET_PROJECT_NUMBER=<number>`, `TARGET_PROJECT_OWNER=<user>`.
 
-The owner is the org or user in the URL path. Set `GITHUB_PROJECT_OWNER` only
-when it differs from the repo owner (step 1).
+The owner is the org or user in the URL path. Set `TARGET_PROJECT_OWNER` only
+when it differs from the repo owner (step 1). (These repo-variable names map to
+the `GITHUB_PROJECT_*` runtime env keys — see the table in step 1.)
 
 ### 4. Register the GitHub PM webhook
 

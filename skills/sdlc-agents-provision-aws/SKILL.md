@@ -194,8 +194,13 @@ set the variables relevant to the chosen backend — a GitHub-PM deploy needs no
 
 | Variable | Source | Consumed by | Required? |
 |---|---|---|---|
-| `GITHUB_PROJECT_NUMBER` | `selection.yaml → pm.github_project_number` | `workitems`, `researcher` (github mode) | Yes in github mode |
-| `GITHUB_PROJECT_OWNER` | `selection.yaml → pm.github_project_owner` | same | Only if the board owner differs from the repo owner |
+| `TARGET_PROJECT_NUMBER` | `selection.yaml → pm.github_project_number` — baked into the runtime as env var `GITHUB_PROJECT_NUMBER` | `workitems`, `researcher` (github mode) | Yes in github mode |
+| `TARGET_PROJECT_OWNER` | `selection.yaml → pm.github_project_owner` — baked as env var `GITHUB_PROJECT_OWNER` | same | Only if the board owner differs from the repo owner |
+
+> Same `GITHUB_`-prefix reservation as `TARGET_REPO`: GitHub rejects repo
+> variables named `GITHUB_PROJECT_NUMBER`/`GITHUB_PROJECT_OWNER` (422). Set them
+> as `TARGET_PROJECT_NUMBER`/`TARGET_PROJECT_OWNER`; the deploy workflow rebakes
+> them into the runtime under the `GITHUB_PROJECT_*` keys the agent reads.
 
 Why `TARGET_REPO` (not `GITHUB_REPO`) is the variable name: GitHub reserves the `GITHUB_` prefix and silently rejects user-defined variables that start with it. Setting a variable named `GITHUB_REPO` with `gh variable set` fails with `422 Variable names cannot start with GITHUB_`. The deploy workflows read `vars.TARGET_REPO` and pass it through to the container as `GITHUB_REPO=...` — the agent Python still reads `os.environ["GITHUB_REPO"]` at runtime.
 

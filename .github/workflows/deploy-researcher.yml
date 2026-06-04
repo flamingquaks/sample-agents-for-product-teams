@@ -11,11 +11,13 @@ name: Deploy Researcher Agent
 #     ASANA_WORKSPACE_GID  Asana workspace containing that project
 #
 #   PM_BACKEND = github   (GitHub Issues + Projects V2 as the PM backend)
-#     TARGET_REPO          <owner>/<repo> (baked as GITHUB_REPO; the variable
-#                            can't be named GITHUB_REPO — GitHub reserves that
-#                            prefix for user-defined variables)
-#     GITHUB_PROJECT_NUMBER  Projects V2 board number
-#     GITHUB_PROJECT_OWNER   (optional) board owner if different from repo owner
+#     TARGET_REPO            <owner>/<repo> (baked as GITHUB_REPO; the variable
+#                              can't be named GITHUB_REPO — GitHub reserves that
+#                              prefix for user-defined variables)
+#     TARGET_PROJECT_NUMBER  Projects V2 board number (baked as GITHUB_PROJECT_NUMBER;
+#                              same GITHUB_-prefix workaround as TARGET_REPO)
+#     TARGET_PROJECT_OWNER   (optional) board owner if different from repo owner
+#                              (baked as GITHUB_PROJECT_OWNER)
 #
 # Optional in both modes: ASANA_PROJECT_NAME (cosmetic). The prepare job emits
 # only the vars relevant to the selected backend, so a GitHub-PM deploy needs
@@ -40,21 +42,25 @@ jobs:
     steps:
       - name: Build env_vars for PM backend
         id: build
+        # GitHub rejects repo variables starting with GITHUB_ (422), so the
+        # board number/owner are stored as TARGET_PROJECT_NUMBER /
+        # TARGET_PROJECT_OWNER and baked into the runtime under the GITHUB_PROJECT_*
+        # keys the agent reads (same workaround as TARGET_REPO -> GITHUB_REPO).
         env:
           PM_BACKEND: ${{ vars.PM_BACKEND }}
           TARGET_REPO: ${{ vars.TARGET_REPO }}
           ASANA_PROJECT_GID: ${{ vars.ASANA_PROJECT_GID }}
           ASANA_WORKSPACE_GID: ${{ vars.ASANA_WORKSPACE_GID }}
-          GITHUB_PROJECT_NUMBER: ${{ vars.GITHUB_PROJECT_NUMBER }}
-          GITHUB_PROJECT_OWNER: ${{ vars.GITHUB_PROJECT_OWNER }}
+          TARGET_PROJECT_NUMBER: ${{ vars.TARGET_PROJECT_NUMBER }}
+          TARGET_PROJECT_OWNER: ${{ vars.TARGET_PROJECT_OWNER }}
         run: |
           set -euo pipefail
           BACKEND="${PM_BACKEND:-asana}"
           if [ "$BACKEND" = "github" ]; then
             # github mode: GitHub is the only workspace researcher connects to.
-            PAIRS="PM_BACKEND=github,GITHUB_REPO=${TARGET_REPO},GITHUB_PROJECT_NUMBER=${GITHUB_PROJECT_NUMBER}"
-            if [ -n "${GITHUB_PROJECT_OWNER}" ]; then
-              PAIRS="${PAIRS},GITHUB_PROJECT_OWNER=${GITHUB_PROJECT_OWNER}"
+            PAIRS="PM_BACKEND=github,GITHUB_REPO=${TARGET_REPO},GITHUB_PROJECT_NUMBER=${TARGET_PROJECT_NUMBER}"
+            if [ -n "${TARGET_PROJECT_OWNER}" ]; then
+              PAIRS="${PAIRS},GITHUB_PROJECT_OWNER=${TARGET_PROJECT_OWNER}"
             fi
           else
             # asana mode: Asana is the only workspace (no GITHUB_REPO needed).
