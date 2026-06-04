@@ -104,13 +104,20 @@ jobs:
 
       - name: Resolve guardrail env vars from foundation stack
         id: guardrail
+        env:
+          STAGE: ${{ vars.STAGE || 'dev' }}
+          FOUNDATION_STACK_NAME: ${{ vars.FOUNDATION_STACK_NAME }}
         run: |
           # Read the prompt-injection guardrail ID/version from the foundation
           # stack's outputs so every agent's Bedrock model calls get the same
           # guardrail attached (threat-model T-1, T-2, T-3). Missing outputs
           # are treated as a deploy-time error — agents must not run without a
           # guardrail once the foundation stack has been updated to publish one.
-          STACK_NAME="sdlc-agents-${STAGE:-dev}"
+          # Foundation stack name. Canonical convention is
+          # sdlc-agents-foundation-${stage} (matches the bootstrap scripts and
+          # docs/aws-deploy.md). Override via the FOUNDATION_STACK_NAME repo
+          # variable if you deployed under a different name.
+          STACK_NAME="${FOUNDATION_STACK_NAME:-sdlc-agents-foundation-${STAGE:-dev}}"
           GUARDRAIL_ID=$(aws cloudformation describe-stacks \
             --stack-name "${STACK_NAME}" \
             --region "${AWS_REGION}" \

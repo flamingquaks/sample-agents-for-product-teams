@@ -122,7 +122,7 @@ Top-to-bottom, no skipping.
 1. **Enable Bedrock model access** (console) for `us.anthropic.claude-opus-4-7-v1` in `$AWS_REGION`.
 2. **Create the OIDC provider and deploy role** (skill: `sdlc-agents-provision-aws`, Step 0 prereqs). Capture the role ARN.
 3. **Set GitHub Actions secrets** (`AWS_DEPLOY_ROLE_ARN`, `AWS_ACCOUNT_ID`) and variables (`AWS_REGION`, plus per-agent vars).
-4. **Deploy the foundation stack** with `sam deploy` — this is how you get the Dispatch Router, webhook Lambda, API Gateway, DynamoDB, S3, SSM registry parameter, and CloudWatch alarms.
+4. **Deploy the foundation stack** with `sam deploy --stack-name sdlc-agents-foundation-$STAGE` — this is how you get the Dispatch Router, webhook Lambdas (Asana/Slack/GitHub), API Gateway, DynamoDB, S3, SSM registry parameter, and CloudWatch alarms. **The stack name matters:** `deploy-agent.yml` and every bootstrap script look up `sdlc-agents-foundation-$STAGE` by default to read stack outputs (guardrail id, webhook URLs). If you must deploy under a different name, set the `FOUNDATION_STACK_NAME` GitHub Actions variable and pass `--stack-name` to each bootstrap script so all consumers agree.
 5. **Connect integrations** — run `sdlc-agents-connect-asana` and/or `sdlc-agents-connect-github` to populate SSM parameters.
 6. **Provision per-agent IAM runtime roles** — `sdlc-agents-provision-aws` creates one per agent, attaches the per-agent SSM-read policy.
 7. **Push to `main`** — this is the first time `deploy-agent.yml` runs for each agent. It creates the ECR repo, builds the image, creates the AgentCore Runtime, syncs the registry to SSM, and smoke-tests.

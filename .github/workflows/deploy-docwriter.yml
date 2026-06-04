@@ -40,6 +40,15 @@ jobs:
           ASANA_WORKSPACE_GID: ${{ vars.ASANA_WORKSPACE_GID }}
         run: |
           set -euo pipefail
+          # Reject values containing ',' or '=' (see deploy-workitems.yml) — they
+          # would corrupt the comma-joined env_vars string / inject runtime vars.
+          for v in "$TARGET_REPO" "$ASANA_PROJECT_GID" "$ASANA_WORKSPACE_GID"; do
+            case "$v" in
+              *,*|*=*)
+                echo "::error::A deploy repo variable contains ',' or '=' (value: '$v'). Rejected."
+                exit 1 ;;
+            esac
+          done
           # GITHUB_REPO is always required. Append the Asana pair only when BOTH
           # GIDs are set — they go together, and the reusable workflow rejects
           # any KEY= with an empty value.

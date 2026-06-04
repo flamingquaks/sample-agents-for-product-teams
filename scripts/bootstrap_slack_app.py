@@ -24,20 +24,27 @@ import boto3
 from botocore.exceptions import ClientError
 
 
-def get_api_gateway_url(region: str, stage: str) -> str | None:
-    """Find the webhook API Gateway URL from CloudFormation outputs."""
+def get_slack_endpoints(region: str, stage: str) -> tuple[str | None, str | None]:
+    """Return (events_url, slash_url) from the foundation stack outputs.
+
+    Reads the SlackEventsEndpoint / SlackSlashEndpoint outputs directly — these
+    are full https URLs. Do NOT match on "WebhookApi": the only output whose key
+    contains that substring is WebhookApiId, whose value is the bare REST API id
+    (e.g. "abc123"), not a URL — using it produced an invalid "abc123/slack/events".
+    """
     cf = boto3.client("cloudformation", region_name=region)
     stack_name = f"sdlc-agents-foundation-{stage}"
 
+    events_url = slash_url = None
     try:
         response = cf.describe_stacks(StackName=stack_name)
-        outputs = response["Stacks"][0].get("Outputs", [])
-        for output in outputs:
-            if "WebhookApi" in output.get("OutputKey", ""):
-                return output["OutputValue"]
+        outputs = {o["OutputKey"]: o["OutputValue"]
+                   for o in response["Stacks"][0].get("Outputs", [])}
+        events_url = outputs.get("SlackEventsEndpoint")
+        slash_url = outputs.get("SlackSlashEndpoint")
     except ClientError:
         pass
-    return None
+    return events_url, slash_url
 
 
 def store_secret(region: str, name: str, value: str):
@@ -68,17 +75,16 @@ def main():
     print("=" * 60)
     print()
 
-    # Try to find the API Gateway URL
-    api_url = get_api_gateway_url(args.region, args.stage)
-    if api_url:
-        events_url = f"{api_url}/slack/events"
-        slash_url = f"{api_url}/slack/slash"
-        print(f"Found API Gateway: {api_url}")
+    # Read the Slack endpoint URLs straight from the foundation stack outputs.
+    events_url, slash_url = get_slack_endpoints(args.region, args.stage)
+    if events_url and slash_url:
+        print(f"Found Slack Events URL: {events_url}")
+        print(f"Found Slack Slash URL:  {slash_url}")
     else:
-        print("Could not find API Gateway URL from CloudFormation.")
-        print("You'll need to provide it after deployment.")
-        events_url = "<deploy infra first>"
-        slash_url = "<deploy infra first>"
+        print("Could not read SlackEventsEndpoint/SlackSlashEndpoint from CloudFormation.")
+        print("Deploy the foundation stack first (sdlc-agents-foundation-<stage>).")
+        events_url = events_url or "<deploy infra first>"
+        slash_url = slash_url or "<deploy infra first>"
 
     print()
     print("Step 1: Create your Slack app")

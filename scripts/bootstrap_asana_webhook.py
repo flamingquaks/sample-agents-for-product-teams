@@ -146,12 +146,12 @@ def main() -> int:
     parser.add_argument(
         "--stack-name",
         default=None,
-        help="Override CloudFormation stack name (default: sdlc-agents-${stage})",
+        help="Override CloudFormation stack name (default: sdlc-agents-foundation-${stage})",
     )
     args = parser.parse_args()
 
     function_name = args.function_name or f"asana-webhook-{args.stage}"
-    stack_name = args.stack_name or f"sdlc-agents-{args.stage}"
+    stack_name = args.stack_name or f"sdlc-agents-foundation-{args.stage}"
 
     session = boto3.Session(region_name=args.region)
     lambda_client = session.client("lambda")

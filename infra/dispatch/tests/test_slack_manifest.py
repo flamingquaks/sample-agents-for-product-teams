@@ -67,9 +67,10 @@ def test_assistant_view_shape(manifest):
         "assistant:write scope this app uses ('Agent View should not use "
         "assistant:write bot scope')."
     )
-    av = feats.get("assistant_view")
-    if av is None:
-        pytest.skip("no assistant_view block")
+    # Assert the surface is actually PRESENT — not just that the wrong one is
+    # absent. A manifest with neither would otherwise pass silently.
+    assert "assistant_view" in feats, "manifest must declare features.assistant_view"
+    av = feats["assistant_view"]
     assert "assistant_description" in av, "assistant_view requires assistant_description"
     for prompt in av.get("suggested_prompts", []):
         assert set(prompt) == {"title", "message"}, (
@@ -86,9 +87,20 @@ def test_slash_commands_shape(manifest):
 
 
 def test_oauth_and_events_present(manifest):
-    # Sanity: the Agents capability needs the scope + event even though the
-    # manifest also declares agent_view.
+    # The Assistant capability needs the assistant:write scope + the
+    # assistant_thread_started event in addition to the assistant_view block.
     scopes = manifest["oauth_config"]["scopes"]["bot"]
     assert "assistant:write" in scopes
     events = manifest["settings"]["event_subscriptions"]["bot_events"]
     assert "assistant_thread_started" in events
+
+
+def test_interactivity_has_handler_or_disabled(manifest):
+    # If interactivity is enabled, the receiver must have an interactions
+    # handler — otherwise interactive payloads fall into the slash-command path
+    # and error. We currently ship no such handler, so it must be disabled.
+    interactivity = manifest["settings"].get("interactivity", {})
+    assert interactivity.get("is_enabled") is False, (
+        "interactivity is enabled but the receiver has no interactions handler; "
+        "disable it or add a /slack/interactions route + handler first."
+    )

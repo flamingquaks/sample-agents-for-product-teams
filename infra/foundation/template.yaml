@@ -31,6 +31,16 @@ Parameters:
     Default: ""
     Description: GitHub login of the Workitems bot account (issue assignments to it dispatch to @workitems)
 
+  ProjectStatusAgentMap:
+    Type: String
+    Default: ""
+    Description: >
+      Optional routing for GitHub Projects V2 board moves, as
+      "status:agent,status:agent" (e.g. "Needs Research:researcher,In Progress:workitems").
+      A board move to a listed Status column dispatches to that agent; unlisted
+      columns fall back to the default PM agent (workitems). Leave empty to send
+      all board moves to workitems.
+
 Globals:
   Function:
     Runtime: python3.12
@@ -382,6 +392,7 @@ Resources:
           GITHUB_WEBHOOK_SECRET_PARAM: /sdlc-agents/github-webhook-secret
           DISPATCH_FUNCTION: !Ref DispatchRouterFunction
           WORKITEMS_GH_BOT_LOGIN: !Ref WorkitemsGitHubBotLogin
+          PROJECT_STATUS_AGENT_MAP: !Ref ProjectStatusAgentMap
       Policies:
         - LambdaInvokePolicy:
             FunctionName: !Ref DispatchRouterFunction

@@ -310,3 +310,65 @@ def test_describe_status_change_helper(gh):
     changes = {"field_value": {"from": {"name": "Todo"}, "to": {"name": "Done"}}}
     assert gh._describe_status_change(changes) == "Todo → Done"
     assert gh._describe_status_change({"field_value": {"to": {"name": "Done"}}}) == "→ Done"
+
+
+# --- base64-encoded body (API Gateway) ---------------------------------------
+
+
+def test_base64_encoded_body_verified_and_dispatched(gh):
+    # API Gateway may base64-encode the body; the handler must decode to the raw
+    # bytes GitHub signed BEFORE computing the HMAC, then dispatch normally.
+    import base64
+    body = json.dumps({
+        "action": "assigned",
+        "assignee": {"login": "workitems-bot"},
+        "issue": {"number": 7, "title": "T", "body": ""},
+        "repository": {"full_name": "acme/web"},
+        "sender": {"login": "alice", "type": "User"},
+    })
+    sig = "sha256=" + hmac.new(SECRET.encode(), body.encode(), hashlib.sha256).hexdigest()
+    event = {
+        "headers": {"X-GitHub-Event": "issues", "X-Hub-Signature-256": sig},
+        "body": base64.b64encode(body.encode()).decode(),
+        "isBase64Encoded": True,
+    }
+    resp = gh.handler(event, None)
+    assert resp["statusCode"] == 200
+    assert _last_dispatch(gh)["agent_id"] == "workitems"
+
+
+def test_invalid_base64_body_returns_400(gh):
+    event = {
+        "headers": {"X-GitHub-Event": "issues", "X-Hub-Signature-256": "sha256=x"},
+        "body": "!!!not-base64!!!",
+        "isBase64Encoded": True,
+    }
+    resp = gh.handler(event, None)
+    assert resp["statusCode"] == 400
+
+
+# --- status-column -> agent routing (PROJECT_STATUS_AGENT_MAP) ----------------
+
+
+def test_project_item_routes_by_status_map(gh):
+    # A move to "Needs Research" should dispatch to researcher, not the default.
+    gh.PROJECT_STATUS_AGENT_MAP = {"needs research": "researcher"}
+    body = _project_item_body(from_name="Todo", to_name="Needs Research")
+    resp = gh.handler(_signed_event(gh, body, "projects_v2_item"), None)
+    assert resp["statusCode"] == 200
+    assert _last_dispatch(gh)["agent_id"] == "researcher"
+
+
+def test_project_item_unmapped_status_falls_back_to_default(gh):
+    gh.PROJECT_STATUS_AGENT_MAP = {"needs research": "researcher"}
+    body = _project_item_body(from_name="Todo", to_name="In Progress")
+    resp = gh.handler(_signed_event(gh, body, "projects_v2_item"), None)
+    assert resp["statusCode"] == 200
+    assert _last_dispatch(gh)["agent_id"] == gh.PROJECT_ITEM_AGENT
+
+
+def test_parse_status_agent_map_helper(gh):
+    m = gh._parse_status_agent_map("Needs Research:researcher, In Progress:workitems")
+    assert m == {"needs research": "researcher", "in progress": "workitems"}
+    assert gh._parse_status_agent_map("") == {}
+    assert gh._parse_status_agent_map("garbage,no-colon") == {}

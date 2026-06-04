@@ -220,3 +220,47 @@ def test_github_mode_uses_github_prompt(agent_mod):
     sp = cap["agent_ctor"].call_args.kwargs["system_prompt"]
     assert "new GitHub issues" in sp
     assert "project #7" in sp
+
+
+def test_project_item_context_reaches_system_prompt(agent_mod):
+    # Regression: researcher's project_item dispatch branch must match before
+    # the generic github branch (the dead-branch bug we hit in workitems).
+    mod, cap = agent_mod("github")
+    mod.invoke({
+        "prompt": "review the board",
+        "assignment_id": "a1",
+        "source": "github",
+        "source_context": {
+            "trigger_type": "project_item",
+            "repo": "acme/web",
+            "project_number": "7",
+            "item_id": "PVTI_abc",
+            "issue_number": "42",
+            "status_change": "Todo → Needs Research",
+        },
+    })
+    sp = cap["agent_ctor"].call_args.kwargs["system_prompt"]
+    assert "Projects V2 board" in sp
+    assert "PVTI_abc" in sp
+    assert "Todo → Needs Research" in sp
+
+
+def test_project_item_without_issue_number_degrades_gracefully(agent_mod):
+    mod, cap = agent_mod("github")
+    mod.invoke({
+        "prompt": "review the board",
+        "assignment_id": "a1",
+        "source": "github",
+        "source_context": {
+            "trigger_type": "project_item",
+            "repo": "",
+            "project_number": "7",
+            "item_id": "PVTI_abc",
+            "issue_number": "",
+            "content_node_id": "I_xyz",
+            "status_change": "Todo → Done",
+        },
+    })
+    sp = cap["agent_ctor"].call_args.kwargs["system_prompt"]
+    assert "Projects V2 board" in sp
+    assert "content node" in sp.lower() or "I_xyz" in sp

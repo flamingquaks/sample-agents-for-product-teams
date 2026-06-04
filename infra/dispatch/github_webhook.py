@@ -62,15 +62,44 @@ def _get_ssm_param(name: str) -> str:
 # exactly like asana_webhook.py's BOT_USERS map keyed on bot GIDs. A login is a
 # stable, non-editable identifier on GitHub, so matching the assignee against
 # this allowlist is a safe authorization signal (cf. asana threat T-4).
+# Empty values are filtered out: unset env vars default to "" and would
+# otherwise collapse into a single "" key that maps an empty assignee login to
+# a real agent.
 BOT_LOGINS = {
-    os.environ.get("WORKITEMS_GH_BOT_LOGIN", ""): "workitems",
-    os.environ.get("UAT_GH_BOT_LOGIN", ""): "uat",
-    os.environ.get("RESEARCHER_GH_BOT_LOGIN", ""): "researcher",
-    os.environ.get("DOCWRITER_GH_BOT_LOGIN", ""): "docwriter",
+    login: agent
+    for login, agent in {
+        os.environ.get("WORKITEMS_GH_BOT_LOGIN", ""): "workitems",
+        os.environ.get("UAT_GH_BOT_LOGIN", ""): "uat",
+        os.environ.get("RESEARCHER_GH_BOT_LOGIN", ""): "researcher",
+        os.environ.get("DOCWRITER_GH_BOT_LOGIN", ""): "docwriter",
+    }.items()
+    if login
 }
 
 # Default agent for Projects V2 board moves — the PM agent owns the board.
 PROJECT_ITEM_AGENT = os.environ.get("PROJECT_ITEM_AGENT", "workitems")
+
+# Optional Status-column -> agent routing for board moves. Lets a board move to
+# e.g. "Needs Research" dispatch to researcher instead of the default PM agent.
+# Configured via PROJECT_STATUS_AGENT_MAP as "status:agent,status:agent"
+# (status match is case-insensitive on the destination column name). Unmatched
+# statuses fall back to PROJECT_ITEM_AGENT.
+def _parse_status_agent_map(raw: str) -> dict:
+    mapping = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair or ":" not in pair:
+            continue
+        status, agent = pair.split(":", 1)
+        status, agent = status.strip().lower(), agent.strip()
+        if status and agent:
+            mapping[status] = agent
+    return mapping
+
+
+PROJECT_STATUS_AGENT_MAP = _parse_status_agent_map(
+    os.environ.get("PROJECT_STATUS_AGENT_MAP", "")
+)
 
 # Recognized @agent mentions inside issue comments. Resolution itself is
 # delegated to the Router (which loads the live registry); this pattern is only
@@ -209,8 +238,13 @@ def process_projects_v2_item(payload: dict):
     sender = (payload.get("sender", {}) or {}).get("login", "")
     status_change = _describe_status_change(payload.get("changes", {}) or {})
 
+    # Route by destination status column if a mapping is configured (e.g. a move
+    # to "Needs Research" -> researcher); otherwise the default PM agent owns it.
+    to_status = _destination_status(payload.get("changes", {}) or {})
+    agent_id = PROJECT_STATUS_AGENT_MAP.get((to_status or "").lower(), PROJECT_ITEM_AGENT)
+
     dispatch(
-        agent_id=PROJECT_ITEM_AGENT,
+        agent_id=agent_id,
         trigger_type="project_item",
         instruction=(
             f"A Projects V2 board item changed status ({status_change}) on project "
@@ -302,6 +336,18 @@ def _describe_status_change(changes: dict) -> str:
     if new_name:
         return f"→ {new_name}"
     return "status changed"
+
+
+def _destination_status(changes: dict) -> str:
+    """Return the destination Status column name ('to' value), or '' if absent.
+
+    Used to route the board move to a status-specific agent
+    (PROJECT_STATUS_AGENT_MAP) before falling back to the default PM agent.
+    """
+    field_value = changes.get("field_value") or {}
+    new = field_value.get("to") or {}
+    name = new.get("name") if isinstance(new, dict) else new
+    return name or ""
 
 
 # --- Lambda Handler ----------------------------------------------------------

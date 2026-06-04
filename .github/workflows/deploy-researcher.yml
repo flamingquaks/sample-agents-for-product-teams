@@ -55,6 +55,16 @@ jobs:
           TARGET_PROJECT_OWNER: ${{ vars.TARGET_PROJECT_OWNER }}
         run: |
           set -euo pipefail
+          # Reject values containing ',' or '=' (see deploy-workitems.yml) — they
+          # would corrupt the comma-joined env_vars string / inject runtime vars.
+          for v in "$TARGET_REPO" "$ASANA_PROJECT_GID" "$ASANA_WORKSPACE_GID" \
+                   "$TARGET_PROJECT_NUMBER" "$TARGET_PROJECT_OWNER" "$PM_BACKEND"; do
+            case "$v" in
+              *,*|*=*)
+                echo "::error::A deploy repo variable contains ',' or '=' (value: '$v'). Rejected."
+                exit 1 ;;
+            esac
+          done
           BACKEND="${PM_BACKEND:-asana}"
           if [ "$BACKEND" = "github" ]; then
             # github mode: GitHub is the only workspace researcher connects to.

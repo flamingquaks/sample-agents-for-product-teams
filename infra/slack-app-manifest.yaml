@@ -112,9 +112,12 @@ settings:
       - app_mention
       - assistant_thread_started
       - message.im
+  # Interactivity is disabled: the fleet uses no block buttons / modals yet, and
+  # the receiver has no interactive-payload handler (a form-encoded interaction
+  # POST would fall into the slash-command path and return "Unknown command").
+  # Enable this + add a /slack/interactions handler when block actions are added.
   interactivity:
-    is_enabled: true
-    request_url: <EVENTS_URL>
+    is_enabled: false
   org_deploy_enabled: false
   socket_mode_enabled: false
   token_rotation_enabled: false

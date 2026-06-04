@@ -63,6 +63,19 @@ jobs:
           TARGET_PROJECT_OWNER: ${{ vars.TARGET_PROJECT_OWNER }}
         run: |
           set -euo pipefail
+          # Reject values containing ',' or '=' — they'd corrupt the
+          # comma-joined KEY=VALUE env_vars string and could inject/override
+          # arbitrary runtime env vars (e.g. the SSM path the agent reads its
+          # token from). These are config identifiers; none legitimately
+          # contains those characters.
+          for v in "$TARGET_REPO" "$ASANA_PROJECT_GID" "$ASANA_WORKSPACE_GID" \
+                   "$TARGET_PROJECT_NUMBER" "$TARGET_PROJECT_OWNER" "$PM_BACKEND"; do
+            case "$v" in
+              *,*|*=*)
+                echo "::error::A deploy repo variable contains ',' or '=' (value: '$v'). These break the env_vars string and are rejected."
+                exit 1 ;;
+            esac
+          done
           BACKEND="${PM_BACKEND:-asana}"
           # GITHUB_REPO (from the TARGET_REPO variable) is required in both modes.
           PAIRS="GITHUB_REPO=${TARGET_REPO}"

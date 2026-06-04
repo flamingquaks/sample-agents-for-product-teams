@@ -21,10 +21,11 @@ agents:
     aliases: [pm, status, plan]
     triggers:
       asana: [comment_mention, assignment, custom_field]
-      # `assignment` and `project_item` require the GitHub PM webhook
-      # (github-webhook-${STAGE} Lambda, route /github/webhook). The
-      # agent-dispatch.yml Actions workflow only carries issue_comment.
-      github: [issue_comment, assignment, project_item]
+      # Trigger-type names must match what the receivers actually emit:
+      # both agent-dispatch.yml and github_webhook.py emit `comment_mention`
+      # for issue/PR comments. `assignment` and `project_item` require the
+      # GitHub PM webhook (github-webhook-${STAGE} Lambda, /github/webhook).
+      github: [comment_mention, assignment, project_item]
       slack: [mention, slash_command, assistant_thread]
     authorization:
       users: []
@@ -40,8 +41,9 @@ agents:
     triggers:
       asana: [comment_mention, assignment, custom_field]
       # github triggers apply when researcher runs with PM_BACKEND=github.
-      # assignment/project_item require the GitHub PM webhook.
-      github: [issue_comment, assignment, project_item]
+      # `comment_mention` is what the receivers emit; assignment/project_item
+      # require the GitHub PM webhook.
+      github: [comment_mention, assignment, project_item]
       slack: [mention, slash_command, assistant_thread]
     authorization:
       users: []
@@ -55,7 +57,8 @@ agents:
     runtime_arn: "${DOCWRITER_RUNTIME_ARN}"
     aliases: [docs, doc, writer]
     triggers:
-      github: [issue_comment, pr_comment]
+      # agent-dispatch.yml emits `comment_mention` for both issue and PR comments.
+      github: [comment_mention]
       asana: [comment_mention, assignment, custom_field]
       slack: [mention, slash_command, assistant_thread]
     authorization:
@@ -70,7 +73,8 @@ agents:
     runtime_arn: "${ADR_RUNTIME_ARN}"
     aliases: [decisions, architecture]
     triggers:
-      github: [issue_comment, pr_comment]
+      # agent-dispatch.yml emits `comment_mention` for both issue and PR comments.
+      github: [comment_mention]
       slack: [mention, slash_command]
     authorization:
       users: []

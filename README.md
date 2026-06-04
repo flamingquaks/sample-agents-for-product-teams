@@ -136,8 +136,10 @@ export AWS_ACCOUNT_ID=123456789012   # your 12-digit account ID
 
 ```bash
 # Deploy shared resources (DynamoDB, S3, IAM roles)
+# Use the canonical stack name — deploy-agent.yml and the bootstrap scripts
+# look up `sdlc-agents-foundation-$STAGE` to read stack outputs.
 cd infra/foundation
-sam build && sam deploy --guided --region "$AWS_REGION"
+sam build && sam deploy --guided --stack-name "sdlc-agents-foundation-${STAGE:-dev}" --region "$AWS_REGION"
 ```
 
 This creates the `dispatch-router` Lambda, DynamoDB tables, and IAM roles used by all agents.

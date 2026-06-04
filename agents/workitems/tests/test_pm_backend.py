@@ -15,14 +15,25 @@ from pathlib import Path
 
 import pytest
 
+WORKITEMS_DIR = Path(__file__).resolve().parents[1]
 # agents/workitems on sys.path so `import project_config` / `import prompts` work
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(WORKITEMS_DIR))
 
 
 def _fresh(module_name: str):
-    """Import (or reimport) a module so module-level env reads re-run."""
+    """Import (or reimport) a module so module-level env reads re-run.
+
+    Every agent has its own `project_config`/`prompts`/`tools`, so a sibling
+    agent's test (e.g. researcher's) may leave its copy cached in sys.modules.
+    Evict the cached module AND force WORKITEMS_DIR to the front of sys.path on
+    every call so the reimport resolves THIS agent's copy regardless of which
+    agent's test ran first. (Without this the suite passed only by alphabetical
+    collection luck — running researcher's test first made workitems reimport
+    researcher's prompts/project_config.)
+    """
     if module_name in sys.modules:
         del sys.modules[module_name]
+    sys.path.insert(0, str(WORKITEMS_DIR))
     return importlib.import_module(module_name)
 
 
