@@ -51,7 +51,15 @@ You want `SlackEventsEndpoint` (`.../slack/events`) and `SlackSlashEndpoint` (`.
 3. Replace `<EVENTS_URL>` with the `SlackEventsEndpoint` value and `<SLASH_URL>` with the `SlackSlashEndpoint` value.
 4. Create the app.
 
-The manifest already declares the bot scopes (`app_mentions:read`, `assistant:write`, `chat:write`, `chat:write.public`, `commands`, `channels:history`, `channels:read`, `im:history`, `im:read`, `im:write`, `reactions:read`, `reactions:write`, `users:read`), the event subscriptions (`app_mention`, `message.im`, `assistant_thread_started`, `app_home_opened`), and the five slash commands (`/workitems`, `/researcher`, `/docwriter`, `/adr`, `/fleet`). Socket Mode is intentionally off — the fleet uses the Events API via API Gateway.
+The manifest already declares the bot scopes (`app_mentions:read`, `assistant:write`, `chat:write`, `commands`, `channels:history`, `channels:read`, `im:history`, `im:read`, `im:write`, `reactions:read`, `reactions:write`, `users:read`), the event subscriptions (`app_mention`, `message.im`, `assistant_thread_started`, `app_home_opened`), and the five slash commands (`/workitems`, `/researcher`, `/docwriter`, `/adr`, `/fleet`). Socket Mode is intentionally off — the fleet uses the Events API via API Gateway.
+
+> The AI Assistant capability is declared via the `features.assistant_view`
+> block (`assistant_description` + `suggested_prompts`). Use `assistant_view` —
+> **not** `agent_view` (a different container that rejects the `assistant:write`
+> scope this app uses) and **not** `assistant` (an invalid key). It pairs with
+> the `assistant:write` scope and the `assistant_thread_started` event (both in
+> the manifest). The receiver may also refresh suggested prompts per-thread at
+> runtime (`assistant.threads.setSuggestedPrompts`).
 
 ## Step 3 — Install to the workspace and capture credentials
 

@@ -10,7 +10,9 @@
 
 display_information:
   name: SDLC Agent Fleet
-  description: Autonomous AI agents for the software development lifecycle — work decomposition, status reports, research, documentation, and architecture decisions.
+  # description must be <= 140 chars (Slack manifest limit). The fuller pitch
+  # lives in long_description below.
+  description: Autonomous AI agents for the software development lifecycle — PM, research, docs, and architecture decisions.
   background_color: "#1a1a2e"
   long_description: |
     The SDLC Agent Fleet plants an autonomous AI agent in each role's seat so
@@ -31,8 +33,17 @@ features:
   bot_user:
     display_name: SDLC Agents
     always_online: true
-  assistant:
-    enabled: true
+  # The AI Assistant surface. The manifest key is `assistant_view` — this is the
+  # surface that pairs with the `assistant:write` scope and the
+  # `assistant_thread_started` event + assistant.threads.* APIs the receiver
+  # uses (see process_assistant_thread_started in infra/dispatch/slack_events.py).
+  # NOT `agent_view` (that's a different container that rejects assistant:write
+  # and needs separate enablement) and NOT `assistant` (invalid key).
+  # suggested_prompts is an array of {title, message}; the receiver may also
+  # refresh them per-thread at runtime, but declaring defaults here gives users
+  # prompts on first open.
+  assistant_view:
+    assistant_description: PM, research, documentation, and architecture-decision agents for your software lifecycle.
     suggested_prompts:
       - title: Sprint Status
         message: Generate a status report for the current sprint
