@@ -21,10 +21,11 @@ def synthesize_research(
     Args:
         input_type: Type of input — 'transcript', 'survey', 'support_tickets',
             'app_reviews', or 'feedback'.
-        task_gid: Asana task GID where the raw data is attached or described.
-            Empty means use the current task context.
+        task_gid: Work-item id (Asana task GID or GitHub issue number) where the
+            raw data is attached or described. Empty means use the current
+            work-item context.
         output_format: 'structured' (themes with counts), 'narrative' (prose
-            summary), or 'user_stories' (ready-to-create Asana tasks).
+            summary), or 'user_stories' (ready-to-create work items).
 
     Returns:
         Instructions for the agent to follow when synthesizing research.
@@ -60,9 +61,9 @@ def synthesize_research(
 
     task_step = ""
     if task_gid:
-        task_step = f"1. Read Asana task '{task_gid}' and all its comments to get the raw data.\n"
+        task_step = f"1. Read work item '{task_gid}' and all its comments to get the raw data.\n"
     else:
-        task_step = "1. Read the current Asana task and all its comments to get the raw data.\n"
+        task_step = "1. Read the originating work item and all its comments to get the raw data.\n"
 
     output_guidance = {
         "structured": (
@@ -96,9 +97,9 @@ def synthesize_research(
         f"{task_step}"
         "2. Extract and organize the raw data.\n"
         "3. Identify themes and rank by frequency and severity.\n"
-        "4. Cross-reference findings against the existing backlog using\n"
-        "   asana_search to find related tasks.\n"
+        "4. Cross-reference findings against the existing backlog (search the\n"
+        "   work items in your configured backend) to find related items.\n"
         f"5. {output_guidance.get(output_format, output_guidance['structured'])}\n"
-        "6. Post results as an Asana comment on the originating task.\n"
+        "6. Post results as a comment on the originating work item.\n"
         "7. Include methodology notes and confidence level."
     )

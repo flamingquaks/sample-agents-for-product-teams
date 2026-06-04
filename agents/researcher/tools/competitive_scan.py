@@ -76,6 +76,6 @@ def competitive_scan(
         "4. Update memory with the latest competitive data.\n"
         "5. Identify opportunities (gaps competitors haven't filled) and\n"
         "   threats (areas where competitors are advancing).\n"
-        "6. Post the competitive brief as an Asana comment.\n"
+        "6. Post the competitive brief as a comment on the originating work item.\n"
         "7. Flag confidence level for each finding (confirmed / reported / rumored)."
     )

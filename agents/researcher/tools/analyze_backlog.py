@@ -11,7 +11,7 @@ from strands import tool
 def analyze_backlog(
     analysis_type: str = "full",
 ) -> str:
-    """Analyze the Asana project backlog for quality and prioritization.
+    """Analyze the project backlog for quality and prioritization.
 
     The agent should use this tool when asked to review the backlog,
     find duplicates, compute priorities, or assess backlog health.
@@ -30,7 +30,8 @@ def analyze_backlog(
     analyses = {
         "duplicates": (
             "DUPLICATE DETECTION:\n"
-            "1. Read all open tasks in the project using asana_list_tasks.\n"
+            "1. Read all open work items in the project (Asana tasks or GitHub\n"
+            "   issues/board items, per your configured backend).\n"
             "2. Identify pairs of tasks with overlapping scope by comparing\n"
             "   titles and descriptions.\n"
             "3. For each pair, explain why they might be duplicates and\n"
@@ -83,6 +84,6 @@ def analyze_backlog(
         f"Analyze the project backlog.\n"
         f"Analysis type: {analysis_type}\n\n"
         f"{steps}\n\n"
-        "Post results as an Asana comment with clear sections and\n"
-        "actionable recommendations. Include data citations."
+        "Post results as a comment on the originating work item, with clear\n"
+        "sections and actionable recommendations. Include data citations."
     )

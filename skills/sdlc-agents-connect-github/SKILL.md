@@ -125,19 +125,19 @@ github:
 
 Everything above wires GitHub for **source control / dev** (Contents, Issues,
 PRs). GitHub can *also* be the **project-management backend** for `workitems`
-— GitHub Issues + Projects V2 instead of Asana. Do this section only when the
-user picked GitHub as their PM tool during selection (`toolchain.pm == github`
-in `.sdlc-agents/selection.yaml`). If they're on Asana, skip this entirely; the
-SCM setup above is all GitHub needs.
+**and `researcher`** — GitHub Issues + Projects V2 instead of Asana. Do this
+section only when the user picked GitHub as their PM tool during selection
+(`toolchain.pm == github` in `.sdlc-agents/selection.yaml`). If they're on
+Asana, skip this entirely; the SCM setup above is all GitHub needs.
 
 This is additive to the SCM credential — you reuse the **same** PAT or App,
 just with added scopes and a couple of runtime env vars.
 
 ### 1. Set the PM runtime env vars
 
-When GitHub is the PM backend, the workitems agent runs with `PM_BACKEND=github`
-(`project_config.py` reads it; default is `asana`). In github mode it reads **no**
-Asana vars and instead requires:
+When GitHub is the PM backend, the `workitems` and `researcher` agents run with
+`PM_BACKEND=github` (`project_config.py` reads it; default is `asana`). In github
+mode they read **no** Asana vars and instead require:
 
 - `PM_BACKEND=github`
 - `GITHUB_REPO` — `owner/repo` of the repository whose issues are tracked
@@ -146,8 +146,10 @@ Asana vars and instead requires:
   owner (e.g. an org-level board over a repo in a different namespace). If the
   board lives under the same owner as the repo, omit it.
 
-Set these on the workitems AgentCore runtime (the same place the runtime's other
-environment is configured). They are configuration, not secrets — no SSM needed.
+Set these on **each** PM-capable agent's AgentCore runtime that you deployed
+(`workitems`, and `researcher` if selected) — the same place the runtime's
+other environment is configured. They are configuration, not secrets — no SSM
+needed. (`docwriter` and `adr` don't use `PM_BACKEND`; leave it unset for them.)
 
 ### 2. Add the Projects scopes to the token
 

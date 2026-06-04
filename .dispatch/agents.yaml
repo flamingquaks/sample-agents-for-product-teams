@@ -39,6 +39,9 @@ agents:
     aliases: [ba, research, analyze]
     triggers:
       asana: [comment_mention, assignment, custom_field]
+      # github triggers apply when researcher runs with PM_BACKEND=github.
+      # assignment/project_item require the GitHub PM webhook.
+      github: [issue_comment, assignment, project_item]
       slack: [mention, slash_command, assistant_thread]
     authorization:
       users: []

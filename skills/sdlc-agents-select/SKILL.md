@@ -24,7 +24,7 @@ Only agents with `Status: shipping` have working code and can be installed today
 | Agent | Status | What it does | Hard requirements | PM backends supported | Nice-to-have |
 |---|---|---|---|---|---|
 | `workitems` | shipping | PO/PM. Decomposes feature asks into tracker issues; status reports; risk detection. | PM tool **and** source control (GitHub can satisfy **both** at once — see note below) | **asana or github** | Slack (supported) for weekly status — any agent can also post results there |
-| `researcher` | shipping | Business analyst. Research synthesis, competitive intel, backlog analysis. | PM tool | **asana only** (no GitHub-PM path — see note) | Web search (Tavily, SerpAPI, Perplexity) |
+| `researcher` | shipping | Business analyst. Research synthesis, competitive intel, backlog analysis. | PM tool | **asana or github** | Web search (Tavily, SerpAPI, Perplexity) |
 | `docwriter` | shipping | Technical writer. API docs, release notes, doc PRs. | Source control | n/a — SCM-native; Asana is optional feature context | PM tool for feature context |
 | `adr` | shipping | Tags issues + reviews PRs against the ADRs that govern the work. | Source control **and** an ADR directory that already exists | n/a — GitHub-native | - |
 
@@ -42,21 +42,18 @@ because they don't use Asana.
 - **`docwriter`** — SCM-native (reads code, opens doc PRs). Needs GitHub only;
   Asana is *optional* supplementary feature context. Works fine with no Asana.
 - **`adr`** — GitHub-native; never needed Asana.
-- **`researcher`** — **Asana-only today.** It has no GitHub-PM code path (no
-  GitHub MCP client, no `PM_BACKEND` support). If the user's PM backend is
-  `github` and they have **no** Asana, you MUST NOT offer `researcher` — it
-  cannot function and will fail at startup. Tell the user plainly: *"researcher
-  currently requires Asana; it has no GitHub Issues/Projects backend yet, so
-  it's not available in a GitHub-only setup."* Only offer `researcher` when
-  `toolchain.pm == asana` (or Asana is otherwise connected).
+- **`researcher`** — supports `PM_BACKEND=asana` AND `PM_BACKEND=github`. In
+  github mode it reads GitHub issues + the Projects V2 board, posts findings as
+  issue comments, and creates new GitHub issues (added to the board) when
+  drafting user stories. Fully works in a GitHub-only setup.
 
 The PM backend is recorded in `selection.yaml` under `toolchain.pm`:
 - `pm: asana` — Asana is the PM backend (works exactly as before; all four
   agents available).
-- `pm: github` — GitHub Issues + Projects V2 is the PM backend. Offer
-  `workitems`, `docwriter`, and `adr` (the last two subject to their own
-  requirements). Exclude `researcher`. Record the Projects V2 board number
-  (see schema). `workitems` runs with `PM_BACKEND=github`.
+- `pm: github` — GitHub Issues + Projects V2 is the PM backend. All four agents
+  are available (each subject to its own requirements — e.g. `adr` still needs
+  an ADR directory). Record the Projects V2 board number (see schema).
+  `workitems` and `researcher` run with `PM_BACKEND=github`.
 
 Asana remains fully supported; nothing about the Asana path changes.
 
@@ -76,28 +73,27 @@ The agent has no fallback behavior for "no ADRs" — it's not useful without the
 
 ## Present to the user
 
-1. Filter the table to agents that are `shipping` **and** whose hard requirements are met. Two backend-specific exclusions:
+1. Filter the table to agents that are `shipping` **and** whose hard requirements are met. The one backend-specific exclusion:
    - For `adr`, apply the ADR-directory check above — don't show it if the repo doesn't have ADRs.
-   - For `researcher`, apply the **PM-backend** check: it is Asana-only. If `toolchain.pm == github` and Asana is not connected, EXCLUDE `researcher` — do not present it. It has no GitHub-PM path and would crash at startup. (Only show it when Asana is the PM backend or Asana is otherwise connected.)
+   (`workitems`, `researcher`, and `docwriter` all work under either PM backend; no PM-backend exclusion applies to them.)
 2. Group into two categories — **Recommended** and **Optional** — and print each with a one-line purpose. The Recommended bucket should be anchored to what tools the user has. For a GitHub-only stack (no Asana), e.g.:
 
    > Based on your setup (GitHub Issues + Projects V2 + Slack), I recommend starting with:
    > - **workitems** — decomposes board items into GitHub issues, runs the work loop on the Projects V2 board, posts status to Slack
+   > - **researcher** — synthesizes research into GitHub issues on the board; competitive intel and backlog analysis
    > - **docwriter** — opens GitHub doc PRs on merged code PRs
    >
    > Optional add-ons that fit your stack: `adr` (if you have an ADR library).
-   > Not available: `researcher` (requires Asana — no GitHub-PM backend yet).
 
-   Or, for an Asana + GitHub + Slack stack, all four are available (researcher included). If the user has Slack, note that any selected agent can be reached from and post results to Slack once they run `sdlc-agents-connect-slack`.
+   Or, for an Asana + GitHub + Slack stack, all four are available too. If the user has Slack, note that any selected agent can be reached from and post results to Slack once they run `sdlc-agents-connect-slack`.
 
 3. Ask the user which to install. Accept three answers:
    - "just the recommended" → select the Recommended list
    - an explicit list (space- or comma-separated agent names)
    - "all" → select Recommended + Optional
 
-4. Before recording, warn on redundant or unsupported combinations:
+4. Before recording, warn on redundant combinations:
    - `adr` without an ADR directory → won't find anything to link against (the ADR-directory check above should already have removed it)
-   - `researcher` selected while `toolchain.pm == github` and no Asana connected → reject it with the explanation above; it cannot run without Asana. If the user insists they want research capability in a GitHub-only setup, tell them it's a roadmap item (researcher needs a GitHub-PM port) and do not add it to the selection.
 
 ## Record the selection
 
