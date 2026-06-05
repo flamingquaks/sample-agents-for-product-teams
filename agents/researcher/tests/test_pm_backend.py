@@ -172,15 +172,17 @@ def agent_mod(monkeypatch):
             monkeypatch.setenv("ASANA_PROJECT_GID", "111")
             monkeypatch.setenv("ASANA_WORKSPACE_GID", "222")
 
-        # Also evict shared.* (read PM_BACKEND at import) so the patched
-        # PM_BACKEND for this case isn't masked by a prior case's cached value.
+        # Evict shared.* too — project_config/prompts read PM_BACKEND at import,
+        # and mcp_clients holds the wiring symbols we patch.
         for m in ("agent", "project_config", "prompts",
-                  "shared.project_config", "shared.prompts"):
+                  "shared.project_config", "shared.prompts", "shared.mcp_clients"):
             sys.modules.pop(m, None)
         sys.path.insert(0, str(RESEARCHER_DIR))
         import agent as mod
+        # MCP/Agent/token/assignment symbols live in the shared wiring module.
+        import shared.mcp_clients as wiring
 
-        cap = {"streamable_calls": []}
+        cap = {"streamable_calls": [], "wiring": wiring}
 
         def fake_shc(url, headers=None, **kw):
             cap["streamable_calls"].append({"url": url, "headers": headers or {}})
@@ -193,15 +195,15 @@ def agent_mod(monkeypatch):
                 pass
             return _FakeMCP()
 
-        monkeypatch.setattr(mod, "streamablehttp_client", fake_shc)
-        monkeypatch.setattr(mod, "MCPClient", fake_mcp)
+        monkeypatch.setattr(wiring, "streamablehttp_client", fake_shc)
+        monkeypatch.setattr(wiring, "MCPClient", fake_mcp)
+        monkeypatch.setattr(wiring, "get_github_token", lambda: "ghtok")
+        monkeypatch.setattr(wiring, "get_access_token", lambda: "asanatok")
         monkeypatch.setattr(mod, "build_model", lambda *a, **k: object())
-        monkeypatch.setattr(mod, "get_github_token", lambda: "ghtok")
-        monkeypatch.setattr(mod, "get_access_token", lambda: "asanatok")
         agent_ctor = MagicMock(return_value=MagicMock(return_value="ok"))
-        monkeypatch.setattr(mod, "Agent", agent_ctor)
-        monkeypatch.setattr(mod, "complete_assignment", lambda *a, **k: None)
-        monkeypatch.setattr(mod, "fail_assignment", lambda *a, **k: None)
+        monkeypatch.setattr(wiring, "Agent", agent_ctor)
+        monkeypatch.setattr(wiring, "complete_assignment", lambda *a, **k: None)
+        monkeypatch.setattr(wiring, "fail_assignment", lambda *a, **k: None)
         cap["agent_ctor"] = agent_ctor
         return mod, cap
 
@@ -213,7 +215,7 @@ def test_github_mode_single_github_client_with_projects_header(agent_mod):
     mod.invoke({"prompt": "research X", "assignment_id": "a1", "source": "github"})
     assert len(cap["streamable_calls"]) == 1
     call = cap["streamable_calls"][0]
-    assert call["url"] == mod.GITHUB_MCP_URL
+    assert call["url"] == cap["wiring"].GITHUB_MCP_URL
     assert call["headers"].get("X-MCP-Toolsets") == "default,projects"
 
 
@@ -221,7 +223,7 @@ def test_asana_mode_connects_asana_client(agent_mod):
     mod, cap = agent_mod("asana")
     mod.invoke({"prompt": "research X", "assignment_id": "a1", "source": "asana"})
     assert len(cap["streamable_calls"]) == 1
-    assert cap["streamable_calls"][0]["url"] == mod.ASANA_MCP_URL
+    assert cap["streamable_calls"][0]["url"] == cap["wiring"].ASANA_MCP_URL
     assert "X-MCP-Toolsets" not in cap["streamable_calls"][0]["headers"]
 
 

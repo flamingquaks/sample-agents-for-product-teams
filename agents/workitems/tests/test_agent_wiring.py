@@ -87,22 +87,25 @@ def agent_mod(monkeypatch):
             monkeypatch.setenv("ASANA_WORKSPACE_GID", "222")
         monkeypatch.delenv("AGENTCORE_MEMORY_ID", raising=False)
 
-        # Evict this agent's own modules, any `tools`/`tools.*` packages a
-        # sibling agent's test may have cached (every agent has its own
-        # top-level `tools`), AND the shared.* modules that read PM_BACKEND at
-        # their import (so this test's patched PM_BACKEND takes effect rather
-        # than a value cached by a prior github/asana-mode test).
+        # Evict this agent's own modules, any `tools`/`tools.*` a sibling
+        # agent's test cached, AND the shared.* modules that read env at import
+        # (project_config/prompts read PM_BACKEND; mcp_clients holds the wiring
+        # we patch) so this test's patched env + fakes take effect cleanly.
         for m in list(sys.modules):
             if (m in ("agent", "project_config", "prompts",
-                      "shared.project_config", "shared.prompts")
+                      "shared.project_config", "shared.prompts", "shared.mcp_clients")
                     or m == "tools" or m.startswith("tools.")):
                 sys.modules.pop(m, None)
         # Ensure workitems is first on sys.path so its `tools`/`prompts`/
         # `project_config` win regardless of earlier test import order.
         sys.path.insert(0, str(WORKITEMS_DIR))
         import agent as mod
+        # The MCP client / Agent / token / assignment symbols now live in the
+        # shared wiring module; patch them there (that's what agent.invoke calls
+        # via run_with_pm_backend).
+        import shared.mcp_clients as wiring
 
-        captures = {"streamable_calls": [], "tokens": []}
+        captures = {"streamable_calls": [], "tokens": [], "wiring": wiring}
 
         # streamablehttp_client(url, headers=...) — record every call
         def fake_shc(url, headers=None, **kw):
@@ -117,20 +120,22 @@ def agent_mod(monkeypatch):
                 pass
             return FakeMCPClient()
 
-        monkeypatch.setattr(mod, "streamablehttp_client", fake_shc)
-        monkeypatch.setattr(mod, "MCPClient", fake_mcp)
+        monkeypatch.setattr(wiring, "streamablehttp_client", fake_shc)
+        monkeypatch.setattr(wiring, "MCPClient", fake_mcp)
+        monkeypatch.setattr(wiring, "get_github_token",
+                            lambda: captures["tokens"].append("gh") or "ghtok")
+        monkeypatch.setattr(wiring, "get_access_token",
+                            lambda: captures["tokens"].append("asana") or "asanatok")
         monkeypatch.setattr(mod, "build_model", lambda *a, **k: object())
-        monkeypatch.setattr(mod, "get_github_token", lambda: captures["tokens"].append("gh") or "ghtok")
-        monkeypatch.setattr(mod, "get_access_token", lambda: captures["tokens"].append("asana") or "asanatok")
 
         fake_agent = MagicMock(return_value="agent-result")
         agent_ctor = MagicMock(return_value=fake_agent)
-        monkeypatch.setattr(mod, "Agent", agent_ctor)
+        monkeypatch.setattr(wiring, "Agent", agent_ctor)
         captures["agent_ctor"] = agent_ctor
 
         completes, fails = [], []
-        monkeypatch.setattr(mod, "complete_assignment", lambda aid, **k: completes.append((aid, k)))
-        monkeypatch.setattr(mod, "fail_assignment", lambda aid, **k: fails.append((aid, k)))
+        monkeypatch.setattr(wiring, "complete_assignment", lambda aid, **k: completes.append((aid, k)))
+        monkeypatch.setattr(wiring, "fail_assignment", lambda aid, **k: fails.append((aid, k)))
         captures["completes"] = completes
         captures["fails"] = fails
         return mod, captures
@@ -156,7 +161,7 @@ def test_github_mode_single_client_with_projects_toolset_header(agent_mod):
     # exactly one MCP connection, to the GitHub MCP URL, with the projects toolset
     assert len(cap["streamable_calls"]) == 1
     call = cap["streamable_calls"][0]
-    assert call["url"] == mod.GITHUB_MCP_URL
+    assert call["url"] == cap["wiring"].GITHUB_MCP_URL
     assert call["headers"].get("X-MCP-Toolsets") == "default,projects"
     # no Asana token fetched in github mode
     assert "asana" not in cap["tokens"]
@@ -180,8 +185,8 @@ def test_asana_mode_connects_both_clients(agent_mod):
     mod.invoke({"prompt": "hi", "assignment_id": "a1", "source": "asana"})
 
     urls = [c["url"] for c in cap["streamable_calls"]]
-    assert mod.ASANA_MCP_URL in urls
-    assert mod.GITHUB_MCP_URL in urls
+    assert cap["wiring"].ASANA_MCP_URL in urls
+    assert cap["wiring"].GITHUB_MCP_URL in urls
     assert len(urls) == 2
     # github client in asana mode must NOT request the projects toolset
     for c in cap["streamable_calls"]:
