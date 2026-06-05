@@ -64,21 +64,29 @@ def _asana(sc: dict) -> str:
 
 
 def _github_issue(sc: dict) -> str:
-    """Generic GitHub issue/PR comment dispatch.
+    """Generic GitHub issue/PR comment dispatch — one block for all agents.
 
-    Handles both issues and pull requests: PR-reviewing agents (docwriter, adr)
-    pass pr_number / is_pr and the extra labels/state fields; issue-only agents
-    (workitems, researcher) simply omit them and the optional lines render empty
-    or are skipped. Keeping one builder means a future field is added once.
+    Consolidating four hand-written blocks onto one renderer intentionally
+    NORMALIZES the prompt text across agents (it is not a byte-for-byte copy of
+    any single agent's old block):
+
+    - The number line is uniformly `Issue: #N` / `PR: #N` (workitems/researcher
+      previously said `Issue Title:`/`Issue Body:`; the value the LLM reads is
+      unchanged — only the field label).
+    - `Labels:` / `State:` render whenever the payload carries them
+      (`issue_labels` / `issue_state`). The GitHub Actions dispatch payload
+      always includes these, so every github-triggered agent now sees them; the
+      PM-webhook payloads omit them. This is additive context (more signal for
+      the LLM), never less — a deliberate harmonization, not a regression.
+    - PR-reviewing agents may send pr_title/pr_body and `comments` instead of the
+      issue_* keys; we prefer the PR-specific value, then the issue value, so
+      docwriter's and adr's PR payloads keep every field they had.
     """
     repo = sc.get("repo", "unknown")
     is_pr = sc.get("is_pr") == "true" or bool(sc.get("pr_number"))
     target_type = "PR" if is_pr else "issue"
     label = "PR" if is_pr else "Issue"
     number = sc.get("issue_number") or sc.get("pr_number", "unknown")
-    # Field-name fallbacks so the one builder serves every agent's payload shape:
-    # PR-reviewing agents may send pr_title/pr_body and `comments` instead of the
-    # issue_* keys; prefer the PR-specific value, then the issue value.
     title = sc.get("pr_title") or sc.get("issue_title", "unknown")
     body = sc.get("pr_body") or sc.get("issue_body", "")
     comments = sc.get("issue_comments") or sc.get("comments", "(not loaded)")
@@ -91,7 +99,6 @@ def _github_issue(sc: dict) -> str:
         f"Title: {title}\n"
         f"Body:\n{body}\n"
     )
-    # Optional fields PR-reviewing agents include; harmless to omit otherwise.
     if "issue_labels" in sc:
         block += f"Labels: {sc.get('issue_labels', '')}\n"
     if "issue_state" in sc:
