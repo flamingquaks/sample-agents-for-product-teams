@@ -31,7 +31,7 @@ from tools.competitive_scan import competitive_scan
 from tools.review_spec import review_spec
 from tools.analyze_backlog import analyze_backlog
 from tools.draft_user_stories import draft_user_stories
-from tools.post_results import post_results
+from shared.tools.post_results import post_results
 from tools.web_search import web_search
 from shared.tools.asana_mcp import get_access_token, ASANA_MCP_URL
 from shared.tools.github_mcp import get_github_token, GITHUB_MCP_URL

@@ -25,7 +25,7 @@ from tools.generate_api_docs import generate_api_docs
 from tools.generate_release_notes import generate_release_notes
 from tools.detect_doc_gaps import detect_doc_gaps
 from tools.check_doc_freshness import check_doc_freshness
-from tools.post_results import post_results
+from shared.tools.post_results import post_results
 from shared.tools.github_mcp import get_github_token, GITHUB_MCP_URL
 from shared.tools.slack_post import slack_post_message, slack_add_reaction
 

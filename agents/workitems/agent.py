@@ -30,7 +30,7 @@ from project_config import build_project_context, PM_BACKEND
 from tools.status_report import generate_status_report
 from tools.risk_detection import detect_risks
 from tools.sync import reconcile_sync
-from tools.post_results import post_results
+from shared.tools.post_results import post_results
 from shared.tools.asana_mcp import get_access_token, ASANA_MCP_URL
 from shared.tools.github_mcp import get_github_token, GITHUB_MCP_URL
 from shared.tools.slack_post import slack_post_message, slack_add_reaction
