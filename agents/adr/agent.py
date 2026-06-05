@@ -19,6 +19,7 @@ from strands_tools.agent_core_memory import AgentCoreMemoryToolProvider
 
 from shared.assignment import complete_assignment, fail_assignment
 from shared.bedrock import build_model
+from shared.dispatch_context import build_dispatch_context
 from prompts import SYSTEM_PROMPT
 from project_config import build_project_context
 from tools.index_adrs import index_adrs
@@ -63,40 +64,10 @@ def invoke(payload, context=None):
 
     # Adr only operates on GitHub events. Context tells it whether the
     # mention was on an issue, on a linked PR, or on an unlinked PR.
-    # Dispatch context lives in the system prompt, not in the user message —
-    # the "[Dispatch Context] ... [User Request]" wrapper trips Bedrock
-    # Guardrails' PROMPT_ATTACK filter because it mirrors the canonical
-    # injection shape.
-    dispatch_context_block = ""
-    if source_context and source == "github":
-        is_pr = bool(source_context.get("pr_number"))
-        pr_body = source_context.get("pr_body", "")
-        issue_or_pr_number = (
-            source_context.get("pr_number") if is_pr
-            else source_context.get("issue_number", "unknown")
-        )
-        dispatch_context_block = (
-            "\n\n## Current Dispatch\n\n"
-            f"Source: github\n"
-            f"Repository: {source_context.get('repo', 'unknown')}\n"
-            f"Trigger target: {'PR' if is_pr else 'Issue'} #{issue_or_pr_number}\n"
-            f"Title: {source_context.get('pr_title') or source_context.get('issue_title', 'unknown')}\n"
-            f"Body:\n{pr_body or source_context.get('issue_body', '')}\n"
-            f"Comments:\n{source_context.get('comments', '(not loaded)')}\n"
-            f"Reply to: GitHub {'PR' if is_pr else 'issue'} #{issue_or_pr_number} "
-            f"on {source_context.get('repo', 'unknown')}\n"
-        )
-    elif source_context and source == "slack":
-        dispatch_context_block = (
-            "\n\n## Current Dispatch\n\n"
-            f"Source: slack\n"
-            f"Channel: {source_context.get('channel_id', 'unknown')}\n"
-            f"Thread: {source_context.get('thread_ts', 'none')}\n"
-            f"Team: {source_context.get('team_id', 'unknown')}\n"
-            f"Reply to: Slack channel {source_context.get('channel_id', 'unknown')}"
-            + (f" thread {source_context.get('thread_ts')}" if source_context.get('thread_ts') else "")
-            + "\n"
-        )
+    # Built by the shared helper so all agents share one correct implementation
+    # (see agents/shared/dispatch_context.py). Its github branch handles PRs
+    # (pr_title/pr_body/comments fallbacks) which adr's PR reviews rely on.
+    dispatch_context_block = build_dispatch_context(source, source_context)
 
     system_prompt = SYSTEM_PROMPT.format(project_context=build_project_context()) + dispatch_context_block
 

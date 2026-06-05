@@ -25,6 +25,7 @@ from strands_tools.agent_core_memory import AgentCoreMemoryToolProvider
 
 from shared.assignment import complete_assignment, fail_assignment
 from shared.bedrock import build_model
+from shared.dispatch_context import build_dispatch_context
 from prompts import get_system_prompt
 from project_config import build_project_context, PM_BACKEND
 from tools.status_report import generate_status_report
@@ -83,85 +84,13 @@ def invoke(payload, context=None):
     assignment_id = payload.get("assignment_id", "")
     source_context = payload.get("source_context", {})
 
-    # Dispatch context lives in the system prompt, not in the user message.
-    # Structured "[Dispatch Context] ... [User Request] ..." wrappers look
-    # like the canonical prompt-injection shape and trip Bedrock Guardrails'
-    # PROMPT_ATTACK filter even at MEDIUM strength. Keeping the user-supplied
-    # content as the only user-role message lets the guardrail evaluate what
-    # actually came from outside the trust boundary.
+    # Dispatch context lives in the system prompt, not the user message — a
+    # "[Dispatch Context] ... [User Request]" wrapper in the user turn mirrors
+    # the canonical prompt-injection shape and trips Bedrock Guardrails'
+    # PROMPT_ATTACK filter. Built by the shared helper so all agents share one
+    # correct implementation (see agents/shared/dispatch_context.py).
     source = payload.get("source", "unknown")
-    dispatch_context_block = ""
-    if source_context and source == "asana":
-        dispatch_context_block = (
-            "\n\n## Current Dispatch\n\n"
-            f"Source: asana\n"
-            f"Task GID: {source_context.get('task_gid', 'unknown')}\n"
-            f"Task: {source_context.get('task_name', 'unknown')}\n"
-            f"Task Notes: {source_context.get('task_notes', '')}\n"
-            f"Project: {source_context.get('project_name', 'unknown')} ({source_context.get('project_gid', '')})\n"
-            f"Reply to: Asana task {source_context.get('task_gid', 'unknown')}\n"
-        )
-    elif source_context and source == "github" and source_context.get("trigger_type") == "project_item":
-        # NOTE: this branch MUST precede the generic `source == "github"` branch
-        # below — both match a github source, and the first matching elif wins.
-        #
-        # A Projects V2 board item may not carry a resolvable issue number (the
-        # webhook delivers a content_node_id, not always an issue number), and
-        # the board can span repos so `repo` may be empty. Render those fields
-        # conditionally and tell the agent how to resolve them via the board.
-        issue_number = source_context.get("issue_number", "")
-        content_node_id = source_context.get("content_node_id", "")
-        repo = source_context.get("repo", "")
-        linked_issue_line = (
-            f"Linked issue: #{issue_number}\n" if issue_number
-            else f"Linked content node: {content_node_id or 'unknown'} "
-                 "(resolve the issue via the board item if you need to comment)\n"
-        )
-        if issue_number and repo:
-            reply_target = (
-                f"Reply to: GitHub issue #{issue_number} on {repo}, and update "
-                f"board item {source_context.get('item_id', 'unknown')} on project "
-                f"#{source_context.get('project_number', 'unknown')}\n"
-            )
-        else:
-            reply_target = (
-                "Reply to: post a project status update on project "
-                f"#{source_context.get('project_number', 'unknown')} (and comment on "
-                "the linked issue if you can resolve it from the board item)\n"
-            )
-        dispatch_context_block = (
-            "\n\n## Current Dispatch\n\n"
-            f"Source: github (Projects V2 board)\n"
-            f"Repository: {repo or '(board spans repos / not specified)'}\n"
-            f"Project: #{source_context.get('project_number', 'unknown')}\n"
-            f"Board item: {source_context.get('item_id', 'unknown')}\n"
-            f"{linked_issue_line}"
-            f"Status change: {source_context.get('status_change', 'unknown')}\n"
-            f"{reply_target}"
-        )
-    elif source_context and source == "github":
-        dispatch_context_block = (
-            "\n\n## Current Dispatch\n\n"
-            f"Source: github\n"
-            f"Repository: {source_context.get('repo', 'unknown')}\n"
-            f"Issue: #{source_context.get('issue_number', 'unknown')}\n"
-            f"Issue Title: {source_context.get('issue_title', 'unknown')}\n"
-            f"Issue Body:\n{source_context.get('issue_body', '')}\n"
-            f"Comments:\n{source_context.get('issue_comments', '(not loaded)')}\n"
-            f"Reply to: GitHub issue #{source_context.get('issue_number', 'unknown')} "
-            f"on {source_context.get('repo', 'unknown')}\n"
-        )
-    elif source_context and source == "slack":
-        dispatch_context_block = (
-            "\n\n## Current Dispatch\n\n"
-            f"Source: slack\n"
-            f"Channel: {source_context.get('channel_id', 'unknown')}\n"
-            f"Thread: {source_context.get('thread_ts', 'none')}\n"
-            f"Team: {source_context.get('team_id', 'unknown')}\n"
-            f"Reply to: Slack channel {source_context.get('channel_id', 'unknown')}"
-            + (f" thread {source_context.get('thread_ts')}" if source_context.get('thread_ts') else "")
-            + "\n"
-        )
+    dispatch_context_block = build_dispatch_context(source, source_context)
 
     model = build_model()
     # Slack posting is a pair of cheap function tools (direct Web API), so they
