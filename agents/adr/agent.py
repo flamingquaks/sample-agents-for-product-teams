@@ -11,22 +11,18 @@ import logging
 import os
 import sys
 
-from strands import Agent
-from strands.tools.mcp import MCPClient
-from mcp.client.streamable_http import streamablehttp_client
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from strands_tools.agent_core_memory import AgentCoreMemoryToolProvider
 
-from shared.assignment import complete_assignment, fail_assignment
 from shared.bedrock import build_model
 from shared.dispatch_context import build_dispatch_context
+from shared.mcp_clients import run_single_github_agent
 from prompts import SYSTEM_PROMPT
 from project_config import build_project_context
 from tools.index_adrs import index_adrs
 from tools.match_adrs import match_issue_to_adrs, match_pr_to_adrs
 from tools.find_linked_issues import find_linked_issues
 from tools.format_rationale import format_tag_issue_comment, format_pr_review_summary
-from shared.tools.github_mcp import get_github_token, GITHUB_MCP_URL
 from shared.tools.slack_post import slack_post_message, slack_add_reaction
 
 # --- Logging -----------------------------------------------------------------
@@ -92,33 +88,16 @@ def invoke(payload, context=None):
         )
         tools.extend(memory_provider.tools)
 
-    github_token = get_github_token()
-    github_client = MCPClient(
-        lambda: streamablehttp_client(
-            GITHUB_MCP_URL,
-            headers={"Authorization": f"Bearer {github_token}"},
-        )
+    # ADR is GitHub-native (reads issues/PRs + the repo's ADR library). The
+    # shared helper connects one GitHub MCP client and runs the agent through
+    # the shared assignment lifecycle.
+    result = run_single_github_agent(
+        model=model,
+        system_prompt=system_prompt,
+        custom_tools=tools,
+        user_input=user_input,
+        assignment_id=assignment_id,
     )
-
-    with github_client:
-        github_tools = github_client.list_tools_sync()
-        all_tools = [*github_tools, *tools]
-
-        agent = Agent(
-            model=model,
-            system_prompt=system_prompt,
-            tools=all_tools,
-        )
-        try:
-            result = agent(user_input)
-        except Exception as agent_error:
-            try:
-                fail_assignment(assignment_id, error=str(agent_error))
-            except Exception:
-                logger.exception("fail_assignment also failed for %s", assignment_id)
-            raise
-        complete_assignment(assignment_id, result_summary=str(result)[:500])
-
     return {"result": str(result)}
 
 

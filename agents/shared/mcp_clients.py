@@ -72,6 +72,26 @@ def run_agent(model, system_prompt, all_tools, user_input, assignment_id):
     return result
 
 
+def run_single_github_agent(
+    *,
+    model,
+    system_prompt,
+    custom_tools,
+    user_input,
+    assignment_id,
+):
+    """Connect a single GitHub MCP client (default toolset) and run the agent.
+
+    For GitHub-native agents (docwriter, adr) that have no PM backend, no Asana,
+    and no Projects V2 needs — they just read issues/PRs and write comments.
+    Reuses the shared run_agent loop so the assignment lifecycle isn't reimplemented.
+    """
+    client = _github_client(projects_toolset=False)
+    with client:
+        all_tools = [*client.list_tools_sync(), *custom_tools]
+        return run_agent(model, system_prompt, all_tools, user_input, assignment_id)
+
+
 def run_with_pm_backend(
     pm_backend,
     *,

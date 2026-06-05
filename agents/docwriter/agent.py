@@ -10,16 +10,14 @@ GitHub-only — the Workitems agent owns Asana side of the loop.
 
 import logging
 import os
+import sys
 
-from strands import Agent
-from strands.tools.mcp import MCPClient
-from mcp.client.streamable_http import streamablehttp_client
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from strands_tools.agent_core_memory import AgentCoreMemoryToolProvider
 
-from shared.assignment import complete_assignment, fail_assignment
 from shared.bedrock import build_model
 from shared.dispatch_context import build_dispatch_context
+from shared.mcp_clients import run_single_github_agent
 from prompts import SYSTEM_PROMPT
 from project_config import build_project_context
 from tools.generate_api_docs import generate_api_docs
@@ -27,9 +25,15 @@ from tools.generate_release_notes import generate_release_notes
 from tools.detect_doc_gaps import detect_doc_gaps
 from tools.check_doc_freshness import check_doc_freshness
 from shared.tools.post_results import post_results
-from shared.tools.github_mcp import get_github_token, GITHUB_MCP_URL
 from shared.tools.slack_post import slack_post_message, slack_add_reaction
 
+# Configure root logger to stdout so AgentCore's OTel sidecar captures app logs
+# (matches the other agents; docwriter previously omitted this).
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    stream=sys.stdout,
+)
 logger = logging.getLogger(__name__)
 
 # --- Configuration -----------------------------------------------------------
@@ -102,39 +106,17 @@ def invoke(payload, context=None):
         )
         tools.extend(memory_provider.tools)
 
-    # GitHub MCP — official remote server (primary for Docwriter)
-    github_token = get_github_token()
-    github_client = MCPClient(
-        lambda: streamablehttp_client(
-            GITHUB_MCP_URL,
-            headers={"Authorization": f"Bearer {github_token}"},
-        )
+    # Docwriter is GitHub-native (reads issues/PRs, opens doc PRs). Slack posting
+    # is handled by direct Web API tools already in `tools` — no live MCP
+    # connection needed. The shared helper connects one GitHub MCP client and
+    # runs the agent through the shared assignment lifecycle.
+    result = run_single_github_agent(
+        model=model,
+        system_prompt=system_prompt,
+        custom_tools=tools,
+        user_input=user_input,
+        assignment_id=assignment_id,
     )
-
-    # Slack posting is handled by direct Web API tools (slack_post_message,
-    # slack_add_reaction) already in `tools` — no live MCP connection needed,
-    # so the agent can post to Slack regardless of trigger source.
-
-    with github_client:
-        github_tools = github_client.list_tools_sync()
-
-        all_tools = [*github_tools, *tools]
-
-        agent = Agent(
-            model=model,
-            system_prompt=system_prompt,
-            tools=all_tools,
-        )
-        try:
-            result = agent(user_input)
-        except Exception as agent_error:
-            try:
-                fail_assignment(assignment_id, error=str(agent_error))
-            except Exception:
-                logger.exception("fail_assignment also failed for %s", assignment_id)
-            raise
-        complete_assignment(assignment_id, result_summary=str(result)[:500])
-
     return {"result": str(result)}
 
 

@@ -8,7 +8,6 @@ Router opens when it creates an assignment.
 import logging
 import os
 import time
-from decimal import Decimal
 
 import boto3
 
