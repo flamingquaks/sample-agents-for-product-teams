@@ -16,23 +16,27 @@ from pathlib import Path
 import pytest
 
 WORKITEMS_DIR = Path(__file__).resolve().parents[1]
-# agents/workitems on sys.path so `import project_config` / `import prompts` work
-sys.path.insert(0, str(WORKITEMS_DIR))
+AGENTS_DIR = WORKITEMS_DIR.parent
+# agents/workitems for `import project_config`/`prompts`; agents/ for `shared.*`
+# (project_config now imports from shared.project_config).
+for _p in (str(AGENTS_DIR), str(WORKITEMS_DIR)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 
 def _fresh(module_name: str):
     """Import (or reimport) a module so module-level env reads re-run.
 
-    Every agent has its own `project_config`/`prompts`/`tools`, so a sibling
-    agent's test (e.g. researcher's) may leave its copy cached in sys.modules.
-    Evict the cached module AND force WORKITEMS_DIR to the front of sys.path on
-    every call so the reimport resolves THIS agent's copy regardless of which
-    agent's test ran first. (Without this the suite passed only by alphabetical
-    collection luck — running researcher's test first made workitems reimport
-    researcher's prompts/project_config.)
+    Two things must happen on every call:
+    1. Evict the agent's own module AND the shared.* modules it imports —
+       shared.project_config / shared.prompts read PM_BACKEND at THEIR import,
+       so a stale cache would ignore this test's patched PM_BACKEND.
+    2. Force WORKITEMS_DIR to the front of sys.path so the reimport resolves
+       THIS agent's project_config/prompts, not a sibling agent's (every agent
+       has its own). Without (2) the suite passed only by alphabetical luck.
     """
-    if module_name in sys.modules:
-        del sys.modules[module_name]
+    for cached in (module_name, "shared.project_config", "shared.prompts"):
+        sys.modules.pop(cached, None)
     sys.path.insert(0, str(WORKITEMS_DIR))
     return importlib.import_module(module_name)
 

@@ -87,12 +87,15 @@ def agent_mod(monkeypatch):
             monkeypatch.setenv("ASANA_WORKSPACE_GID", "222")
         monkeypatch.delenv("AGENTCORE_MEMORY_ID", raising=False)
 
-        # Evict this agent's own modules AND any `tools`/`tools.*` packages a
-        # sibling agent's test may have cached — every agent has its own
-        # top-level `tools` package, so a stale cache entry would make
-        # `from tools.status_report import ...` resolve to the wrong agent.
+        # Evict this agent's own modules, any `tools`/`tools.*` packages a
+        # sibling agent's test may have cached (every agent has its own
+        # top-level `tools`), AND the shared.* modules that read PM_BACKEND at
+        # their import (so this test's patched PM_BACKEND takes effect rather
+        # than a value cached by a prior github/asana-mode test).
         for m in list(sys.modules):
-            if m in ("agent", "project_config", "prompts") or m == "tools" or m.startswith("tools."):
+            if (m in ("agent", "project_config", "prompts",
+                      "shared.project_config", "shared.prompts")
+                    or m == "tools" or m.startswith("tools.")):
                 sys.modules.pop(m, None)
         # Ensure workitems is first on sys.path so its `tools`/`prompts`/
         # `project_config` win regardless of earlier test import order.

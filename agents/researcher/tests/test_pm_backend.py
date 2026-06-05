@@ -24,12 +24,15 @@ for p in (str(RESEARCHER_DIR), str(AGENTS_DIR)):
 
 
 def _fresh(name):
-    # Evict this agent's modules AND any sibling agent's same-named modules
-    # (every agent has its own project_config/prompts/tools), then force the
-    # researcher dir to the front of sys.path so the reimport resolves here
-    # regardless of which agent's test ran first in a full-suite run.
+    # Evict this agent's modules, any sibling agent's same-named modules (every
+    # agent has its own project_config/prompts/tools), AND the shared.* modules
+    # that read PM_BACKEND at their import (so a stale cache doesn't ignore this
+    # test's patched PM_BACKEND). Then force the researcher dir to the front of
+    # sys.path so the reimport resolves here regardless of collection order.
     for m in list(sys.modules):
-        if m in (name, "agent", "project_config", "prompts") or m == "tools" or m.startswith("tools."):
+        if (m in (name, "agent", "project_config", "prompts",
+                  "shared.project_config", "shared.prompts")
+                or m == "tools" or m.startswith("tools.")):
             sys.modules.pop(m, None)
     sys.path.insert(0, str(RESEARCHER_DIR))
     return importlib.import_module(name)
@@ -164,7 +167,10 @@ def agent_mod(monkeypatch):
             monkeypatch.setenv("ASANA_PROJECT_GID", "111")
             monkeypatch.setenv("ASANA_WORKSPACE_GID", "222")
 
-        for m in ("agent", "project_config", "prompts"):
+        # Also evict shared.* (read PM_BACKEND at import) so the patched
+        # PM_BACKEND for this case isn't masked by a prior case's cached value.
+        for m in ("agent", "project_config", "prompts",
+                  "shared.project_config", "shared.prompts"):
             sys.modules.pop(m, None)
         sys.path.insert(0, str(RESEARCHER_DIR))
         import agent as mod
