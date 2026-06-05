@@ -25,7 +25,7 @@ from tools.index_adrs import index_adrs
 from tools.match_adrs import match_issue_to_adrs, match_pr_to_adrs
 from tools.find_linked_issues import find_linked_issues
 from tools.format_rationale import format_tag_issue_comment, format_pr_review_summary
-from tools.github_mcp import get_github_token, GITHUB_MCP_URL
+from shared.tools.github_mcp import get_github_token, GITHUB_MCP_URL
 from shared.tools.slack_post import slack_post_message, slack_add_reaction
 
 # --- Logging -----------------------------------------------------------------

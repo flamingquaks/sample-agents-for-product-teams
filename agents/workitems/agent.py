@@ -31,8 +31,8 @@ from tools.status_report import generate_status_report
 from tools.risk_detection import detect_risks
 from tools.sync import reconcile_sync
 from tools.post_results import post_results
-from tools.asana_mcp import get_access_token, ASANA_MCP_URL
-from tools.github_mcp import get_github_token, GITHUB_MCP_URL
+from shared.tools.asana_mcp import get_access_token, ASANA_MCP_URL
+from shared.tools.github_mcp import get_github_token, GITHUB_MCP_URL
 from shared.tools.slack_post import slack_post_message, slack_add_reaction
 
 # When GitHub is the PM backend we need the (opt-in) Projects V2 toolset in
