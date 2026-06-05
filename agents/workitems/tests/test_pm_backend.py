@@ -147,33 +147,38 @@ def test_unknown_backend_raises(monkeypatch):
 # --- prompts -----------------------------------------------------------------
 
 
+_CTX = "<<PROJECT-CTX-SENTINEL>>"
+
+
 def test_get_system_prompt_github_variant():
     prompts = _fresh("prompts")
-    gh = prompts.get_system_prompt("github")
+    gh = prompts.get_system_prompt("github", _CTX)
     assert "Projects V2 board" in gh
-    # shared rules interpolated, project_context placeholder preserved for agent.py
-    assert "HARD RULE: Agent triggers" in gh
+    assert "HARD RULE: Agent triggers" in gh  # shared rules spliced in
+    # Both placeholders are now fully substituted (no .format downstream).
     assert "{shared_rules}" not in gh
-    assert "{project_context}" in gh
+    assert "{project_context}" not in gh
+    assert _CTX in gh  # project_context was substituted
 
 
 def test_get_system_prompt_asana_variant():
     prompts = _fresh("prompts")
-    az = prompts.get_system_prompt("asana")
+    az = prompts.get_system_prompt("asana", _CTX)
     assert "bridges Asana" in az
     assert "HARD RULE: Agent triggers" in az
     assert "{shared_rules}" not in az
-    assert "{project_context}" in az
+    assert "{project_context}" not in az
+    assert _CTX in az
 
 
 def test_get_system_prompt_defaults_to_asana_for_unknown():
     prompts = _fresh("prompts")
-    assert prompts.get_system_prompt("trello") == prompts.get_system_prompt("asana")
+    assert prompts.get_system_prompt("trello", _CTX) == prompts.get_system_prompt("asana", _CTX)
 
 
 def test_shared_rules_present_in_both_variants():
     prompts = _fresh("prompts")
     for backend in ("asana", "github"):
-        p = prompts.get_system_prompt(backend)
+        p = prompts.get_system_prompt(backend, _CTX)
         assert "NEVER close issues, merge PRs, or delete tasks" in p
         assert "[Workitems Agent]" in p

@@ -88,22 +88,27 @@ def test_github_missing_project_number_raises(monkeypatch):
 # --- prompts -----------------------------------------------------------------
 
 
+_CTX = "<<PROJECT-CTX-SENTINEL>>"
+
+
 def test_github_prompt_creates_issues_for_stories():
     prompts = _fresh("prompts")
-    gh = prompts.get_system_prompt("github")
+    gh = prompts.get_system_prompt("github", _CTX)
     assert "new GitHub issues" in gh
     assert "add_issue_comment" in gh
-    assert "{shared_rules}" not in gh and "{project_context}" in gh
-    # shared rules present
-    assert "HARD RULE: Source Citation" in gh
+    # both placeholders fully substituted (no .format downstream)
+    assert "{shared_rules}" not in gh and "{project_context}" not in gh
+    assert _CTX in gh
+    assert "HARD RULE: Source Citation" in gh  # shared rules present
 
 
 def test_asana_prompt_unchanged():
     prompts = _fresh("prompts")
-    az = prompts.get_system_prompt("asana")
+    az = prompts.get_system_prompt("asana", _CTX)
     assert "within Asana" in az
     assert "HARD RULE: Source Citation" in az
-    assert "{shared_rules}" not in az and "{project_context}" in az
+    assert "{shared_rules}" not in az and "{project_context}" not in az
+    assert _CTX in az
 
 
 # --- agent.py wiring ---------------------------------------------------------

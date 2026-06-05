@@ -5,13 +5,16 @@ Two PM-backend variants share one set of backend-neutral rules:
 - SYSTEM_PROMPT_GITHUB — input/output through GitHub issues + a Projects V2
   board (comments for analysis/briefs; new issues for drafted user stories).
 
-agent.py selects the variant by PM_BACKEND via get_system_prompt(). SYSTEM_PROMPT
-aliases the Asana variant for any importer that predates the split.
+get_system_prompt(pm_backend, project_context) selects the variant and assembles
+the full prompt via shared.prompts.compose_system_prompt.
 
 _SHARED_RULES holds the backend-neutral rules (operating modes, research,
-error honesty, source citation, signature, hard rules). Keep backend-specific
+error honesty, source citation, signature, hard rules). Its TEXT is
+researcher-specific (not shared with other agents); keep backend-specific
 I/O guidance OUT of it so a correction applies to both variants.
 """
+
+from shared.prompts import compose_system_prompt
 
 _SHARED_RULES = """\
 ## Your Role
@@ -188,17 +191,17 @@ This is mandatory on every write action. Never omit it.
 - Use GitHub-flavored markdown in issue comments.
 """
 
-# Backwards-compatible default (Asana) for importers that predate the split.
-SYSTEM_PROMPT = SYSTEM_PROMPT_ASANA
+def get_system_prompt(pm_backend: str, project_context: str) -> str:
+    """Return this agent's fully-assembled system prompt for the PM backend.
 
-
-def get_system_prompt(pm_backend: str) -> str:
-    """Return the system-prompt template for the given PM backend.
-
-    The returned string still contains the `{project_context}` placeholder,
-    which agent.py fills via str.format(project_context=...). The shared rules
-    are already interpolated here.
+    Assembly is delegated to shared.prompts.compose_system_prompt, which uses
+    pure string replacement — so a literal brace in any rule text can't crash
+    startup.
     """
-    backend = (pm_backend or "asana").lower()
-    template = SYSTEM_PROMPT_GITHUB if backend == "github" else SYSTEM_PROMPT_ASANA
-    return template.replace("{shared_rules}", _SHARED_RULES)
+    return compose_system_prompt(
+        pm_backend,
+        asana_template=SYSTEM_PROMPT_ASANA,
+        github_template=SYSTEM_PROMPT_GITHUB,
+        shared_rules=_SHARED_RULES,
+        project_context=project_context,
+    )

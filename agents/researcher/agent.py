@@ -92,7 +92,7 @@ def invoke(payload, context=None):
 
     # Build system prompt with project context + dispatch context.
     system_prompt = (
-        get_system_prompt(PM_BACKEND).format(project_context=build_project_context())
+        get_system_prompt(PM_BACKEND, build_project_context())
         + dispatch_context_block
     )
 

@@ -4,13 +4,16 @@ Two PM-backend variants share one set of backend-neutral hard rules:
 - SYSTEM_PROMPT_ASANA  — Asana is the planning surface, GitHub the dev surface.
 - SYSTEM_PROMPT_GITHUB — GitHub Issues + a Projects V2 board are BOTH surfaces.
 
-agent.py selects the variant by PM_BACKEND. SYSTEM_PROMPT aliases the Asana
-variant so any importer that predates the split keeps working.
+get_system_prompt(pm_backend, project_context) selects the variant and assembles
+the full prompt via shared.prompts.compose_system_prompt.
 
 The _SHARED_RULES block holds the rules that do not depend on the PM backend
-(error honesty, agent triggers, signature, hard prohibitions). Keep
-backend-specific guidance OUT of it so a correction applies to both variants.
+(error honesty, agent triggers, signature, hard prohibitions). Its TEXT is
+workitems-specific (not shared with other agents); keep backend-specific
+guidance OUT of it so a correction applies to both variants.
 """
+
+from shared.prompts import compose_system_prompt
 
 # --- Shared, backend-neutral rules --------------------------------------------
 
@@ -419,18 +422,17 @@ When asked to detect risks:
 {shared_rules}
 """
 
-# Backwards-compatible default (Asana) for importers that predate the split.
-SYSTEM_PROMPT = SYSTEM_PROMPT_ASANA
+def get_system_prompt(pm_backend: str, project_context: str) -> str:
+    """Return this agent's fully-assembled system prompt for the PM backend.
 
-
-def get_system_prompt(pm_backend: str) -> str:
-    """Return the system-prompt template for the given PM backend.
-
-    The returned string still contains the `{project_context}` placeholder,
-    which agent.py fills via str.format(project_context=...). The shared
-    rules are already interpolated here.
+    Assembly (variant selection + shared-rules + project-context substitution)
+    is delegated to shared.prompts.compose_system_prompt, which uses pure
+    string replacement — so a literal brace in any rule text can't crash startup.
     """
-    backend = (pm_backend or "asana").lower()
-    template = SYSTEM_PROMPT_GITHUB if backend == "github" else SYSTEM_PROMPT_ASANA
-    # Interpolate only the shared-rules slot; leave {project_context} for agent.py.
-    return template.replace("{shared_rules}", _SHARED_RULES)
+    return compose_system_prompt(
+        pm_backend,
+        asana_template=SYSTEM_PROMPT_ASANA,
+        github_template=SYSTEM_PROMPT_GITHUB,
+        shared_rules=_SHARED_RULES,
+        project_context=project_context,
+    )
