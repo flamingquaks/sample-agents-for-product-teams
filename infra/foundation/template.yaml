@@ -18,6 +18,19 @@ Parameters:
     Type: String
     Description: Asana custom field GID for the "Agent" dropdown
 
+  DeployDashboard:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Opt-in flag for the fleet monitoring dashboard. When "true", provisions
+      the Cognito user pool, the operator-authorized read API (query Lambda),
+      and the CloudFront-hosted SPA. Default "false" so existing deploys are
+      unaffected until an operator opts in.
+
+Conditions:
+  DashboardEnabled: !Equals [!Ref DeployDashboard, "true"]
+
 Globals:
   Function:
     Runtime: python3.12
@@ -465,6 +478,157 @@ Resources:
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
 
+  # ===========================================================================
+  # Fleet Monitoring Dashboard (opt-in: DeployDashboard=true)
+  # ===========================================================================
+  # Cross-user, read-only view over the assignments table. All resources below
+  # are gated on the DashboardEnabled condition so a default deploy provisions
+  # none of them. The CloudFront-hosted SPA is added in a later change; this
+  # block provides the identity (Cognito) + the operator-authorized query API.
+
+  # --- Cognito: operator identity for the dashboard --------------------------
+
+  DashboardUserPool:
+    Type: AWS::Cognito::UserPool
+    Condition: DashboardEnabled
+    Properties:
+      UserPoolName: !Sub sdlc-agents-dashboard-${Stage}
+      # Operators are provisioned by an admin (no open sign-up) — the dashboard
+      # exposes fleet-wide activity and must not be self-service.
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+
+  # Members of this group pass the operator check in dashboard/auth.py
+  # (OPERATOR_GROUP = "operators"). Membership is an explicit admin action.
+  DashboardOperatorGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Condition: DashboardEnabled
+    Properties:
+      GroupName: operators
+      Description: Operators authorized to view fleet-wide agent activity
+      UserPoolId: !Ref DashboardUserPool
+
+  DashboardUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Condition: DashboardEnabled
+    Properties:
+      ClientName: !Sub sdlc-agents-dashboard-spa-${Stage}
+      UserPoolId: !Ref DashboardUserPool
+      # Public SPA client: no secret, Authorization Code + PKCE via Hosted UI.
+      GenerateSecret: false
+      AllowedOAuthFlows: [code]
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes: [openid, email, profile]
+      SupportedIdentityProviders: [COGNITO]
+      # Callback/logout URLs are set to the CloudFront domain once the SPA
+      # ships; localhost is included so the SPA can be developed against a
+      # real pool before the distribution exists.
+      CallbackURLs:
+        - http://localhost:5173/
+      LogoutURLs:
+        - http://localhost:5173/
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  DashboardUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Condition: DashboardEnabled
+    Properties:
+      # Hosted-UI login domain. Includes the account id to keep the prefix
+      # globally unique.
+      Domain: !Sub sdlc-agents-dash-${AWS::AccountId}-${Stage}
+      UserPoolId: !Ref DashboardUserPool
+
+  # --- Query API -------------------------------------------------------------
+
+  DashboardApiAccessLogs:
+    Type: AWS::Logs::LogGroup
+    Condition: DashboardEnabled
+    Properties:
+      LogGroupName: !Sub /aws/apigateway/sdlc-agents-dashboard-${Stage}
+      RetentionInDays: 30
+
+  DashboardApi:
+    Type: AWS::Serverless::Api
+    Condition: DashboardEnabled
+    Properties:
+      StageName: !Ref Stage
+      Description: Operator-authorized read API for the fleet monitoring dashboard
+      TracingEnabled: true
+      # Every method is authorized by the Cognito user pool by default; the
+      # Lambda additionally enforces operator-group membership.
+      Auth:
+        DefaultAuthorizer: CognitoOperators
+        Authorizers:
+          CognitoOperators:
+            UserPoolArn: !GetAtt DashboardUserPool.Arn
+        AddDefaultAuthorizerToCorsPreflight: false
+      Cors:
+        AllowMethods: "'GET,OPTIONS'"
+        AllowHeaders: "'Authorization,Content-Type'"
+        AllowOrigin: "'*'"
+      AccessLogSetting:
+        DestinationArn: !GetAtt DashboardApiAccessLogs.Arn
+        Format: >-
+          {"requestId":"$context.requestId","ip":"$context.identity.sourceIp",
+          "requestTime":"$context.requestTime","httpMethod":"$context.httpMethod",
+          "routeKey":"$context.routeKey","status":"$context.status",
+          "protocol":"$context.protocol","responseLength":"$context.responseLength"}
+
+  DashboardQueryFunction:
+    Type: AWS::Serverless::Function
+    Condition: DashboardEnabled
+    Properties:
+      FunctionName: !Sub dashboard-query-${Stage}
+      CodeUri: ../dashboard/
+      Handler: api.handler
+      Timeout: 30
+      ReservedConcurrentExecutions: 10
+      Environment:
+        Variables:
+          ASSIGNMENTS_TABLE: !Ref AssignmentsTable
+      Policies:
+        # Read-only: GetItem on the table + Query on its indexes (the dashboard
+        # never writes). DynamoDBReadPolicy covers GetItem/Query/Scan and the
+        # table's index/* ARNs.
+        - DynamoDBReadPolicy:
+            TableName: !Ref AssignmentsTable
+      Events:
+        ListRuns:
+          Type: Api
+          Properties:
+            Path: /runs
+            Method: GET
+            RestApiId: !Ref DashboardApi
+        GetRun:
+          Type: Api
+          Properties:
+            Path: /runs/{assignment_id}
+            Method: GET
+            RestApiId: !Ref DashboardApi
+        Trace:
+          Type: Api
+          Properties:
+            Path: /trace
+            Method: GET
+            RestApiId: !Ref DashboardApi
+        Stats:
+          Type: Api
+          Properties:
+            Path: /stats
+            Method: GET
+            RestApiId: !Ref DashboardApi
+
 Outputs:
   AssignmentsTableName:
     Value: !Ref AssignmentsTable
@@ -507,3 +671,25 @@ Outputs:
     Description: Guardrail version referenced by Router and agents. Bump explicitly to pin a published version.
     Export:
       Name: !Sub ${AWS::StackName}-GuardrailVersion
+
+  # --- Dashboard (only present when DeployDashboard=true) --------------------
+
+  DashboardApiEndpoint:
+    Condition: DashboardEnabled
+    Value: !Sub https://${DashboardApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}
+    Description: Base URL of the dashboard query API (SPA config apiBaseUrl)
+
+  DashboardUserPoolId:
+    Condition: DashboardEnabled
+    Value: !Ref DashboardUserPool
+    Description: Cognito user pool id for the dashboard SPA
+
+  DashboardUserPoolClientId:
+    Condition: DashboardEnabled
+    Value: !Ref DashboardUserPoolClient
+    Description: Cognito app client id for the dashboard SPA (public, PKCE)
+
+  DashboardLoginDomain:
+    Condition: DashboardEnabled
+    Value: !Sub https://sdlc-agents-dash-${AWS::AccountId}-${Stage}.auth.${AWS::Region}.amazoncognito.com
+    Description: Cognito Hosted UI domain for operator login
