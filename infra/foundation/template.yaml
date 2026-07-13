@@ -585,6 +585,35 @@ Resources:
           "routeKey":"$context.routeKey","status":"$context.status",
           "protocol":"$context.protocol","responseLength":"$context.responseLength"}
 
+  # CORS on authorizer-rejected / error responses. When the Cognito authorizer
+  # rejects a request (401 on a missing/invalid/EXPIRED token, 403), or a 5xx
+  # occurs, API Gateway returns a default GatewayResponse that carries no
+  # Access-Control-Allow-Origin — so the browser SPA can't read the status/body
+  # and sees an opaque CORS error instead of a clean "session expired → log in
+  # again" signal. These echo the CORS header onto those responses. (The SAM
+  # Cors block only covers the OPTIONS preflight and Lambda-origin responses.)
+  DashboardGatewayResponse4xx:
+    Type: AWS::ApiGateway::GatewayResponse
+    Condition: DashboardEnabled
+    Properties:
+      RestApiId: !Ref DashboardApi
+      ResponseType: DEFAULT_4XX
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Authorization,Content-Type'"
+        gatewayresponse.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+
+  DashboardGatewayResponse5xx:
+    Type: AWS::ApiGateway::GatewayResponse
+    Condition: DashboardEnabled
+    Properties:
+      RestApiId: !Ref DashboardApi
+      ResponseType: DEFAULT_5XX
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Authorization,Content-Type'"
+        gatewayresponse.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+
   DashboardQueryFunction:
     Type: AWS::Serverless::Function
     Condition: DashboardEnabled
@@ -593,7 +622,11 @@ Resources:
       CodeUri: ../dashboard/
       Handler: api.handler
       Timeout: 30
-      ReservedConcurrentExecutions: 10
+      # No ReservedConcurrentExecutions: this is a low-traffic, operator-only
+      # read path. Reserving a slice would (a) give it a guarantee it doesn't
+      # need and (b) count against the account concurrency floor alongside the
+      # router/webhook reservations — and we never want dashboard reads to be
+      # able to starve dispatch. Let it draw from the unreserved pool.
       Environment:
         Variables:
           ASSIGNMENTS_TABLE: !Ref AssignmentsTable
@@ -691,5 +724,7 @@ Outputs:
 
   DashboardLoginDomain:
     Condition: DashboardEnabled
-    Value: !Sub https://sdlc-agents-dash-${AWS::AccountId}-${Stage}.auth.${AWS::Region}.amazoncognito.com
+    # Reference the domain resource (its Ref is the prefix) rather than
+    # re-deriving the literal, so this can't drift from the Domain property.
+    Value: !Sub https://${DashboardUserPoolDomain}.auth.${AWS::Region}.amazoncognito.com
     Description: Cognito Hosted UI domain for operator login

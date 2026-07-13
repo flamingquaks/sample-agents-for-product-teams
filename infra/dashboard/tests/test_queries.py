@@ -111,6 +111,53 @@ def test_list_runs_filter(monkeypatch):
     assert {r["assignment_id"] for r in out["runs"]} == {"a-0", "a-2"}
 
 
+def test_list_runs_selective_filter_beyond_scan_window_is_reachable(monkeypatch):
+    # Regression for the silent-truncation bug: with limit=1 the loop scans one
+    # row per page, and its 20-page cap covers only the first 20 rows. The only
+    # matching row sits at index 50 — far past that window. The first call must
+    # NOT report "done" (empty page + no token); it must hand back a continuation
+    # token so paging eventually reaches the match.
+    rows = [_run(i, status="dispatched") for i in range(60)]
+    rows[50] = _run(50, status="failed")
+    t = FakeTable(rows)
+    monkeypatch.setattr(queries, "_get_table", lambda: t)
+
+    seen = []
+    token = None
+    for _ in range(200):  # generous bound; must terminate well before this
+        params = {"status": "failed", "limit": "1"}
+        if token:
+            params["next_token"] = token
+        out = queries.list_runs(params)
+        seen.extend(r["assignment_id"] for r in out["runs"])
+        token = out["next_token"]
+        if not token:
+            break
+    assert seen == ["a-50"]  # the deep match is found, not silently dropped
+
+
+def test_list_runs_page_fill_mid_dynamo_page_no_skip(monkeypatch):
+    # When a single DynamoDB page holds more matches than `limit`, the page fills
+    # mid-scan; the next page must resume right after the last RETURNED row, not
+    # past the whole DynamoDB page (which would skip the unreturned matches).
+    rows = [_run(i, status="failed") for i in range(10)]
+    t = FakeTable(rows)
+    monkeypatch.setattr(queries, "_get_table", lambda: t)
+
+    seen = []
+    token = None
+    for _ in range(50):
+        params = {"status": "failed", "limit": "3"}
+        if token:
+            params["next_token"] = token
+        out = queries.list_runs(params)
+        seen.extend(r["assignment_id"] for r in out["runs"])
+        token = out["next_token"]
+        if not token:
+            break
+    assert seen == [f"a-{i}" for i in range(10)]  # no skips, no dupes
+
+
 def test_get_run(table):
     assert queries.get_run("a-4")["assignment_id"] == "a-4"
     assert queries.get_run("missing") is None

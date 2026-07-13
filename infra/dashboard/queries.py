@@ -119,14 +119,13 @@ def list_runs(params: dict) -> dict:
 
     runs: list[dict] = []
     cursor = _decode_cursor(params.get("next_token"))
-    # ``resume`` is the cursor the caller should send to fetch the next page. We
-    # advance it to the key of each item as we accept it, so if the page fills
-    # mid-DynamoDB-page we resume exactly after the last item we returned — never
-    # skipping the rows we collected-but-didn't-return. When filters are present
-    # a GSI page may yield fewer than `limit` matches, so we page (bounded) until
-    # the page is full or the index is exhausted.
+    # ``resume`` is the GSI key of the last item we RETURNED. When the page fills
+    # mid-DynamoDB-page we resume exactly after it, so we never skip the matches
+    # we collected-but-didn't-return. When filters are present a GSI page may
+    # yield fewer than `limit` matches, so we page (bounded) until the page is
+    # full or the index is exhausted.
     resume = None
-    exhausted = False
+    page_full = False
     for _ in range(20):  # page cap: bounds worst-case fan-out on a sparse filter
         query = {
             "IndexName": ALL_RUNS_INDEX,
@@ -137,9 +136,8 @@ def list_runs(params: dict) -> dict:
         if cursor:
             query["ExclusiveStartKey"] = cursor
         resp = table.query(**query)
-        items = resp.get("Items", [])
         page_full = False
-        for item in items:
+        for item in resp.get("Items", []):
             if _matches_filters(item, filters):
                 runs.append(item)
                 # The GSI key of this item = where the next page resumes.
@@ -152,14 +150,24 @@ def list_runs(params: dict) -> dict:
                     page_full = True
                     break
         cursor = resp.get("LastEvaluatedKey")
-        if not cursor:
-            exhausted = True
-            break
-        if page_full:
+        # Stop when the page is full, or when the index is drained (no cursor).
+        if page_full or not cursor:
             break
 
-    # No next page if we drained the index and didn't fill the page.
-    next_token = None if (exhausted and len(runs) < limit) else _encode_cursor(resume)
+    # Continuation token, by why the loop ended:
+    #  - page filled: we broke mid-scan, so more rows may follow the last one we
+    #    returned — resume just after it (``resume``), NOT ``cursor`` (which is
+    #    past the whole DynamoDB page and would skip the unexamined tail).
+    #  - page not full but the index still has rows (hit the 20-page cap):
+    #    continue from the raw DynamoDB ``cursor`` so a selective filter can't
+    #    silently truncate matches beyond the scan window.
+    #  - page not full and index drained: genuinely no more pages.
+    if page_full:
+        next_token = _encode_cursor(resume)
+    elif cursor:
+        next_token = _encode_cursor(cursor)
+    else:
+        next_token = None
     return {"runs": runs, "next_token": next_token}
 
 
@@ -170,17 +178,25 @@ def get_run(assignment_id: str) -> dict | None:
 
 
 def _scan_all_runs(cap: int) -> tuple[list[dict], bool]:
-    """Read up to ``cap`` runs newest-first off the fleet index. Returns
-    (items, truncated)."""
+    """Read runs newest-first off the fleet index, up to ``cap``. Returns
+    (items, truncated) where items has at most ``cap`` entries.
+
+    Truncation is detected by reading one item PAST ``cap``: if the fleet holds
+    more than ``cap`` runs we collect ``cap + 1``, report truncated, and trim
+    back to ``cap``. Relying on a lingering ``LastEvaluatedKey`` instead would
+    false-positive when the fleet holds exactly ``cap`` rows (DynamoDB returns a
+    cursor whenever a query hits its ``Limit``, even with nothing left to read).
+    """
     table = _get_table()
+    probe = cap + 1  # one extra row is the truncation signal
     items: list[dict] = []
     cursor = None
-    while len(items) < cap:
+    while len(items) < probe:
         query = {
             "IndexName": ALL_RUNS_INDEX,
             "KeyConditionExpression": Key("gsi_all").eq(ALL_RUNS_PK),
             "ScanIndexForward": False,
-            "Limit": min(_MAX_LIMIT, cap - len(items)),
+            "Limit": min(_MAX_LIMIT, probe - len(items)),
         }
         if cursor:
             query["ExclusiveStartKey"] = cursor
@@ -188,8 +204,9 @@ def _scan_all_runs(cap: int) -> tuple[list[dict], bool]:
         items.extend(resp.get("Items", []))
         cursor = resp.get("LastEvaluatedKey")
         if not cursor:
-            return items, False
-    return items, True
+            break
+    truncated = len(items) > cap
+    return items[:cap], truncated
 
 
 def trace(dimension: str, value: str) -> dict:
