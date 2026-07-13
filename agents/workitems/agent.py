@@ -19,7 +19,7 @@ from mcp.client.streamable_http import streamablehttp_client
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from strands_tools.agent_core_memory import AgentCoreMemoryToolProvider
 
-from shared.assignment import complete_assignment, fail_assignment
+from shared.assignment import complete_assignment, extract_token_usage, fail_assignment
 from shared.bedrock import build_model
 from prompts import SYSTEM_PROMPT
 from project_config import build_project_context
@@ -159,7 +159,11 @@ def invoke(payload, context=None):
             except Exception:
                 logger.exception("fail_assignment also failed for %s", assignment_id)
             raise
-        complete_assignment(assignment_id, result_summary=str(result)[:500])
+        complete_assignment(
+            assignment_id,
+            result_summary=str(result)[:500],
+            token_usage=extract_token_usage(result),
+        )
 
     return {"result": str(result)}
 

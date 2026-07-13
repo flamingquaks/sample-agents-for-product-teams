@@ -49,6 +49,10 @@ Resources:
           AttributeType: S
         - AttributeName: created_at
           AttributeType: "N"
+        # Constant-value PK ("run") for the fleet-wide "all runs, newest-first"
+        # index the monitoring dashboard pages. See AllRunsIndex below.
+        - AttributeName: gsi_all
+          AttributeType: S
       KeySchema:
         - AttributeName: assignment_id
           KeyType: HASH
@@ -64,6 +68,22 @@ Resources:
         - IndexName: source-created_at-index
           KeySchema:
             - AttributeName: source
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        # Fleet-wide time-ordered index for the monitoring dashboard. All items
+        # share the constant PK gsi_all="run", sorted by created_at, so the
+        # dashboard Querys the whole fleet newest-first in one call instead of a
+        # scatter-gather across agent/source partitions. Single-partition write
+        # concentration is acceptable at sample volume; a sharded PK
+        # (run#<0..N>) is the documented scale follow-up. The GSI is sparse —
+        # only items written with gsi_all (i.e. post-this-change dispatches)
+        # appear; pre-existing rows are absent by design.
+        - IndexName: AllRunsIndex
+          KeySchema:
+            - AttributeName: gsi_all
               KeyType: HASH
             - AttributeName: created_at
               KeyType: RANGE

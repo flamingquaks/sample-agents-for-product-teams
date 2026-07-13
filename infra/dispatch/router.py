@@ -25,6 +25,7 @@ from decimal import Decimal
 import boto3
 from botocore.config import Config
 
+import enrichment
 import guardrail
 import reply
 
@@ -195,9 +196,18 @@ def create_assignment(
     now = int(time.time())
     ttl = now + (30 * 24 * 60 * 60)  # 30 days
 
+    # Enrich the record with the structured, traceable dimensions the dashboard
+    # renders. Derived purely from data we already have in-hand — no new
+    # external collection. ``trace_refs`` is an open map (repo/branch/pr/issue/
+    # jira/asana…); agents may add more at completion via update_trace_refs.
+    trace_refs = enrichment.derive_trace_refs(source, source_context, instruction)
+    participants = enrichment.derive_participants(source, requester, source_context)
+
     assignments_table.put_item(
         Item={
             "assignment_id": assignment_id,
+            # Constant PK for the "all runs, newest-first" fleet GSI (AllRunsIndex).
+            "gsi_all": enrichment.ALL_RUNS_PK,
             "agent_id": agent_id,
             "source": source,
             "trigger_type": trigger_type,
@@ -205,6 +215,8 @@ def create_assignment(
             "instruction": instruction,
             "status": "dispatched",
             "source_context": source_context,
+            "trace_refs": trace_refs,
+            "participants": participants,
             "created_at": now,
             "completed_at": None,
             "duration_seconds": None,
