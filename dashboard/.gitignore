@@ -1,0 +1,10 @@
+# JS/SPA build + dependency artifacts (this is the only Node subproject in the
+# repo, so its ignores are scoped here rather than in the Python-oriented root).
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Local-dev runtime config (see .env.example). Never commit real endpoints/ids.
+.env
+.env.local
+.env.*.local
