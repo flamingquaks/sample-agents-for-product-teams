@@ -23,12 +23,11 @@ export function buildOidcConfig(config: AppConfig): AuthProviderProps {
     onSigninCallback: () => {
       window.history.replaceState({}, document.title, window.location.pathname);
     },
-    // Cognito's RP-initiated logout lives on the Hosted-UI domain, not the OIDC
-    // issuer, so oidc-client-ts can't discover it from metadata. Point the
-    // logout there explicitly. (Wired up in the sign-out handler.)
-    metadataSeed: {
-      end_session_endpoint: `${config.cognitoLoginDomain}/logout`,
-    },
+    // NB: we do NOT seed an end_session_endpoint for oidc-client-ts. Cognito's
+    // RP-initiated logout (/logout on the Hosted-UI domain) requires
+    // client_id + logout_uri rather than the standard OIDC id_token_hint, so
+    // signoutRedirect() wouldn't work against it. Logout goes through
+    // cognitoLogoutUrl() below instead.
   };
 }
 

@@ -34,10 +34,18 @@ function fromEnv(): RawConfig {
     cognitoAuthority: env.VITE_COGNITO_AUTHORITY,
     cognitoClientId: env.VITE_COGNITO_CLIENT_ID,
     cognitoLoginDomain: env.VITE_COGNITO_LOGIN_DOMAIN,
-    // Default the redirect to the current origin so a deployed build "just
-    // works" at whatever CloudFront URL it's served from.
-    redirectUri: env.VITE_REDIRECT_URI || window.location.origin + "/",
+    // Default the redirect to where the app is actually served — origin + the
+    // Vite base path — so it works both at the CloudFront root and under a
+    // subpath. This is the URL that must be registered as a Cognito CallbackURL.
+    redirectUri: env.VITE_REDIRECT_URI || appBaseUrl(),
   };
+}
+
+/** Absolute URL of the app's own base path (honors a non-root deploy). */
+function appBaseUrl(): string {
+  // import.meta.env.BASE_URL is Vite's configured base ("/" at root, or e.g.
+  // "/dashboard/" under a subpath). Resolve it against the current origin.
+  return new URL(import.meta.env.BASE_URL ?? "/", window.location.origin).href;
 }
 
 function trimTrailingSlash(url: string): string {
@@ -45,7 +53,7 @@ function trimTrailingSlash(url: string): string {
 }
 
 /**
- * Load and validate runtime config. Tries /config.json first (deployed), then
+ * Load and validate runtime config. Tries config.json first (deployed), then
  * merges in env fallbacks for any missing field (local dev). Throws with a
  * clear message if a required field is still missing — a misconfigured deploy
  * should fail loudly at startup, not silently point auth/API at nothing.
@@ -53,7 +61,11 @@ function trimTrailingSlash(url: string): string {
 export async function loadConfig(): Promise<AppConfig> {
   let file: RawConfig = {};
   try {
-    const resp = await fetch("/config.json", { cache: "no-store" });
+    // Fetch relative to the app's base path (not the origin root), so config.json
+    // is found whether the SPA is served at "/" or under a subpath — matching
+    // Vite's base:"./" and the appBaseUrl() redirect above.
+    const configUrl = new URL("config.json", appBaseUrl()).href;
+    const resp = await fetch(configUrl, { cache: "no-store" });
     if (resp.ok) file = (await resp.json()) as RawConfig;
   } catch {
     // No config.json (local dev) — fall back to env entirely.

@@ -92,6 +92,7 @@ export function App({ config }: { config: AppConfig }) {
             api={api}
             onOpenRun={(assignmentId) => setView({ name: "run", assignmentId })}
             onTrace={(dimension, value) => setView({ name: "trace", dimension, value })}
+            onAuthError={() => void auth.signinRedirect()}
           />
         )}
         {view.name === "run" && (

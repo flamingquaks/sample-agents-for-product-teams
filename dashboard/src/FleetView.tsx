@@ -2,7 +2,7 @@
 // filterable, paginated, live-polling table of runs.
 
 import { useCallback, useMemo, useState } from "react";
-import type { DashboardApi } from "./api";
+import { ApiError, type DashboardApi } from "./api";
 import { StatusPill, TraceChips } from "./components";
 import { fmtCost, fmtDuration, fmtTime, isActive } from "./format";
 import { usePolling } from "./hooks";
@@ -22,10 +22,13 @@ export function FleetView({
   api,
   onOpenRun,
   onTrace,
+  onAuthError,
 }: {
   api: DashboardApi;
   onOpenRun: (assignmentId: string) => void;
   onTrace: (dimension: string, value: string) => void;
+  /** Called when the API rejects a request as unauthenticated (expired token). */
+  onAuthError: () => void;
 }) {
   const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS);
   // Pagination: a stack of page tokens so "prev" works. token[i] fetches page i;
@@ -33,12 +36,21 @@ export function FleetView({
   const [pageTokens, setPageTokens] = useState<(string | null)[]>([null]);
   const pageToken = pageTokens[pageTokens.length - 1];
 
-  // Stats poll — cheap header, active while any run is dispatched.
-  const statsPoll = usePolling<FleetStats>(
-    () => api.stats(),
-    (s) => s.active > 0,
-    [api],
+  // A 401 from any poll means the token expired — hand off to the app so it can
+  // re-authenticate rather than spinning on an error banner forever.
+  const handleError = useCallback(
+    (e: unknown) => {
+      if (e instanceof ApiError && e.status === 401) onAuthError();
+    },
+    [onAuthError],
   );
+
+  // Stats poll — cheap header, active while any run is dispatched.
+  const statsPoll = usePolling<FleetStats>(() => api.stats(), {
+    isActive: (s) => s.active > 0,
+    deps: [api],
+    onError: handleError,
+  });
 
   // Runs poll — the visible page. Active while any row on the page is in flight.
   const listFetcher = useCallback(
@@ -53,11 +65,11 @@ export function FleetView({
       }),
     [api, pageToken, filters],
   );
-  const runsPoll = usePolling<RunsPage>(
-    listFetcher,
-    (page) => page.runs.some((r) => isActive(r.status)),
-    [listFetcher],
-  );
+  const runsPoll = usePolling<RunsPage>(listFetcher, {
+    isActive: (page) => page.runs.some((r) => isActive(r.status)),
+    deps: [listFetcher],
+    onError: handleError,
+  });
 
   const setFilter = (key: keyof Filters, value: string) => {
     setFilters((f) => ({ ...f, [key]: value }));
