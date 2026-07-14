@@ -56,7 +56,9 @@ agents/
   researcher/    Strands agent — Business analyst
   adr/           Strands agent — ADR linker
   shared/        Shared tools and helpers
+dashboard/       Fleet monitoring SPA (React + Vite)
 infra/
+  dashboard/     Dashboard query API (Lambda)
   dispatch/      Dispatch Router + Asana webhook (Lambda)
   foundation/    Shared AWS resources (DynamoDB, S3, IAM)
 cedar/           Cedar policy guardrails
@@ -220,6 +222,7 @@ Run these only for the integrations you actually use.
 | `deploy-researcher.yml` | Push to `main` touching `agents/researcher/**` | Build, scan, deploy Researcher |
 | `deploy-adr.yml` | Push to `main` touching `agents/adr/**` | Build, scan, deploy Adr |
 | `deploy-agent.yml` | Called by above | Shared build/deploy logic |
+| `deploy-dashboard.yml` | Push to `main` touching `dashboard/**` | Build SPA, upload to S3, invalidate CloudFront |
 | `claude-code.yml` | `@claude` in comments/PRs | Claude Code assistant |
 | `agent-dispatch.yml` | `@workitems`, `@docwriter`, etc. in comments | Route mentions to agents |
 | `python-lint.yml` | Push/PR to `main` | Ruff lint + format check |
@@ -286,6 +289,7 @@ repo or workspace:
 - [Roadmap](docs/roadmap.md) — shipped, near-term, ideas
 - [Threat Model](docs/threat-model.md) — threats, current controls, recommended next work
 - [AWS Deploy Surface](docs/aws-deploy.md) — what the project provisions and what's required for a deterministic deploy
+- [Dashboard](dashboard/README.md) — fleet monitoring SPA: local dev, architecture, deploy
 - [PRFAQ](docs/01-prfaq-agent-fleet.md) — framing and FAQ
 - [PRD](docs/02-prd-agent-fleet.md) — requirements (Shipped vs. Roadmap per item)
 - [Design](docs/03-design-agent-fleet.md) — system architecture as shipped

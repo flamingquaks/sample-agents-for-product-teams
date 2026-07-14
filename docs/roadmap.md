@@ -24,6 +24,7 @@ Supporting infrastructure shipped:
 - **Per-agent Cedar policies** under `cedar/<agent>.cedar` declare what each agent may and may not do.
 - **Per-agent CI/CD** (`deploy-<agent>.yml`) on push to `main`, plus a reusable `deploy-agent.yml` that handles build, Inspector scan, AgentCore Runtime create/update, registry sync, and smoke test.
 - **Skills** under `skills/` drive guided install into a new repo/account.
+- **Fleet monitoring dashboard** (`dashboard/`) — React + Vite SPA showing run history, traces, and fleet status. Backed by a query API Lambda (`infra/dashboard/`), hosted on S3 + CloudFront, deployed via `deploy-dashboard.yml`.
 
 All four agents run Claude Opus 4.7 via Bedrock.
 
@@ -72,7 +73,6 @@ Collected from earlier design sessions. Worth considering, not committed to.
 - **AgentCore Gateway migration** — Centralize MCP access through one managed endpoint instead of per-agent direct connections.
 - **AgentCore Identity migration** — Replace the SSM credential paths with a centralized Identity vault and `@requires_access_token` pattern.
 - **Trello, Aha!, Linear PM support** — Workitems with different backends.
-- **Fleet dashboard** — A production-grade view showing cost, eval scores, and assignment history per agent.
 
 ---
 
