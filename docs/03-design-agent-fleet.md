@@ -272,14 +272,16 @@ Cedar evaluation today is advisory — the policies document the contract. Hard 
 
 - **CloudWatch Logs** for every agent runtime, Dispatch Router Lambda, and Asana webhook Lambda.
 - **OpenTelemetry** via the `aws-opentelemetry-distro` Python package baked into each agent container — emits traces for Bedrock calls, MCP calls, and custom tool executions.
-- **DynamoDB assignments table** is the authoritative record of what was requested and whether it succeeded.
+- **DynamoDB assignments table** is the authoritative record of what was requested and whether it succeeded. Each assignment carries the structured, traceable dimensions the dashboard reads: `trace_refs` (repo, branch, PR, issue, Jira key, Asana task — an open map any integration can extend), `participants` (requester plus assignees/commenters), and, on completion, `duration_seconds`, `token_usage`, and a derived `cost_estimate_usd`.
+- **Per-assignment cost tracking.** Agents write token usage (from the model result's usage metrics) and a derived cost estimate to DynamoDB at close — no longer roadmap.
+- **Fleet monitoring dashboard** (optional, `DeployDashboard=true`) — an operator-only, read-only web view over the assignments table: fleet list with filters, per-run detail, and cross-agent traceability by dimension. Served on CloudFront + S3, backed by a Cognito-authorized query API Lambda (`infra/dashboard/`). See [`dashboard/README.md`](../dashboard/README.md) and [`aws-deploy.md`](./aws-deploy.md).
 
 ### 6.2 What's not (roadmap)
 
-- A fleet-wide CloudWatch dashboard aggregating per-agent metrics.
+- A fleet-wide **CloudWatch** dashboard aggregating native per-agent metrics (distinct from the run-tracking web dashboard above, which reads the assignments table, not CloudWatch metrics).
 - Alarms on OAuth refresh failures, runtime errors, or token-budget breaches.
 - AgentCore Evaluations against the per-agent `eval_dataset.json` golden sets (the datasets exist; the evaluation pipeline doesn't).
-- Per-assignment cost tracking. Token usage is available from Bedrock's response metadata but not yet surfaced to DynamoDB.
+- Durable run history beyond the assignments table's 30-day TTL (the dashboard is a recent-activity view by design).
 
 ---
 
