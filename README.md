@@ -123,9 +123,29 @@ The skill will:
 The region you pick is written to `.sdlc-agents/selection.yaml` and reused by
 every downstream step — nothing in the install path is hard-coded to `us-west-2`.
 
+## Setup (interactive script)
+
+The fastest self-serve path — no CI, no GitHub OIDC role — is the interactive
+deploy script. It uses the AWS profile/credentials you pick, so a human with
+console access can stand up the fleet directly:
+
+```bash
+python scripts/deploy.py            # walks you through it
+python scripts/deploy.py --dry-run  # show the plan first, touch nothing
+```
+
+It preflights the required tools (`aws`, `sam`, `docker`) with install guidance
+if any are missing, lets you choose an AWS profile + region (and confirms the
+account), collects config (stage, target repo, Asana GIDs — remembered in
+`.sdlc-agents/deploy.config.json` for re-runs), then deploys the foundation
+stack, checks that each selected agent's SSM secrets are present, and creates
+each agent's IAM role, ECR repo, image, and AgentCore Runtime — idempotently.
+Secrets themselves are still populated by the bootstrap scripts below (the
+deploy script tells you which ones are missing).
+
 ## Setup (manual)
 
-If you'd rather provision by hand, the outline below mirrors what the skill does.
+If you'd rather provision by hand, the outline below mirrors what the script does.
 Set `AWS_REGION` (and `AWS_ACCOUNT_ID`) once in your shell and every snippet
 below picks it up.
 
@@ -206,6 +226,7 @@ ECR repositories are created with `IMMUTABLE` tag mutability — each push must 
 
 Under `scripts/`:
 
+- `deploy.py` — interactive end-to-end deploy (see [Setup (interactive script)](#setup-interactive-script)); preflights tooling, collects config, and provisions the foundation stack + selected agents using your chosen AWS profile
 - `bootstrap_asana_oauth.py` — one-shot OAuth 2.0 dance for the Asana MCP server; stores the refresh token in SSM
 - `bootstrap_jira_oauth.py` — same thing for Atlassian/Jira (3LO)
 - `bootstrap_asana_webhook.py` — operator-run webhook registration; attaches a temporary `ssm:PutParameter` policy to the webhook Lambda's role so the Asana handshake can persist the shared secret, then removes the policy

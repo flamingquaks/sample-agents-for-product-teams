@@ -23,6 +23,10 @@ Thumbs.db
 cdk.out/
 samconfig.toml
 
+# Local operator deploy config (scripts/deploy.py) — machine-specific
+# profile/region/GIDs, not for the repo.
+.sdlc-agents/
+
 # Environment
 .env
 .env.*
