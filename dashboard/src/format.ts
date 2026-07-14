@@ -52,3 +52,46 @@ export function statusClass(status?: RunStatus): string {
 export function isActive(status?: RunStatus): boolean {
   return status === "dispatched";
 }
+
+export interface SourceLink {
+  label: string;
+  url: string;
+}
+
+/**
+ * Build a deep link back to the system that triggered a run, from the fields
+ * the router stored on trace_refs / source_context. Returns null when there's
+ * nothing linkable (e.g. an unknown source, or missing identifiers) rather than
+ * a broken URL. GitHub links are derived from repo + issue/pr number; Asana
+ * links from the task gid.
+ */
+export function sourceLink(
+  source: string | undefined,
+  refs: Record<string, string> | undefined,
+  ctx: Record<string, unknown> | undefined,
+): SourceLink | null {
+  const r = refs ?? {};
+  const c = (ctx ?? {}) as Record<string, string | undefined>;
+
+  if (source === "github") {
+    const repo = r.repo ?? c.repo;
+    // A PR carries pr_number; otherwise it's an issue. Both live at the same
+    // path on github.com (owner/repo/issues/N redirects PRs correctly).
+    const num = r.pr_number ?? r.issue_number ?? c.issue_number;
+    if (repo && num) {
+      const kind = r.pr_number ? "pull" : "issues";
+      return { label: `${repo}#${num}`, url: `https://github.com/${repo}/${kind}/${num}` };
+    }
+    return null;
+  }
+
+  if (source === "asana") {
+    const taskGid = r.asana_task_gid ?? c.task_gid;
+    if (taskGid) {
+      return { label: `Asana task ${taskGid}`, url: `https://app.asana.com/0/0/${taskGid}` };
+    }
+    return null;
+  }
+
+  return null;
+}

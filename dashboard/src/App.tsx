@@ -1,7 +1,6 @@
-// Top-level app: gate on Cognito auth + operator role, then render the fleet
-// view. Run-detail and trace are lightweight stubs here — Phase 4 fills them.
-// Navigation is a tiny in-memory view state (no router dep) since there are
-// only a few views.
+// Top-level app: gate on Cognito auth + operator role, then render the fleet /
+// run-detail / trace views. Navigation is a tiny in-memory view state (no
+// router dep) since there are only a few views.
 
 import { useState } from "react";
 import { useAuth } from "react-oidc-context";
@@ -9,6 +8,8 @@ import type { AppConfig } from "./config";
 import { cognitoLogoutUrl } from "./auth";
 import { useApi } from "./hooks";
 import { FleetView } from "./FleetView";
+import { RunDetailView } from "./RunDetailView";
+import { TraceView } from "./TraceView";
 
 type View =
   | { name: "fleet" }
@@ -96,26 +97,26 @@ export function App({ config }: { config: AppConfig }) {
           />
         )}
         {view.name === "run" && (
-          <StubView title={`Run ${view.assignmentId}`} onBack={() => setView({ name: "fleet" })} />
+          <RunDetailView
+            api={api}
+            assignmentId={view.assignmentId}
+            onBack={() => setView({ name: "fleet" })}
+            onTrace={(dimension, value) => setView({ name: "trace", dimension, value })}
+            onAuthError={() => void auth.signinRedirect()}
+          />
         )}
         {view.name === "trace" && (
-          <StubView
-            title={`Trace ${view.dimension} = ${view.value}`}
+          <TraceView
+            api={api}
+            dimension={view.dimension}
+            value={view.value}
             onBack={() => setView({ name: "fleet" })}
+            onOpenRun={(assignmentId) => setView({ name: "run", assignmentId })}
+            onAuthError={() => void auth.signinRedirect()}
           />
         )}
       </main>
     </>
-  );
-}
-
-function StubView({ title, onBack }: { title: string; onBack: () => void }) {
-  return (
-    <div>
-      <button onClick={onBack}>← Back to fleet</button>
-      <h2>{title}</h2>
-      <p className="muted">Detailed view lands in Phase 4.</p>
-    </div>
   );
 }
 

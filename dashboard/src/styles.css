@@ -232,3 +232,35 @@ td.mono,
   align-items: center;
   margin-top: 12px;
 }
+
+/* Run detail */
+.detail-grid {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 8px 20px;
+  margin: 16px 0 24px;
+}
+.detail-grid dt {
+  color: var(--text-dim);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.detail-grid dd {
+  margin: 0;
+}
+.prewrap {
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  font-family: var(--mono);
+  font-size: 12px;
+  margin: 6px 0 20px;
+}
+h3 {
+  font-size: 14px;
+  margin: 20px 0 4px;
+}
