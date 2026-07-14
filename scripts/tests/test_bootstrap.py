@@ -162,3 +162,96 @@ def test_runner_aws_base_includes_profile_and_region():
             dry_run=True, profile=None, region="us-west-2"
         )._aws_base()
     )
+
+
+# --- scoped deploy-role policy (#3) ------------------------------------------
+
+
+def test_deploy_role_policy_is_scoped_not_admin():
+    import json as _json
+
+    pol = bootstrap.deploy_role_policy("us-west-2", "123456789012")
+    blob = _json.dumps(pol)
+    # No AdministratorAccess / blanket allow-all.
+    assert "AdministratorAccess" not in blob
+    assert not any(s.get("Action") == "*" for s in pol["Statement"])
+    sids = {s.get("Sid") for s in pol["Statement"]}
+    assert {"EcrPushPull", "AgentCoreRuntime", "PassAgentRuntimeRoles"} <= sids
+    # PassRole is limited to the per-agent runtime roles + the agentcore service.
+    passrole = next(s for s in pol["Statement"] if s["Sid"] == "PassAgentRuntimeRoles")
+    assert passrole["Resource"].endswith(":role/*-agentcore-runtime")
+    assert (
+        passrole["Condition"]["StringEquals"]["iam:PassedToService"]
+        == "bedrock-agentcore.amazonaws.com"
+    )
+    # No cloudformation *write* — the foundation sam deploy runs locally, not in CI.
+    assert "cloudformation:CreateStack" not in blob and "cloudformation:*" not in blob
+
+
+# --- failure tracking (#1) ---------------------------------------------------
+
+
+class _FakeResult:
+    def __init__(self, returncode, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def test_step_records_failure_and_returns_false(monkeypatch):
+    r = bootstrap.Runner(dry_run=False, profile=None, region="us-west-2")
+    monkeypatch.setattr(
+        bootstrap.subprocess,
+        "run",
+        lambda *a, **k: _FakeResult(254, stderr="An error occurred: AccessDenied"),
+    )
+    ok = r.step("create role", ["aws", "iam", "create-role"])
+    assert ok is False
+    assert len(r.failures) == 1
+    assert "create role" in r.failures[0] and "AccessDenied" in r.failures[0]
+
+
+def test_step_success_records_nothing(monkeypatch):
+    r = bootstrap.Runner(dry_run=False, profile=None, region="us-west-2")
+    monkeypatch.setattr(
+        bootstrap.subprocess, "run", lambda *a, **k: _FakeResult(0, stdout="{}")
+    )
+    assert r.step("x", ["aws", "iam", "create-role"]) is True
+    assert r.failures == []
+
+
+def test_step_dry_run_is_true_and_silent():
+    r = bootstrap.Runner(dry_run=True, profile=None, region="us-west-2")
+    assert r.step("x", ["aws", "iam", "create-role"]) is True
+    assert r.failures == []
+
+
+# --- aws_exists trichotomy (#4) ----------------------------------------------
+
+
+def test_aws_exists_present_absent_ambiguous(monkeypatch):
+    r = bootstrap.Runner(dry_run=False, profile=None, region="us-west-2")
+
+    def result_for(rc, err=""):
+        return lambda *a, **k: _FakeResult(
+            rc, stdout="{}" if rc == 0 else "", stderr=err
+        )
+
+    monkeypatch.setattr(bootstrap.subprocess, "run", result_for(0))
+    assert r.aws_exists(["iam", "get-role", "--role-name", "x"]) is True
+
+    monkeypatch.setattr(
+        bootstrap.subprocess, "run", result_for(254, "NoSuchEntity: not found")
+    )
+    assert r.aws_exists(["iam", "get-role", "--role-name", "x"]) is False
+
+    # Transient/permission error → ambiguous (None), NOT "absent".
+    monkeypatch.setattr(
+        bootstrap.subprocess, "run", result_for(254, "Throttling: rate exceeded")
+    )
+    assert r.aws_exists(["iam", "get-role", "--role-name", "x"]) is None
+
+
+def test_aws_exists_dry_run_is_none():
+    r = bootstrap.Runner(dry_run=True, profile=None, region="us-west-2")
+    assert r.aws_exists(["iam", "get-role", "--role-name", "x"]) is None

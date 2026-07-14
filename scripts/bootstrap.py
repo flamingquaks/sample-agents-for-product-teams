@@ -312,18 +312,123 @@ def deploy_role_trust(account: str, owner: str, repo: str) -> dict:
     }
 
 
+def deploy_role_policy(region: str, account: str) -> dict:
+    """Scoped permission policy for the CI deploy role — only what the deploy
+    workflows actually do, instead of AdministratorAccess.
+
+    The workflows that assume this role (deploy-agent.yml, deploy-dashboard.yml,
+    agent-dispatch.yml, claude-code.yml) build/push agent images, create/update
+    AgentCore runtimes, sync the SSM registry, read stack outputs, invoke the
+    Dispatch Router + Bedrock, and (dashboard) push the SPA to S3 + invalidate
+    CloudFront. The foundation `sam deploy` runs locally in this script, NOT in
+    CI, so no CloudFormation write/IAM-role-create permissions are granted here.
+    PassRole is limited to the per-agent runtime roles the workflows attach."""
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "EcrPushPull",
+                "Effect": "Allow",
+                "Action": [
+                    "ecr:GetAuthorizationToken",
+                    "ecr:CreateRepository",
+                    "ecr:DescribeRepositories",
+                    "ecr:BatchCheckLayerAvailability",
+                    "ecr:InitiateLayerUpload",
+                    "ecr:UploadLayerPart",
+                    "ecr:CompleteLayerUpload",
+                    "ecr:PutImage",
+                    "ecr:BatchGetImage",
+                    "ecr:GetDownloadUrlForLayer",
+                    "ecr:PutImageScanningConfiguration",
+                ],
+                "Resource": "*",
+            },
+            {
+                "Sid": "AgentCoreRuntime",
+                "Effect": "Allow",
+                "Action": [
+                    "bedrock-agentcore-control:*",
+                    "bedrock-agentcore:InvokeAgentRuntime",
+                ],
+                "Resource": "*",
+            },
+            {
+                "Sid": "PassAgentRuntimeRoles",
+                "Effect": "Allow",
+                "Action": "iam:PassRole",
+                "Resource": f"arn:aws:iam::{account}:role/*-agentcore-runtime",
+                "Condition": {
+                    "StringEquals": {
+                        "iam:PassedToService": "bedrock-agentcore.amazonaws.com"
+                    }
+                },
+            },
+            {
+                "Sid": "RegistrySyncAndStackOutputs",
+                "Effect": "Allow",
+                "Action": [
+                    "ssm:PutParameter",
+                    "ssm:GetParameter",
+                    "cloudformation:DescribeStacks",
+                ],
+                "Resource": "*",
+            },
+            {
+                "Sid": "BedrockInvoke",
+                "Effect": "Allow",
+                "Action": [
+                    "bedrock:InvokeModel",
+                    "bedrock:InvokeModelWithResponseStream",
+                    "bedrock:ApplyGuardrail",
+                ],
+                "Resource": "*",
+            },
+            {
+                "Sid": "DashboardPublish",
+                "Effect": "Allow",
+                "Action": [
+                    "s3:PutObject",
+                    "s3:DeleteObject",
+                    "s3:ListBucket",
+                    "cloudfront:CreateInvalidation",
+                ],
+                "Resource": [
+                    f"arn:aws:s3:::sdlc-agent-dashboard-{account}-*",
+                    f"arn:aws:s3:::sdlc-agent-dashboard-{account}-*/*",
+                    f"arn:aws:cloudfront::{account}:distribution/*",
+                ],
+            },
+            {
+                "Sid": "InspectorScan",
+                "Effect": "Allow",
+                "Action": "inspector-scan:ScanSbom",
+                "Resource": "*",
+            },
+        ],
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Command execution
 # --------------------------------------------------------------------------- #
 
 
 class Runner:
-    """Runs shell commands, honoring --dry-run (print, don't execute)."""
+    """Runs shell commands, honoring --dry-run (print, don't execute).
+
+    Mutating AWS/gh calls go through ``step()``, which records failures rather
+    than raising — so one failed IAM/gh call doesn't abort the whole run, but
+    the failures are collected and surfaced at the end (main() aborts with a
+    summary instead of falsely reporting success). ``run()``/``aws()`` keep the
+    raise-on-failure default for the few hard gates (sam) that must stop the run.
+    """
 
     def __init__(self, dry_run: bool, profile: str | None, region: str):
         self.dry_run = dry_run
         self.profile = profile
         self.region = region
+        self.failures: list[str] = []
 
     def _aws_base(self) -> list[str]:
         base = ["aws"]
@@ -335,6 +440,25 @@ class Runner:
     def aws(self, args: list[str], capture: bool = False, check: bool = True):
         return self.run(self._aws_base() + args, capture=capture, check=check)
 
+    def aws_step(self, label: str, args: list[str]) -> bool:
+        """Run a mutating aws command, recording (not raising) on failure."""
+        return self.step(label, self._aws_base() + args)
+
+    def step(self, label: str, cmd: list[str]) -> bool:
+        """Run a mutating command; on non-zero exit, record the failure under
+        ``label`` and return False (never raises). Returns True on success or
+        under --dry-run."""
+        result = self.run(cmd, capture=True, check=False)
+        if result is None:  # dry-run
+            return True
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip().splitlines()
+            msg = detail[-1] if detail else f"exit {result.returncode}"
+            self.failures.append(f"{label}: {msg}")
+            print(f"    ⚠️  {label} failed: {msg}")
+            return False
+        return True
+
     def aws_json(self, args: list[str]):
         result = self.aws(args + ["--output", "json"], capture=True, check=False)
         if result is None or result.returncode != 0 or not result.stdout.strip():
@@ -343,6 +467,24 @@ class Runner:
             return json.loads(result.stdout)
         except json.JSONDecodeError:
             return None
+
+    def aws_exists(self, args: list[str]) -> bool | None:
+        """Existence check for a get-* call that distinguishes a genuine
+        'not found' from a transient/permission error. Returns True (exists),
+        False (genuinely absent — NoSuchEntity/NotFound/ResourceNotFound), or
+        None (couldn't tell: transient error or dry-run — caller should not
+        blindly take the create path). check=False so a 404 isn't fatal."""
+        result = self.aws(args + ["--output", "json"], capture=True, check=False)
+        if result is None:  # dry-run
+            return None
+        if result.returncode == 0:
+            return True
+        err = ((result.stderr or "") + (result.stdout or "")).lower()
+        if any(
+            marker in err for marker in ("nosuchentity", "notfound", "does not exist")
+        ):
+            return False
+        return None  # ambiguous — don't assume absent
 
     def run(
         self,
@@ -451,12 +593,21 @@ def gather_config(cfg: dict) -> dict:
 def ensure_oidc_provider(runner: Runner, account: str) -> None:
     print("\n== GitHub OIDC provider ==")
     arn = f"arn:aws:iam::{account}:oidc-provider/token.actions.githubusercontent.com"
-    if runner.aws_json(
+    exists = runner.aws_exists(
         ["iam", "get-open-id-connect-provider", "--open-id-connect-provider-arn", arn]
-    ):
+    )
+    if exists:
         print("  OIDC provider: exists (skip create)")
         return
-    runner.aws(
+    if exists is None and not runner.dry_run:
+        # Ambiguous (transient/permission error) — don't blindly create; record.
+        runner.failures.append("oidc-provider: could not determine if it exists")
+        print(
+            "    ⚠️  could not check the OIDC provider — skipping create to avoid a dup"
+        )
+        return
+    runner.aws_step(
+        "create OIDC provider",
         [
             "iam",
             "create-open-id-connect-provider",
@@ -467,16 +618,30 @@ def ensure_oidc_provider(runner: Runner, account: str) -> None:
             "--thumbprint-list",
             GITHUB_OIDC_THUMBPRINT,
         ],
-        check=False,
     )
 
 
-def ensure_deploy_role(runner: Runner, account: str, owner: str, repo: str) -> str:
+def ensure_deploy_role(
+    runner: Runner, account: str, region: str, owner: str, repo: str
+) -> str | None:
+    """Create/update the CI deploy role and return its ARN — or None if we
+    couldn't confirm the role actually exists afterward (so a fabricated ARN is
+    never handed on to the GitHub secret)."""
     print("\n== CI deploy role ==")
     trust = deploy_role_trust(account, owner, repo)
-    if runner.aws_json(["iam", "get-role", "--role-name", DEPLOY_ROLE_NAME]):
+    exists = runner.aws_exists(["iam", "get-role", "--role-name", DEPLOY_ROLE_NAME])
+    if exists is None and not runner.dry_run:
+        runner.failures.append(
+            f"deploy role: could not check whether {DEPLOY_ROLE_NAME} exists"
+        )
+        print(
+            "    ⚠️  could not check the deploy role — skipping to avoid a wrong-branch write"
+        )
+        return None
+    if exists:
         print(f"  role {DEPLOY_ROLE_NAME}: exists — updating trust policy to this repo")
-        runner.aws(
+        runner.aws_step(
+            "update deploy-role trust",
             [
                 "iam",
                 "update-assume-role-policy",
@@ -485,10 +650,10 @@ def ensure_deploy_role(runner: Runner, account: str, owner: str, repo: str) -> s
                 "--policy-document",
                 json.dumps(trust),
             ],
-            check=False,
         )
     else:
-        runner.aws(
+        runner.aws_step(
+            "create deploy role",
             [
                 "iam",
                 "create-role",
@@ -499,27 +664,33 @@ def ensure_deploy_role(runner: Runner, account: str, owner: str, repo: str) -> s
                 "--description",
                 "Assumed by GitHub Actions via OIDC to deploy the SDLC agent fleet",
             ],
-            check=False,
         )
-    # AdministratorAccess is the documented demo default; production should scope
-    # this down (docs/aws-deploy.md §1.3). Attach it AND print the note, rather
-    # than silently over-granting.
-    runner.aws(
+    # Scoped deploy policy (not AdministratorAccess) — only what the CI deploy
+    # workflows actually do. See deploy_role_policy() for the rationale.
+    runner.aws_step(
+        "attach deploy-role policy",
         [
             "iam",
-            "attach-role-policy",
+            "put-role-policy",
             "--role-name",
             DEPLOY_ROLE_NAME,
-            "--policy-arn",
-            "arn:aws:iam::aws:policy/AdministratorAccess",
+            "--policy-name",
+            "sdlc-agents-deploy",
+            "--policy-document",
+            json.dumps(deploy_role_policy(region, account)),
         ],
-        check=False,
     )
-    print(
-        "  NOTE: attached AdministratorAccess (demo default). For production, scope it "
-        "down — see docs/aws-deploy.md §1.3."
-    )
-    return f"arn:aws:iam::{account}:role/{DEPLOY_ROLE_NAME}"
+    # Verify the role really exists before handing its ARN to the GitHub secret,
+    # so a failed create above can't publish an ARN CI will fail to assume.
+    if runner.dry_run:
+        return f"arn:aws:iam::{account}:role/{DEPLOY_ROLE_NAME}"
+    confirmed = runner.aws_json(["iam", "get-role", "--role-name", DEPLOY_ROLE_NAME])
+    if not confirmed:
+        runner.failures.append(
+            f"deploy role {DEPLOY_ROLE_NAME} was not created — CI will have no role to assume"
+        )
+        return None
+    return confirmed["Role"]["Arn"]
 
 
 def ensure_agent_roles(
@@ -528,7 +699,14 @@ def ensure_agent_roles(
     print("\n== Per-agent runtime IAM roles ==")
     for agent in agents:
         role = f"{agent}-agentcore-runtime"
-        if runner.aws_json(["iam", "get-role", "--role-name", role]):
+        exists = runner.aws_exists(["iam", "get-role", "--role-name", role])
+        if exists is None and not runner.dry_run:
+            runner.failures.append(f"{role}: could not check whether it exists")
+            print(
+                f"    ⚠️  could not check {role} — skipping to avoid a wrong-branch write"
+            )
+            continue
+        if exists:
             print(f"  role {role}: exists (updating policies)")
         else:
             trust = {
@@ -541,7 +719,8 @@ def ensure_agent_roles(
                     }
                 ],
             }
-            runner.aws(
+            runner.aws_step(
+                f"create role {role}",
                 [
                     "iam",
                     "create-role",
@@ -552,9 +731,9 @@ def ensure_agent_roles(
                     "--description",
                     f"AgentCore runtime role for {agent}",
                 ],
-                check=False,
             )
-        runner.aws(
+        runner.aws_step(
+            f"attach BedrockFullAccess to {role}",
             [
                 "iam",
                 "attach-role-policy",
@@ -563,10 +742,10 @@ def ensure_agent_roles(
                 "--policy-arn",
                 "arn:aws:iam::aws:policy/AmazonBedrockFullAccess",
             ],
-            check=False,
         )
         for name, doc in agent_role_policies(agent, region, account, stage).items():
-            runner.aws(
+            runner.aws_step(
+                f"put {name} on {role}",
                 [
                     "iam",
                     "put-role-policy",
@@ -577,7 +756,6 @@ def ensure_agent_roles(
                     "--policy-document",
                     json.dumps(doc),
                 ],
-                check=False,
             )
 
 
@@ -620,7 +798,7 @@ def stack_outputs(runner: Runner, stack: str) -> dict[str, str]:
 
 
 def set_github_config(
-    runner: Runner, cfg: dict, account: str, deploy_role_arn: str
+    runner: Runner, cfg: dict, account: str, deploy_role_arn: str | None
 ) -> None:
     """Set the Actions secrets + variables the deploy workflows read, via gh."""
     print("\n== GitHub Actions secrets + variables ==")
@@ -628,19 +806,30 @@ def set_github_config(
     if not repo:
         print("  (no target repo set — skipping; set secrets/vars manually)")
         return
-    secrets = {"AWS_DEPLOY_ROLE_ARN": deploy_role_arn, "AWS_ACCOUNT_ID": account}
+    if not deploy_role_arn and not runner.dry_run:
+        # The deploy role wasn't confirmed (see ensure_deploy_role) — do NOT
+        # write a role ARN CI can't assume. Record and skip the ARN secret.
+        runner.failures.append(
+            "skipped AWS_DEPLOY_ROLE_ARN secret — deploy role was not confirmed"
+        )
+        print("    ⚠️  deploy role not confirmed — not setting AWS_DEPLOY_ROLE_ARN")
+    secrets = {"AWS_ACCOUNT_ID": account}
+    if deploy_role_arn:
+        secrets["AWS_DEPLOY_ROLE_ARN"] = deploy_role_arn
     variables = {"AWS_REGION": runner.region, "TARGET_REPO": repo}
     if cfg.get("asana_project_gid"):
         variables["ASANA_PROJECT_GID"] = cfg["asana_project_gid"]
     if cfg.get("asana_workspace_gid"):
         variables["ASANA_WORKSPACE_GID"] = cfg["asana_workspace_gid"]
     for key, val in secrets.items():
-        runner.run(
-            ["gh", "secret", "set", key, "--repo", repo, "--body", val], check=False
+        runner.step(
+            f"gh secret {key}",
+            ["gh", "secret", "set", key, "--repo", repo, "--body", val],
         )
     for key, val in variables.items():
-        runner.run(
-            ["gh", "variable", "set", key, "--repo", repo, "--body", val], check=False
+        runner.step(
+            f"gh variable {key}",
+            ["gh", "variable", "set", key, "--repo", repo, "--body", val],
         )
 
 
@@ -747,12 +936,24 @@ def main() -> int:
         return 0
 
     ensure_oidc_provider(runner, account)
-    deploy_role_arn = ensure_deploy_role(runner, account, owner, repo)
+    deploy_role_arn = ensure_deploy_role(runner, account, region, owner, repo)
     ensure_agent_roles(runner, agents, region, account, cfg["stage"])
     deploy_foundation(runner, cfg)
     outputs = stack_outputs(runner, f"sdlc-agents-{cfg['stage']}")
     set_github_config(runner, cfg, account, deploy_role_arn)
     check_secrets(runner, agents)
+
+    # A swallowed IAM/gh failure must not read as success — surface them and
+    # exit non-zero so the operator fixes the setup before pushing to CI.
+    if runner.failures:
+        print(f"\n== Bootstrap finished with {len(runner.failures)} problem(s) ==")
+        for f in runner.failures:
+            print(f"  ✗ {f}")
+        print(
+            "\nThe setup is incomplete — resolve the above (often a permissions or gh-scope\n"
+            "issue) and re-run (the script is idempotent). Do NOT push to CI yet."
+        )
+        return 1
 
     print("\n== Bootstrap complete — hand off to CI ==")
     print("  1. Populate any missing SSM secrets (see above).")
