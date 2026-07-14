@@ -6,6 +6,7 @@ A FakeTable emulates just enough of the boto3 resource Table API — a
 """
 
 import sys
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,22 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import queries  # noqa: E402
+
+
+def test_encode_cursor_handles_decimal():
+    # Regression: DynamoDB returns Decimal numbers; json.dumps must not choke.
+    key = {
+        "assignment_id": "a-1",
+        "gsi_all": "run",
+        "created_at": Decimal("1784041404"),
+    }
+    token = queries._encode_cursor(key)
+    assert token
+    assert queries._decode_cursor(token) == {
+        "assignment_id": "a-1",
+        "gsi_all": "run",
+        "created_at": 1784041404,  # integral Decimal → int on round-trip
+    }
 
 
 def _run(i, **over):
@@ -54,7 +71,10 @@ class FakeTable:
             resp["LastEvaluatedKey"] = {
                 "assignment_id": last["assignment_id"],
                 "gsi_all": last["gsi_all"],
-                "created_at": last["created_at"],
+                # boto3's resource interface returns numbers as Decimal — the
+                # cursor encoder must handle that (regression: a plain int here
+                # hid a json.dumps(Decimal) TypeError that 500'd real paging).
+                "created_at": Decimal(str(last["created_at"])),
             }
         return resp
 

@@ -20,6 +20,7 @@ opaque base64 JSON.
 import base64
 import json
 import os
+from decimal import Decimal
 
 import boto3
 from boto3.dynamodb.conditions import Key
@@ -67,10 +68,21 @@ def _get_table():
     return _table
 
 
+def _cursor_default(o):
+    # DynamoDB's resource interface returns numbers (e.g. created_at) as Decimal,
+    # which json.dumps can't serialize. Encode as int when integral (created_at
+    # is epoch seconds) else float, so the round-tripped ExclusiveStartKey keeps
+    # its numeric type when it goes back to DynamoDB.
+    if isinstance(o, Decimal):
+        return int(o) if o == o.to_integral_value() else float(o)
+    raise TypeError(f"unencodable cursor value: {type(o).__name__}")
+
+
 def _encode_cursor(last_evaluated_key: dict | None) -> str | None:
     if not last_evaluated_key:
         return None
-    return base64.urlsafe_b64encode(json.dumps(last_evaluated_key).encode()).decode()
+    raw = json.dumps(last_evaluated_key, default=_cursor_default)
+    return base64.urlsafe_b64encode(raw.encode()).decode()
 
 
 def _decode_cursor(token: str | None) -> dict | None:
