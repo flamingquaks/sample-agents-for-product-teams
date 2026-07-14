@@ -16,6 +16,7 @@ Beyond status, agents enrich the run record the monitoring dashboard reads:
   exist at dispatch time.
 """
 
+import json
 import logging
 import os
 import re
@@ -70,28 +71,80 @@ def extract_token_usage(result) -> int | None:
 # trailing (?!\d) stops a longer number from being truncated.
 _PR_URL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/(\d+)(?!\d)")
 
+# GitHub MCP tool names that create a PR or branch, and the input keys that
+# carry the branch. Tool names vary across MCP server versions, so match on a
+# substring rather than an exact name.
+_PR_TOOL_HINT = "pull_request"
+_BRANCH_KEYS = ("head", "branch", "head_ref", "branchName")
+
+
+def _walk_content_blocks(messages):
+    """Yield each content block across a Strands conversation (agent.messages).
+    Each message is {role, content:[block,...]}; a block may carry toolUse or
+    toolResult. Tolerant of odd shapes — yields nothing rather than raising."""
+    for msg in messages or []:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        for block in content or []:
+            if isinstance(block, dict):
+                yield block
+
+
+def _first_pr_url(text: str) -> tuple[str, str] | None:
+    m = _PR_URL_RE.search(text or "")
+    return (m.group(0), m.group(1)) if m else None
+
+
+def extract_trace_refs_from_messages(messages) -> dict:
+    """Mine branch/PR trace refs from the agent's tool-call transcript.
+
+    Strands keeps the full conversation on ``agent.messages``. When an agent
+    opens a PR through the GitHub MCP server, the transcript carries:
+      - a ``toolUse`` block for the create-PR call whose ``input`` includes the
+        head branch (``head``/``branch``/…), and
+      - a ``toolResult`` block with the PR object (its text carries the
+        ``html_url``).
+    This is the reliable, structured source — unlike scraping the final prose —
+    so we can capture the *branch* here too, not just the PR number. Returns
+    ``{}`` when nothing matches; never raises.
+    """
+    refs: dict = {}
+    try:
+        for block in _walk_content_blocks(messages):
+            use = block.get("toolUse")
+            if isinstance(use, dict) and _PR_TOOL_HINT in str(use.get("name", "")).lower():
+                inp = use.get("input")
+                if isinstance(inp, dict):
+                    for key in _BRANCH_KEYS:
+                        val = inp.get(key)
+                        if isinstance(val, str) and val.strip():
+                            refs.setdefault("branch", val.strip())
+                            break
+            # PR url can appear in a toolResult's text content or in prose;
+            # scan the block's stringified content for it.
+            if "pr_url" not in refs:
+                found = _first_pr_url(json.dumps(block, default=str))
+                if found:
+                    refs["pr_url"], refs["pr_number"] = found
+    except Exception:
+        logger.debug("Could not extract trace refs from messages", exc_info=True)
+    return refs
+
 
 def extract_trace_refs_from_result(result) -> dict:
-    """Best-effort branch/PR trace refs parsed from the agent's final text.
+    """Best-effort branch/PR trace refs for a completed run.
 
-    The agents are asked to report full PR ``html_url``s in their result
-    (workitems/docwriter). This scans that text for a GitHub PR URL and, when
-    found, returns ``{"pr_url", "pr_number"}`` so the run becomes traceable by
-    PR — the identifiers don't exist at dispatch time, only after the agent
-    opens the PR. Returns an empty dict when nothing is found; never raises
-    (trace capture must not break completion).
-
-    Branch names are intentionally not scraped from free text: agents don't
-    emit them in a stable, unambiguous form, and a wrong branch chip is worse
-    than none. An agent that knows its branch precisely can still call
-    ``update_trace_refs(assignment_id, branch=...)`` directly.
+    Prefers the structured tool-call transcript (``result.message`` history via
+    the agent, passed as ``messages``) but this convenience wrapper works from
+    the result's final text alone: it scans for a GitHub PR ``html_url`` (which
+    the workitems/docwriter prompts require agents to report) → ``{pr_url,
+    pr_number}`` so the run is traceable by PR. Branch is *not* recoverable from
+    final text (no stable form there) — callers that have the conversation
+    should use ``extract_trace_refs_from_messages`` to also capture the branch.
+    Returns ``{}`` when nothing is found; never raises.
     """
     try:
-        text = str(result)
-        match = _PR_URL_RE.search(text)
-        if not match:
-            return {}
-        return {"pr_url": match.group(0), "pr_number": match.group(1)}
+        found = _first_pr_url(str(result))
+        return {"pr_url": found[0], "pr_number": found[1]} if found else {}
     except Exception:
         logger.debug("Could not extract trace refs from result", exc_info=True)
         return {}

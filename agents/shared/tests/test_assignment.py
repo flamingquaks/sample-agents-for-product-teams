@@ -109,6 +109,64 @@ def test_extract_trace_refs_tolerates_non_string():
     assert asg.extract_trace_refs_from_result(object()) == {}
 
 
+# --- extract_trace_refs_from_messages (structured tool transcript) -----------
+
+
+def test_messages_extract_branch_and_pr_from_tool_calls():
+    # Mirrors a Strands conversation where the agent opened a PR via the GitHub
+    # MCP server: a toolUse (create_pull_request) with the head branch, then a
+    # toolResult carrying the PR html_url.
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "toolUse": {
+                        "name": "github_create_pull_request",
+                        "toolUseId": "t1",
+                        "input": {"head": "docs/17-readme", "base": "main", "title": "docs"},
+                    }
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "toolResult": {
+                        "toolUseId": "t1",
+                        "content": [
+                            {"text": '{"html_url": "https://github.com/acme/web/pull/9"}'}
+                        ],
+                    }
+                }
+            ],
+        },
+    ]
+    assert asg.extract_trace_refs_from_messages(messages) == {
+        "branch": "docs/17-readme",
+        "pr_url": "https://github.com/acme/web/pull/9",
+        "pr_number": "9",
+    }
+
+
+def test_messages_extract_none_when_no_pr_tool():
+    messages = [
+        {"role": "assistant", "content": [{"text": "just a comment, no PR"}]},
+        {
+            "role": "assistant",
+            "content": [{"toolUse": {"name": "github_add_comment", "input": {"body": "hi"}}}],
+        },
+    ]
+    assert asg.extract_trace_refs_from_messages(messages) == {}
+
+
+def test_messages_extract_tolerates_junk():
+    # Odd/empty shapes must not raise.
+    assert asg.extract_trace_refs_from_messages(None) == {}
+    assert asg.extract_trace_refs_from_messages([{}, {"content": None}, "nope"]) == {}
+
+
 # --- complete_assignment -----------------------------------------------------
 
 

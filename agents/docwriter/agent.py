@@ -20,6 +20,7 @@ from strands_tools.agent_core_memory import AgentCoreMemoryToolProvider
 from shared.assignment import (
     complete_assignment,
     extract_token_usage,
+    extract_trace_refs_from_messages,
     extract_trace_refs_from_result,
     fail_assignment,
     update_trace_refs,
@@ -153,9 +154,15 @@ def invoke(payload, context=None):
             result_summary=str(result)[:500],
             token_usage=extract_token_usage(result),
         )
-        # If the run opened a doc PR, record it as a trace ref so the work is
-        # traceable by PR on the dashboard. Best-effort — never blocks the run.
-        refs = extract_trace_refs_from_result(result)
+        # If the run opened a doc PR, record branch/PR as trace refs so the work
+        # is traceable on the dashboard. docwriter opens the PR itself via the
+        # GitHub MCP server, so the tool-call transcript (agent.messages) carries
+        # the branch and PR — the reliable, structured source. Fall back to the
+        # PR url in the final text. Best-effort — never blocks the run.
+        refs = {
+            **extract_trace_refs_from_result(result),
+            **extract_trace_refs_from_messages(getattr(agent, "messages", None)),
+        }
         if refs:
             try:
                 update_trace_refs(assignment_id, **refs)
