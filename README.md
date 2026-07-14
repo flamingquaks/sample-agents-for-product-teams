@@ -123,25 +123,32 @@ The skill will:
 The region you pick is written to `.sdlc-agents/selection.yaml` and reused by
 every downstream step — nothing in the install path is hard-coded to `us-west-2`.
 
-## Setup (interactive script)
+## Setup (interactive bootstrap)
 
-The fastest self-serve path — no CI, no GitHub OIDC role — is the interactive
-deploy script. It uses the AWS profile/credentials you pick, so a human with
-console access can stand up the fleet directly:
+The cumbersome part of standing up the fleet is the one-time, privileged setup
+that CI depends on but can't create for itself — the GitHub OIDC provider, the
+deploy role, the per-agent IAM runtime roles, and the GitHub Actions
+secrets/variables. The interactive bootstrap script does exactly that, using an
+AWS profile you pick, then **hands ongoing deployment to CI**:
 
 ```bash
-python scripts/deploy.py            # walks you through it
-python scripts/deploy.py --dry-run  # show the plan first, touch nothing
+python scripts/bootstrap.py            # walks you through it
+python scripts/bootstrap.py --dry-run  # show the plan first, touch nothing
 ```
 
-It preflights the required tools (`aws`, `sam`, `docker`) with install guidance
-if any are missing, lets you choose an AWS profile + region (and confirms the
+It preflights the required tools (`aws`, `sam`, `gh`) with install guidance if
+any are missing, lets you choose an AWS profile + region (and confirms the
 account), collects config (stage, target repo, Asana GIDs — remembered in
-`.sdlc-agents/deploy.config.json` for re-runs), then deploys the foundation
-stack, checks that each selected agent's SSM secrets are present, and creates
-each agent's IAM role, ECR repo, image, and AgentCore Runtime — idempotently.
-Secrets themselves are still populated by the bootstrap scripts below (the
-deploy script tells you which ones are missing).
+`.sdlc-agents/bootstrap.config.json` for re-runs), then creates the OIDC
+provider + repo-scoped deploy role, the per-agent runtime IAM roles, deploys the
+foundation stack, sets the GitHub Actions secrets/variables, and preflights the
+SSM secrets (pointing you at the bootstrap scripts for any that are missing — it
+doesn't handle secrets itself). Everything is idempotent.
+
+It deliberately does **not** build images or create AgentCore runtimes — that's
+CI's job (`deploy-agent.yml`), the single source of truth for agent deploys.
+Once bootstrap finishes, you push to `main` and the per-agent workflows deploy
+the agents.
 
 ## Setup (manual)
 
@@ -226,7 +233,7 @@ ECR repositories are created with `IMMUTABLE` tag mutability — each push must 
 
 Under `scripts/`:
 
-- `deploy.py` — interactive end-to-end deploy (see [Setup (interactive script)](#setup-interactive-script)); preflights tooling, collects config, and provisions the foundation stack + selected agents using your chosen AWS profile
+- `bootstrap.py` — interactive one-time setup (see [Setup (interactive bootstrap)](#setup-interactive-bootstrap)); preflights tooling, creates the OIDC provider + deploy role + per-agent runtime roles, deploys the foundation stack, and sets the GitHub Actions secrets/variables, then hands agent deploys to CI
 - `bootstrap_asana_oauth.py` — one-shot OAuth 2.0 dance for the Asana MCP server; stores the refresh token in SSM
 - `bootstrap_jira_oauth.py` — same thing for Atlassian/Jira (3LO)
 - `bootstrap_asana_webhook.py` — operator-run webhook registration; attaches a temporary `ssm:PutParameter` policy to the webhook Lambda's role so the Asana handshake can persist the shared secret, then removes the policy
