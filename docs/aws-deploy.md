@@ -22,6 +22,26 @@ Deployed once per stage with `sam deploy`. Creates:
 
 **Outputs:** `AssignmentsTableName`, `ArtifactsBucketName`, `DispatchRouterArn`, `WebhookEndpoint` (Asana webhook URL), `WebhookApiId`.
 
+**Optional — fleet monitoring dashboard (`DeployDashboard=true`).** Off by
+default; set the SAM parameter `DeployDashboard=true` to provision an
+operator-only, read-only web view of agent runs. When enabled the foundation
+stack additionally creates:
+
+| Resource | Logical name | Purpose |
+|---|---|---|
+| Cognito user pool + group + client + domain | `sdlc-agents-dashboard-${Stage}` (+ `operators` group) | Operator login (Hosted UI, PKCE); the `operators` group gates API access |
+| Lambda + API Gateway | `dashboard-query-${Stage}` / `DashboardApi` | Read-only query API (`/runs`, `/runs/{id}`, `/trace`, `/stats`), Cognito-authorized |
+| S3 bucket + CloudFront (OAC) | `sdlc-agent-dashboard-${AWS::AccountId}-${Stage}` / `DashboardDistribution` | Hosts the SPA (private bucket, served only via CloudFront) |
+
+Additional outputs (present only when enabled): `DashboardUrl` (the operator
+entry point), `DashboardApiEndpoint`, `DashboardUserPoolId`,
+`DashboardUserPoolClientId`, `DashboardLoginDomain`, `DashboardSiteBucketName`,
+`DashboardDistributionId`. The SPA lives in `dashboard/` and is published by
+`.github/workflows/deploy-dashboard.yml` (build → write `config.json` from these
+outputs → S3 sync → CloudFront invalidation). Operators are created by an admin
+(no self sign-up) and must be added to the `operators` group. See
+`dashboard/README.md`.
+
 ### 1.2 Per-agent runtime (created by the deploy pipeline, not SAM)
 
 Each agent creates its own AWS resources when its deploy workflow runs for the first time:
@@ -40,7 +60,7 @@ Four agents ship today, so the per-agent surface is **four of each** of the abov
 The GitHub Actions workflows assume an IAM role via OIDC. This is **not created by the foundation stack.** You must create it yourself (the `sdlc-agents-provision-aws` skill walks through it). The role needs:
 
 - Trust policy allowing `token.actions.githubusercontent.com`, with `sub` restricted via `StringEquals` to the exact subjects your workflows use. For this repo that's two subjects: `repo:<your-org>/<your-repo>:ref:refs/heads/main` (covers `push`-to-main events for the deploy workflows, and comment-driven triggers like `issue_comment` / `pull_request_review_comment` in `agent-dispatch.yml` and `claude-code.yml` — all of which run on the default branch) and `repo:<your-org>/<your-repo>:pull_request` (covers the `pull_request: [opened, synchronize]` trigger in `claude-code.yml`, which auto-reviews new PRs). Do **not** use `StringLike: "repo:<org>/<repo>:*"` — that allows any branch, tag, or environment in the repo to assume the role, including feature branches a contributor can push without review. Re-check this list if you add workflows that use `workflow_dispatch`, `schedule`, or `workflow_call` from a different repo — those may emit different `sub` claims.
-- `AdministratorAccess` or a tighter scoped policy covering: ECR push, `bedrock-agentcore:*`, Lambda invoke on the Dispatch Router, CloudFormation/SAM operations for the foundation stack
+- `AdministratorAccess` or a tighter scoped policy covering: ECR push, `bedrock-agentcore:*`, Lambda invoke on the Dispatch Router, CloudFormation/SAM operations for the foundation stack. **If the dashboard is enabled (`DeployDashboard=true`),** the same role also needs: S3 (`s3:CreateBucket`/`PutObject`/`ListBucket`/`DeleteObject` + bucket policy) for the SPA bucket, CloudFront (`cloudfront:CreateDistribution`/`UpdateDistribution`/`CreateOriginAccessControl`/`CreateInvalidation`), and Cognito (`cognito-idp:*` on the pool) to create/update those resources and publish the SPA. A tightly scoped deploy role will roll back with `AccessDenied` if these are missing — grant them before enabling the flag.
 - OIDC provider for `token.actions.githubusercontent.com` with `sts.amazonaws.com` audience and the GitHub thumbprint
 
 The role ARN goes into the target repo's GitHub Actions secrets as `AWS_DEPLOY_ROLE_ARN`.

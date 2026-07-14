@@ -529,13 +529,15 @@ Resources:
       AllowedOAuthFlowsUserPoolClient: true
       AllowedOAuthScopes: [openid, email, profile]
       SupportedIdentityProviders: [COGNITO]
-      # Callback/logout URLs are set to the CloudFront domain once the SPA
-      # ships; localhost is included so the SPA can be developed against a
-      # real pool before the distribution exists.
+      # The CloudFront URL is the real operator entry point; localhost is kept so
+      # the SPA can run against a real pool during development. Trailing slash
+      # matches the SPA's redirectUri (origin + base path).
       CallbackURLs:
         - http://localhost:5173/
+        - !Sub https://${DashboardDistribution.DomainName}/
       LogoutURLs:
         - http://localhost:5173/
+        - !Sub https://${DashboardDistribution.DomainName}/
       ExplicitAuthFlows:
         - ALLOW_USER_SRP_AUTH
         - ALLOW_REFRESH_TOKEN_AUTH
@@ -662,6 +664,96 @@ Resources:
             Method: GET
             RestApiId: !Ref DashboardApi
 
+  # --- SPA hosting: private S3 + CloudFront (OAC) ----------------------------
+  # The built SPA is uploaded to a private bucket (account Block Public Access
+  # stays on, consistent with the artifacts/logs buckets) and served only
+  # through CloudFront via Origin Access Control. The deploy workflow
+  # (.github/workflows/deploy-dashboard.yml) syncs dist/ and writes config.json.
+
+  DashboardSiteBucket:
+    Type: AWS::S3::Bucket
+    Condition: DashboardEnabled
+    Properties:
+      BucketName: !Sub sdlc-agent-dashboard-${AWS::AccountId}-${Stage}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Project
+          Value: sdlc-agents
+
+  # Grants the CloudFront distribution (and only it) read access to the private
+  # bucket, scoped by the distribution ARN via the OAC service principal.
+  DashboardSiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: DashboardEnabled
+    Properties:
+      Bucket: !Ref DashboardSiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontOACRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${DashboardSiteBucket.Arn}/*
+            Condition:
+              StringEquals:
+                "AWS:SourceArn": !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${DashboardDistribution}
+
+  DashboardOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Condition: DashboardEnabled
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub sdlc-agents-dashboard-oac-${Stage}
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  DashboardDistribution:
+    Type: AWS::CloudFront::Distribution
+    Condition: DashboardEnabled
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub SDLC Agent Fleet dashboard (${Stage})
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        # SPA client-side routing / deep links: a request for a path the bucket
+        # doesn't have (e.g. after the OIDC redirect) must serve index.html so
+        # the app boots and handles the route, rather than CloudFront 403/404.
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+        Origins:
+          - Id: DashboardS3Origin
+            DomainName: !GetAtt DashboardSiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt DashboardOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: DashboardS3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          # AWS managed "CachingOptimized" cache policy.
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+
 Outputs:
   AssignmentsTableName:
     Value: !Ref AssignmentsTable
@@ -728,3 +820,18 @@ Outputs:
     # re-deriving the literal, so this can't drift from the Domain property.
     Value: !Sub https://${DashboardUserPoolDomain}.auth.${AWS::Region}.amazoncognito.com
     Description: Cognito Hosted UI domain for operator login
+
+  DashboardUrl:
+    Condition: DashboardEnabled
+    Value: !Sub https://${DashboardDistribution.DomainName}/
+    Description: CloudFront URL of the fleet dashboard — the operator entry point
+
+  DashboardSiteBucketName:
+    Condition: DashboardEnabled
+    Value: !Ref DashboardSiteBucket
+    Description: S3 bucket the deploy workflow syncs the built SPA into
+
+  DashboardDistributionId:
+    Condition: DashboardEnabled
+    Value: !Ref DashboardDistribution
+    Description: CloudFront distribution id — used to invalidate the cache on deploy
