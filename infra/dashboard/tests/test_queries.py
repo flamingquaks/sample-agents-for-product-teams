@@ -17,7 +17,9 @@ import queries  # noqa: E402
 
 
 def test_encode_cursor_handles_decimal():
-    # Regression: DynamoDB returns Decimal numbers; json.dumps must not choke.
+    # Regression: DynamoDB returns Decimal numbers; json.dumps must not choke,
+    # and the round-trip must revive numbers as Decimal (not float) so the
+    # cursor is a boto3-accepted ExclusiveStartKey.
     key = {
         "assignment_id": "a-1",
         "gsi_all": "run",
@@ -28,8 +30,23 @@ def test_encode_cursor_handles_decimal():
     assert queries._decode_cursor(token) == {
         "assignment_id": "a-1",
         "gsi_all": "run",
-        "created_at": 1784041404,  # integral Decimal → int on round-trip
+        "created_at": Decimal("1784041404"),
     }
+
+
+def test_cursor_round_trip_preserves_decimal_type():
+    # A fractional value must survive as Decimal, never a Python float (which
+    # boto3 rejects as an ExclusiveStartKey) — this is the hardening that frees
+    # the round-trip from the "created_at is always integral" write invariant.
+    key = {"assignment_id": "a-1", "gsi_all": "run", "created_at": Decimal("1.5")}
+    revived = queries._decode_cursor(queries._encode_cursor(key))
+    assert revived["created_at"] == Decimal("1.5")
+    assert isinstance(revived["created_at"], Decimal)
+
+
+def test_decode_cursor_malformed_returns_none():
+    assert queries._decode_cursor("!!not-base64!!") is None
+    assert queries._decode_cursor(None) is None
 
 
 def _run(i, **over):

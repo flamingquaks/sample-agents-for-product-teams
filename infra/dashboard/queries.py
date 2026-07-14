@@ -20,10 +20,10 @@ opaque base64 JSON.
 import base64
 import json
 import os
-from decimal import Decimal
 
 import boto3
 from boto3.dynamodb.conditions import Key
+from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
 
 # ALL_RUNS_PK / the index name are defined by the dispatch enrichment module and
 # the SAM template respectively; duplicated here as constants because the
@@ -68,28 +68,33 @@ def _get_table():
     return _table
 
 
-def _cursor_default(o):
-    # DynamoDB's resource interface returns numbers (e.g. created_at) as Decimal,
-    # which json.dumps can't serialize. Encode as int when integral (created_at
-    # is epoch seconds) else float, so the round-tripped ExclusiveStartKey keeps
-    # its numeric type when it goes back to DynamoDB.
-    if isinstance(o, Decimal):
-        return int(o) if o == o.to_integral_value() else float(o)
-    raise TypeError(f"unencodable cursor value: {type(o).__name__}")
+# A DynamoDB LastEvaluatedKey holds attribute values whose Python types
+# (Decimal for numbers, str for strings) don't all survive a plain JSON
+# round-trip and, when handed back as ExclusiveStartKey, must match the stored
+# attribute's DynamoDB type exactly. Rather than hand-encode types (a Python
+# float is rejected by boto3; a numeric string would be sent as a String-typed
+# key and mismatch a Number key), we round-trip through boto3's own wire form:
+# serialize each value to its ``{"N": "..."}`` / ``{"S": "..."}`` descriptor
+# (all JSON-native strings, lossless), then deserialize back to the exact Python
+# types (numbers → Decimal) on the way in. This is invariant-free: it doesn't
+# rely on created_at always being an integer.
+_ser = TypeSerializer()
+_deser = TypeDeserializer()
 
 
 def _encode_cursor(last_evaluated_key: dict | None) -> str | None:
     if not last_evaluated_key:
         return None
-    raw = json.dumps(last_evaluated_key, default=_cursor_default)
-    return base64.urlsafe_b64encode(raw.encode()).decode()
+    wire = {k: _ser.serialize(v) for k, v in last_evaluated_key.items()}
+    return base64.urlsafe_b64encode(json.dumps(wire).encode()).decode()
 
 
 def _decode_cursor(token: str | None) -> dict | None:
     if not token:
         return None
     try:
-        return json.loads(base64.urlsafe_b64decode(token.encode()).decode())
+        wire = json.loads(base64.urlsafe_b64decode(token.encode()).decode())
+        return {k: _deser.deserialize(v) for k, v in wire.items()}
     except Exception:
         # A malformed cursor resets to the first page rather than erroring — the
         # dashboard treats next_token as opaque and a bad one is non-fatal.
