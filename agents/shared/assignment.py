@@ -18,6 +18,7 @@ Beyond status, agents enrich the run record the monitoring dashboard reads:
 
 import logging
 import os
+import re
 import time
 from decimal import Decimal
 
@@ -62,6 +63,38 @@ def extract_token_usage(result) -> int | None:
     except Exception:
         logger.debug("Could not extract token usage from result", exc_info=True)
         return None
+
+
+# A GitHub PR URL as the agents are instructed to report it (workitems/prompts.py
+# requires the full html_url, e.g. https://github.com/owner/repo/pull/45). The
+# trailing (?!\d) stops a longer number from being truncated.
+_PR_URL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/(\d+)(?!\d)")
+
+
+def extract_trace_refs_from_result(result) -> dict:
+    """Best-effort branch/PR trace refs parsed from the agent's final text.
+
+    The agents are asked to report full PR ``html_url``s in their result
+    (workitems/docwriter). This scans that text for a GitHub PR URL and, when
+    found, returns ``{"pr_url", "pr_number"}`` so the run becomes traceable by
+    PR — the identifiers don't exist at dispatch time, only after the agent
+    opens the PR. Returns an empty dict when nothing is found; never raises
+    (trace capture must not break completion).
+
+    Branch names are intentionally not scraped from free text: agents don't
+    emit them in a stable, unambiguous form, and a wrong branch chip is worse
+    than none. An agent that knows its branch precisely can still call
+    ``update_trace_refs(assignment_id, branch=...)`` directly.
+    """
+    try:
+        text = str(result)
+        match = _PR_URL_RE.search(text)
+        if not match:
+            return {}
+        return {"pr_url": match.group(0), "pr_number": match.group(1)}
+    except Exception:
+        logger.debug("Could not extract trace refs from result", exc_info=True)
+        return {}
 
 
 def _get_table():

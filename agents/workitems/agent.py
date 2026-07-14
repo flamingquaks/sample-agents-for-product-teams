@@ -19,7 +19,13 @@ from mcp.client.streamable_http import streamablehttp_client
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from strands_tools.agent_core_memory import AgentCoreMemoryToolProvider
 
-from shared.assignment import complete_assignment, extract_token_usage, fail_assignment
+from shared.assignment import (
+    complete_assignment,
+    extract_token_usage,
+    extract_trace_refs_from_result,
+    fail_assignment,
+    update_trace_refs,
+)
 from shared.bedrock import build_model
 from prompts import SYSTEM_PROMPT
 from project_config import build_project_context
@@ -164,6 +170,14 @@ def invoke(payload, context=None):
             result_summary=str(result)[:500],
             token_usage=extract_token_usage(result),
         )
+        # If the run opened a PR, record it as a trace ref so the work is
+        # traceable by PR on the dashboard. Best-effort — never blocks the run.
+        refs = extract_trace_refs_from_result(result)
+        if refs:
+            try:
+                update_trace_refs(assignment_id, **refs)
+            except Exception:
+                logger.exception("update_trace_refs failed for %s", assignment_id)
 
     return {"result": str(result)}
 

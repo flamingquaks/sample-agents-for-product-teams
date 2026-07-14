@@ -83,6 +83,32 @@ def test_extract_token_usage_zero_is_none():
     assert asg.extract_token_usage(result) is None
 
 
+# --- extract_trace_refs_from_result ------------------------------------------
+
+
+def test_extract_trace_refs_finds_pr_url():
+    text = "All 3 issues done. PRs: https://github.com/acme/web/pull/45 and more."
+    assert asg.extract_trace_refs_from_result(text) == {
+        "pr_url": "https://github.com/acme/web/pull/45",
+        "pr_number": "45",
+    }
+
+
+def test_extract_trace_refs_none_when_no_pr():
+    assert asg.extract_trace_refs_from_result("Posted a status comment; no PR.") == {}
+
+
+def test_extract_trace_refs_ignores_issue_url():
+    # An issue URL is not a PR — must not be captured as pr_url.
+    text = "See https://github.com/acme/web/issues/12 for context."
+    assert asg.extract_trace_refs_from_result(text) == {}
+
+
+def test_extract_trace_refs_tolerates_non_string():
+    # str() of an arbitrary result object must not raise.
+    assert asg.extract_trace_refs_from_result(object()) == {}
+
+
 # --- complete_assignment -----------------------------------------------------
 
 
