@@ -35,7 +35,9 @@ logger.setLevel(logging.INFO)
 # --- Clients -----------------------------------------------------------------
 
 dynamodb = boto3.resource("dynamodb")
-assignments_table = dynamodb.Table(os.environ.get("ASSIGNMENTS_TABLE", "dispatch-assignments"))
+assignments_table = dynamodb.Table(
+    os.environ.get("ASSIGNMENTS_TABLE", "dispatch-assignments")
+)
 ssm = boto3.client("ssm")
 cloudwatch = boto3.client("cloudwatch")
 agentcore = boto3.client(
@@ -45,6 +47,13 @@ agentcore = boto3.client(
 
 CLOUDWATCH_NAMESPACE = os.environ.get("CLOUDWATCH_NAMESPACE", "SDLCAgents/Dispatch")
 STAGE = os.environ.get("STAGE", "dev")
+
+# The single GitHub repo this fleet is bound to (owner/repo), or "" to disable
+# the check. The agents are single-repo — GITHUB_REPO is baked into their
+# runtime — so a GitHub mention from a *different* repo would feed the agent a
+# prompt whose dispatched repo contradicts its hardcoded one, risking work
+# landing in the wrong repo. When set, we reject the mismatch up front.
+FLEET_GITHUB_REPO = os.environ.get("FLEET_GITHUB_REPO", "").strip()
 
 BLOCKED_MESSAGE_TEMPLATE = (
     "This request was blocked by a prompt-injection safety filter"
@@ -107,7 +116,9 @@ def resolve_agent(mention: str, registry: dict) -> dict | None:
     return None
 
 
-def extract_mention_and_instruction(body: str, registry: dict) -> tuple[dict | None, str]:
+def extract_mention_and_instruction(
+    body: str, registry: dict
+) -> tuple[dict | None, str]:
     """Extract the first recognized @agent mention and the instruction text."""
     for match in MENTION_PATTERN.finditer(body):
         agent = resolve_agent(match.group(1), registry)
@@ -160,6 +171,27 @@ def check_authorization(agent_config: dict, sender: str, source: str) -> bool:
         return True
 
     return sender in allowed_users
+
+
+# --- Repo binding (single-repo guard) ----------------------------------------
+
+
+def check_repo_allowed(source: str, source_context: dict) -> bool:
+    """For a GitHub dispatch, confirm its repo matches the fleet's bound repo.
+
+    Fail-closed on mismatch, no-op when unbound. Only GitHub carries a repo, so
+    other sources always pass. GitHub owner/repo is case-insensitive, so compare
+    casefolded. When FLEET_GITHUB_REPO is unset the check is disabled (returns
+    True) — preserving the prior any-repo behavior for anyone who hasn't set it.
+    """
+    if not FLEET_GITHUB_REPO or source != "github":
+        return True
+    repo = str(source_context.get("repo", "")).strip()
+    if not repo:
+        # A GitHub dispatch with no repo can't be validated against the binding;
+        # reject rather than let an unverifiable repo through.
+        return False
+    return repo.casefold() == FLEET_GITHUB_REPO.casefold()
 
 
 # --- Concurrency -------------------------------------------------------------
@@ -256,7 +288,13 @@ def update_assignment(assignment_id: str, **kwargs):
 # --- Agent Invocation --------------------------------------------------------
 
 
-def invoke_agent(agent_config: dict, instruction: str, source: str, source_context: dict, assignment_id: str):
+def invoke_agent(
+    agent_config: dict,
+    instruction: str,
+    source: str,
+    source_context: dict,
+    assignment_id: str,
+):
     """Invoke an AgentCore Runtime agent."""
     runtime_arn = agent_config["runtime_arn"]
 
@@ -266,13 +304,15 @@ def invoke_agent(agent_config: dict, instruction: str, source: str, source_conte
             f"({runtime_arn!r}). Run scripts/sync_registry.py to substitute placeholders."
         )
 
-    payload = json.dumps({
-        "prompt": instruction,
-        "session_id": assignment_id,
-        "source": source,
-        "source_context": source_context,
-        "assignment_id": assignment_id,
-    }).encode("utf-8")
+    payload = json.dumps(
+        {
+            "prompt": instruction,
+            "session_id": assignment_id,
+            "source": source,
+            "source_context": source_context,
+            "assignment_id": assignment_id,
+        }
+    ).encode("utf-8")
 
     agentcore.invoke_agent_runtime(
         agentRuntimeArn=runtime_arn,
@@ -294,7 +334,14 @@ def _put_metric(name: str, dimensions: dict | None = None, value: float = 1.0):
     try:
         cloudwatch.put_metric_data(
             Namespace=CLOUDWATCH_NAMESPACE,
-            MetricData=[{"MetricName": name, "Dimensions": dims, "Value": value, "Unit": "Count"}],
+            MetricData=[
+                {
+                    "MetricName": name,
+                    "Dimensions": dims,
+                    "Value": value,
+                    "Unit": "Count",
+                }
+            ],
         )
     except Exception as exc:
         logger.warning("Failed to emit metric %s: %s", name, exc)
@@ -365,7 +412,11 @@ def handler(event, context):
         if pre_resolved_id not in agents:
             return _error(404, f"unknown agent: {pre_resolved_id}")
         agent_config = {**agents[pre_resolved_id], "agent_id": pre_resolved_id}
-        instruction = event.get("instruction", body or f"You have been assigned to task: {source_context.get('task_name', 'unknown')}")
+        instruction = event.get(
+            "instruction",
+            body
+            or f"You have been assigned to task: {source_context.get('task_name', 'unknown')}",
+        )
     else:
         # --- Parse @mention from body ---
         agent_config, instruction = extract_mention_and_instruction(body, registry)
@@ -378,10 +429,24 @@ def handler(event, context):
     if not check_authorization(agent_config, sender, source):
         return _error(403, f"user '{sender}' not authorized to invoke @{agent_id}")
 
+    # --- Repo binding (single-repo guard) ---
+    if not check_repo_allowed(source, source_context):
+        got = source_context.get("repo", "unknown")
+        _put_metric("RepoRejected", dimensions={"Source": source, "AgentId": agent_id})
+        return _error(
+            403,
+            f"@{agent_id} is bound to repo '{FLEET_GITHUB_REPO}' but this request "
+            f"came from '{got}'. This fleet serves a single repo; mention the agents "
+            f"from '{FLEET_GITHUB_REPO}'.",
+        )
+
     # --- Concurrency ---
     max_concurrent = agent_config.get("limits", {}).get("max_concurrent", 5)
     if not check_concurrency(agent_id, max_concurrent):
-        return _error(429, f"@{agent_id} is at capacity ({max_concurrent} active). Try again later.")
+        return _error(
+            429,
+            f"@{agent_id} is at capacity ({max_concurrent} active). Try again later.",
+        )
 
     # --- Guardrail (prompt-injection edge check, T-1/T-2/T-3) ---
     # Score the raw `body` — the text the user typed plus any surrounding
@@ -406,15 +471,21 @@ def handler(event, context):
             result_summary=f"guardrail intervened: {guardrail_result.reason}",
             completed_at=int(time.time()),
         )
-        _put_metric("GuardrailTripped", dimensions={"Source": source, "AgentId": agent_id})
-        reason_suffix = f" ({guardrail_result.reason})" if guardrail_result.reason else ""
+        _put_metric(
+            "GuardrailTripped", dimensions={"Source": source, "AgentId": agent_id}
+        )
+        reason_suffix = (
+            f" ({guardrail_result.reason})" if guardrail_result.reason else ""
+        )
         message = BLOCKED_MESSAGE_TEMPLATE.format(
             reason_suffix=reason_suffix,
             assignment_id=assignment_id,
         )
         if not _post_block_reply(source, source_context, message):
             _put_metric("GuardrailReplyFailed", dimensions={"Source": source})
-        return _error(400, f"@{agent_id} request blocked by guardrail: {guardrail_result.reason}")
+        return _error(
+            400, f"@{agent_id} request blocked by guardrail: {guardrail_result.reason}"
+        )
 
     if guardrail_result.outcome == "error":
         assignment_id = create_assignment(
@@ -431,7 +502,10 @@ def handler(event, context):
             result_summary=f"guardrail check failed: {guardrail_result.reason}",
             completed_at=int(time.time()),
         )
-        _put_metric("GuardrailError", dimensions={"Source": source, "Reason": guardrail_result.reason})
+        _put_metric(
+            "GuardrailError",
+            dimensions={"Source": source, "Reason": guardrail_result.reason},
+        )
         message = GUARDRAIL_ERROR_MESSAGE_TEMPLATE.format(assignment_id=assignment_id)
         if not _post_block_reply(source, source_context, message):
             _put_metric("GuardrailReplyFailed", dimensions={"Source": source})

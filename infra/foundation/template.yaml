@@ -18,6 +18,17 @@ Parameters:
     Type: String
     Description: Asana custom field GID for the "Agent" dropdown
 
+  FleetGitHubRepo:
+    Type: String
+    Default: ""
+    Description: >
+      The single GitHub repo (owner/repo) this fleet is bound to. When set, the
+      Dispatch Router rejects any GitHub dispatch whose repo doesn't match, so a
+      mention from another repo can't drive the agents against the wrong repo
+      (the agents are single-repo — GITHUB_REPO is baked into their runtime).
+      Leave empty to disable the check (any repo is dispatched). Should equal the
+      TARGET_REPO the agent runtimes are deployed with.
+
   DeployDashboard:
     Type: String
     Default: "false"
@@ -228,6 +239,7 @@ Resources:
           GITHUB_PAT_PARAM: /sdlc-agents/github-mcp-token
           ASANA_PAT_PARAM: /sdlc-agents/asana-pat
           CLOUDWATCH_NAMESPACE: SDLCAgents/Dispatch
+          FLEET_GITHUB_REPO: !Ref FleetGitHubRepo
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref AssignmentsTable
