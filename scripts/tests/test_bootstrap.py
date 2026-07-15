@@ -177,6 +177,12 @@ def test_deploy_role_policy_is_scoped_not_admin():
     assert not any(s.get("Action") == "*" for s in pol["Statement"])
     sids = {s.get("Sid") for s in pol["Statement"]}
     assert {"EcrPushPull", "AgentCoreRuntime", "PassAgentRuntimeRoles"} <= sids
+    # The @mention dispatch path (agent-dispatch.yml) invokes the router Lambda —
+    # the scoped role must grant it (regression: it was missing, so every
+    # dispatch would have 403'd under the scoped role).
+    invoke = next(s for s in pol["Statement"] if s["Sid"] == "InvokeDispatchRouter")
+    assert invoke["Action"] == "lambda:InvokeFunction"
+    assert ":function:dispatch-router-*" in invoke["Resource"]
     # PassRole is limited to the per-agent runtime roles + the agentcore service.
     passrole = next(s for s in pol["Statement"] if s["Sid"] == "PassAgentRuntimeRoles")
     assert passrole["Resource"].endswith(":role/*-agentcore-runtime")

@@ -354,6 +354,15 @@ def deploy_role_policy(region: str, account: str) -> dict:
                 "Resource": "*",
             },
             {
+                # agent-dispatch.yml assumes this role and invokes the Dispatch
+                # Router Lambda to route an @mention — without this the core
+                # trigger path fails AccessDenied.
+                "Sid": "InvokeDispatchRouter",
+                "Effect": "Allow",
+                "Action": "lambda:InvokeFunction",
+                "Resource": f"arn:aws:lambda:{region}:{account}:function:dispatch-router-*",
+            },
+            {
                 "Sid": "PassAgentRuntimeRoles",
                 "Effect": "Allow",
                 "Action": "iam:PassRole",
