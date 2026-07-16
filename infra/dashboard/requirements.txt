@@ -1,0 +1,5 @@
+# The dashboard admin Lambda signs GitHub App JWTs (RS256) with cryptography.
+# boto3 is provided by the Lambda runtime; cryptography is not, so it must be
+# bundled. (The read-only query Lambda doesn't need it, but both share this
+# CodeUri, so one requirements file covers the package.)
+cryptography>=42.0.0
