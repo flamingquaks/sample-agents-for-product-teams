@@ -40,15 +40,20 @@ class PolicySyncError(Exception):
 
 def _sync_repo_policy() -> None:
     """Regenerate + push the single fleet Cedar policy from the current allowed
-    set. No-op seam until WS5 (Gateway migration) wires the policy engine.
+    set to the Gateway policy engine.
 
-    WS5 will: compute config_store.allowed_repos(), render the forbid-unless-in
-    Cedar statement, and CreatePolicy/update the named fleet policy via
-    bedrock-agentcore-control, raising PolicySyncError on failure / Cedar
-    Analysis rejection / not reaching the intended enforcement mode."""
-    logger.info(
-        "policy sync (no-op until WS5): allowed=%s", config_store.allowed_repos()
-    )
+    Delegates to policy_sync.sync_fleet_policy, which renders the forbid-unless-in
+    Cedar statement from config_store.allowed_repos() and CreatePolicy/updates the
+    named fleet policy via bedrock-agentcore-control — raising PolicySyncError on
+    failure, Cedar-analysis rejection, or not reaching the intended enforcement
+    mode. A no-op (logged) until the gateway is provisioned (POLICY_ENGINE_ID
+    unset), so the dispatch allowlist still works before WS5's gateway lands.
+
+    Imported lazily so the admin API's config routes don't hard-depend on the
+    control-plane client (and tests can monkeypatch this seam directly)."""
+    import policy_sync
+
+    policy_sync.sync_fleet_policy()
 
 
 def _parse_body(event: dict) -> dict:

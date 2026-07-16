@@ -28,8 +28,47 @@ Parameters:
       and the CloudFront-hosted SPA. Default "false" so existing deploys are
       unaffected until an operator opts in.
 
+  DeployGateway:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Opt-in flag for the AgentCore Gateway + Cedar policy engine (the
+      deterministic tool-call boundary that complements the dispatch allowlist).
+      When "true", provisions the policy engine, the initial fleet Cedar policy,
+      the Gateway (MCP, AWS_IAM inbound), and the GitHub/Asana MCP targets, and
+      grants the admin Lambda permission to sync the fleet policy. Default
+      "false" so the migration is rolled out deliberately (log-only first — see
+      GatewayPolicyEnforcement). Requires DeployDashboard=true (the admin API
+      owns the policy sync).
+
+  GatewayPolicyEnforcement:
+    Type: String
+    Default: "LOG_ONLY"
+    AllowedValues: ["LOG_ONLY", "ACTIVE"]
+    Description: >
+      Per-policy enforcement mode for the fleet Cedar policy. LOG_ONLY (default)
+      logs deny decisions without blocking, so an operator can watch CloudWatch
+      before flipping to ACTIVE. Applied to both the initial CFN policy and the
+      admin Lambda's runtime policy sync (via FLEET_POLICY_ENFORCEMENT).
+
+  GitHubMcpEndpoint:
+    Type: String
+    Default: "https://api.githubcopilot.com/mcp/"
+    Description: GitHub MCP server endpoint registered as a gateway target.
+
+  AsanaMcpEndpoint:
+    Type: String
+    Default: "https://mcp.asana.com/v2/mcp"
+    Description: Asana MCP server endpoint registered as a gateway target.
+
 Conditions:
   DashboardEnabled: !Equals [!Ref DeployDashboard, "true"]
+  GatewayEnabled: !Equals [!Ref DeployGateway, "true"]
+  # GatewayPolicyEnforcement is expressed in per-policy terms (LOG_ONLY|ACTIVE);
+  # the gateway→engine attachment Mode instead uses LOG_ONLY|ENFORCE. This maps
+  # the ACTIVE choice to the attachment's ENFORCE value (see FleetGateway).
+  GatewayEnforceActive: !Equals [!Ref GatewayPolicyEnforcement, "ACTIVE"]
 
 Globals:
   Function:
@@ -716,16 +755,33 @@ Resources:
       FunctionName: !Sub dashboard-admin-${Stage}
       CodeUri: ../dashboard/
       Handler: admin.handler
-      Timeout: 30
+      Timeout: 60
       Environment:
         Variables:
           FLEET_CONFIG_TABLE: !Ref FleetConfigTable
+          # When the gateway is deployed, the admin Lambda syncs the fleet Cedar
+          # policy on every repo/settings change. Unset otherwise → policy_sync
+          # is a logged no-op and only the dispatch allowlist is affected.
+          POLICY_ENGINE_ID: !If [GatewayEnabled, !GetAtt FleetPolicyEngine.PolicyEngineId, !Ref "AWS::NoValue"]
+          FLEET_POLICY_ENFORCEMENT: !If [GatewayEnabled, !Ref GatewayPolicyEnforcement, !Ref "AWS::NoValue"]
       Policies:
         # Read+write the config table (onboard/enable/disable repos, settings).
-        # WS5 adds bedrock-agentcore policy-update permissions here for the
-        # Gateway Cedar policy sync.
         - DynamoDBCrudPolicy:
             TableName: !Ref FleetConfigTable
+        # Sync the fleet Cedar policy to the engine (gateway deploys only).
+        - !If
+          - GatewayEnabled
+          - Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:CreatePolicy
+                  - bedrock-agentcore:UpdatePolicy
+                  - bedrock-agentcore:GetPolicy
+                  - bedrock-agentcore:ListPolicies
+                Resource:
+                  - !GetAtt FleetPolicyEngine.PolicyEngineArn
+                  - !Sub ${FleetPolicyEngine.PolicyEngineArn}/*
+          - !Ref "AWS::NoValue"
       Events:
         ListRepos:
           Type: Api
@@ -757,6 +813,113 @@ Resources:
             Path: /admin/settings
             Method: PUT
             RestApiId: !Ref DashboardApi
+
+  # ===========================================================================
+  # AgentCore Gateway + Cedar Policy Engine (opt-in: DeployGateway=true)
+  # ===========================================================================
+  # The deterministic tool-call boundary. Agents route MCP tool calls through
+  # this Gateway (instead of direct-to-MCP); the attached policy engine enforces
+  # Cedar policies — including the fleet repo-allowlist policy the admin Lambda
+  # syncs (policy_sync.py). Native CFN resource types (verified available in
+  # us-east-1/us-west-2). Rolled out log-only first (GatewayPolicyEnforcement):
+  # an engine attached in LOG_ONLY logs deny decisions without blocking, so
+  # agents keep working while permit policies are authored and observed before
+  # the enforce flip.
+  #
+  # Deploy-time steps that require the LIVE gateway tool manifest (cannot be
+  # modeled here — see docs/aws-deploy.md): authoring the per-agent permit
+  # policies (the folded-in cedar/*.cedar, rewritten to the gateway schema:
+  # `<Target>___<tool>` actions, context.input.* conditions), confirming the
+  # exact GitHub write-tool names in infra/dashboard/fleet_policy.py, and wiring
+  # each agent's inbound auth to the Gateway (AWS_IAM / SigV4 via runtime role).
+
+  FleetPolicyEngine:
+    Type: AWS::BedrockAgentCore::PolicyEngine
+    Condition: GatewayEnabled
+    Properties:
+      Name: !Sub sdlcFleet${Stage}
+      Description: Cedar policy engine enforcing the SDLC agent fleet tool-call boundary
+      Tags:
+        - Key: Project
+          Value: sdlc-agents
+
+  # Gateway role — used by the gateway for outbound auth to the MCP targets.
+  FleetGatewayRole:
+    Type: AWS::IAM::Role
+    Condition: GatewayEnabled
+    Properties:
+      RoleName: !Sub sdlc-fleet-gateway-${Stage}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: mcp-token-read
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Read the shared MCP credentials for outbound auth to the targets.
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource:
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/github-mcp-token
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/asana-pat
+
+  FleetGateway:
+    Type: AWS::BedrockAgentCore::Gateway
+    Condition: GatewayEnabled
+    Properties:
+      Name: !Sub sdlcFleet${Stage}
+      RoleArn: !GetAtt FleetGatewayRole.Arn
+      Description: MCP gateway fronting GitHub/Asana for the SDLC agent fleet
+      # Agents authenticate to the gateway with their AgentCore Runtime IAM role
+      # (SigV4). No Cognito JWT minting in the agent path.
+      AuthorizerType: AWS_IAM
+      ProtocolType: MCP
+      ProtocolConfiguration:
+        Mcp:
+          SupportedVersions:
+            - "2025-06-18"
+      # Attach the policy engine. Mode maps from GatewayPolicyEnforcement:
+      # LOG_ONLY (default, safe rollout) or ENFORCE (blocks denied calls).
+      PolicyEngineConfiguration:
+        Arn: !GetAtt FleetPolicyEngine.PolicyEngineArn
+        Mode: !If [GatewayEnforceActive, "ENFORCE", "LOG_ONLY"]
+      Tags:
+        Project: sdlc-agents
+
+  # GitHub MCP target — the "<TargetName>" (GitHubTarget) that prefixes the
+  # generated Cedar action names. Must match fleet_policy.GITHUB_TARGET.
+  GitHubGatewayTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Condition: GatewayEnabled
+    Properties:
+      GatewayIdentifier: !GetAtt FleetGateway.GatewayIdentifier
+      Name: GitHubTarget
+      Description: GitHub official remote MCP server
+      TargetConfiguration:
+        Mcp:
+          McpServer:
+            Endpoint: !Ref GitHubMcpEndpoint
+            # DYNAMIC listing aggregates + preserves tool annotations at the
+            # gateway root (vs an empty tools/list).
+            ListingMode: DYNAMIC
+
+  AsanaGatewayTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Condition: GatewayEnabled
+    Properties:
+      GatewayIdentifier: !GetAtt FleetGateway.GatewayIdentifier
+      Name: AsanaTarget
+      Description: Asana official MCP server
+      TargetConfiguration:
+        Mcp:
+          McpServer:
+            Endpoint: !Ref AsanaMcpEndpoint
+            ListingMode: DYNAMIC
 
   # --- SPA hosting: private S3 + CloudFront (OAC) ----------------------------
   # The built SPA is uploaded to a private bucket (account Block Public Access
@@ -929,3 +1092,17 @@ Outputs:
     Condition: DashboardEnabled
     Value: !Ref DashboardDistribution
     Description: CloudFront distribution id — used to invalidate the cache on deploy
+
+  # --- Gateway (only present when DeployGateway=true) ------------------------
+
+  FleetGatewayUrl:
+    Condition: GatewayEnabled
+    Value: !GetAtt FleetGateway.GatewayUrl
+    Description: MCP gateway URL — set as GATEWAY_MCP_URL on the agent runtimes to route tools through the policy engine
+    Export:
+      Name: !Sub ${AWS::StackName}-FleetGatewayUrl
+
+  FleetPolicyEngineId:
+    Condition: GatewayEnabled
+    Value: !GetAtt FleetPolicyEngine.PolicyEngineId
+    Description: Policy engine id the admin Lambda syncs the fleet Cedar policy into

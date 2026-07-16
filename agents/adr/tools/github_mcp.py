@@ -40,4 +40,10 @@ def get_github_token() -> str:
     return _cached_token
 
 
-GITHUB_MCP_URL = "https://api.githubcopilot.com/mcp/"
+# The GitHub MCP endpoint. When the AgentCore Gateway is deployed, set
+# GATEWAY_MCP_URL on the runtime to route tool calls through the gateway (and
+# thus the Cedar policy engine -- the deterministic tool-call boundary).
+# Absent, the agent connects direct to GitHub's official remote MCP server
+# (pre-gateway behavior). The gateway fronts GitHub and Asana behind one URL.
+_DIRECT_GITHUB_MCP_URL = "https://api.githubcopilot.com/mcp/"
+GITHUB_MCP_URL = os.environ.get("GATEWAY_MCP_URL") or _DIRECT_GITHUB_MCP_URL
