@@ -182,6 +182,22 @@ def put_installation(owner: str, *, owner_type: str, installation_id: int) -> di
     return item
 
 
+def delete_installation(owner: str) -> bool:
+    """Remove an owner's install record. Returns True if one existed."""
+    resp = _get_table().delete_item(
+        Key={"pk": _owner_pk(owner)}, ReturnValues="ALL_OLD"
+    )
+    return bool(resp.get("Attributes"))
+
+
+def owner_has_repos(owner: str) -> bool:
+    """Whether any onboarded repo still belongs to ``owner`` — used to decide
+    whether deleting a repo should also drop the shared per-owner install
+    record (only once the owner's LAST repo is gone)."""
+    target = owner.strip().casefold()
+    return any(r.get("owner") == target for r in list_repos())
+
+
 def set_repo_status(repo: str, status: str) -> None:
     _get_table().update_item(
         Key={"pk": _repo_pk(repo)},

@@ -35,9 +35,13 @@ function postManifestToGitHub(postUrl: string, manifest: Record<string, unknown>
 export function GitHubAppPanel({
   api,
   onAuthError,
+  refreshKey = 0,
 }: {
   api: DashboardApi;
   onAuthError: () => void;
+  /** Bumped by the parent after a successful registration to force an immediate
+   *  status re-fetch (instead of waiting for the idle poll). */
+  refreshKey?: number;
 }) {
   const handleError = useCallback(
     (e: unknown) => {
@@ -48,7 +52,9 @@ export function GitHubAppPanel({
 
   const statusPoll = usePolling<GitHubAppStatus>(() => api.gitHubAppStatus(), {
     isActive: () => false,
-    deps: [api],
+    // refreshKey in deps → a bump re-runs the fetcher, so a just-registered App
+    // shows as configured immediately rather than after the ~20s idle beat.
+    deps: [api, refreshKey],
     onError: handleError,
   });
 

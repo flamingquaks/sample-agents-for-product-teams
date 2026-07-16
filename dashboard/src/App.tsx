@@ -58,14 +58,21 @@ function groupsFromProfile(profile: Record<string, unknown> | undefined): string
  *  (a "#..." redirect_url is rejected by GitHub). CloudFront serves that path as
  *  the SPA; here we translate it — once, on load — into the hash route AdminView
  *  already handles (#/admin/github-app/setup-callback?code=...), preserving the
- *  code, so there's a single exchange path. */
+ *  code, so there's a single exchange path.
+ *
+ *  Rewrites onto the app's OWN base path (import.meta.env.BASE_URL — "/" at the
+ *  CloudFront root, or e.g. "/dashboard/" under a subpath), NOT a hardcoded
+ *  origin root: a subpath deploy serves index.html/config.json only under that
+ *  base, so an origin-root rewrite would land where nothing is served and the
+ *  code would never be exchanged. */
 function normalizeGitHubAppCallback() {
   if (window.location.pathname.replace(/\/$/, "").endsWith("/github-app-callback")) {
     const search = window.location.search; // ?code=...&state=...
+    const base = (import.meta.env.BASE_URL || "/").replace(/\/$/, "");
     window.history.replaceState(
       {},
       document.title,
-      `/#/admin/github-app/setup-callback${search}`,
+      `${base}/#/admin/github-app/setup-callback${search}`,
     );
   }
 }

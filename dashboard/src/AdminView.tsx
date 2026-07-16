@@ -48,6 +48,10 @@ export function AdminView({
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
   const [onboardOpen, setOnboardOpen] = useState(false);
+  // Bumped after a successful App registration so GitHubAppPanel re-fetches its
+  // status immediately instead of waiting for its idle poll (avoids showing the
+  // stale "Set up" form — and a duplicate-registration click — for ~20s).
+  const [appRefreshKey, setAppRefreshKey] = useState(0);
 
   // Wrap a write so the button disables, the outcome ALWAYS surfaces (success or
   // failure — never a silent no-op), and both affected polls re-fetch. `label`
@@ -84,26 +88,47 @@ export function AdminView({
   );
 
   // GitHub App manifest callback: GitHub redirects back to
-  // #/admin/github-app/setup-callback?code=... — exchange the code once, then
-  // clean the hash to #/admin so a refresh doesn't re-redeem a used code.
+  // #/admin/github-app/setup-callback?code=... — exchange the code, then clean
+  // the hash to #/admin ONLY on success so a refresh doesn't re-redeem a used
+  // code. The manifest code is single-use and short-lived, so on a transient
+  // failure we LEAVE it in the hash: the surfaced error tells the admin to
+  // reload, which retries the exchange rather than forcing a full re-creation.
+  // A ref guards against React StrictMode's double effect-invoke (which would
+  // otherwise double-redeem the code) now that the hash isn't cleaned up-front.
+  const exchangeStarted = useRef(false);
   useEffect(() => {
     const hash = window.location.hash;
     if (!hash.includes("github-app/setup-callback")) return;
+    if (exchangeStarted.current) return;
+    exchangeStarted.current = true;
     const q = hash.split("?")[1] ?? "";
     const code = new URLSearchParams(q).get("code");
-    window.location.hash = "#/admin";
-    if (!code) return;
+    if (!code) {
+      window.location.hash = "#/admin";
+      return;
+    }
     setBusy(true);
     setActionError(null);
     api
       .gitHubAppExchange(code)
-      .then((r) => setActionMsg(`GitHub App "${r.slug}" registered.`))
+      .then((r) => {
+        setActionMsg(`GitHub App "${r.slug}" registered.`);
+        // Success: burn the code from the URL, and refresh the App panel so it
+        // reflects the newly-registered App immediately (not on the next idle poll).
+        window.location.hash = "#/admin";
+        setAppRefreshKey((k) => k + 1);
+      })
       .catch((e) => {
         if (e instanceof ApiError && e.status === 401) onAuthError();
-        setActionError(`GitHub App setup failed: ${(e as Error).message}`);
+        // Leave the code in the hash so a reload can retry (unless it's a 401,
+        // where re-auth is the real fix and the code is likely still intact).
+        setActionError(
+          `GitHub App setup failed: ${(e as Error).message}. Reload to retry.`,
+        );
+        exchangeStarted.current = false;
       })
       .finally(() => setBusy(false));
-    // Run once on mount; the hash is cleaned above so it won't re-fire.
+    // Run once on mount.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -129,7 +154,7 @@ export function AdminView({
       {actionError && <div className="banner error">{actionError}</div>}
       {actionMsg && <div className="banner ok">{actionMsg}</div>}
 
-      <GitHubAppPanel api={api} onAuthError={onAuthError} />
+      <GitHubAppPanel api={api} onAuthError={onAuthError} refreshKey={appRefreshKey} />
 
       <SettingsPanel
         restrict={restrict}

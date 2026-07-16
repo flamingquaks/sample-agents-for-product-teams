@@ -819,6 +819,13 @@ Resources:
   DashboardAdminFunction:
     Type: AWS::Serverless::Function
     Condition: DashboardEnabled
+    # cryptography (used by github_client to sign App JWTs) is a native/cffi
+    # wheel, so it must be built for the Lambda target, not the build host. The
+    # python3.12 build method makes `sam build` resolve manylinux wheels for the
+    # function's runtime/architecture — without it, a build on macOS/arm64
+    # bundles an unloadable .so and every App-mode admin route fails at import.
+    Metadata:
+      BuildMethod: python3.12
     Properties:
       FunctionName: !Sub dashboard-admin-${Stage}
       CodeUri: ../dashboard/

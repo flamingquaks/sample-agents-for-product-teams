@@ -398,3 +398,62 @@ def test_pat_mode_skips_verification(monkeypatch):
     import config_store
 
     assert "installation_id" not in config_store.get_repo("acme/web")
+
+
+@mock_aws
+def test_update_existing_repo_skips_verification(monkeypatch):
+    # An already-onboarded repo can be updated (e.g. DISABLED during an incident)
+    # even when the App is now unreachable — verification gates NEW onboards only,
+    # never updates, so the admin is never locked out of turning a repo off.
+    _make_table()
+    admin = _load_admin_app_mode(monkeypatch, _FakeGitHub(installation_id=55))
+    admin.handler(_event("POST", "/admin/repos", body={"repo": "acme/web"}))
+    import config_store
+
+    assert config_store.get_repo("acme/web")["installation_id"] == 55
+
+    # App becomes unreachable; disabling the repo must still succeed.
+    admin2 = _load_admin_app_mode(monkeypatch, _FakeGitHub(installation_id=None))
+    resp = admin2.handler(
+        _event("POST", "/admin/repos", body={"repo": "acme/web", "enabled": False})
+    )
+    assert resp["statusCode"] == 200
+    rec = config_store.get_repo("acme/web")
+    assert rec["enabled"] is False
+    assert rec["installation_id"] == 55  # preserved, not wiped
+
+
+@mock_aws
+def test_verification_error_is_actionable_not_500(monkeypatch):
+    # A non-GitHubError during verification (e.g. bad key → ValueError) must
+    # surface as an actionable 502, not an opaque 500.
+    class _Boom(_FakeGitHub):
+        def get_owner_type(self, owner):
+            raise ValueError("could not deserialize key data")
+
+    _make_table()
+    admin = _load_admin_app_mode(monkeypatch, _Boom())
+    resp = admin.handler(_event("POST", "/admin/repos", body={"repo": "acme/web"}))
+    assert resp["statusCode"] == 502
+    assert "private key" in _body(resp)["error"]
+
+
+@mock_aws
+def test_delete_last_repo_removes_install_record(monkeypatch):
+    # Deleting an owner's LAST repo cleans up the shared per-owner install record;
+    # a sibling repo keeps it alive.
+    _make_table()
+    admin = _load_admin_app_mode(monkeypatch, _FakeGitHub(installation_id=55))
+    admin.handler(_event("POST", "/admin/repos", body={"repo": "acme/web"}))
+    admin.handler(_event("POST", "/admin/repos", body={"repo": "acme/api"}))
+    import config_store
+
+    assert config_store.get_installation("acme") is not None
+
+    # Delete one of two — install record survives (acme still has a repo).
+    admin.handler(_event("DELETE", "/admin/repos/{repo+}", path={"repo": "acme/web"}))
+    assert config_store.get_installation("acme") is not None
+
+    # Delete the last — install record is cleaned up.
+    admin.handler(_event("DELETE", "/admin/repos/{repo+}", path={"repo": "acme/api"}))
+    assert config_store.get_installation("acme") is None

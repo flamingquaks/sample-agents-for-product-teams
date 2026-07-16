@@ -6,6 +6,7 @@ token cache, owner-type/installation/reachability branches) without AWS or
 network. RS256 signing is real — a throwaway key is generated in-process.
 """
 
+import calendar
 import sys
 import time
 from pathlib import Path
@@ -21,6 +22,7 @@ import github_client  # noqa: E402
 def _reset(monkeypatch):
     # Clear module caches + point env at fake param/secret names.
     github_client._pem_cache = None
+    github_client._jwt_cache = None
     github_client._token_cache.clear()
     monkeypatch.setenv("GITHUB_APP_ID_PARAM", "/x/app-id")
     monkeypatch.setenv("GITHUB_APP_SLUG_PARAM", "/x/app-slug")
@@ -51,6 +53,31 @@ def test_app_not_configured_when_placeholder(monkeypatch):
     # else the UI shows a registered App + a /apps/unset/ install link.
     monkeypatch.setattr(github_client, "_app_id", lambda: "unset")
     assert github_client.app_configured() is False
+
+
+def test_app_not_configured_when_key_secret_empty(monkeypatch):
+    # A real app-id but an empty private-key secret (template placeholder / a
+    # failed key write) must read as NOT configured — else verification passes
+    # its "not set up" guard and the first JWT sign 500s on an empty PEM.
+    monkeypatch.setattr(github_client, "_private_key", lambda: "")
+    assert github_client.app_configured() is False
+
+
+def test_app_jwt_cached_across_calls(monkeypatch):
+    # One onboarding calls _app_jwt three times (owner-type + installation +
+    # mint); it must sign once and reuse, not re-sign + re-read app-id each time.
+    signs = {"n": 0}
+    real_app_id = github_client._app_id
+
+    def counting_app_id():
+        signs["n"] += 1
+        return real_app_id()
+
+    monkeypatch.setattr(github_client, "_app_id", counting_app_id)
+    a = github_client._app_jwt()
+    b = github_client._app_jwt()
+    assert a == b
+    assert signs["n"] == 1  # second call served from cache, no re-sign/app-id read
 
 
 def test_app_jwt_is_three_segments_with_iss():
@@ -110,6 +137,13 @@ def test_mint_installation_token_caches(monkeypatch):
     assert t1 == t2 == "ghs_abc"
     assert calls["n"] == 1  # second call hit the cache, no HTTP
 
+    # The cached expiry must be parsed as UTC (calendar.timegm), not local time
+    # (time.mktime) — else a non-UTC host skews it. Assert the stored epoch is
+    # within a minute of the true UTC epoch for the "...Z" timestamp.
+    _tok, cached_exp = github_client._token_cache[99]
+    true_epoch = calendar.timegm(time.strptime(future, "%Y-%m-%dT%H:%M:%SZ"))
+    assert abs(cached_exp - true_epoch) < 60
+
 
 def test_repo_reachable_true_false(monkeypatch):
     future = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
@@ -159,3 +193,47 @@ def test_exchange_manifest_code_persists(monkeypatch):
     assert put_secret["SecretString"] == "PEMDATA"
     assert put_params["/x/app-id"] == "777"
     assert put_params["/x/app-slug"] == "sdlc-fleet"
+
+
+def test_exchange_manifest_code_never_leaks_code(monkeypatch):
+    # SECURITY: on a failed exchange the still-redeemable manifest code must NOT
+    # appear in the raised error (it would flow into the 502 body + CloudWatch).
+    def boom(method, url, **k):
+        # _request embeds the URL (which contains the code) in the message.
+        raise github_client.GitHubError(f"GitHub {method} {url} -> 500: oops", status=500)
+
+    monkeypatch.setattr(github_client, "_request", boom)
+    with pytest.raises(github_client.GitHubError) as ei:
+        github_client.exchange_manifest_code("SUPER_SECRET_CODE")
+    assert "SUPER_SECRET_CODE" not in str(ei.value)
+
+
+def test_exchange_manifest_code_writes_app_id_last(monkeypatch):
+    # CRASH-CONSISTENCY: app_configured() keys on app-id, so app-id must be the
+    # LAST write — if the slug write fails, app-id must not have been written
+    # (no half-registered App that reports configured with no key/slug).
+    monkeypatch.setattr(
+        github_client,
+        "_request",
+        lambda *a, **k: (201, {"id": 777, "slug": "sdlc-fleet", "pem": "PEMDATA"}),
+    )
+    order = []
+
+    class _SM:
+        def put_secret_value(self, **kw):
+            order.append("secret")
+
+    class _SSM:
+        def put_parameter(self, **kw):
+            if kw["Name"] == "/x/app-slug":
+                order.append("slug")
+                raise RuntimeError("transient SSM failure")
+            order.append("app-id")
+
+    monkeypatch.setattr(github_client, "_sm", lambda: _SM())
+    monkeypatch.setattr(github_client, "_ssm_client", lambda: _SSM())
+    with pytest.raises(RuntimeError):
+        github_client.exchange_manifest_code("thecode")
+    # The slug write blew up before app-id was ever written.
+    assert "app-id" not in order
+    assert order == ["secret", "slug"]

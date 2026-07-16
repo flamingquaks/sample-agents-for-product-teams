@@ -77,15 +77,20 @@ export class DashboardApi {
       throw new ApiError(0, `network error: ${(e as Error).message}`);
     }
     if (!resp.ok) {
-      // The API returns {"error": "..."}; the authorizer's own 401/403 may not.
-      let message = resp.statusText;
+      // The API returns {"error": "..."}; API Gateway / the Cognito authorizer's
+      // own 401/403 instead return {"message": "..."}. statusText is empty over
+      // HTTP/2 (CloudFront/API Gateway), so never fall back to it alone — always
+      // end with a non-empty, status-bearing message the UI can show.
+      let message = "";
       let body: Record<string, unknown> | null = null;
       try {
         body = await resp.json();
         if (body && typeof body.error === "string") message = body.error;
+        else if (body && typeof body.message === "string") message = body.message;
       } catch {
-        // non-JSON error body (e.g. an authorizer rejection) — keep statusText
+        // non-JSON error body (e.g. an authorizer rejection) — fall through.
       }
+      if (!message) message = resp.statusText || `HTTP ${resp.status}`;
       throw new ApiError(resp.status, message, body);
     }
     // 204/empty bodies (rare) → undefined cast; JSON otherwise.

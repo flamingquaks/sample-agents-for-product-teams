@@ -127,7 +127,7 @@ def _verify_github_install(repo: str):
         owner_type = github_client.get_owner_type(owner)
         installation_id = github_client.find_installation(owner, owner_type)
         if installation_id is None:
-            link = github_client.install_url(owner)
+            link = github_client.install_url()
             payload = {
                 "error": f"the GitHub App is not installed on '{owner}'. Install "
                 "it, then re-check.",
@@ -142,7 +142,7 @@ def _verify_github_install(repo: str):
                     "error": f"'{repo}' isn't covered by the App installation on "
                     f"'{owner}'. Add it to the installation's repository "
                     "selection, then re-check.",
-                    "install_url": github_client.install_url(owner),
+                    "install_url": github_client.install_url(),
                     "owner_type": owner_type,
                 },
             )
@@ -155,6 +155,19 @@ def _verify_github_install(repo: str):
         logger.exception("GitHub App verification failed for %s", repo)
         status = 404 if exc.status == 404 else 502
         return None, error(status, f"GitHub verification failed for {repo}: {exc}")
+    except Exception:  # noqa: BLE001
+        # Non-GitHub failures (a malformed/empty private key → ValueError, a
+        # missing 'token' in GitHub's response → KeyError, or a Secrets
+        # Manager/SSM ClientError) would otherwise escape to handler()'s blanket
+        # 500 "internal error" — the opaque failure this verification gate exists
+        # to prevent. Surface an actionable 502 instead, without echoing the
+        # exception (it can carry secret material, e.g. a JWT/token/PEM fragment).
+        logger.exception("GitHub App verification errored for %s", repo)
+        return None, error(
+            502,
+            f"GitHub App verification could not complete for {repo} — check the "
+            "App's private key is configured, then retry",
+        )
 
 
 def _parse_body(event: dict) -> dict:
@@ -196,15 +209,22 @@ def _route(event: dict) -> dict:
                 return error(400, "body.repo must be 'owner/repo'")
             enabled = bool(body.get("enabled", True))
             eligible = bool(body.get("multi_repo_eligible", True))
-            # GitHub App verification (when GITHUB_AUTH_MODE=app): confirm the App
-            # is installed on the repo's owner and can reach the repo BEFORE
-            # onboarding it. Returns a ready response (409 + install deep-link, or
-            # 502) on any problem — never a silent `active` onboard of an
-            # unreachable repo — else the resolved installation_id (or None when
-            # verification is off).
-            installation_id, verify_response = _verify_github_install(repo)
-            if verify_response is not None:
-                return verify_response
+            # GitHub App verification (when GITHUB_AUTH_MODE=app) gates bringing a
+            # repo INTO the fleet — confirm the App is installed on the owner and
+            # can reach the repo BEFORE a NEW onboard, so we never silently
+            # activate an unreachable repo. It must NOT gate UPDATES to an
+            # already-onboarded repo: an admin has to be able to disable/adjust a
+            # repo during an incident (e.g. the App was just uninstalled, or
+            # GitHub is down) — blocking that on live reachability is the opposite
+            # of what's needed. So for an existing repo we skip verification and
+            # preserve its recorded installation_id.
+            existing = config_store.get_repo(repo)
+            if existing is not None:
+                installation_id = existing.get("installation_id")
+            else:
+                installation_id, verify_response = _verify_github_install(repo)
+                if verify_response is not None:
+                    return verify_response
             # 1) write the row active, 2) sync the tool-call policy from the
             # allowed set (which now INCLUDES this repo — allowed_repos() only
             # returns active rows, so syncing while pending would omit the very
@@ -214,6 +234,12 @@ def _route(event: dict) -> dict:
             # denies. During the brief window before the sync lands the policy
             # still denies (the safe direction), and the dispatch config cache is
             # stale anyway, so dispatch does not widen ahead of the policy.
+            # Preserve the prior verification timestamp on an update (we didn't
+            # re-verify); stamp now only on a fresh verified onboard.
+            if existing is not None:
+                verified_at = existing.get("install_verified_at")
+            else:
+                verified_at = int(time.time()) if installation_id else None
             config_store.put_repo(
                 repo,
                 enabled=enabled,
@@ -221,7 +247,7 @@ def _route(event: dict) -> dict:
                 onboarded_by=auth.caller_sub(event),
                 status="active",
                 installation_id=installation_id,
-                install_verified_at=int(time.time()) if installation_id else None,
+                install_verified_at=verified_at,
             )
             try:
                 _sync_repo_policy()
@@ -266,6 +292,15 @@ def _route(event: dict) -> dict:
                 return error(400, "missing repo")
             repo = unquote(raw)
             deleted = config_store.delete_repo(repo)
+            # The per-owner install record is shared across all of an owner's
+            # repos, so drop it only once this was the owner's LAST repo —
+            # otherwise a sibling repo would lose its installation reference.
+            # Leaving it forever would orphan a record pointing at an
+            # installation that may later be revoked.
+            if deleted and "/" in repo:
+                owner = repo.split("/", 1)[0]
+                if not config_store.owner_has_repos(owner):
+                    config_store.delete_installation(owner)
             # Removing a repo narrows the allowlist — sync the policy so its tool
             # calls stop being allowed. Delete has already narrowed dispatch (the
             # safe direction), so a sync failure is only reported as fatal when the
@@ -300,12 +335,16 @@ def _route(event: dict) -> dict:
         import github_client
 
         configured = github_client.app_configured()
+        # Resolve the slug once and derive the install URL from it (install_url()
+        # would otherwise re-read the slug SSM param a second time per status poll).
+        slug = github_client.app_slug() if configured else None
+        install = f"{github_client.GITHUB_API}/apps/{slug}/installations/new" if slug else None
         return ok(
             {
                 "configured": configured,
                 "auth_mode": os.environ.get("GITHUB_AUTH_MODE", "pat").lower(),
-                "slug": github_client.app_slug() if configured else None,
-                "install_url": github_client.install_url() if configured else None,
+                "slug": slug,
+                "install_url": install,
             }
         )
 
