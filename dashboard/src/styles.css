@@ -270,6 +270,33 @@ h3 {
   margin: 20px 0 4px;
 }
 
+/* Admin: a bordered config panel (GitHub App setup). */
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  margin-bottom: 16px;
+}
+.panel h3 {
+  margin-top: 0;
+}
+/* An anchor styled as a button (install deep-links). */
+.button-link {
+  display: inline-block;
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  color: #06101f;
+  font-weight: 600;
+  border-radius: 6px;
+  padding: 6px 12px;
+  text-decoration: none;
+}
+.button-link:hover {
+  text-decoration: none;
+  filter: brightness(1.05);
+}
+
 /* Admin: header row with a right-aligned primary action. */
 .section-head {
   display: flex;

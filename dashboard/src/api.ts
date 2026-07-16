@@ -6,14 +6,27 @@
 // operator-group membership. A 401 is surfaced as ApiError with status 401 so
 // the UI can trigger re-authentication (the token likely expired).
 
-import type { FleetSettings, FleetStats, RepoConfig, Run, RunsPage, TraceResult } from "./types";
+import type {
+  FleetSettings,
+  FleetStats,
+  GitHubAppStatus,
+  GitHubManifest,
+  RepoConfig,
+  Run,
+  RunsPage,
+  TraceResult,
+} from "./types";
 
 export class ApiError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  /** The parsed error response body, when the server returned JSON. Carries
+   *  extra fields like `install_url` on a 409 the UI can act on. */
+  body: Record<string, unknown> | null;
+  constructor(status: number, message: string, body: Record<string, unknown> | null = null) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.body = body;
   }
 }
 
@@ -66,13 +79,14 @@ export class DashboardApi {
     if (!resp.ok) {
       // The API returns {"error": "..."}; the authorizer's own 401/403 may not.
       let message = resp.statusText;
+      let body: Record<string, unknown> | null = null;
       try {
-        const body = await resp.json();
+        body = await resp.json();
         if (body && typeof body.error === "string") message = body.error;
       } catch {
         // non-JSON error body (e.g. an authorizer rejection) — keep statusText
       }
-      throw new ApiError(resp.status, message);
+      throw new ApiError(resp.status, message, body);
     }
     // 204/empty bodies (rare) → undefined cast; JSON otherwise.
     const text = await resp.text();
@@ -133,5 +147,24 @@ export class DashboardApi {
 
   putSettings(body: FleetSettings): Promise<FleetSettings> {
     return this.request<FleetSettings>("PUT", "/admin/settings", { body });
+  }
+
+  // --- GitHub App setup (manifest flow) --------------------------------------
+
+  gitHubAppStatus(): Promise<GitHubAppStatus> {
+    return this.get<GitHubAppStatus>("/admin/github-app/status");
+  }
+
+  gitHubAppManifest(org?: string): Promise<GitHubManifest> {
+    // Sent as query so a plain GET works; org optional (org- vs user-owned app).
+    return this.get<GitHubManifest>("/admin/github-app/setup/manifest", {
+      org: org || undefined,
+    });
+  }
+
+  gitHubAppExchange(code: string): Promise<{ app_id: string; slug: string }> {
+    return this.request("POST", "/admin/github-app/setup/callback", {
+      body: { code },
+    });
   }
 }

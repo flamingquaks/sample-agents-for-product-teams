@@ -25,11 +25,12 @@ import json
 import logging
 import os
 import re
+import time
 from urllib.parse import unquote
 
 import auth
 import config_store
-from http_responses import error, ok
+from http_responses import error, json_response, ok
 
 # GitHub owner/repo segment: letters, digits, hyphen, underscore, dot. This is
 # stricter than GitHub's own rules but a safe superset for real repos, and it is
@@ -90,8 +91,70 @@ def _sync_after_write(log_msg: str, error_msg: str) -> dict | None:
         if _gateway_enforcing():
             logger.exception(log_msg)
             return error(502, error_msg)
-        logger.warning("%s (gateway not enforcing; will re-sync on next change)", log_msg)
+        logger.warning(
+            "%s (gateway not enforcing; will re-sync on next change)", log_msg
+        )
         return None
+
+
+def _github_app_mode() -> bool:
+    """Whether onboarding must verify a GitHub App installation (GITHUB_AUTH_MODE
+    =app) vs the legacy PAT path (default). Behind a flag so the App capability
+    rolls out per stage without breaking existing PAT-mode deploys (spec §6)."""
+    return os.environ.get("GITHUB_AUTH_MODE", "pat").lower() == "app"
+
+
+def _verify_github_install(repo: str):
+    """Verify the GitHub App is installed on ``repo``'s owner and can reach the
+    repo. Returns ``(installation_id, None)`` on success, ``(None, None)`` when
+    App mode is off (no verification), or ``(None, <response>)`` where response is
+    a ready 409/502 to return to the caller.
+
+    409s are actionable: "not installed" carries the install deep-link; "not
+    covered" tells the admin the repo isn't in the installation's selection."""
+    if not _github_app_mode():
+        return None, None  # PAT mode — skip verification (legacy behavior)
+
+    import github_client
+
+    if not github_client.app_configured():
+        return None, error(
+            409, "GitHub App is not set up yet — set it up in the admin UI first"
+        )
+
+    owner, name = repo.split("/", 1)
+    try:
+        owner_type = github_client.get_owner_type(owner)
+        installation_id = github_client.find_installation(owner, owner_type)
+        if installation_id is None:
+            link = github_client.install_url(owner)
+            payload = {
+                "error": f"the GitHub App is not installed on '{owner}'. Install "
+                "it, then re-check.",
+                "install_url": link,
+                "owner_type": owner_type,
+            }
+            return None, json_response(409, payload)
+        if not github_client.repo_reachable(owner, name, installation_id):
+            return None, json_response(
+                409,
+                {
+                    "error": f"'{repo}' isn't covered by the App installation on "
+                    f"'{owner}'. Add it to the installation's repository "
+                    "selection, then re-check.",
+                    "install_url": github_client.install_url(owner),
+                    "owner_type": owner_type,
+                },
+            )
+        # Record the per-owner installation (source of truth) before returning.
+        config_store.put_installation(
+            owner, owner_type=owner_type, installation_id=installation_id
+        )
+        return installation_id, None
+    except github_client.GitHubError as exc:
+        logger.exception("GitHub App verification failed for %s", repo)
+        status = 404 if exc.status == 404 else 502
+        return None, error(status, f"GitHub verification failed for {repo}: {exc}")
 
 
 def _parse_body(event: dict) -> dict:
@@ -133,6 +196,15 @@ def _route(event: dict) -> dict:
                 return error(400, "body.repo must be 'owner/repo'")
             enabled = bool(body.get("enabled", True))
             eligible = bool(body.get("multi_repo_eligible", True))
+            # GitHub App verification (when GITHUB_AUTH_MODE=app): confirm the App
+            # is installed on the repo's owner and can reach the repo BEFORE
+            # onboarding it. Returns a ready response (409 + install deep-link, or
+            # 502) on any problem — never a silent `active` onboard of an
+            # unreachable repo — else the resolved installation_id (or None when
+            # verification is off).
+            installation_id, verify_response = _verify_github_install(repo)
+            if verify_response is not None:
+                return verify_response
             # 1) write the row active, 2) sync the tool-call policy from the
             # allowed set (which now INCLUDES this repo — allowed_repos() only
             # returns active rows, so syncing while pending would omit the very
@@ -148,6 +220,8 @@ def _route(event: dict) -> dict:
                 multi_repo_eligible=eligible,
                 onboarded_by=auth.caller_sub(event),
                 status="active",
+                installation_id=installation_id,
+                install_verified_at=int(time.time()) if installation_id else None,
             )
             try:
                 _sync_repo_policy()
@@ -220,6 +294,63 @@ def _route(event: dict) -> dict:
             if failure is not None:
                 return failure
             return ok(settings)
+
+    # --- GitHub App setup (manifest flow) ---
+    if resource == "/admin/github-app/status" and method == "GET":
+        import github_client
+
+        configured = github_client.app_configured()
+        return ok(
+            {
+                "configured": configured,
+                "auth_mode": os.environ.get("GITHUB_AUTH_MODE", "pat").lower(),
+                "slug": github_client.app_slug() if configured else None,
+                "install_url": github_client.install_url() if configured else None,
+            }
+        )
+
+    if resource == "/admin/github-app/setup/manifest" and method == "GET":
+        import github_client
+
+        # GET carries no body — read optional org/app_name from the query string.
+        qs = event.get("queryStringParameters") or {}
+        app_name = qs.get("app_name") or os.environ.get(
+            "GITHUB_APP_NAME", "SDLC Agent Fleet"
+        )
+        # Derive the API base from the request itself (avoids a CFN cycle between
+        # the admin function and its own API). The App webhook is disabled, so
+        # this only fills the manifest's (inactive) hook URL.
+        rc = event.get("requestContext") or {}
+        domain = rc.get("domainName", "")
+        stage = rc.get("stage", "")
+        api_base = f"https://{domain}/{stage}" if domain else ""
+        frontend = os.environ.get("DASHBOARD_URL", "")
+        if not api_base or not frontend:
+            return error(500, "could not resolve API/dashboard URL for the manifest")
+        manifest = github_client.generate_manifest(app_name, api_base, frontend)
+        # The SPA POSTs this to the org form when an org is given, else the user
+        # form. Hand back both the manifest and the target so the SPA doesn't
+        # hardcode GitHub URLs.
+        org = (qs.get("org") or "").strip()
+        post_url = (
+            f"{github_client.GITHUB_API}/organizations/{org}/settings/apps/new"
+            if org
+            else f"{github_client.GITHUB_API}/settings/apps/new"
+        )
+        return ok({"manifest": manifest, "post_url": post_url})
+
+    if resource == "/admin/github-app/setup/callback" and method == "POST":
+        import github_client
+
+        code = (body.get("code") or "").strip() if body else ""
+        if not code:
+            return error(400, "body.code (manifest conversion code) required")
+        try:
+            result = github_client.exchange_manifest_code(code)
+        except github_client.GitHubError as exc:
+            logger.exception("manifest code exchange failed")
+            return error(502, f"GitHub App creation failed: {exc}")
+        return ok(result)
 
     return error(404, f"no such admin route: {method} {resource}")
 

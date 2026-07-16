@@ -8,7 +8,11 @@ contract). It replaces the deploy-time ``FLEET_GITHUB_REPO`` parameter.
 Table shape (single table, ``FLEET_CONFIG_TABLE`` env var). Partition key ``pk``:
   - Repo record:   pk="repo#<owner/repo>",  {kind:"repo", repo, enabled(bool),
                    multi_repo_eligible(bool), onboarded_by, onboarded_at,
-                   status: "pending"|"active"}
+                   status: "pending"|"active", owner, installation_id?,
+                   install_verified_at?}
+  - Install record: pk="owner#<owner>",     {kind:"install", owner,
+                   owner_type: "User"|"Organization", installation_id(int),
+                   install_verified_at(epoch)}
   - Settings:      pk="settings",           {kind:"settings", restrict_repos(bool)}
 
 ``enabled``            — the repo is dispatchable (a mention from it is routed).
@@ -17,6 +21,12 @@ Table shape (single table, ``FLEET_CONFIG_TABLE`` env var). Partition key ``pk``
                          enabled-but-not-eligible: dispatchable, tool-calls denied.
 ``restrict_repos``     — when False, any enabled repo is allowed; when True, only
                          enabled + eligible repos (the allowlist) are.
+
+Per-owner install record (O-1): the GitHub App is installed per OWNER (a user or
+an org), so one installation serves all of that owner's onboarded repos. We key
+the installation by owner (``owner#<owner>``) rather than duplicating the
+installation_id on every repo row — the repo row references its owner. This lets
+one App span many individual + org owners (each a separate installation).
 """
 
 import os
@@ -25,6 +35,7 @@ import time
 import boto3
 
 _REPO_PK_PREFIX = "repo#"
+_OWNER_PK_PREFIX = "owner#"
 _SETTINGS_PK = "settings"
 
 _table = None
@@ -51,6 +62,15 @@ def _normalize_repo(repo: str) -> str:
 
 def _repo_pk(repo: str) -> str:
     return f"{_REPO_PK_PREFIX}{_normalize_repo(repo)}"
+
+
+def _owner_of(repo: str) -> str:
+    """The owner half of a normalized 'owner/repo'."""
+    return _normalize_repo(repo).split("/", 1)[0]
+
+
+def _owner_pk(owner: str) -> str:
+    return f"{_OWNER_PK_PREFIX}{owner.strip().casefold()}"
 
 
 # --- reads -------------------------------------------------------------------
@@ -105,22 +125,58 @@ def put_repo(
     multi_repo_eligible: bool = True,
     onboarded_by: str = "",
     status: str = "pending",
+    installation_id: int | None = None,
+    install_verified_at: int | None = None,
 ) -> dict:
     """Create/replace a repo record. ``status`` defaults to ``pending``; the
     admin onboarding flow instead writes ``active`` and rolls back to ``pending``
     if the Gateway policy sync fails — because ``allowed_repos()`` only returns
     ``active`` rows, so syncing while ``pending`` would omit the very repo being
-    onboarded. See admin.py's POST /admin/repos."""
+    onboarded. See admin.py's POST /admin/repos.
+
+    ``installation_id`` / ``install_verified_at`` are set once onboarding has
+    verified the GitHub App is installed on the repo's owner and can reach the
+    repo. They're denormalized onto the repo row for convenience; the per-owner
+    install record (put_installation) is the source of truth."""
     normalized = _normalize_repo(repo)
     item = {
         "pk": _repo_pk(normalized),
         "kind": "repo",
         "repo": normalized,
+        "owner": _owner_of(normalized),
         "enabled": bool(enabled),
         "multi_repo_eligible": bool(multi_repo_eligible),
         "onboarded_by": onboarded_by,
         "onboarded_at": int(time.time()),
         "status": status,
+    }
+    if installation_id is not None:
+        item["installation_id"] = int(installation_id)
+    if install_verified_at is not None:
+        item["install_verified_at"] = int(install_verified_at)
+    _get_table().put_item(Item=item)
+    return item
+
+
+# --- per-owner GitHub App installation records -------------------------------
+
+
+def get_installation(owner: str) -> dict | None:
+    """The GitHub App install record for ``owner``, or None if not onboarded."""
+    resp = _get_table().get_item(Key={"pk": _owner_pk(owner)})
+    return resp.get("Item")
+
+
+def put_installation(owner: str, *, owner_type: str, installation_id: int) -> dict:
+    """Record (create/replace) the App installation for an owner. One install
+    serves all of that owner's repos."""
+    item = {
+        "pk": _owner_pk(owner),
+        "kind": "install",
+        "owner": owner.strip().casefold(),
+        "owner_type": owner_type,
+        "installation_id": int(installation_id),
+        "install_verified_at": int(time.time()),
     }
     _get_table().put_item(Item=item)
     return item

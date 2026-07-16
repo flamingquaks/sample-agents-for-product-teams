@@ -62,6 +62,23 @@ Parameters:
     Default: "https://mcp.asana.com/v2/mcp"
     Description: Asana MCP server endpoint registered as a gateway target.
 
+  GitHubAuthMode:
+    Type: String
+    Default: "pat"
+    AllowedValues: ["pat", "app"]
+    Description: >
+      GitHub credential model. "pat" (default) = the legacy shared SSM token.
+      "app" = per-owner GitHub App installation tokens; onboarding then verifies
+      the App is installed on a repo's owner and can reach the repo before
+      activating it. Roll out per stage after registering the App in the admin UI.
+
+  GitHubAppName:
+    Type: String
+    Default: "SDLC Agent Fleet"
+    Description: >
+      Display name used when registering the fleet's GitHub App from the admin
+      UI manifest flow (GitHubAuthMode=app). Must be unique across GitHub.
+
 Conditions:
   DashboardEnabled: !Equals [!Ref DeployDashboard, "true"]
   GatewayEnabled: !Equals [!Ref DeployGateway, "true"]
@@ -189,6 +206,43 @@ Resources:
       Tags:
         - Key: Project
           Value: sdlc-agents
+
+  # ---------------------------------------------------------------------------
+  # GitHub App credentials (GitHubAuthMode=app) — created empty, populated by
+  # the admin manifest flow. Private key → Secrets Manager (rotation, resource
+  # policy, staged versions); app id + slug → SSM String (not secret). See
+  # docs/specs/github-onboarding-spec.md §3.2. Gated on DashboardEnabled — the
+  # admin Lambda is what reads/writes them.
+  # ---------------------------------------------------------------------------
+
+  GitHubAppPrivateKey:
+    Type: AWS::SecretsManager::Secret
+    Condition: DashboardEnabled
+    Properties:
+      Name: !Sub sdlc-agents/${Stage}/github-app/private-key
+      Description: GitHub App private key (PEM) — written by the admin manifest flow
+      Tags:
+        - Key: Project
+          Value: sdlc-agents
+
+  GitHubAppIdParam:
+    Type: AWS::SSM::Parameter
+    Condition: DashboardEnabled
+    Properties:
+      Name: !Sub /sdlc-agents/${Stage}/github-app-id
+      Type: String
+      # Placeholder until the manifest flow overwrites it; SSM has no empty value.
+      Value: "unset"
+      Description: GitHub App ID (populated by the admin manifest flow)
+
+  GitHubAppSlugParam:
+    Type: AWS::SSM::Parameter
+    Condition: DashboardEnabled
+    Properties:
+      Name: !Sub /sdlc-agents/${Stage}/github-app-slug
+      Type: String
+      Value: "unset"
+      Description: GitHub App slug (drives the install deep-link)
 
   # ---------------------------------------------------------------------------
   # S3 — Agent Artifacts
@@ -786,10 +840,34 @@ Resources:
           # are the agents' runtime-role ARNs, resource is the literal gateway).
           FLEET_GATEWAY_ARN: !If [GatewayEnabled, !GetAtt FleetGateway.GatewayArn, !Ref "AWS::NoValue"]
           AWS_ACCOUNT_ID: !If [GatewayEnabled, !Ref "AWS::AccountId", !Ref "AWS::NoValue"]
+          # GitHub App: onboarding verification + manifest flow. Param/secret
+          # names are always passed (the resources exist when the dashboard is
+          # on); GITHUB_AUTH_MODE gates whether verification actually runs.
+          GITHUB_AUTH_MODE: !Ref GitHubAuthMode
+          GITHUB_APP_NAME: !Ref GitHubAppName
+          GITHUB_APP_ID_PARAM: !Ref GitHubAppIdParam
+          GITHUB_APP_SLUG_PARAM: !Ref GitHubAppSlugParam
+          GITHUB_APP_PRIVATE_KEY_SECRET_ARN: !Ref GitHubAppPrivateKey
+          DASHBOARD_URL: !Sub https://${DashboardDistribution.DomainName}/
       Policies:
         # Read+write the config table (onboard/enable/disable repos, settings).
         - DynamoDBCrudPolicy:
             TableName: !Ref FleetConfigTable
+        # GitHub App: read app id/slug + read/write the private key + update the
+        # id/slug params after the manifest flow creates the App.
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+                - secretsmanager:PutSecretValue
+              Resource: !Ref GitHubAppPrivateKey
+            - Effect: Allow
+              Action:
+                - ssm:GetParameter
+                - ssm:PutParameter
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/github-app-id
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/github-app-slug
         # Sync the fleet Cedar policy to the engine (gateway deploys only).
         - !If
           - GatewayEnabled
@@ -847,6 +925,24 @@ Resources:
           Properties:
             Path: /admin/settings
             Method: PUT
+            RestApiId: !Ref DashboardApi
+        GitHubAppStatus:
+          Type: Api
+          Properties:
+            Path: /admin/github-app/status
+            Method: GET
+            RestApiId: !Ref DashboardApi
+        GitHubAppManifest:
+          Type: Api
+          Properties:
+            Path: /admin/github-app/setup/manifest
+            Method: GET
+            RestApiId: !Ref DashboardApi
+        GitHubAppCallback:
+          Type: Api
+          Properties:
+            Path: /admin/github-app/setup/callback
+            Method: POST
             RestApiId: !Ref DashboardApi
 
   # ===========================================================================

@@ -286,3 +286,115 @@ def test_unknown_route_404():
     _make_table()
     admin = _load_admin()
     assert admin.handler(_event("GET", "/admin/nope"))["statusCode"] == 404
+
+
+# --- GitHub App onboarding verification (GITHUB_AUTH_MODE=app) ----------------
+
+
+class _FakeGitHub:
+    """Stand-in for github_client injected into the handler's lazy import."""
+
+    GitHubError = type("GitHubError", (Exception,), {"status": None})
+
+    def __init__(
+        self, *, configured=True, owner_type="User", installation_id=7, reachable=True
+    ):
+        self._configured = configured
+        self._owner_type = owner_type
+        self._installation_id = installation_id
+        self._reachable = reachable
+
+    def app_configured(self):
+        return self._configured
+
+    def get_owner_type(self, owner):
+        return self._owner_type
+
+    def find_installation(self, owner, owner_type):
+        return self._installation_id
+
+    def repo_reachable(self, owner, name, installation_id):
+        return self._reachable
+
+    def install_url(self, owner=None):
+        return "https://github.com/apps/sdlc-fleet/installations/new"
+
+
+def _load_admin_app_mode(monkeypatch, fake):
+    monkeypatch.setenv("GITHUB_AUTH_MODE", "app")
+    for m in ("admin", "config_store", "auth", "http_responses", "github_client"):
+        sys.modules.pop(m, None)
+    sys.modules["github_client"] = (
+        fake  # handler's `import github_client` picks this up
+    )
+    monkeypatch.setattr("policy_sync.sync_fleet_policy", lambda: None, raising=False)
+    import admin
+
+    # policy sync is a no-op in these tests (no gateway); stub the seam.
+    monkeypatch.setattr(admin, "_sync_repo_policy", lambda: None)
+    return admin
+
+
+@mock_aws
+def test_onboard_verifies_and_stores_installation(monkeypatch):
+    _make_table()
+    admin = _load_admin_app_mode(
+        monkeypatch, _FakeGitHub(owner_type="Organization", installation_id=55)
+    )
+    resp = admin.handler(_event("POST", "/admin/repos", body={"repo": "acme/web"}))
+    assert resp["statusCode"] == 200
+    import config_store
+
+    rec = config_store.get_repo("acme/web")
+    assert rec["installation_id"] == 55 and rec["status"] == "active"
+    # per-owner install record written
+    inst = config_store.get_installation("acme")
+    assert inst["owner_type"] == "Organization" and inst["installation_id"] == 55
+
+
+@mock_aws
+def test_onboard_409_when_app_not_installed(monkeypatch):
+    _make_table()
+    fake = _FakeGitHub(installation_id=None)  # App not installed on the owner
+    admin = _load_admin_app_mode(monkeypatch, fake)
+    resp = admin.handler(_event("POST", "/admin/repos", body={"repo": "acme/web"}))
+    assert resp["statusCode"] == 409
+    body = _body(resp)
+    assert "install_url" in body and body["install_url"].startswith(
+        "https://github.com/apps/"
+    )
+    import config_store
+
+    assert config_store.get_repo("acme/web") is None  # NOT onboarded
+
+
+@mock_aws
+def test_onboard_409_when_repo_not_covered(monkeypatch):
+    _make_table()
+    admin = _load_admin_app_mode(monkeypatch, _FakeGitHub(reachable=False))
+    resp = admin.handler(_event("POST", "/admin/repos", body={"repo": "acme/web"}))
+    assert resp["statusCode"] == 409
+    assert "covered" in _body(resp)["error"]
+
+
+@mock_aws
+def test_onboard_409_when_app_not_configured(monkeypatch):
+    _make_table()
+    admin = _load_admin_app_mode(monkeypatch, _FakeGitHub(configured=False))
+    resp = admin.handler(_event("POST", "/admin/repos", body={"repo": "acme/web"}))
+    assert resp["statusCode"] == 409
+    assert "not set up" in _body(resp)["error"]
+
+
+@mock_aws
+def test_pat_mode_skips_verification(monkeypatch):
+    # Default (pat) mode: onboarding does NOT call GitHub and stores no install id.
+    monkeypatch.setenv("GITHUB_AUTH_MODE", "pat")
+    _make_table()
+    admin = _load_admin()
+    monkeypatch.setattr(admin, "_sync_repo_policy", lambda: None)
+    resp = admin.handler(_event("POST", "/admin/repos", body={"repo": "acme/web"}))
+    assert resp["statusCode"] == 200
+    import config_store
+
+    assert "installation_id" not in config_store.get_repo("acme/web")

@@ -12,6 +12,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError, type DashboardApi } from "./api";
 import { fmtTime } from "./format";
+import { GitHubAppPanel } from "./GitHubAppPanel";
 import { usePolling } from "./hooks";
 import type { FleetSettings, RepoConfig } from "./types";
 
@@ -82,6 +83,30 @@ export function AdminView({
     [reposPoll, settingsPoll, onAuthError],
   );
 
+  // GitHub App manifest callback: GitHub redirects back to
+  // #/admin/github-app/setup-callback?code=... — exchange the code once, then
+  // clean the hash to #/admin so a refresh doesn't re-redeem a used code.
+  useEffect(() => {
+    const hash = window.location.hash;
+    if (!hash.includes("github-app/setup-callback")) return;
+    const q = hash.split("?")[1] ?? "";
+    const code = new URLSearchParams(q).get("code");
+    window.location.hash = "#/admin";
+    if (!code) return;
+    setBusy(true);
+    setActionError(null);
+    api
+      .gitHubAppExchange(code)
+      .then((r) => setActionMsg(`GitHub App "${r.slug}" registered.`))
+      .catch((e) => {
+        if (e instanceof ApiError && e.status === 401) onAuthError();
+        setActionError(`GitHub App setup failed: ${(e as Error).message}`);
+      })
+      .finally(() => setBusy(false));
+    // Run once on mount; the hash is cleaned above so it won't re-fire.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const repos = reposPoll.data?.repos ?? [];
   const restrict = settingsPoll.data?.restrict_repos ?? false;
 
@@ -104,6 +129,8 @@ export function AdminView({
       {actionError && <div className="banner error">{actionError}</div>}
       {actionMsg && <div className="banner ok">{actionMsg}</div>}
 
+      <GitHubAppPanel api={api} onAuthError={onAuthError} />
+
       <SettingsPanel
         restrict={restrict}
         disabled={busy}
@@ -116,11 +143,13 @@ export function AdminView({
 
       {onboardOpen && (
         <OnboardModal
-          busy={busy}
+          api={api}
           onClose={() => setOnboardOpen(false)}
-          onOnboard={async (body) => {
-            const ok = await run(`Onboard ${body.repo}`, () => api.onboardRepo(body));
-            if (ok) setOnboardOpen(false);
+          onSuccess={(repo, warning) => {
+            setOnboardOpen(false);
+            setActionError(null);
+            setActionMsg(warning ? `Onboarded ${repo} — ${warning}` : `Onboarded ${repo}.`);
+            reposPoll.refresh();
           }}
         />
       )}
@@ -223,26 +252,27 @@ const REPO_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
 // form in a focused dialog, submit. The dialog only closes on success (the
 // parent's onOnboard resolves after the write); a validation or API failure
 // keeps it open with the reason shown so the input isn't lost.
+// The modal owns its submit so it can handle the GitHub-App verification loop:
+// a 409 "not installed" / "not covered" carries an `install_url` the dialog
+// surfaces as an install button + a Re-check (retry) — a guided loop, not a
+// dead end. On success it calls onSuccess (which closes the dialog + refreshes
+// the parent's list).
 function OnboardModal({
-  busy,
-  onOnboard,
+  api,
+  onSuccess,
   onClose,
 }: {
-  busy: boolean;
-  onOnboard: (body: {
-    repo: string;
-    enabled: boolean;
-    multi_repo_eligible: boolean;
-  }) => void | Promise<void>;
+  api: DashboardApi;
+  onSuccess: (repo: string, warning?: string) => void;
   onClose: () => void;
 }) {
   const [repo, setRepo] = useState("");
   const [eligible, setEligible] = useState(true);
+  const [busy, setBusy] = useState(false);
   const [hint, setHint] = useState<string | null>(null);
+  const [installUrl, setInstallUrl] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  // Focus the field on open and allow Esc to dismiss, so the dialog is usable
-  // from the keyboard the moment it appears.
   useEffect(() => {
     inputRef.current?.focus();
     const onKey = (e: KeyboardEvent) => {
@@ -252,9 +282,8 @@ function OnboardModal({
     return () => window.removeEventListener("keydown", onKey);
   }, [busy, onClose]);
 
-  const submit = () => {
+  const submit = async () => {
     const trimmed = repo.trim();
-    // Never a silent no-op: if the field is empty or malformed, say why.
     if (!trimmed) {
       setHint("Enter a repository as owner/repo (e.g. octocat/hello-world).");
       return;
@@ -264,13 +293,32 @@ function OnboardModal({
       return;
     }
     setHint(null);
-    void onOnboard({ repo: trimmed, enabled: true, multi_repo_eligible: eligible });
+    setInstallUrl(null);
+    setBusy(true);
+    try {
+      const rec = (await api.onboardRepo({
+        repo: trimmed,
+        enabled: true,
+        multi_repo_eligible: eligible,
+      })) as { policy_sync_warning?: string };
+      onSuccess(trimmed, rec.policy_sync_warning);
+    } catch (e) {
+      if (e instanceof ApiError) {
+        setHint(e.message);
+        // 409 with an install deep-link → offer to install + re-check.
+        const link = e.body?.install_url;
+        if (typeof link === "string") setInstallUrl(link);
+      } else {
+        setHint((e as Error).message);
+      }
+    } finally {
+      setBusy(false);
+    }
   };
 
   return (
     <div
       className="modal-overlay"
-      // Click on the backdrop (not the dialog) closes, matching common dialog UX.
       onClick={() => {
         if (!busy) onClose();
       }}
@@ -300,7 +348,7 @@ function OnboardModal({
               if (hint) setHint(null);
             }}
             onKeyDown={(e) => {
-              if (e.key === "Enter") submit();
+              if (e.key === "Enter") void submit();
             }}
             aria-label="Repository (owner/repo)"
           />
@@ -319,6 +367,14 @@ function OnboardModal({
         {hint && (
           <div className="banner error" role="alert">
             {hint}
+            {installUrl && (
+              <div style={{ marginTop: 8 }}>
+                <a className="button-link" href={installUrl} target="_blank" rel="noreferrer">
+                  Install the GitHub App ↗
+                </a>{" "}
+                then Re-check.
+              </div>
+            )}
           </div>
         )}
 
@@ -326,10 +382,8 @@ function OnboardModal({
           <button disabled={busy} onClick={onClose}>
             Cancel
           </button>
-          {/* Button is NOT disabled on empty input — submit() reports the reason
-              instead of being an inert dead end. */}
-          <button className="primary" disabled={busy} onClick={submit}>
-            {busy ? "Onboarding…" : "Onboard repo"}
+          <button className="primary" disabled={busy} onClick={() => void submit()}>
+            {busy ? "Onboarding…" : installUrl ? "Re-check" : "Onboard repo"}
           </button>
         </div>
       </div>

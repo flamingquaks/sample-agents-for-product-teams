@@ -81,3 +81,17 @@ export interface FleetSettings {
    *  enabled repo is. */
   restrict_repos: boolean;
 }
+
+/** GitHub App registration status for the admin setup panel. */
+export interface GitHubAppStatus {
+  configured: boolean;
+  auth_mode: "pat" | "app" | string;
+  slug?: string | null;
+  install_url?: string | null;
+}
+
+/** The manifest + the GitHub form URL the SPA POSTs it to. */
+export interface GitHubManifest {
+  manifest: Record<string, unknown>;
+  post_url: string;
+}
