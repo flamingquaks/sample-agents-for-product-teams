@@ -61,3 +61,23 @@ export interface FleetStats {
   by_source: Record<string, number>;
   truncated: boolean;
 }
+
+// --- admin config (fleet-config table, admin API) ---------------------------
+
+/** An onboarded repo. `enabled` = dispatchable; `multi_repo_eligible` = allowed
+ *  for cross-repo tool actions (the Gateway policy allowlist). `status` is
+ *  "pending" until the tool-call policy sync lands, then "active". */
+export interface RepoConfig {
+  repo: string;
+  enabled: boolean;
+  multi_repo_eligible: boolean;
+  status?: string;
+  onboarded_by?: string;
+  onboarded_at?: number;
+}
+
+export interface FleetSettings {
+  /** When true, only enabled+eligible repos are allowed; when false, any
+   *  enabled repo is. */
+  restrict_repos: boolean;
+}

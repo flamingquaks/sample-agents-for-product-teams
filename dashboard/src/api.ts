@@ -6,7 +6,7 @@
 // operator-group membership. A 401 is surfaced as ApiError with status 401 so
 // the UI can trigger re-authentication (the token likely expired).
 
-import type { FleetStats, Run, RunsPage, TraceResult } from "./types";
+import type { FleetSettings, FleetStats, RepoConfig, Run, RunsPage, TraceResult } from "./types";
 
 export class ApiError extends Error {
   status: number;
@@ -34,18 +34,30 @@ export class DashboardApi {
     private readonly getToken: TokenGetter,
   ) {}
 
-  private async get<T>(path: string, query?: Record<string, string | number | undefined>): Promise<T> {
+  /** Core request: attaches the Bearer token, sends an optional JSON body, and
+   *  normalizes errors to ApiError (status 0 = network/CORS). Shared by the
+   *  read GETs and the admin write verbs. */
+  private async request<T>(
+    method: string,
+    path: string,
+    opts: { query?: Record<string, string | number | undefined>; body?: unknown } = {},
+  ): Promise<T> {
     const url = new URL(this.baseUrl + path);
-    if (query) {
-      for (const [k, v] of Object.entries(query)) {
+    if (opts.query) {
+      for (const [k, v] of Object.entries(opts.query)) {
         if (v !== undefined && v !== "") url.searchParams.set(k, String(v));
       }
     }
     const token = this.getToken();
+    const headers: Record<string, string> = {};
+    if (token) headers.Authorization = `Bearer ${token}`;
+    if (opts.body !== undefined) headers["Content-Type"] = "application/json";
     let resp: Response;
     try {
       resp = await fetch(url.toString(), {
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        method,
+        headers,
+        body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
       });
     } catch (e) {
       // Network/CORS failure — distinct from an HTTP error status.
@@ -62,8 +74,16 @@ export class DashboardApi {
       }
       throw new ApiError(resp.status, message);
     }
-    return (await resp.json()) as T;
+    // 204/empty bodies (rare) → undefined cast; JSON otherwise.
+    const text = await resp.text();
+    return (text ? JSON.parse(text) : undefined) as T;
   }
+
+  private get<T>(path: string, query?: Record<string, string | number | undefined>): Promise<T> {
+    return this.request<T>("GET", path, { query });
+  }
+
+  // --- read API --------------------------------------------------------------
 
   listRuns(params: ListRunsParams = {}): Promise<RunsPage> {
     return this.get<RunsPage>("/runs", { ...params });
@@ -79,5 +99,31 @@ export class DashboardApi {
 
   stats(): Promise<FleetStats> {
     return this.get<FleetStats>("/stats");
+  }
+
+  // --- admin API (admins group; write) --------------------------------------
+
+  listRepos(): Promise<{ repos: RepoConfig[] }> {
+    return this.get<{ repos: RepoConfig[] }>("/admin/repos");
+  }
+
+  onboardRepo(body: {
+    repo: string;
+    enabled?: boolean;
+    multi_repo_eligible?: boolean;
+  }): Promise<RepoConfig> {
+    return this.request<RepoConfig>("POST", "/admin/repos", { body });
+  }
+
+  deleteRepo(repo: string): Promise<{ repo: string; deleted: boolean }> {
+    return this.request("DELETE", `/admin/repos/${encodeURIComponent(repo)}`);
+  }
+
+  getSettings(): Promise<FleetSettings> {
+    return this.get<FleetSettings>("/admin/settings");
+  }
+
+  putSettings(body: FleetSettings): Promise<FleetSettings> {
+    return this.request<FleetSettings>("PUT", "/admin/settings", { body });
   }
 }

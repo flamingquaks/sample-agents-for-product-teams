@@ -2,7 +2,7 @@
 
 Read-only access to the ``dispatch-assignments`` table the Dispatch Router and
 agents write. Every function returns plain dicts/lists (Decimal-valued numbers
-are serialized by responses._DecimalEncoder at the edge).
+are serialized by http_responses._DecimalEncoder at the edge).
 
 Access paths:
 - ``list_runs`` → ``AllRunsIndex`` GSI (constant PK, SK created_at) for

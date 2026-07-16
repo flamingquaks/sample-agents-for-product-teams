@@ -15,11 +15,17 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Cognito group whose members may call the dashboard API. Must match the group
-# provisioned in infra/foundation/template.yaml (OperatorGroup). Kept as a
-# constant, not env-driven, so a stack misconfiguration cannot silently widen
-# who counts as an operator.
+# Cognito groups whose members may call the dashboard API. Must match the groups
+# provisioned in infra/foundation/template.yaml (DashboardOperatorGroup /
+# DashboardAdminGroup). Kept as constants, not env-driven, so a stack
+# misconfiguration cannot silently widen who counts as an operator or admin.
+#
+# operators view fleet activity (read-only). admins additionally configure the
+# fleet (onboard repos, restriction settings) via the write endpoints. admins
+# are a strict superset for API purposes: an admin can do anything an operator
+# can plus the writes.
 OPERATOR_GROUP = "operators"
+ADMIN_GROUP = "admins"
 
 
 def _claims(event: dict) -> dict:
@@ -45,10 +51,10 @@ def parse_groups(claims: dict) -> set[str]:
     return {g.strip() for g in stripped.replace(",", " ").split() if g.strip()}
 
 
-def is_operator(event: dict) -> bool:
-    """True iff the authenticated caller is a member of the operator group.
+def _in_group(event: dict, allowed: set[str], label: str) -> bool:
+    """True iff the authenticated caller belongs to any group in ``allowed``.
 
-    Fails closed: no claims, no groups claim, or the group absent → False.
+    Fails closed: no claims, no subject, or no matching group → False.
     """
     claims = _claims(event)
     sub = claims.get("sub") if isinstance(claims, dict) else None
@@ -56,10 +62,22 @@ def is_operator(event: dict) -> bool:
         logger.warning("Dashboard request with no authenticated subject; denying")
         return False
     groups = parse_groups(claims)
-    if OPERATOR_GROUP not in groups:
-        logger.warning("Subject %s not in %s group; denying", sub, OPERATOR_GROUP)
+    if allowed.isdisjoint(groups):
+        logger.warning("Subject %s not authorized for %s; denying", sub, label)
         return False
     return True
+
+
+def is_operator(event: dict) -> bool:
+    """True iff the caller may read fleet activity — a member of ``operators``
+    or ``admins`` (admins can do everything operators can)."""
+    return _in_group(event, {OPERATOR_GROUP, ADMIN_GROUP}, "read access")
+
+
+def is_admin(event: dict) -> bool:
+    """True iff the caller may configure the fleet — a member of ``admins``.
+    Fails closed. Gates the write endpoints (repo onboarding, settings)."""
+    return _in_group(event, {ADMIN_GROUP}, "admin access")
 
 
 def caller_sub(event: dict) -> str:

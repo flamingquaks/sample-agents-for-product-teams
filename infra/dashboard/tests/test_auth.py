@@ -60,3 +60,29 @@ def test_substring_group_does_not_grant():
 def test_caller_sub():
     assert auth.caller_sub(_event({"sub": "abc"})) == "abc"
     assert auth.caller_sub({"requestContext": {}}) == ""
+
+
+# --- admin group + operator/admin relationship ------------------------------
+
+
+def test_admin_can_also_read():
+    # admins are a superset of operators for API purposes.
+    ev = _event({"sub": "u1", "cognito:groups": "[admins]"})
+    assert auth.is_admin(ev) is True
+    assert auth.is_operator(ev) is True
+
+
+def test_operator_is_not_admin():
+    ev = _event({"sub": "u1", "cognito:groups": "[operators]"})
+    assert auth.is_operator(ev) is True
+    assert auth.is_admin(ev) is False
+
+
+def test_is_admin_false_without_group_or_sub():
+    assert auth.is_admin(_event({"sub": "u1", "cognito:groups": "operators"})) is False
+    assert auth.is_admin(_event({"cognito:groups": "admins"})) is False
+    assert auth.is_admin({"requestContext": {}}) is False
+
+
+def test_admin_substring_does_not_grant():
+    assert auth.is_admin(_event({"sub": "u1", "cognito:groups": "admins-ro"})) is False

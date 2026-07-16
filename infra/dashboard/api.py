@@ -19,7 +19,7 @@ import logging
 
 import auth
 import queries
-from responses import error, ok
+from http_responses import error, ok
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)

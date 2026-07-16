@@ -123,6 +123,32 @@ Resources:
           Value: sdlc-agents
 
   # ---------------------------------------------------------------------------
+  # DynamoDB — Fleet Configuration (runtime-mutable: onboarded repos + settings)
+  # ---------------------------------------------------------------------------
+  # The admin API writes this; the Dispatch Router reads it to decide which
+  # repos may dispatch (multi-repo allowlist). Unconditional — the router needs
+  # it even when the dashboard UI isn't deployed. Replaces the deploy-time
+  # FLEET_GITHUB_REPO parameter. Small item count (a handful of repos + one
+  # settings row), no TTL (config is not ephemeral).
+
+  FleetConfigTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub fleet-config-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: sdlc-agents
+
+  # ---------------------------------------------------------------------------
   # S3 — Agent Artifacts
   # ---------------------------------------------------------------------------
 
@@ -529,6 +555,16 @@ Resources:
       Description: Operators authorized to view fleet-wide agent activity
       UserPoolId: !Ref DashboardUserPool
 
+  # admins additionally configure the fleet (onboard repos, restriction
+  # settings) through the write API. Membership is an explicit admin action.
+  DashboardAdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Condition: DashboardEnabled
+    Properties:
+      GroupName: admins
+      Description: Admins authorized to configure the fleet (onboard repos, restrictions)
+      UserPoolId: !Ref DashboardUserPool
+
   DashboardUserPoolClient:
     Type: AWS::Cognito::UserPoolClient
     Condition: DashboardEnabled
@@ -588,7 +624,7 @@ Resources:
             UserPoolArn: !GetAtt DashboardUserPool.Arn
         AddDefaultAuthorizerToCorsPreflight: false
       Cors:
-        AllowMethods: "'GET,OPTIONS'"
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
         AllowHeaders: "'Authorization,Content-Type'"
         AllowOrigin: "'*'"
       AccessLogSetting:
@@ -615,7 +651,7 @@ Resources:
       ResponseParameters:
         gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
         gatewayresponse.header.Access-Control-Allow-Headers: "'Authorization,Content-Type'"
-        gatewayresponse.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+        gatewayresponse.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
 
   DashboardGatewayResponse5xx:
     Type: AWS::ApiGateway::GatewayResponse
@@ -626,7 +662,7 @@ Resources:
       ResponseParameters:
         gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
         gatewayresponse.header.Access-Control-Allow-Headers: "'Authorization,Content-Type'"
-        gatewayresponse.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+        gatewayresponse.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
 
   DashboardQueryFunction:
     Type: AWS::Serverless::Function
@@ -674,6 +710,61 @@ Resources:
           Properties:
             Path: /stats
             Method: GET
+            RestApiId: !Ref DashboardApi
+
+  # --- Admin write API: fleet configuration (repos + settings) ---------------
+  # Separate function from the read-only query fn so its write IAM (CRUD on the
+  # config table) doesn't broaden the read path. Admin-group enforcement is in
+  # admin.py (auth.is_admin); the Cognito authorizer on DashboardApi still
+  # validates the JWT for these routes too.
+
+  DashboardAdminFunction:
+    Type: AWS::Serverless::Function
+    Condition: DashboardEnabled
+    Properties:
+      FunctionName: !Sub dashboard-admin-${Stage}
+      CodeUri: ../dashboard/
+      Handler: admin.handler
+      Timeout: 30
+      Environment:
+        Variables:
+          FLEET_CONFIG_TABLE: !Ref FleetConfigTable
+      Policies:
+        # Read+write the config table (onboard/enable/disable repos, settings).
+        # WS5 adds bedrock-agentcore policy-update permissions here for the
+        # Gateway Cedar policy sync.
+        - DynamoDBCrudPolicy:
+            TableName: !Ref FleetConfigTable
+      Events:
+        ListRepos:
+          Type: Api
+          Properties:
+            Path: /admin/repos
+            Method: GET
+            RestApiId: !Ref DashboardApi
+        OnboardRepo:
+          Type: Api
+          Properties:
+            Path: /admin/repos
+            Method: POST
+            RestApiId: !Ref DashboardApi
+        DeleteRepo:
+          Type: Api
+          Properties:
+            Path: /admin/repos/{repo}
+            Method: DELETE
+            RestApiId: !Ref DashboardApi
+        GetSettings:
+          Type: Api
+          Properties:
+            Path: /admin/settings
+            Method: GET
+            RestApiId: !Ref DashboardApi
+        PutSettings:
+          Type: Api
+          Properties:
+            Path: /admin/settings
+            Method: PUT
             RestApiId: !Ref DashboardApi
 
   # --- SPA hosting: private S3 + CloudFront (OAC) ----------------------------

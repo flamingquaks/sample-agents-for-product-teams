@@ -19,7 +19,10 @@ CORS_HEADERS = {
     "Content-Type": "application/json",
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Headers": "Authorization,Content-Type",
-    "Access-Control-Allow-Methods": "GET,OPTIONS",
+    # GET for the read API; POST/PUT/DELETE for the admin write API (repo
+    # onboarding + settings). Auth is still enforced per-request by the Cognito
+    # authorizer + group check, so listing the methods here doesn't widen access.
+    "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
 }
 
 
