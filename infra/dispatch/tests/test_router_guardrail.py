@@ -44,6 +44,9 @@ def router(monkeypatch):
     # Avoid real DynamoDB calls:
     router_mod.assignments_table = MagicMock()
     router_mod.assignments_table.query.return_value = {"Count": 0}
+    # The repo allowlist is exercised in test_router_repo_binding; here we assume
+    # the dispatch repo is onboarded so these tests focus on guardrail handling.
+    monkeypatch.setattr(router_mod, "check_repo_allowed", lambda *a, **k: True)
     yield router_mod
 
 

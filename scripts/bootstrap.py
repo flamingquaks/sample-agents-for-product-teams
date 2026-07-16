@@ -790,9 +790,6 @@ def deploy_foundation(runner: Runner, cfg: dict) -> None:
         f"WorkitemsBotGID={cfg.get('workitems_bot_gid', '')}",
         f"AgentFieldGID={cfg.get('agent_field_gid', '')}",
         f"DeployDashboard={'true' if cfg.get('deploy_dashboard') else 'false'}",
-        # Bind the Dispatch Router's single-repo guard to the same repo the
-        # agents are deployed against, so a mention from another repo is rejected.
-        f"FleetGitHubRepo={cfg.get('target_repo', '')}",
     ]
     if runner.profile:
         cmd += ["--profile", runner.profile]

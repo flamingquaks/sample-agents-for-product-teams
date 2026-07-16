@@ -94,7 +94,8 @@ Passed to `sam deploy --parameter-overrides`:
 - **`Stage`** — `dev` / `staging` / `prod`. Embedded in every resource name.
 - **`WorkitemsBotGID`** — Asana user GID that tasks are assigned to to trigger Workitems.
 - **`AgentFieldGID`** — Asana custom field GID for the "Agent" dropdown (optional — empty string is fine if you're not using custom-field triggers).
-- **`FleetGitHubRepo`** — the single GitHub repo (`owner/repo`) this fleet is bound to. When set, the Dispatch Router rejects any GitHub mention from a *different* repo with a `403` — the agents are single-repo (`GITHUB_REPO` is baked into their runtime), so a mention from another repo would otherwise feed an agent a dispatched repo that contradicts its hardcoded one and risk work landing in the wrong repo. Should equal the `TARGET_REPO` the agents are deployed with; `scripts/bootstrap.py` sets it automatically from your target repo. Empty disables the check (any repo is dispatched).
+
+Which GitHub repos the fleet acts on is no longer a deploy parameter. The fleet is multi-repo: deploy it once, then an admin onboards repos at runtime in the dashboard's Admin view (stored in the `fleet-config-${Stage}` DynamoDB table). The Dispatch Router reads that allowlist and rejects a GitHub mention from a non-onboarded repo with a `403`. See the dashboard admin docs for the onboarding flow.
 
 ### 2.4 SSM SecureString parameters (populated by connect skills)
 

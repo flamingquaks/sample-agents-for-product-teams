@@ -26,6 +26,7 @@ import boto3
 from botocore.config import Config
 
 import enrichment
+import fleet_config
 import guardrail
 import reply
 
@@ -47,13 +48,6 @@ agentcore = boto3.client(
 
 CLOUDWATCH_NAMESPACE = os.environ.get("CLOUDWATCH_NAMESPACE", "SDLCAgents/Dispatch")
 STAGE = os.environ.get("STAGE", "dev")
-
-# The single GitHub repo this fleet is bound to (owner/repo), or "" to disable
-# the check. The agents are single-repo — GITHUB_REPO is baked into their
-# runtime — so a GitHub mention from a *different* repo would feed the agent a
-# prompt whose dispatched repo contradicts its hardcoded one, risking work
-# landing in the wrong repo. When set, we reject the mismatch up front.
-FLEET_GITHUB_REPO = os.environ.get("FLEET_GITHUB_REPO", "").strip()
 
 BLOCKED_MESSAGE_TEMPLATE = (
     "This request was blocked by a prompt-injection safety filter"
@@ -173,25 +167,23 @@ def check_authorization(agent_config: dict, sender: str, source: str) -> bool:
     return sender in allowed_users
 
 
-# --- Repo binding (single-repo guard) ----------------------------------------
+# --- Repo binding (multi-repo allowlist) -------------------------------------
 
 
 def check_repo_allowed(source: str, source_context: dict) -> bool:
-    """For a GitHub dispatch, confirm its repo matches the fleet's bound repo.
+    """For a GitHub dispatch, confirm its repo is onboarded (and, when the fleet
+    is restricted, multi-repo eligible) per the runtime fleet config.
 
-    Fail-closed on mismatch, no-op when unbound. Only GitHub carries a repo, so
-    other sources always pass. GitHub owner/repo is case-insensitive, so compare
-    casefolded. When FLEET_GITHUB_REPO is unset the check is disabled (returns
-    True) — preserving the prior any-repo behavior for anyone who hasn't set it.
+    Only GitHub carries a repo, so other sources always pass. The allowlist is
+    read from the fleet-config table through a short-TTL cache, so an admin
+    onboarding/removing a repo takes effect fleet-wide within the cache window.
+    Fails closed: a GitHub dispatch whose repo is empty or not-yet-allowed is
+    rejected rather than let through.
     """
-    if not FLEET_GITHUB_REPO or source != "github":
+    if source != "github":
         return True
     repo = str(source_context.get("repo", "")).strip()
-    if not repo:
-        # A GitHub dispatch with no repo can't be validated against the binding;
-        # reject rather than let an unverifiable repo through.
-        return False
-    return repo.casefold() == FLEET_GITHUB_REPO.casefold()
+    return fleet_config.is_repo_allowed(repo)
 
 
 # --- Concurrency -------------------------------------------------------------
@@ -435,9 +427,8 @@ def handler(event, context):
         _put_metric("RepoRejected", dimensions={"Source": source, "AgentId": agent_id})
         return _error(
             403,
-            f"@{agent_id} is bound to repo '{FLEET_GITHUB_REPO}' but this request "
-            f"came from '{got}'. This fleet serves a single repo; mention the agents "
-            f"from '{FLEET_GITHUB_REPO}'.",
+            f"repo '{got}' is not onboarded for this fleet, so @{agent_id} won't "
+            f"act on it. Ask an admin to onboard it in the dashboard.",
         )
 
     # --- Concurrency ---
