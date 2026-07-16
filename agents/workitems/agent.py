@@ -150,7 +150,14 @@ def invoke(payload, context=None):
 
         all_tools = [*asana_tools, *github_tools, *tools]
 
-        system_prompt = SYSTEM_PROMPT.format(project_context=build_project_context()) + dispatch_context_block
+        # The repo to act on comes from the dispatch (multi-repo fleet), not a
+        # baked env var. Absent for non-GitHub dispatches — the project context
+        # then defers to the Current Dispatch block.
+        dispatch_repo = source_context.get("repo") if source == "github" else None
+        system_prompt = (
+            SYSTEM_PROMPT.format(project_context=build_project_context(dispatch_repo))
+            + dispatch_context_block
+        )
 
         agent = Agent(
             model=model,

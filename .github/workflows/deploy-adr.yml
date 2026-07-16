@@ -1,11 +1,9 @@
 name: Deploy Adr Agent
 
-# Required GitHub Actions repository variables (Settings → Secrets and
-# variables → Actions → Variables). See agents/adr/project_config.py.
-#   TARGET_REPO   <owner>/<repo> the agent should act on
-#                   (baked into the runtime as env var GITHUB_REPO — see
-#                   deploy-workitems.yml for why the variable name itself
-#                   can't start with GITHUB_)
+# Adr is GitHub-only and multi-repo: the repo it acts on comes from the dispatch
+# (source_context.repo) per invocation, not a deploy-time variable. It reads no
+# Asana config, so it needs no agent-specific env vars — the shared pipeline
+# still injects the Bedrock guardrail env from the foundation stack.
 
 on:
   push:
@@ -23,5 +21,4 @@ jobs:
     uses: ./.github/workflows/deploy-agent.yml
     with:
       agent_name: adr
-      env_vars: "GITHUB_REPO=${{ vars.TARGET_REPO }}"
     secrets: inherit

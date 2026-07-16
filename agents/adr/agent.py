@@ -86,7 +86,13 @@ def invoke(payload, context=None):
             f"on {source_context.get('repo', 'unknown')}\n"
         )
 
-    system_prompt = SYSTEM_PROMPT.format(project_context=build_project_context()) + dispatch_context_block
+    # The repo to act on comes from the dispatch (multi-repo fleet), not a baked
+    # env var. Adr is GitHub-only, so the dispatch always carries the repo.
+    dispatch_repo = source_context.get("repo") if source == "github" else None
+    system_prompt = (
+        SYSTEM_PROMPT.format(project_context=build_project_context(dispatch_repo))
+        + dispatch_context_block
+    )
 
     model = build_model()
     tools = [

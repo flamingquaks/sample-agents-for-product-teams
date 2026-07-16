@@ -102,9 +102,11 @@ def invoke(payload, context=None):
             f"Reply to: Asana task {source_context.get('task_gid', 'unknown')}\n"
         )
 
-    # Build system prompt with project context + dispatch context.
+    # Build system prompt with project context + dispatch context. The repo to
+    # act on comes from the dispatch (multi-repo fleet), not a baked env var.
+    dispatch_repo = source_context.get("repo") if source == "github" else None
     system_prompt = SYSTEM_PROMPT.format(
-        project_context=build_project_context(),
+        project_context=build_project_context(dispatch_repo),
     ) + dispatch_context_block
 
     # max_tokens bumped from Claude's default (4K) to 16K so Docwriter can
