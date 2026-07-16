@@ -1,7 +1,11 @@
 # GitHub Repo Onboarding & GitHub App Credential Model
 ## Supporting individual and organization repos with a bounded, per-owner credential
 
-Status: **Draft** — for review. No code changes yet.
+Status: **Partially implemented.** Direct-mode GitHub App onboarding is built +
+deployed to staging (manifest flow, per-owner install verification, token
+minting behind `GITHUB_AUTH_MODE=app`; commits on `feat/v2-multi-repo`).
+Remaining: the §3.6 broker Lambda target for gateway mode, PAT retirement/
+backfill (§6), and GitLab/Bitbucket providers.
 Owner: fleet infra. Related: `docs/threat-model.md` T-11, `docs/roadmap.md`,
 `skills/sdlc-agents-connect-github/SKILL.md` (Path B).
 
@@ -185,23 +189,76 @@ mint_installation_token(installation_id) -> (token, expires_at)
 | Call site | Today | Target |
 |---|---|---|
 | **Agents, direct mode** (`github_mcp.get_github_token`) | reads PAT | `github_app.mint_installation_token(installation_id)` for the **dispatched repo's owner**; the dispatch context already carries `owner/repo` (`docwriter/project_config.py`), so the agent knows which installation to mint for |
-| **Agents, gateway mode** | Gateway holds PAT for outbound | Gateway outbound auth must mint per-owner tokens too — **see O-2**, this is the hardest piece |
+| **Agents, gateway mode** | Gateway holds PAT for outbound | Route through a **broker Lambda target** that mints the per-owner token per call — see §3.6 (this replaces the old "static gateway credential" dead-end; O-2 resolved) |
 | **Dispatch reply Lambda** (`reply.post_github_comment`) | reads PAT | mint token for the repo it's replying to (it has `repo`); needs its own copy of minting logic + Secrets Manager read of the private key + SSM read of app-id |
 | **Bootstrap SSM grants** (`AGENT_SSM`, `bootstrap.py:183`) | grants `github-mcp-*` | grant `github-app-*`; the current prefix does **not** match the new param names, so roles can't read them until updated |
 
-> Open question O-2 (Gateway outbound): the AgentCore Gateway target holds one
-> outbound credential for the GitHub MCP endpoint. Per-owner installation tokens
-> mean the correct token depends on the *call's* target repo, which the static
-> gateway target credential can't express. Options: (a) short-term, install the
-> App on all onboarded owners and keep a single broad-ish install token as the
-> gateway outbound cred (weaker bound, but still App-scoped); (b) investigate
-> whether the gateway target supports a credential-provider hook that can select
-> by request; (c) keep the *per-owner* bound only in direct mode and document
-> gateway mode as a coarser bound until AgentCore supports dynamic outbound
-> creds. **This needs an AgentCore Gateway capability check before we commit.**
-> Recall from prior work: agentcoreRuntime HTTP targets reject
-> `credentialProviderConfigurations` — so dynamic per-call outbound creds may
-> not be available and (a)/(c) may be forced.
+> O-2 (Gateway outbound per-owner token) — **RESOLVED** (see §3.6). The static
+> per-target credential genuinely can't vary per call, and AgentCore Identity
+> can't mint GitHub App installation tokens (it's OAuth2/API-key-shaped only).
+> The answer is NOT per-owner targets/gateways (a namespace + tool-listing
+> multiplier) and NOT AgentCore Identity: it's a single **broker Lambda target**
+> that mints the right per-owner/per-provider credential inside our own code, per
+> call. Verified against AWS docs (2026): Lambda targets receive the resolved
+> tool args + `bedrockAgentCoreToolName`, define their own tool schema, make
+> arbitrary outbound calls, use the `GATEWAY_IAM_ROLE` credential model (designed
+> for "our code holds the downstream credential"), and Cedar still evaluates.
+
+### 3.6 Gateway mode — the SCM broker Lambda target
+
+The gateway's value here is **not** just the Cedar chokepoint: it's a single MCP
+endpoint that fronts **GitHub, GitLab, and Bitbucket uniformly** with one tool
+surface, plus native per-tool observability. GitHub App installation tokens are
+per-owner and minted per call, which a static per-target credential can't
+express — so instead of pointing the gateway at GitHub's MCP server directly,
+point it at **one broker Lambda target** (`agents/.../scm_broker` or
+`infra/gateway/scm_broker`, TBD) that:
+
+- **Exposes a provider-agnostic tool schema** (one `toolSchema` on the target):
+  `create_issue`, `add_issue_comment`, `add_labels`, `get_issue`, `list_issues`,
+  `get_pull_request`, `list_pull_requests`, `create_pull_request`,
+  `get_file_contents`, `create_or_update_file`, `push_files`, `create_branch`,
+  `list_commits`, `search_code`. **Curated to what the agents' Cedar grants
+  actually use** (`fleet_policy.AGENT_TOOL_GRANTS`) — NOT a 1:1 mirror of the
+  full GitHub MCP surface. *(Decision to confirm: curated set vs full mirror.)*
+- **Dispatches on `bedrockAgentCoreToolName`** (`<Target>___<tool>`), resolving
+  the provider from the call's `owner/repo` via the config store (the repo/owner
+  records already know owner + installation_id; a `provider` field is added when
+  GitLab/Bitbucket land).
+- **Mints the per-call credential in our code** — GitHub via `github_client`'s
+  App-JWT→installation-token flow; GitLab/Bitbucket via their own token model
+  later. This is the same minting the direct-mode agents use, moved server-side.
+- **Calls the provider's REST API** and returns the tool result as JSON.
+- **Logs every tool call** (agent, tool, owner/repo, provider, outcome, latency)
+  — on top of the gateway's native metrics/logs/spans (`Name`=tool dimension).
+
+Credential model: the Lambda target uses `GATEWAY_IAM_ROLE` only (the gateway
+invokes it; the Lambda itself reads the SM private key + mints tokens). NO
+outbound OAuth/API-key credential provider on the target.
+
+**Caller identity caveat (verified):** a Lambda *target* does NOT natively
+receive the Cedar principal / inbound identity — only gateway/target/tool IDs.
+If the broker needs "which agent is calling" (e.g. to scope beyond what Cedar
+already enforces), add a **REQUEST interceptor** (customer Lambda, runs before
+Cedar) that injects the identity into the request. Cedar's per-agent
+`permit`s remain the authoritative per-agent tool scope, so the broker may not
+need identity at all for v1 — confirm during implementation.
+
+**Why not the alternatives** (recorded so we don't relitigate):
+- *Per-owner gateway targets / per-owner gateways* — a gateway scales to many
+  targets fine, but using a target as a per-tenant credential holder multiplies
+  the Cedar action namespace (`<owner-target>___<tool>`) and re-lists the whole
+  tool set per target. One broker target avoids both.
+- *AgentCore Identity* — OAuth2/API-key-shaped only; can't mint GitHub App
+  installation tokens (§ research). It DOES fit GitLab/Bitbucket OAuth, so it
+  may serve those providers' credential storage even though the broker owns the
+  GitHub App path.
+
+**Rollout:** direct mode (built) is unaffected and ships first. The broker is a
+distinct, later workstream (its own tool-surface implementation per provider);
+gateway mode stays `LOG_ONLY` until it lands. `github_client`'s minting is shared
+between direct mode and the broker (extract to `agents/shared` or an importable
+module).
 
 ---
 
@@ -272,22 +329,24 @@ The modal from the just-shipped change is the entry point. Additions:
    verifying live.
 4. **Retire the PAT**: delete the SSM param + IAM grants once all stages are on
    `app` and the reply Lambda + gateway path are confirmed.
-5. Gateway mode (O-2) may lag direct mode — document the bound difference until
-   resolved.
+5. Gateway mode lags direct mode: it needs the broker Lambda target (§3.6), a
+   separate workstream. Until it ships, gateway mode stays `LOG_ONLY` and GitHub
+   calls that route through the gateway use whatever outbound cred the target has
+   — so keep GitHub in **direct mode** until the broker lands.
 
 ---
 
 ## 7. Open questions
 
-- **O-1** Installation ID storage: per-repo record vs. per-owner record
-  (`pk="owner#<owner>"`). *Recommendation: per-owner* — one install serves all
-  of an owner's onboarded repos; repo record references the owner. Reduces
-  redundant GitHub calls and makes re-check cheap.
-- **O-2** Gateway outbound per-owner token (§3.5) — **blocking for gateway
-  mode**; needs an AgentCore capability check. Direct mode is unaffected.
-- **O-3** App slug for the install deep-link — needs to be recorded at App
-  registration and stored (SSM String `/sdlc-agents/github-app-slug`?) so the
-  admin API can build the link.
+- **O-1** — **RESOLVED + implemented.** Per-owner install record
+  (`pk="owner#<owner>"`, `config_store.get/put_installation`); repo rows carry
+  `installation_id`. One install serves all of an owner's repos.
+- **O-2** — **RESOLVED** (§3.6): single broker Lambda target mints per-owner/
+  per-provider tokens per call. Not blocking gateway mode's *design* anymore;
+  the broker is its own implementation workstream. Direct mode already ships.
+- **O-3** — **RESOLVED + implemented.** Slug stored in SSM String
+  `/sdlc-agents/${Stage}/github-app-slug`, written by the manifest exchange;
+  `github_client.install_url()` builds the deep-link from it.
 - **O-4** Rate limits: installation tokens have per-install rate limits;
   per-owner minting + caching should stay well under, but worth noting for
   many-owner fleets.
