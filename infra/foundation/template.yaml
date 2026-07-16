@@ -803,6 +803,16 @@ Resources:
                 Resource:
                   - !GetAtt FleetPolicyEngine.PolicyEngineArn
                   - !Sub ${FleetPolicyEngine.PolicyEngineArn}/*
+              # CreatePolicy/UpdatePolicy attach a resource-scoped policy to the
+              # gateway, which the service authorizes as ManageResourceScopedPolicy
+              # against the GATEWAY resource (not the engine) — without this,
+              # CreatePolicy fails AccessDenied even with the engine actions above.
+              # The admin function is not the gateway's RoleArn, so referencing the
+              # gateway ARN here is not a dependency cycle (unlike the gateway role).
+              - Effect: Allow
+                Action: bedrock-agentcore:ManageResourceScopedPolicy
+                Resource:
+                  - !GetAtt FleetGateway.GatewayArn
           - !Ref "AWS::NoValue"
       Events:
         ListRepos:
