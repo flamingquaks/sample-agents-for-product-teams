@@ -23,10 +23,20 @@ still denies (or vice-versa).
 
 import json
 import logging
+import re
+from urllib.parse import unquote
 
 import auth
 import config_store
 from http_responses import error, ok
+
+# GitHub owner/repo segment: letters, digits, hyphen, underscore, dot. This is
+# stricter than GitHub's own rules but a safe superset for real repos, and it is
+# the security boundary that keeps repo names out of the Cedar policy as
+# metacharacters — the owner/repo strings are interpolated into the generated
+# Cedar statement (fleet_policy.py), so a name containing a quote/pipe/newline
+# could otherwise inject into or break the policy.
+_REPO_SEGMENT = re.compile(r"^[A-Za-z0-9._-]+$")
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -68,12 +78,16 @@ def _parse_body(event: dict) -> dict:
 
 
 def _valid_repo(repo: str) -> bool:
-    """Cheap owner/repo shape check — exactly one slash, non-empty halves, no
-    whitespace. Not a GitHub existence check."""
+    """Validate owner/repo shape AND character set — exactly one slash, and each
+    half matches ``_REPO_SEGMENT`` ([A-Za-z0-9._-]). The character check is not
+    cosmetic: owner/repo flows unescaped into the generated Cedar policy
+    statement (fleet_policy.py), so rejecting quotes/pipes/newlines/whitespace
+    here prevents policy injection or a malformed statement. Not a GitHub
+    existence check."""
     if not isinstance(repo, str) or repo.count("/") != 1:
         return False
     owner, name = repo.split("/", 1)
-    return bool(owner.strip()) and bool(name.strip()) and " " not in repo
+    return bool(_REPO_SEGMENT.match(owner)) and bool(_REPO_SEGMENT.match(name))
 
 
 def _route(event: dict) -> dict:
@@ -91,33 +105,46 @@ def _route(event: dict) -> dict:
                 return error(400, "body.repo must be 'owner/repo'")
             enabled = bool(body.get("enabled", True))
             eligible = bool(body.get("multi_repo_eligible", True))
-            # 1) write the intent as pending, 2) sync the tool-call policy,
-            # 3) only then mark active. If the policy sync fails we leave the row
-            # pending and report an error — dispatch won't treat it as allowed.
+            # 1) write the row active, 2) sync the tool-call policy from the
+            # allowed set (which now INCLUDES this repo — allowed_repos() only
+            # returns active rows, so syncing while pending would omit the very
+            # repo being onboarded), 3) roll back to pending if the sync fails.
+            # A repo is only ever left active once its policy sync succeeded, so
+            # dispatch never treats as allowed a repo the tool-call policy still
+            # denies. During the brief window before the sync lands the policy
+            # still denies (the safe direction), and the dispatch config cache is
+            # stale anyway, so dispatch does not widen ahead of the policy.
             config_store.put_repo(
                 repo,
                 enabled=enabled,
                 multi_repo_eligible=eligible,
                 onboarded_by=auth.caller_sub(event),
-                status="pending",
+                status="active",
             )
             try:
                 _sync_repo_policy()
             except PolicySyncError:
-                logger.exception("policy sync failed for %s; left pending", repo)
+                logger.exception("policy sync failed for %s; rolling back", repo)
+                config_store.set_repo_status(repo, "pending")
                 return error(
                     502,
                     f"repo recorded but policy update failed for {repo}; left pending, retry",
                 )
-            config_store.set_repo_status(repo, "active")
             return ok(config_store.get_repo(repo))
 
-    if resource == "/admin/repos/{repo}":
+    # Greedy {repo+} so an "owner/repo" (with its slash) is one path parameter;
+    # accept the plain {repo} form too so the handler isn't coupled to the exact
+    # template path.
+    if resource in ("/admin/repos/{repo+}", "/admin/repos/{repo}"):
         if method == "DELETE":
-            repo = path_params.get("repo")
-            if not repo:
+            # API Gateway URL-decodes path params, but a client that
+            # double-encoded the slash would leave a literal "%2F"; decode
+            # defensively so the pk matches the stored (decoded) key.
+            raw = path_params.get("repo") or path_params.get("repo+")
+            if not raw:
                 return error(400, "missing repo")
-            config_store.delete_repo(repo)
+            repo = unquote(raw)
+            deleted = config_store.delete_repo(repo)
             # Removing a repo narrows the allowlist — sync the policy so its tool
             # calls stop being allowed. A sync failure here is non-fatal to the
             # delete (the repo is already gone from dispatch) but is reported.
@@ -128,7 +155,7 @@ def _route(event: dict) -> dict:
                 return error(
                     502, "repo removed from dispatch but policy update failed; retry"
                 )
-            return ok({"repo": repo, "deleted": True})
+            return ok({"repo": repo, "deleted": deleted})
 
     if resource == "/admin/settings":
         if method == "GET":

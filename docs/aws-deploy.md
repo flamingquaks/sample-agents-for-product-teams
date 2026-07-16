@@ -101,12 +101,14 @@ Passed to `sam deploy --parameter-overrides`:
 
 Which GitHub repos the fleet acts on is no longer a deploy parameter. The fleet is multi-repo: deploy it once, then an admin onboards repos at runtime in the dashboard's Admin view (stored in the `fleet-config-${Stage}` DynamoDB table). The Dispatch Router reads that allowlist and rejects a GitHub mention from a non-onboarded repo with a `403`. See § AgentCore Gateway below for the tool-call boundary that complements it.
 
+**If you deploy without the dashboard** (`DeployDashboard=false`), there is no Admin UI to onboard repos — an empty allowlist would reject every GitHub mention. `bootstrap.py` therefore prompts for **initial repos** and seeds them directly into `fleet-config-${Stage}` (enabled + eligible + active). Provide at least one, or onboard later by writing repo rows to that table (`pk="repo#<owner/repo>"`, lowercase). This is the only in-band onboarding path when the dashboard is off.
+
 ### 2.3.1 AgentCore Gateway + Cedar policy (the deterministic tool-call boundary)
 
 The dispatch allowlist (above) stops a *mention* from a non-onboarded repo. The Gateway stops a *tool call* against a non-allowlisted repo — even one an over-scoped GitHub PAT could otherwise reach (threat T-11). It is opt-in and rolled out in stages:
 
 1. **Deploy it** — `DeployGateway=true`, `GatewayPolicyEnforcement=LOG_ONLY`. This creates the policy engine, the Gateway (MCP, `AWS_IAM` inbound), and the `GitHubTarget`/`AsanaTarget` MCP targets. `bootstrap.py` offers this when the dashboard is enabled.
-2. **Route agents through it** — set `GATEWAY_MCP_URL` (stack output `FleetGatewayUrl`) on each agent runtime. Absent this env, agents connect direct to the MCP servers (pre-gateway behavior), so this is a deliberate, reversible switch. Wire each agent's inbound auth to the Gateway (SigV4 via its runtime role).
+2. **Route agents through it** — set `GATEWAY_MCP_URL` (stack output `FleetGatewayUrl`) on each agent runtime. Absent this env, agents connect direct to the MCP servers (pre-gateway behavior), so this is a deliberate, reversible switch. **Not yet wired in the agent code** (`agents/*/agent.py` flags this): the Gateway authenticates inbound with `AWS_IAM` (SigV4), but the agents currently send Bearer tokens, and both MCP clients would resolve to the single gateway URL — so before setting `GATEWAY_MCP_URL` you must (a) collapse the two `MCPClient`s to one and (b) SigV4-sign requests with the runtime role. Until that lands, leave `GATEWAY_MCP_URL` unset.
 3. **Confirm the manifest-dependent bits** against the *live* gateway `tools/list`:
    - the GitHub write-tool names and the target name in `infra/dashboard/fleet_policy.py` (`WRITE_TOOLS`, `GITHUB_TARGET`) — the action ids are `<TargetName>___<toolName>`;
    - the repo parameter shape (`REPO_PARAM_MODE` — `pair` for separate `owner`/`repo` inputs, `single` for a combined `repo`);

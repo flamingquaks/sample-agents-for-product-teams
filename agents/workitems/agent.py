@@ -121,6 +121,15 @@ def invoke(payload, context=None):
         )
         tools.extend(memory_provider.tools)
 
+    # NOTE (gateway path, not yet wired): when GATEWAY_MCP_URL is set,
+    # ASANA_MCP_URL and GITHUB_MCP_URL both resolve to the one gateway endpoint,
+    # so the two clients below would open redundant sessions to the same server,
+    # AND the gateway authenticates inbound with AWS_IAM (SigV4) rather than the
+    # Bearer tokens sent here. Routing through the gateway therefore needs (a) a
+    # single MCPClient and (b) SigV4-signed requests via the runtime role — see
+    # docs/aws-deploy.md § AgentCore Gateway. Until that lands, deploy without
+    # GATEWAY_MCP_URL (agents connect direct to the vendor MCP servers).
+
     # Asana MCP — official server with OAuth (required)
     asana_token = get_access_token()
     asana_client = MCPClient(

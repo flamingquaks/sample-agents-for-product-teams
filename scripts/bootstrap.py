@@ -623,6 +623,17 @@ def gather_config(cfg: dict) -> dict:
             )
     else:
         cfg["deploy_gateway"] = False
+    # Which repos the fleet may act on. Onboarding normally happens in the admin
+    # UI, but with the dashboard off there is no UI — so seed at least one repo
+    # here, or every GitHub mention is rejected as "not onboarded" with no
+    # in-band remedy. Comma-separated owner/repo list; optional when the
+    # dashboard is on (onboard later in the UI).
+    default_repos = ",".join(cfg.get("initial_repos", []) or [])
+    prompt_label = "Initial repos to onboard (comma-separated owner/repo)"
+    if not cfg.get("deploy_dashboard"):
+        prompt_label += " [required — no admin UI to onboard later]"
+    raw_repos = prompt(prompt_label, default_repos)
+    cfg["initial_repos"] = [r.strip() for r in raw_repos.split(",") if r.strip()]
     return cfg
 
 
@@ -835,6 +846,54 @@ def stack_outputs(runner: Runner, stack: str) -> dict[str, str]:
     }
 
 
+def seed_fleet_repos(runner: Runner, cfg: dict) -> None:
+    """Onboard the initial repos directly into the fleet-config table.
+
+    Onboarding is normally an admin-UI action, but with the dashboard off there
+    is no UI, and an empty table makes the Dispatch Router reject every GitHub
+    mention as 'not onboarded'. Seeding here gives an in-band path. Repos are
+    written enabled + eligible + active (the same row shape config_store.put_repo
+    writes and fleet_config reads), lowercased to match the store's canonical
+    form. When the Gateway is enabled, the admin API's later policy sync will
+    fold these into the Cedar policy; standalone (no gateway) they only affect
+    dispatch, which is exactly what a dashboard-less deploy needs."""
+    repos = cfg.get("initial_repos") or []
+    if not repos:
+        if not cfg.get("deploy_dashboard"):
+            runner.failures.append(
+                "no initial repos seeded and dashboard is off — every GitHub "
+                "mention will be rejected until repos are onboarded"
+            )
+            print(
+                "    ⚠️  no repos onboarded and no dashboard to onboard them later"
+            )
+        return
+    print("\n== Seed onboarded repos (fleet-config table) ==")
+    table = f"fleet-config-{cfg['stage']}"
+    for repo in repos:
+        norm = repo.strip().casefold()
+        if norm.count("/") != 1 or not all(norm.split("/")):
+            runner.failures.append(f"skipped invalid initial repo '{repo}'")
+            print(f"    ⚠️  '{repo}' is not owner/repo — skipped")
+            continue
+        item = json.dumps(
+            {
+                "pk": {"S": f"repo#{norm}"},
+                "kind": {"S": "repo"},
+                "repo": {"S": norm},
+                "enabled": {"BOOL": True},
+                "multi_repo_eligible": {"BOOL": True},
+                "onboarded_by": {"S": "bootstrap"},
+                "onboarded_at": {"N": "0"},
+                "status": {"S": "active"},
+            }
+        )
+        runner.aws_step(
+            f"seed repo {norm}",
+            ["dynamodb", "put-item", "--table-name", table, "--item", item],
+        )
+
+
 def set_github_config(
     runner: Runner, cfg: dict, account: str, deploy_role_arn: str | None
 ) -> None:
@@ -969,6 +1028,8 @@ def main() -> int:
     if cfg.get("deploy_gateway"):
         gw = f"yes ({cfg.get('gateway_enforcement', 'LOG_ONLY')})"
     print(f"  Gateway:   {gw}")
+    repos = cfg.get("initial_repos") or []
+    print(f"  Repos:     {', '.join(repos) if repos else '(none — onboard in the UI)'}")
     print(f"  Agents:    {', '.join(agents)}")
     print(
         "  Sets up: OIDC provider, CI deploy role, per-agent runtime roles, "
@@ -985,6 +1046,7 @@ def main() -> int:
     ensure_agent_roles(runner, agents, region, account, cfg["stage"])
     deploy_foundation(runner, cfg)
     outputs = stack_outputs(runner, f"sdlc-agents-{cfg['stage']}")
+    seed_fleet_repos(runner, cfg)
     set_github_config(runner, cfg, account, deploy_role_arn)
     check_secrets(runner, agents)
 

@@ -113,6 +113,12 @@ def invoke(payload, context=None):
         )
         tools.extend(memory_provider.tools)
 
+    # NOTE (gateway path, not yet wired): when GATEWAY_MCP_URL is set,
+    # GITHUB_MCP_URL resolves to the gateway endpoint, which authenticates
+    # inbound with AWS_IAM (SigV4) rather than the Bearer token sent here.
+    # Routing through the gateway needs a SigV4-signed client via the runtime
+    # role — see docs/aws-deploy.md § AgentCore Gateway. Until then, deploy
+    # without GATEWAY_MCP_URL (direct to GitHub's MCP server).
     github_token = get_github_token()
     github_client = MCPClient(
         lambda: streamablehttp_client(

@@ -53,19 +53,29 @@ def _load_snapshot() -> dict:
     """Read the full config (settings + repo records) from DynamoDB.
 
     The table is small (a handful of repos + one settings row), so a Scan is
-    cheaper than the GSI a constant-PK Query would need.
+    cheaper than the GSI a constant-PK Query would need. We page on
+    LastEvaluatedKey regardless: a single scan() returns only the first 1MB
+    page, and a repo (or the settings row) beyond it would silently drop out of
+    the allowlist — a legitimately onboarded repo would then be rejected as "not
+    onboarded", or a missed settings row would default restrict_repos to False.
     """
-    resp = _get_table().scan()
+    table = _get_table()
     settings = {"restrict_repos": False}
     repos: dict[str, dict] = {}
-    for item in resp.get("Items", []):
-        pk = str(item.get("pk", ""))
-        if pk == _SETTINGS_PK:
-            settings = {"restrict_repos": bool(item.get("restrict_repos", False))}
-        elif pk.startswith(_REPO_PK_PREFIX):
-            repo = str(item.get("repo", "")).strip()
-            if repo:
-                repos[repo.casefold()] = item
+    start_key = None
+    while True:
+        resp = table.scan(ExclusiveStartKey=start_key) if start_key else table.scan()
+        for item in resp.get("Items", []):
+            pk = str(item.get("pk", ""))
+            if pk == _SETTINGS_PK:
+                settings = {"restrict_repos": bool(item.get("restrict_repos", False))}
+            elif pk.startswith(_REPO_PK_PREFIX):
+                repo = str(item.get("repo", "")).strip()
+                if repo:
+                    repos[repo.casefold()] = item
+        start_key = resp.get("LastEvaluatedKey")
+        if not start_key:
+            break
     return {"settings": settings, "repos": repos}
 
 

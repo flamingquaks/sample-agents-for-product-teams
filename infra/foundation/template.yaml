@@ -70,6 +70,20 @@ Conditions:
   # the ACTIVE choice to the attachment's ENFORCE value (see FleetGateway).
   GatewayEnforceActive: !Equals [!Ref GatewayPolicyEnforcement, "ACTIVE"]
 
+Rules:
+  # The admin Lambda (gated on DeployDashboard) is the ONLY component that
+  # authors/syncs the fleet Cedar policy. Deploying the gateway without it would
+  # create an enforcing policy engine with no way to ever populate its policies —
+  # in ACTIVE mode that default-denies every agent tool call fleet-wide. Fail
+  # fast at deploy instead of shipping a silently-broken stack.
+  GatewayRequiresDashboard:
+    RuleCondition: !Equals [!Ref DeployGateway, "true"]
+    Assertions:
+      - Assert: !Equals [!Ref DeployDashboard, "true"]
+        AssertDescription: >-
+          DeployGateway=true requires DeployDashboard=true — the admin API owns
+          the Gateway Cedar policy sync.
+
 Globals:
   Function:
     Runtime: python3.12
@@ -798,7 +812,10 @@ Resources:
         DeleteRepo:
           Type: Api
           Properties:
-            Path: /admin/repos/{repo}
+            # Greedy {repo+} so an owner/repo value (which contains a slash) is
+            # captured as one path parameter. A plain {repo} matches only a
+            # single path segment and would route-miss / 403 on "owner/repo".
+            Path: /admin/repos/{repo+}
             Method: DELETE
             RestApiId: !Ref DashboardApi
         GetSettings:

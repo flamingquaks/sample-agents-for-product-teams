@@ -125,6 +125,14 @@ def invoke(payload, context=None):
         )
         tools.extend(memory_provider.tools)
 
+    # NOTE (gateway path, not yet wired): when GATEWAY_MCP_URL is set,
+    # GITHUB_MCP_URL/ASANA_MCP_URL both resolve to the one gateway endpoint,
+    # which authenticates inbound with AWS_IAM (SigV4) rather than the Bearer
+    # tokens sent here, and both clients would hit the same server. Routing
+    # through the gateway needs a single SigV4-signed client via the runtime
+    # role — see docs/aws-deploy.md § AgentCore Gateway. Until then, deploy
+    # without GATEWAY_MCP_URL (direct to the vendor MCP servers).
+
     # GitHub MCP — official remote server (primary for Docwriter)
     github_token = get_github_token()
     github_client = MCPClient(

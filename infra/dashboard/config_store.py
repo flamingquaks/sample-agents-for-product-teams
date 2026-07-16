@@ -38,8 +38,19 @@ def _get_table():
     return _table
 
 
+def _normalize_repo(repo: str) -> str:
+    """Canonical repo form: trimmed + lowercased. GitHub owner/repo is
+    case-insensitive, so we store one canonical casing. This keeps every
+    downstream consumer in agreement — the pk, the dispatch allowlist
+    (fleet_config casefolds its lookups), and the Cedar policy literals
+    (fleet_policy compares case-sensitively) all see the same lowercase string,
+    instead of the policy pinning the admin's typed casing while dispatch
+    casefolds."""
+    return repo.strip().casefold()
+
+
 def _repo_pk(repo: str) -> str:
-    return f"{_REPO_PK_PREFIX}{repo.strip().casefold()}"
+    return f"{_REPO_PK_PREFIX}{_normalize_repo(repo)}"
 
 
 # --- reads -------------------------------------------------------------------
@@ -56,12 +67,25 @@ def get_settings() -> dict:
 def list_repos() -> list[dict]:
     """All onboarded repo records, newest first (by onboarded_at)."""
     # A Query on a constant would need a GSI; the repo set is small (an admin
-    # onboards a handful), so a Scan filtered to repo records is fine here.
-    resp = _get_table().scan(
-        FilterExpression="kind = :k",
-        ExpressionAttributeValues={":k": "repo"},
-    )
-    repos = resp.get("Items", [])
+    # onboards a handful), so a Scan filtered to repo records is fine here. We
+    # still page on LastEvaluatedKey: a single scan() returns only the first 1MB
+    # page, and silently dropping repos past it would omit them from both the
+    # admin listing and the Cedar allowlist (allowed_repos builds on this).
+    table = _get_table()
+    repos: list[dict] = []
+    start_key = None
+    while True:
+        kwargs = {
+            "FilterExpression": "kind = :k",
+            "ExpressionAttributeValues": {":k": "repo"},
+        }
+        if start_key:
+            kwargs["ExclusiveStartKey"] = start_key
+        resp = table.scan(**kwargs)
+        repos.extend(resp.get("Items", []))
+        start_key = resp.get("LastEvaluatedKey")
+        if not start_key:
+            break
     repos.sort(key=lambda r: r.get("onboarded_at", 0), reverse=True)
     return repos
 
@@ -82,10 +106,12 @@ def put_repo(
     onboarded_by: str = "",
     status: str = "pending",
 ) -> dict:
-    """Create/replace a repo record. Defaults to ``pending`` so the caller can
-    flip it to ``active`` only after the Gateway policy update lands (WS5) —
-    keeping the dispatch allowlist and the tool-call policy consistent."""
-    normalized = repo.strip()
+    """Create/replace a repo record. ``status`` defaults to ``pending``; the
+    admin onboarding flow instead writes ``active`` and rolls back to ``pending``
+    if the Gateway policy sync fails — because ``allowed_repos()`` only returns
+    ``active`` rows, so syncing while ``pending`` would omit the very repo being
+    onboarded. See admin.py's POST /admin/repos."""
+    normalized = _normalize_repo(repo)
     item = {
         "pk": _repo_pk(normalized),
         "kind": "repo",
@@ -110,8 +136,13 @@ def set_repo_status(repo: str, status: str) -> None:
     )
 
 
-def delete_repo(repo: str) -> None:
-    _get_table().delete_item(Key={"pk": _repo_pk(repo)})
+def delete_repo(repo: str) -> bool:
+    """Delete a repo row. Returns True if a row was actually removed, False if
+    no such repo existed (DynamoDB delete_item is idempotent, so we ask for the
+    old item to distinguish a real delete from a no-op — the admin API reports
+    the difference instead of always claiming success)."""
+    resp = _get_table().delete_item(Key={"pk": _repo_pk(repo)}, ReturnValues="ALL_OLD")
+    return bool(resp.get("Attributes"))
 
 
 def put_settings(*, restrict_repos: bool) -> dict:

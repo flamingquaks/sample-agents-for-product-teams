@@ -22,6 +22,45 @@ def test_empty_allowlist_forbids_all_writes():
     assert 'AgentCore::Action::"GitHubTarget___create_issue"' in stmt
 
 
+def test_destructive_tools_unconditionally_forbidden():
+    _reset_pair_mode()
+    # delete_file (and merge/delete-branch) get an UNCONDITIONAL forbid — even
+    # for an allowlisted repo — so an allowed repo can't lift the destructive
+    # forbid. It must NOT appear in the repo-allowlist (unless-guarded) forbid.
+    stmt = fleet_policy.render_fleet_policy(["acme/web"])
+    assert 'AgentCore::Action::"GitHubTarget___delete_file"' in stmt
+    assert "delete_file" not in _allowlist_forbid(stmt)
+    assert "delete_file" in _destructive_forbid(stmt)
+    # The destructive forbid has no `unless` clause.
+    assert not _destructive_forbid(stmt).rstrip().endswith("unless {")
+    assert "unless" not in _destructive_forbid(stmt)
+
+
+def _allowlist_forbid(stmt: str) -> str:
+    # The rendered set is two forbids separated by a blank line; the first is the
+    # repo-allowlist (unless-guarded) one, the second the unconditional destructive.
+    return stmt.split("\n\n", 1)[0]
+
+
+def _destructive_forbid(stmt: str) -> str:
+    return stmt.split("\n\n", 1)[1]
+
+
+def test_two_forbid_policies_rendered():
+    _reset_pair_mode()
+    stmt = fleet_policy.render_fleet_policy(["acme/web"])
+    assert stmt.count("forbid(") == 2
+
+
+def test_repo_literals_lowercased():
+    _reset_pair_mode()
+    # config_store stores lowercase, but render defensively lowercases too so the
+    # policy agrees with the casefolding dispatch layer.
+    stmt = fleet_policy.render_fleet_policy(["Acme/Web"])
+    assert '(context.input.owner == "acme" && context.input.repo == "web")' in stmt
+    assert "Acme" not in stmt and "Web" not in stmt
+
+
 def test_pair_mode_conditions_on_owner_and_repo():
     _reset_pair_mode()
     stmt = fleet_policy.render_fleet_policy(["acme/web"])

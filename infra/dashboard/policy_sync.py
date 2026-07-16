@@ -114,17 +114,17 @@ def sync_fleet_policy() -> None:
     definition = {"cedar": {"statement": statement}}
     client = _get_client()
 
+    # Concurrency note: two admins editing at once both read the live table
+    # (allowed_repos above), render the FULL current allowlist, and overwrite the
+    # single named policy — so an update is last-writer-wins but always reflects
+    # the whole current table, not a partial diff, and a re-sync converges. The
+    # one non-convergent race is a create/create: both find no policy and both
+    # create the same name, leaving a duplicate. We guard that by treating a
+    # create conflict as "someone created it first" and falling back to update.
     try:
         policy_id = _find_policy_id(client, engine_id)
         if policy_id is None:
-            resp = client.create_policy(
-                policyEngineId=engine_id,
-                name=FLEET_POLICY_NAME,
-                definition=definition,
-                enforcementMode=mode,
-            )
-            policy_id = resp.get("policyId") or resp.get("id")
-            logger.info("Created fleet policy %s (mode=%s)", policy_id, mode)
+            policy_id = _create_or_adopt(client, engine_id, definition, mode)
         else:
             client.update_policy(
                 policyEngineId=engine_id,
@@ -140,3 +140,35 @@ def sync_fleet_policy() -> None:
 
     status = _poll_until_ready(client, engine_id, policy_id)
     logger.info("Fleet policy %s synced to %s (allowed=%s)", policy_id, status, allowed)
+
+
+def _create_or_adopt(client, engine_id: str, definition: dict, mode: str) -> str:
+    """Create the fleet policy, or adopt+update the existing one if a concurrent
+    writer created it first (create/create race). Returns the policy id."""
+    try:
+        resp = client.create_policy(
+            policyEngineId=engine_id,
+            name=FLEET_POLICY_NAME,
+            definition=definition,
+            enforcementMode=mode,
+        )
+        policy_id = resp.get("policyId") or resp.get("id")
+        logger.info("Created fleet policy %s (mode=%s)", policy_id, mode)
+        return policy_id
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code not in ("ConflictException", "ResourceConflictException"):
+            raise
+        # Lost the create race — re-find the policy the other writer made and
+        # update it so our allowlist snapshot is applied (idempotent name).
+        policy_id = _find_policy_id(client, engine_id)
+        if policy_id is None:
+            raise
+        client.update_policy(
+            policyEngineId=engine_id,
+            policyId=policy_id,
+            definition=definition,
+            enforcementMode=mode,
+        )
+        logger.info("Adopted+updated fleet policy %s after create conflict", policy_id)
+        return policy_id

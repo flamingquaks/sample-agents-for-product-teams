@@ -116,7 +116,15 @@ export class DashboardApi {
   }
 
   deleteRepo(repo: string): Promise<{ repo: string; deleted: boolean }> {
-    return this.request("DELETE", `/admin/repos/${encodeURIComponent(repo)}`);
+    // The delete route is a greedy {repo+} path param, so the slash in
+    // "owner/repo" must stay a literal path separator — encode each segment but
+    // keep the "/" between them (encodeURIComponent on the whole string would
+    // send "%2F", which a single/greedy path param does not match reliably).
+    const path = repo
+      .split("/")
+      .map(encodeURIComponent)
+      .join("/");
+    return this.request("DELETE", `/admin/repos/${path}`);
   }
 
   getSettings(): Promise<FleetSettings> {

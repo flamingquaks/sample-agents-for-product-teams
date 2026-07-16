@@ -101,9 +101,35 @@ def test_onboard_list_delete_repo():
     repos = _body(resp)["repos"]
     assert [r["repo"] for r in repos] == ["acme/web"]
 
-    # delete
+    # delete — greedy {repo+} route carries the slash as one path param
     resp = admin.handler(
-        _event("DELETE", "/admin/repos/{repo}", path={"repo": "acme/web"})
+        _event("DELETE", "/admin/repos/{repo+}", path={"repo": "acme/web"})
+    )
+    assert resp["statusCode"] == 200 and _body(resp)["deleted"] is True
+    assert _body(admin.handler(_event("GET", "/admin/repos")))["repos"] == []
+
+
+@mock_aws
+def test_delete_missing_repo_reports_not_deleted():
+    _make_table()
+    admin = _load_admin()
+    # Deleting a repo that was never onboarded must NOT report deleted:true
+    # (DynamoDB delete_item is idempotent; delete_repo returns ALL_OLD presence).
+    resp = admin.handler(
+        _event("DELETE", "/admin/repos/{repo+}", path={"repo": "ghost/repo"})
+    )
+    assert resp["statusCode"] == 200
+    assert _body(resp)["deleted"] is False
+
+
+@mock_aws
+def test_delete_route_decodes_encoded_slash():
+    _make_table()
+    admin = _load_admin()
+    admin.handler(_event("POST", "/admin/repos", body={"repo": "acme/web"}))
+    # A client that percent-encoded the slash still resolves to the stored repo.
+    resp = admin.handler(
+        _event("DELETE", "/admin/repos/{repo+}", path={"repo": "acme%2Fweb"})
     )
     assert resp["statusCode"] == 200 and _body(resp)["deleted"] is True
     assert _body(admin.handler(_event("GET", "/admin/repos")))["repos"] == []
@@ -113,9 +139,58 @@ def test_onboard_list_delete_repo():
 def test_onboard_rejects_bad_repo():
     _make_table()
     admin = _load_admin()
-    for bad in ["", "noslash", "a/b/c", "own er/repo", "owner/"]:
+    bad_inputs = [
+        "",
+        "noslash",
+        "a/b/c",
+        "own er/repo",
+        "owner/",
+        # Cedar-injection attempts: quotes, pipes, newlines must be rejected so
+        # they can't reach the generated policy statement.
+        'x"||true||x/web',
+        "owner/re\npo",
+        "ow|ner/repo",
+        'owner/"web"',
+    ]
+    for bad in bad_inputs:
         resp = admin.handler(_event("POST", "/admin/repos", body={"repo": bad}))
         assert resp["statusCode"] == 400, bad
+
+
+@mock_aws
+def test_onboard_syncs_policy_including_new_repo():
+    # Regression: the policy sync must see the repo being onboarded. Previously
+    # the row was written 'pending' before the sync, and allowed_repos() filters
+    # to 'active', so the just-onboarded repo was omitted from the synced policy.
+    _make_table()
+    admin = _load_admin()
+    import config_store
+
+    seen = {}
+
+    def capture():
+        seen["allowed"] = config_store.allowed_repos()
+
+    # Replace the sync seam with a capture of what allowed_repos() returns AT
+    # sync time (mirrors what policy_sync would render).
+    admin._sync_repo_policy = capture
+    resp = admin.handler(_event("POST", "/admin/repos", body={"repo": "acme/web"}))
+    assert resp["statusCode"] == 200
+    assert seen["allowed"] == ["acme/web"], seen
+
+
+@mock_aws
+def test_onboard_normalizes_case():
+    _make_table()
+    admin = _load_admin()
+    import config_store
+
+    resp = admin.handler(_event("POST", "/admin/repos", body={"repo": "Acme/Web"}))
+    assert resp["statusCode"] == 200
+    # Stored + returned lowercased so dispatch (casefold) and Cedar agree.
+    assert _body(resp)["repo"] == "acme/web"
+    assert config_store.get_repo("ACME/WEB")["repo"] == "acme/web"
+    assert config_store.allowed_repos() == ["acme/web"]
 
 
 @mock_aws
