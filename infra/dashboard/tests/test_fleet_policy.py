@@ -105,3 +105,74 @@ def test_deterministic_output():
     a = fleet_policy.render_fleet_policy(["acme/web", "acme/api"])
     b = fleet_policy.render_fleet_policy(["acme/web", "acme/api"])
     assert a == b
+
+
+# --- per-agent permit policies -----------------------------------------------
+
+ACCT = "111122223333"
+GW = "arn:aws:bedrock-agentcore:us-west-2:111122223333:gateway/sdlcFleetdev-abc123"
+
+
+def test_permit_principal_is_runtime_role_arn():
+    stmt = fleet_policy.render_agent_permit("workitems", ACCT, GW)
+    # Principal is the agent's runtime assumed-role ARN (IamEntity), not an
+    # AgentCore::Agent — that's the verified IAM-gateway principal shape.
+    assert (
+        'principal == AgentCore::IamEntity::'
+        f'"arn:aws:sts::{ACCT}:assumed-role/workitems-agentcore-runtime"' in stmt
+    )
+    assert "AgentCore::Agent::" not in stmt
+
+
+def test_permit_resource_is_literal_gateway_arn():
+    stmt = fleet_policy.render_agent_permit("adr", ACCT, GW)
+    # Resource must be the literal gateway ARN — AgentCore Cedar forbids wildcards.
+    assert f'resource == AgentCore::Gateway::"{GW}"' in stmt
+    assert "*" not in stmt.split("resource ==", 1)[1]
+
+
+def test_permit_actions_are_gateway_shape():
+    stmt = fleet_policy.render_agent_permit("workitems", ACCT, GW)
+    assert 'AgentCore::Action::"GitHubTarget___create_issue"' in stmt
+    assert 'AgentCore::Action::"AsanaTarget___create_task"' in stmt
+
+
+def test_permit_grants_no_destructive_tools():
+    # No agent's permit may name a destructive tool (the forbid would win, but
+    # granting it is a red flag / mis-scope).
+    destructive = set(fleet_policy.DESTRUCTIVE_TOOLS)
+    for agent, actions in fleet_policy.AGENT_TOOL_GRANTS.items():
+        tools = {a.split("___", 1)[1] for a in actions}
+        assert not (tools & destructive), f"{agent} grants a destructive tool"
+
+
+def test_adr_permit_has_no_write_beyond_labels_and_comments():
+    # adr is comment/label-only on GitHub (no create_issue/PR/file).
+    tools = {a.split("___", 1)[1] for a in fleet_policy.AGENT_TOOL_GRANTS["adr"]}
+    assert "create_issue" not in tools
+    assert "create_pull_request" not in tools
+    assert "add_issue_comment" in tools and "add_labels_to_issue" in tools
+
+
+def test_researcher_permit_is_asana_only():
+    actions = fleet_policy.AGENT_TOOL_GRANTS["researcher"]
+    assert actions and all(a.startswith("AsanaTarget___") for a in actions)
+
+
+def test_agent_permit_policies_names():
+    policies = fleet_policy.agent_permit_policies(ACCT, GW)
+    assert set(policies) == {
+        "sdlc_permit_workitems",
+        "sdlc_permit_docwriter",
+        "sdlc_permit_adr",
+        "sdlc_permit_researcher",
+    }
+    for stmt in policies.values():
+        assert stmt.startswith("permit(")
+        assert 35 <= len(stmt) <= 10000
+
+
+def test_permit_deterministic():
+    a = fleet_policy.render_agent_permit("docwriter", ACCT, GW)
+    b = fleet_policy.render_agent_permit("docwriter", ACCT, GW)
+    assert a == b

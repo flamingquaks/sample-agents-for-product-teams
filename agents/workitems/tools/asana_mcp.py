@@ -88,7 +88,6 @@ def get_access_token() -> str:
     return _cached_access_token
 
 
-# See github_mcp.py: GATEWAY_MCP_URL routes tool calls through the AgentCore
-# Gateway (and its Cedar policy engine) when deployed; absent, connect direct.
-_DIRECT_ASANA_MCP_URL = "https://mcp.asana.com/v2/mcp"
-ASANA_MCP_URL = os.environ.get("GATEWAY_MCP_URL") or _DIRECT_ASANA_MCP_URL
+# Asana official MCP server (direct connection). Gateway routing, when enabled,
+# is handled in agent.py via shared/tools/gateway.py.
+ASANA_MCP_URL = "https://mcp.asana.com/v2/mcp"

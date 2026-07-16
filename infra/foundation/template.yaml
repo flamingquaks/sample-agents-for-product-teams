@@ -778,6 +778,10 @@ Resources:
           # is a logged no-op and only the dispatch allowlist is affected.
           POLICY_ENGINE_ID: !If [GatewayEnabled, !GetAtt FleetPolicyEngine.PolicyEngineId, !Ref "AWS::NoValue"]
           FLEET_POLICY_ENFORCEMENT: !If [GatewayEnabled, !Ref GatewayPolicyEnforcement, !Ref "AWS::NoValue"]
+          # Gateway ARN + account for the per-agent permit policies (principals
+          # are the agents' runtime-role ARNs, resource is the literal gateway).
+          FLEET_GATEWAY_ARN: !If [GatewayEnabled, !GetAtt FleetGateway.GatewayArn, !Ref "AWS::NoValue"]
+          AWS_ACCOUNT_ID: !If [GatewayEnabled, !Ref "AWS::AccountId", !Ref "AWS::NoValue"]
       Policies:
         # Read+write the config table (onboard/enable/disable repos, settings).
         - DynamoDBCrudPolicy:

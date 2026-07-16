@@ -153,3 +153,119 @@ def render_fleet_policy(allowed_repos: list[str]) -> str:
         ");"
     )
     return f"{allowlist_forbid}\n\n{destructive_forbid}"
+
+
+# --- per-agent permit policies -----------------------------------------------
+#
+# The engine is default-deny: with only the forbid policies above, an ENFORCE
+# engine denies EVERY tool call. Each agent therefore needs a `permit` naming the
+# tools its runtime role may call. Principals are AgentCore::IamEntity keyed on
+# the runtime's assumed-role ARN (verified: IAM gateways expose the caller as
+# arn:aws:sts::<acct>:assumed-role/<role>, session-name-independent), the action
+# is <Target>___<tool>, and the resource is the literal gateway ARN (Cedar in
+# AgentCore forbids wildcard resources).
+#
+# AGENT_TOOL_GRANTS is the per-agent tool allowlist, translated from the intent
+# in cedar/*.cedar into gateway action shape. TOOL NAMES ARE MANIFEST-DEPENDENT
+# and MUST be reconciled against the live gateway `tools/list` before ENFORCE —
+# see scripts/check_gateway_manifest.py and docs/aws-deploy.md. Reads + safe
+# writes only; destructive tools are never granted (the forbid would win anyway).
+# Researcher is Asana-only (its web_search / code-exec are local tools, not MCP
+# through the gateway), so it gets only Asana actions.
+_GH = GITHUB_TARGET
+_AS = "AsanaTarget"  # must match the AsanaGatewayTarget Name in template.yaml
+
+AGENT_TOOL_GRANTS = {
+    "workitems": [
+        f"{_GH}___get_issue",
+        f"{_GH}___list_issues",
+        f"{_GH}___get_pull_request",
+        f"{_GH}___list_pull_requests",
+        f"{_GH}___list_milestones",
+        f"{_GH}___create_issue",
+        f"{_GH}___update_issue",
+        f"{_GH}___add_issue_comment",
+        f"{_GH}___add_labels_to_issue",
+        f"{_AS}___list_tasks",
+        f"{_AS}___get_task",
+        f"{_AS}___list_projects",
+        f"{_AS}___search",
+        f"{_AS}___create_task",
+        f"{_AS}___update_task",
+        f"{_AS}___add_comment",
+    ],
+    "docwriter": [
+        f"{_GH}___get_file_contents",
+        f"{_GH}___search_code",
+        f"{_GH}___get_pull_request",
+        f"{_GH}___list_pull_requests",
+        f"{_GH}___get_issue",
+        f"{_GH}___list_issues",
+        f"{_GH}___list_commits",
+        f"{_GH}___create_pull_request",
+        f"{_GH}___create_issue",
+        f"{_GH}___add_issue_comment",
+        f"{_GH}___add_labels_to_issue",
+        f"{_GH}___create_or_update_file",
+        f"{_GH}___push_files",
+        f"{_GH}___create_branch",
+        f"{_AS}___get_task",
+        f"{_AS}___list_tasks",
+        f"{_AS}___search",
+        f"{_AS}___add_comment",
+        f"{_AS}___create_task",
+    ],
+    "adr": [
+        f"{_GH}___get_file_contents",
+        f"{_GH}___search_code",
+        f"{_GH}___get_issue",
+        f"{_GH}___list_issues",
+        f"{_GH}___get_pull_request",
+        f"{_GH}___list_pull_requests",
+        f"{_GH}___list_commits",
+        f"{_GH}___add_issue_comment",
+        f"{_GH}___add_labels_to_issue",
+    ],
+    "researcher": [
+        f"{_AS}___get_task",
+        f"{_AS}___list_tasks",
+        f"{_AS}___list_projects",
+        f"{_AS}___search",
+        f"{_AS}___create_task",
+        f"{_AS}___update_task",
+        f"{_AS}___add_comment",
+    ],
+}
+
+
+def runtime_role_arn(account_id: str, agent: str) -> str:
+    """The assumed-role ARN an agent's runtime presents to the gateway. Matches
+    the ``<agent>-agentcore-runtime`` role bootstrap creates; the ``assumed-role``
+    form is what AgentCore surfaces as the Cedar principal id."""
+    return f"arn:aws:sts::{account_id}:assumed-role/{agent}-agentcore-runtime"
+
+
+def render_agent_permit(agent: str, account_id: str, gateway_arn: str) -> str:
+    """Render the permit policy statement granting ``agent`` its allowed tools.
+
+    Deterministic. Raises KeyError for an unknown agent (caller controls the
+    set)."""
+    actions = AGENT_TOOL_GRANTS[agent]
+    action_lines = ",\n".join(f'    AgentCore::Action::"{a}"' for a in actions)
+    principal = runtime_role_arn(account_id, agent)
+    return (
+        "permit(\n"
+        f'  principal == AgentCore::IamEntity::"{principal}",\n'
+        f"  action in [\n{action_lines}\n  ],\n"
+        f'  resource == AgentCore::Gateway::"{gateway_arn}"\n'
+        ");"
+    )
+
+
+def agent_permit_policies(account_id: str, gateway_arn: str) -> dict[str, str]:
+    """All per-agent permit policies, keyed by the policy name to sync them under
+    (``sdlc_permit_<agent>``)."""
+    return {
+        f"sdlc_permit_{agent}": render_agent_permit(agent, account_id, gateway_arn)
+        for agent in AGENT_TOOL_GRANTS
+    }

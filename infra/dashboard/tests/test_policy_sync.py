@@ -24,6 +24,11 @@ def _load(monkeypatch, *, engine_id=ENGINE, enforcement="LOG_ONLY", allowed=None
         monkeypatch.setenv("POLICY_ENGINE_ID", engine_id)
     monkeypatch.setenv("FLEET_POLICY_ENFORCEMENT", enforcement)
     monkeypatch.setenv("FLEET_CONFIG_TABLE", "unused-in-these-tests")
+    # Per-agent permit sync is opt-in on these two env vars; default tests run
+    # with them UNSET (permit path skipped) so the fleet-policy assertions below
+    # see exactly one create/update. test_syncs_agent_permits sets them.
+    monkeypatch.delenv("FLEET_GATEWAY_ARN", raising=False)
+    monkeypatch.delenv("AWS_ACCOUNT_ID", raising=False)
     import config_store
     import policy_sync
 
@@ -133,3 +138,37 @@ def test_control_plane_error_is_policy_sync_error(monkeypatch):
     monkeypatch.setattr(ps, "_get_client", lambda: fake)
     with pytest.raises(admin.PolicySyncError):
         ps.sync_fleet_policy()
+
+
+def test_syncs_agent_permits_when_gateway_env_set(monkeypatch):
+    ps = _load(monkeypatch)
+    monkeypatch.setenv(
+        "FLEET_GATEWAY_ARN",
+        "arn:aws:bedrock-agentcore:us-west-2:111122223333:gateway/sdlcFleetdev-abc",
+    )
+    monkeypatch.setenv("AWS_ACCOUNT_ID", "111122223333")
+    fake = _FakeClient(existing=[], statuses=["ACTIVE"])
+    monkeypatch.setattr(ps, "_get_client", lambda: fake)
+    ps.sync_fleet_policy()
+    names = [c["name"] for c in fake.created]
+    # The fleet allowlist policy + one permit per agent.
+    assert ps.FLEET_POLICY_NAME in names
+    assert "sdlc_permit_workitems" in names
+    assert "sdlc_permit_researcher" in names
+    # A permit statement carries the runtime-role principal.
+    permit = next(
+        c for c in fake.created if c["name"] == "sdlc_permit_workitems"
+    )
+    assert "assumed-role/workitems-agentcore-runtime" in (
+        permit["definition"]["cedar"]["statement"]
+    )
+
+
+def test_permits_skipped_without_gateway_env(monkeypatch):
+    # Default _load leaves FLEET_GATEWAY_ARN/AWS_ACCOUNT_ID unset → only the
+    # fleet allowlist policy is written, no permits.
+    ps = _load(monkeypatch)
+    fake = _FakeClient(existing=[], statuses=["ACTIVE"])
+    monkeypatch.setattr(ps, "_get_client", lambda: fake)
+    ps.sync_fleet_policy()
+    assert [c["name"] for c in fake.created] == [ps.FLEET_POLICY_NAME]

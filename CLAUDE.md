@@ -27,7 +27,7 @@ docs/             — Planning docs, specs, roadmap
 - **Agent Framework**: Strands Agents SDK
 - **Model**: Claude Opus 4.7 via Amazon Bedrock
 - **Runtime**: Amazon Bedrock AgentCore Runtime (containerized)
-- **Tool Access**: Direct MCP (`mcp.asana.com/v2/mcp`, `api.githubcopilot.com/mcp/`) via Strands' `streamablehttp_client` by default. Opt-in **AgentCore Gateway** (`DeployGateway`) fronts both servers behind one MCP URL with a Cedar policy engine; agents route through it when `GATEWAY_MCP_URL` is set.
+- **Tool Access**: Direct MCP (`mcp.asana.com/v2/mcp`, `api.githubcopilot.com/mcp/`) via Strands' `streamablehttp_client` by default. Opt-in **AgentCore Gateway** (`DeployGateway`) fronts both servers behind one MCP URL with a Cedar policy engine; when `GATEWAY_MCP_URL` is set, agents open a single SigV4-signed client to the gateway (via their runtime role) instead — see `agents/shared/tools/gateway.py`.
 - **Auth**: Credentials in SSM Parameter Store (SecureString) — per-agent runtime role has narrow `ssm:GetParameter` access. AgentCore Identity is a planned upgrade.
 - **Memory**: Agents honor `AGENTCORE_MEMORY_ID` via Strands' `AgentCoreMemoryToolProvider`. No Memory resource is provisioned by the fleet's infra template today; this is a roadmap item.
 - **Policy**: Cedar policy files under `cedar/<agent>.cedar` (advisory unless the Gateway is deployed). With `DeployGateway`, the AgentCore Gateway policy engine enforces Cedar in the invocation path — including the admin repo-allowlist policy (`infra/dashboard/fleet_policy.py`).

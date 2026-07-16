@@ -266,6 +266,22 @@ def agent_role_policies(
                 }
             ],
         },
+        # When the fleet routes MCP tool calls through the AgentCore Gateway
+        # (GATEWAY_MCP_URL set), the runtime signs requests with SigV4 using this
+        # role, which needs bedrock-agentcore:InvokeGateway on the fleet gateway.
+        # Scoped to the fleet gateway name pattern (sdlcFleet<Stage>); harmless
+        # when the gateway isn't deployed. This is the runtime side of the auth
+        # the gateway's AWS_IAM inbound authorizer expects.
+        "agentcore-gateway-invoke": {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": "bedrock-agentcore:InvokeGateway",
+                    "Resource": f"arn:aws:bedrock-agentcore:{region}:{account}:gateway/sdlcFleet{stage}*",
+                }
+            ],
+        },
     }
     suffixes = AGENT_SSM.get(agent, [])
     if suffixes:

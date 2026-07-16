@@ -10,15 +10,15 @@ Uses Claude Opus 4.7 via Bedrock and GitHub's official remote MCP server.
 import logging
 import os
 import sys
+from contextlib import ExitStack
 
 from strands import Agent
-from strands.tools.mcp import MCPClient
-from mcp.client.streamable_http import streamablehttp_client
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from strands_tools.agent_core_memory import AgentCoreMemoryToolProvider
 
 from shared.assignment import complete_assignment, extract_token_usage, fail_assignment
 from shared.bedrock import build_model
+from shared.tools import gateway
 from prompts import SYSTEM_PROMPT
 from project_config import build_project_context
 from tools.index_adrs import index_adrs
@@ -113,23 +113,19 @@ def invoke(payload, context=None):
         )
         tools.extend(memory_provider.tools)
 
-    # NOTE (gateway path, not yet wired): when GATEWAY_MCP_URL is set,
-    # GITHUB_MCP_URL resolves to the gateway endpoint, which authenticates
-    # inbound with AWS_IAM (SigV4) rather than the Bearer token sent here.
-    # Routing through the gateway needs a SigV4-signed client via the runtime
-    # role — see docs/aws-deploy.md § AgentCore Gateway. Until then, deploy
-    # without GATEWAY_MCP_URL (direct to GitHub's MCP server).
-    github_token = get_github_token()
-    github_client = MCPClient(
-        lambda: streamablehttp_client(
-            GITHUB_MCP_URL,
-            headers={"Authorization": f"Bearer {github_token}"},
-        )
-    )
-
-    with github_client:
-        github_tools = github_client.list_tools_sync()
-        all_tools = [*github_tools, *tools]
+    # MCP connectivity: one gateway client (SigV4, Cedar-enforced) when
+    # GATEWAY_MCP_URL is set, else the direct GitHub bearer client. See
+    # agents/shared/tools/gateway.py.
+    with ExitStack() as stack:
+        if gateway.gateway_enabled():
+            gw = stack.enter_context(gateway.build_gateway_client())
+            mcp_tools = gw.list_tools_sync()
+        else:
+            github_client = stack.enter_context(
+                gateway.build_bearer_client(GITHUB_MCP_URL, get_github_token())
+            )
+            mcp_tools = github_client.list_tools_sync()
+        all_tools = [*mcp_tools, *tools]
 
         agent = Agent(
             model=model,

@@ -1,3 +1,10 @@
+// NOTE: When the AgentCore Gateway is deployed, the ENFORCED per-agent tool
+// scope lives in infra/dashboard/fleet_policy.py (AGENT_TOOL_GRANTS + the fleet
+// forbid/permit generators), rendered into gateway action shape
+// (<Target>___<tool>) and synced to the policy engine. This file is the
+// human-readable source-of-intent for that scope and remains advisory when the
+// gateway is not deployed. Keep the two in sync.
+
 // Cedar policies specific to the Adr (ADR-linking) agent.
 // Adr reads the repo's ADR library and applies adr-* labels to issues/PRs.
 // Cannot modify code, cannot modify ADRs, cannot close/merge.

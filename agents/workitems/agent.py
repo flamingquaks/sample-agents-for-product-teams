@@ -12,10 +12,9 @@ GitHub's official remote MCP server.
 import logging
 import os
 import sys
+from contextlib import ExitStack
 
 from strands import Agent
-from strands.tools.mcp import MCPClient
-from mcp.client.streamable_http import streamablehttp_client
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from strands_tools.agent_core_memory import AgentCoreMemoryToolProvider
 
@@ -27,6 +26,7 @@ from shared.assignment import (
     update_trace_refs,
 )
 from shared.bedrock import build_model
+from shared.tools import gateway
 from prompts import SYSTEM_PROMPT
 from project_config import build_project_context
 from tools.status_report import generate_status_report
@@ -121,43 +121,31 @@ def invoke(payload, context=None):
         )
         tools.extend(memory_provider.tools)
 
-    # NOTE (gateway path, not yet wired): when GATEWAY_MCP_URL is set,
-    # ASANA_MCP_URL and GITHUB_MCP_URL both resolve to the one gateway endpoint,
-    # so the two clients below would open redundant sessions to the same server,
-    # AND the gateway authenticates inbound with AWS_IAM (SigV4) rather than the
-    # Bearer tokens sent here. Routing through the gateway therefore needs (a) a
-    # single MCPClient and (b) SigV4-signed requests via the runtime role — see
-    # docs/aws-deploy.md § AgentCore Gateway. Until that lands, deploy without
-    # GATEWAY_MCP_URL (agents connect direct to the vendor MCP servers).
-
-    # Asana MCP — official server with OAuth (required)
-    asana_token = get_access_token()
-    asana_client = MCPClient(
-        lambda: streamablehttp_client(
-            ASANA_MCP_URL,
-            headers={"Authorization": f"Bearer {asana_token}"},
-        )
-    )
-
-    # GitHub MCP — official remote server with OAuth (required)
-    github_token = get_github_token()
-    github_client = MCPClient(
-        lambda: streamablehttp_client(
-            GITHUB_MCP_URL,
-            headers={"Authorization": f"Bearer {github_token}"},
-        )
-    )
-
-    with asana_client, github_client:
-        asana_tools = asana_client.list_tools_sync()
-        github_tools = github_client.list_tools_sync()
-
-        # Drop GitHub tools that collide with Asana tool names
-        # (e.g. both servers expose get_me — keep the Asana version)
-        asana_names = {t.tool_name for t in asana_tools}
-        github_tools = [gt for gt in github_tools if gt.tool_name not in asana_names]
-
-        all_tools = [*asana_tools, *github_tools, *tools]
+    # MCP connectivity: one gateway client (SigV4, Cedar-enforced) when
+    # GATEWAY_MCP_URL is set, else direct per-vendor bearer clients. See
+    # agents/shared/tools/gateway.py.
+    with ExitStack() as stack:
+        if gateway.gateway_enabled():
+            # Single gateway client — targets are aggregated + per-principal
+            # filtered at the gateway, so no client-side dedup is needed.
+            gw = stack.enter_context(gateway.build_gateway_client())
+            all_tools = [*gw.list_tools_sync(), *tools]
+        else:
+            asana_client = stack.enter_context(
+                gateway.build_bearer_client(ASANA_MCP_URL, get_access_token())
+            )
+            github_client = stack.enter_context(
+                gateway.build_bearer_client(GITHUB_MCP_URL, get_github_token())
+            )
+            asana_tools = asana_client.list_tools_sync()
+            github_tools = github_client.list_tools_sync()
+            # Drop GitHub tools that collide with Asana tool names
+            # (e.g. both servers expose get_me — keep the Asana version)
+            asana_names = {t.tool_name for t in asana_tools}
+            github_tools = [
+                gt for gt in github_tools if gt.tool_name not in asana_names
+            ]
+            all_tools = [*asana_tools, *github_tools, *tools]
 
         # The repo to act on comes from the dispatch (multi-repo fleet), not a
         # baked env var. Absent for non-GitHub dispatches — the project context

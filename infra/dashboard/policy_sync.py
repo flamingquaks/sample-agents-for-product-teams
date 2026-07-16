@@ -61,12 +61,14 @@ def _enforcement_mode() -> str:
     return mode if mode in {"ACTIVE", "LOG_ONLY"} else _DEFAULT_ENFORCEMENT
 
 
-def _find_policy_id(client, engine_id: str) -> str | None:
-    """Return the fleet policy's id by name, or None if it doesn't exist yet."""
+def _find_policy_id(
+    client, engine_id: str, name: str = FLEET_POLICY_NAME
+) -> str | None:
+    """Return the id of the policy called ``name``, or None if absent."""
     paginator = client.get_paginator("list_policies")
     for page in paginator.paginate(policyEngineId=engine_id):
         for policy in page.get("policies", []):
-            if policy.get("name") == FLEET_POLICY_NAME:
+            if policy.get("name") == name:
                 return policy.get("policyId") or policy.get("id")
     return None
 
@@ -92,8 +94,57 @@ def _poll_until_ready(client, engine_id: str, policy_id: str) -> str:
     )
 
 
+def _upsert_policy(client, engine_id: str, name: str, statement: str, mode: str) -> str:
+    """Create-or-update the named policy with ``statement``, then poll to ready.
+    Returns the policy id. Raises PolicySyncError (via _poll_until_ready) or the
+    underlying ClientError on failure — callers wrap those.
+
+    Concurrency: an update is last-writer-wins but always writes the FULL current
+    statement (not a diff), so a re-sync converges. The one non-convergent race
+    is create/create — two writers both find no policy and both create the same
+    name; we treat a create conflict as "someone created it first" and adopt +
+    update the existing one instead of leaving a duplicate."""
+    definition = {"cedar": {"statement": statement}}
+    policy_id = _find_policy_id(client, engine_id, name)
+    if policy_id is None:
+        try:
+            resp = client.create_policy(
+                policyEngineId=engine_id,
+                name=name,
+                definition=definition,
+                enforcementMode=mode,
+            )
+            policy_id = resp.get("policyId") or resp.get("id")
+            logger.info("Created policy %s (%s, mode=%s)", name, policy_id, mode)
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code not in ("ConflictException", "ResourceConflictException"):
+                raise
+            policy_id = _find_policy_id(client, engine_id, name)
+            if policy_id is None:
+                raise
+            client.update_policy(
+                policyEngineId=engine_id,
+                policyId=policy_id,
+                definition=definition,
+                enforcementMode=mode,
+            )
+            logger.info("Adopted+updated policy %s after create conflict", name)
+    else:
+        client.update_policy(
+            policyEngineId=engine_id,
+            policyId=policy_id,
+            definition=definition,
+            enforcementMode=mode,
+        )
+        logger.info("Updated policy %s (%s, mode=%s)", name, policy_id, mode)
+    _poll_until_ready(client, engine_id, policy_id)
+    return policy_id
+
+
 def sync_fleet_policy() -> None:
-    """Regenerate + push the fleet Cedar policy from the current allowed set.
+    """Push the fleet repo-allowlist policy from the current allowed set, then the
+    per-agent permit policies.
 
     No-op (logged) when POLICY_ENGINE_ID is unset. Raises PolicySyncError on any
     failure reaching the engine or the intended enforcement state.
@@ -109,66 +160,40 @@ def sync_fleet_policy() -> None:
         )
         return
 
-    statement = fleet_policy.render_fleet_policy(allowed)
     mode = _enforcement_mode()
-    definition = {"cedar": {"statement": statement}}
     client = _get_client()
-
-    # Concurrency note: two admins editing at once both read the live table
-    # (allowed_repos above), render the FULL current allowlist, and overwrite the
-    # single named policy — so an update is last-writer-wins but always reflects
-    # the whole current table, not a partial diff, and a re-sync converges. The
-    # one non-convergent race is a create/create: both find no policy and both
-    # create the same name, leaving a duplicate. We guard that by treating a
-    # create conflict as "someone created it first" and falling back to update.
     try:
-        policy_id = _find_policy_id(client, engine_id)
-        if policy_id is None:
-            policy_id = _create_or_adopt(client, engine_id, definition, mode)
-        else:
-            client.update_policy(
-                policyEngineId=engine_id,
-                policyId=policy_id,
-                definition=definition,
-                enforcementMode=mode,
-            )
-            logger.info("Updated fleet policy %s (mode=%s)", policy_id, mode)
+        _upsert_policy(
+            client,
+            engine_id,
+            FLEET_POLICY_NAME,
+            fleet_policy.render_fleet_policy(allowed),
+            mode,
+        )
+        _sync_agent_permits(client, engine_id, mode)
     except (ClientError, BotoCoreError) as exc:
         # A Cedar-analysis rejection surfaces here (validation is at create/update
         # time); treat every control-plane error as a sync failure.
         raise PolicySyncError(f"gateway policy write failed: {exc}") from exc
 
-    status = _poll_until_ready(client, engine_id, policy_id)
-    logger.info("Fleet policy %s synced to %s (allowed=%s)", policy_id, status, allowed)
+    logger.info("Fleet policy set synced (allowed=%s)", allowed)
 
 
-def _create_or_adopt(client, engine_id: str, definition: dict, mode: str) -> str:
-    """Create the fleet policy, or adopt+update the existing one if a concurrent
-    writer created it first (create/create race). Returns the policy id."""
-    try:
-        resp = client.create_policy(
-            policyEngineId=engine_id,
-            name=FLEET_POLICY_NAME,
-            definition=definition,
-            enforcementMode=mode,
+def _sync_agent_permits(client, engine_id: str, mode: str) -> None:
+    """Provision one permit policy per agent (default-deny means the fleet does
+    nothing without them). Skipped when the gateway ARN / account are unknown —
+    the forbid policies still apply, but under ENFORCE nothing is permitted until
+    the permits land, which is why rollout is LOG_ONLY first. The gateway ARN and
+    account come from the admin Lambda's env (set by the template when the gateway
+    is deployed)."""
+    gateway_arn = os.environ.get("FLEET_GATEWAY_ARN", "").strip()
+    account_id = os.environ.get("AWS_ACCOUNT_ID", "").strip()
+    if not gateway_arn or not account_id:
+        logger.info(
+            "FLEET_GATEWAY_ARN/AWS_ACCOUNT_ID unset — skipping per-agent permits"
         )
-        policy_id = resp.get("policyId") or resp.get("id")
-        logger.info("Created fleet policy %s (mode=%s)", policy_id, mode)
-        return policy_id
-    except ClientError as exc:
-        code = exc.response.get("Error", {}).get("Code", "")
-        if code not in ("ConflictException", "ResourceConflictException"):
-            raise
-        # Lost the create race — re-find the policy the other writer made and
-        # update it so our allowlist snapshot is applied (idempotent name).
-        policy_id = _find_policy_id(client, engine_id)
-        if policy_id is None:
-            raise
-        client.update_policy(
-            policyEngineId=engine_id,
-            policyId=policy_id,
-            definition=definition,
-            enforcementMode=mode,
-        )
-        logger.info("Adopted+updated fleet policy %s after create conflict", policy_id)
-        return policy_id
+        return
+    for name, statement in fleet_policy.agent_permit_policies(
+        account_id, gateway_arn
+    ).items():
+        _upsert_policy(client, engine_id, name, statement, mode)

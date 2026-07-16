@@ -1,3 +1,10 @@
+// NOTE: When the AgentCore Gateway is deployed, the ENFORCED per-agent tool
+// scope lives in infra/dashboard/fleet_policy.py (AGENT_TOOL_GRANTS + the fleet
+// forbid/permit generators), rendered into gateway action shape
+// (<Target>___<tool>) and synced to the policy engine. This file is the
+// human-readable source-of-intent for that scope and remains advisory when the
+// gateway is not deployed. Keep the two in sync.
+
 // Cedar policies specific to the Workitems agent.
 // Workitems can read both systems and write to a controlled set of tools.
 
