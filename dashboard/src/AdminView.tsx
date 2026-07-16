@@ -45,21 +45,33 @@ export function AdminView({
 
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [actionMsg, setActionMsg] = useState<string | null>(null);
 
-  // Wrap a write so the button disables, errors surface in one banner, and both
-  // affected polls re-fetch on success (settings + repos can move together once
-  // WS5 wires the policy sync).
+  // Wrap a write so the button disables, the outcome ALWAYS surfaces (success or
+  // failure — never a silent no-op), and both affected polls re-fetch. `label`
+  // names the action so feedback is specific.
   const run = useCallback(
-    async (fn: () => Promise<unknown>) => {
+    async (label: string, fn: () => Promise<unknown>) => {
       setBusy(true);
       setActionError(null);
+      setActionMsg(null);
       try {
-        await fn();
+        const result = (await fn()) as { policy_sync_warning?: string } | undefined;
         reposPoll.refresh();
         settingsPoll.refresh();
+        setActionMsg(
+          result?.policy_sync_warning
+            ? `${label} — ${result.policy_sync_warning}`
+            : `${label} succeeded.`,
+        );
       } catch (e) {
-        if (e instanceof ApiError && e.status === 401) onAuthError();
-        setActionError((e as Error).message);
+        if (e instanceof ApiError && e.status === 401) {
+          onAuthError();
+          setActionError("Session expired — signing you in again.");
+          return;
+        }
+        const status = e instanceof ApiError ? ` (HTTP ${e.status})` : "";
+        setActionError(`${label} failed${status}: ${(e as Error).message}`);
       } finally {
         setBusy(false);
       }
@@ -79,11 +91,23 @@ export function AdminView({
         but blocked from cross-repo tool actions at the Gateway.
       </p>
 
-      {actionError && <div className="banner error">Action failed: {actionError}</div>}
+      {actionError && <div className="banner error">{actionError}</div>}
+      {actionMsg && <div className="banner ok">{actionMsg}</div>}
 
-      <SettingsPanel restrict={restrict} disabled={busy} onToggle={(v) => run(() => api.putSettings({ restrict_repos: v }))} />
+      <SettingsPanel
+        restrict={restrict}
+        disabled={busy}
+        onToggle={(v) =>
+          run(`Set restrict-to-allowlist ${v ? "on" : "off"}`, () =>
+            api.putSettings({ restrict_repos: v }),
+          )
+        }
+      />
 
-      <OnboardForm disabled={busy} onOnboard={(body) => run(() => api.onboardRepo(body))} />
+      <OnboardForm
+        disabled={busy}
+        onOnboard={(body) => run(`Onboard ${body.repo}`, () => api.onboardRepo(body))}
+      />
 
       {reposPoll.error && (
         <div className="banner error">Failed to load repos: {reposPoll.error}</div>
@@ -121,7 +145,7 @@ export function AdminView({
                   disabled={busy}
                   onClick={() => {
                     if (window.confirm(`Remove ${r.repo} from the fleet?`)) {
-                      void run(() => api.deleteRepo(r.repo));
+                      void run(`Remove ${r.repo}`, () => api.deleteRepo(r.repo));
                     }
                   }}
                 >
@@ -172,6 +196,10 @@ function SettingsPanel({
   );
 }
 
+// owner/repo with GitHub-legal segment chars — mirrors admin._valid_repo so the
+// client rejects the same inputs the server would, with an inline reason.
+const REPO_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
+
 function OnboardForm({
   disabled,
   onOnboard,
@@ -181,22 +209,35 @@ function OnboardForm({
 }) {
   const [repo, setRepo] = useState("");
   const [eligible, setEligible] = useState(true);
+  const [hint, setHint] = useState<string | null>(null);
 
   const submit = () => {
     const trimmed = repo.trim();
-    if (!trimmed) return;
+    // Never a silent no-op: if the field is empty or malformed, say why.
+    if (!trimmed) {
+      setHint("Enter a repository as owner/repo (e.g. octocat/hello-world).");
+      return;
+    }
+    if (!REPO_RE.test(trimmed)) {
+      setHint(`"${trimmed}" isn't a valid owner/repo — one slash, letters/digits/._- only.`);
+      return;
+    }
+    setHint(null);
     onOnboard({ repo: trimmed, enabled: true, multi_repo_eligible: eligible });
     setRepo("");
     setEligible(true);
   };
 
   return (
-    <div className="filters">
+    <div className="filters" style={{ flexWrap: "wrap" }}>
       <input
         placeholder="owner/repo"
         value={repo}
         disabled={disabled}
-        onChange={(e) => setRepo(e.target.value)}
+        onChange={(e) => {
+          setRepo(e.target.value);
+          if (hint) setHint(null);
+        }}
         onKeyDown={(e) => {
           if (e.key === "Enter") submit();
         }}
@@ -211,9 +252,16 @@ function OnboardForm({
         />{" "}
         Multi-repo eligible
       </label>
-      <button className="primary" disabled={disabled || !repo.trim()} onClick={submit}>
+      {/* Button is NOT disabled on empty input — submit() reports the reason
+          instead of being an inert dead end. */}
+      <button className="primary" disabled={disabled} onClick={submit}>
         Onboard repo
       </button>
+      {hint && (
+        <span className="muted" role="alert" style={{ width: "100%" }}>
+          {hint}
+        </span>
+      )}
     </div>
   );
 }
