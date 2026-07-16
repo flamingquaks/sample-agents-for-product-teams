@@ -46,6 +46,13 @@ def test_app_configured(monkeypatch):
     assert github_client.app_configured() is False
 
 
+def test_app_not_configured_when_placeholder(monkeypatch):
+    # The template seeds app-id with "unset" — that must read as NOT configured,
+    # else the UI shows a registered App + a /apps/unset/ install link.
+    monkeypatch.setattr(github_client, "_app_id", lambda: "unset")
+    assert github_client.app_configured() is False
+
+
 def test_app_jwt_is_three_segments_with_iss():
     import base64
     import json

@@ -78,12 +78,26 @@ def _ssm_client():
     return _ssm
 
 
+# The template seeds the app-id/slug SSM params with this placeholder (SSM
+# String can't be empty); the manifest flow overwrites it with the real id.
+_UNSET = "unset"
+
+
 def app_configured() -> bool:
-    """Whether the fleet GitHub App has been registered (its id + key present)."""
-    return bool(
+    """Whether the fleet GitHub App has actually been registered — i.e. the app-id
+    SSM param holds a real value, not the deploy-time placeholder. Checking the
+    env-var names alone is insufficient: they're always set once the dashboard is
+    deployed, so the App would look 'configured' before anyone runs the manifest
+    flow (and the install link would point at /apps/unset/...)."""
+    if not (
         os.environ.get("GITHUB_APP_ID_PARAM")
         and os.environ.get("GITHUB_APP_PRIVATE_KEY_SECRET_ARN")
-    )
+    ):
+        return False
+    try:
+        return _app_id().strip() not in ("", _UNSET)
+    except Exception:  # noqa: BLE001 — param missing/unreadable → not configured
+        return False
 
 
 def _app_id() -> str:
@@ -97,9 +111,10 @@ def app_slug() -> str | None:
     if not param:
         return None
     try:
-        return _ssm_client().get_parameter(Name=param)["Parameter"]["Value"]
+        value = _ssm_client().get_parameter(Name=param)["Parameter"]["Value"]
     except Exception:  # noqa: BLE001 — slug is best-effort (drives the install link)
         return None
+    return None if value.strip() in ("", _UNSET) else value
 
 
 def _private_key() -> str:
