@@ -363,10 +363,16 @@ def deploy_role_policy(region: str, account: str) -> dict:
                 "Resource": f"arn:aws:lambda:{region}:{account}:function:dispatch-router-*",
             },
             {
-                "Sid": "PassAgentRuntimeRoles",
+                # Runtime roles the deploy workflows attach, plus the gateway
+                # service role the foundation stack creates and hands to the
+                # AgentCore Gateway. Both are passed to bedrock-agentcore.
+                "Sid": "PassAgentCoreRoles",
                 "Effect": "Allow",
                 "Action": "iam:PassRole",
-                "Resource": f"arn:aws:iam::{account}:role/*-agentcore-runtime",
+                "Resource": [
+                    f"arn:aws:iam::{account}:role/*-agentcore-runtime",
+                    f"arn:aws:iam::{account}:role/sdlc-fleet-gateway-*",
+                ],
                 "Condition": {
                     "StringEquals": {
                         "iam:PassedToService": "bedrock-agentcore.amazonaws.com"
@@ -577,8 +583,13 @@ def gather_config(cfg: dict) -> dict:
     cfg["stage"] = prompt_choice(
         "Stage", ["dev", "staging", "prod"], cfg.get("stage", "dev")
     )
+    # The fleet is multi-repo and deploys as its own isolated repo: this is the
+    # repo that HOSTS the fleet (its CI/OIDC trust + Actions secrets), NOT a repo
+    # the agents act on. Which repos the agents act on is configured at runtime
+    # by an admin in the dashboard (onboard repos), not baked here.
     cfg["target_repo"] = prompt(
-        "Target GitHub repo (owner/repo)", cfg.get("target_repo", "")
+        "Fleet's own GitHub repo (owner/repo) — for CI/OIDC, not a work target",
+        cfg.get("target_repo", ""),
     )
     cfg["asana_project_gid"] = prompt(
         "Asana project GID (blank to skip)", cfg.get("asana_project_gid", "")
@@ -596,6 +607,22 @@ def gather_config(cfg: dict) -> dict:
     cfg["deploy_dashboard"] = prompt_yes(
         "Deploy the monitoring dashboard?", cfg.get("deploy_dashboard", False)
     )
+    # The admin API owns the Gateway Cedar-policy sync, so the gateway needs the
+    # dashboard. Only offer it when the dashboard is on.
+    if cfg.get("deploy_dashboard"):
+        cfg["deploy_gateway"] = prompt_yes(
+            "Deploy the AgentCore Gateway + Cedar policy engine (deterministic "
+            "tool-call boundary)?",
+            cfg.get("deploy_gateway", False),
+        )
+        if cfg.get("deploy_gateway"):
+            cfg["gateway_enforcement"] = prompt_choice(
+                "Gateway policy enforcement (roll out LOG_ONLY first)",
+                ["LOG_ONLY", "ACTIVE"],
+                cfg.get("gateway_enforcement", "LOG_ONLY"),
+            )
+    else:
+        cfg["deploy_gateway"] = False
     return cfg
 
 
@@ -790,6 +817,8 @@ def deploy_foundation(runner: Runner, cfg: dict) -> None:
         f"WorkitemsBotGID={cfg.get('workitems_bot_gid', '')}",
         f"AgentFieldGID={cfg.get('agent_field_gid', '')}",
         f"DeployDashboard={'true' if cfg.get('deploy_dashboard') else 'false'}",
+        f"DeployGateway={'true' if cfg.get('deploy_gateway') else 'false'}",
+        f"GatewayPolicyEnforcement={cfg.get('gateway_enforcement', 'LOG_ONLY')}",
     ]
     if runner.profile:
         cmd += ["--profile", runner.profile]
@@ -825,7 +854,10 @@ def set_github_config(
     secrets = {"AWS_ACCOUNT_ID": account}
     if deploy_role_arn:
         secrets["AWS_DEPLOY_ROLE_ARN"] = deploy_role_arn
-    variables = {"AWS_REGION": runner.region, "TARGET_REPO": repo}
+    # TARGET_REPO is intentionally NOT set: the fleet is multi-repo, so agents
+    # take the repo from the dispatch (an admin onboards repos in the dashboard),
+    # not from a baked deploy variable.
+    variables = {"AWS_REGION": runner.region}
     if cfg.get("asana_project_gid"):
         variables["ASANA_PROJECT_GID"] = cfg["asana_project_gid"]
     if cfg.get("asana_workspace_gid"):
@@ -933,6 +965,10 @@ def main() -> int:
     print(f"  Stage:     {cfg['stage']}")
     print(f"  Repo:      {owner}/{repo}")
     print(f"  Dashboard: {'yes' if cfg.get('deploy_dashboard') else 'no'}")
+    gw = "no"
+    if cfg.get("deploy_gateway"):
+        gw = f"yes ({cfg.get('gateway_enforcement', 'LOG_ONLY')})"
+    print(f"  Gateway:   {gw}")
     print(f"  Agents:    {', '.join(agents)}")
     print(
         "  Sets up: OIDC provider, CI deploy role, per-agent runtime roles, "
@@ -976,8 +1012,31 @@ def main() -> int:
         print("     python scripts/bootstrap_asana_webhook.py")
     if cfg.get("deploy_dashboard") and outputs.get("DashboardUrl"):
         print(
-            f"  5. Dashboard: {outputs['DashboardUrl']} (add operators to the Cognito 'operators' group)"
+            f"  5. Dashboard: {outputs['DashboardUrl']}"
         )
+        print(
+            "     Add viewers to the Cognito 'operators' group and fleet admins to"
+        )
+        print(
+            "     'admins'. An admin then onboards the repos the fleet may act on"
+        )
+        print(
+            "     in the Admin view — the fleet is multi-repo, so no repo is baked in."
+        )
+    if cfg.get("deploy_gateway") and outputs.get("FleetGatewayUrl"):
+        print(
+            f"  6. Gateway: set GATEWAY_MCP_URL={outputs['FleetGatewayUrl']} on the agent"
+        )
+        print(
+            "     runtimes to route tool calls through the policy engine. Enforcement"
+        )
+        print(
+            f"     is {cfg.get('gateway_enforcement', 'LOG_ONLY')}; author the per-agent"
+        )
+        print(
+            "     permit policies + confirm the write-tool names, then flip to ACTIVE."
+        )
+        print("     See docs/aws-deploy.md § AgentCore Gateway.")
     return 0
 
 

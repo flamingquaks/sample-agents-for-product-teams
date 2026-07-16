@@ -80,7 +80,7 @@ The PDLC Agent Fleet is a multi-agent system on **Amazon Bedrock AgentCore Runti
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-**What's *not* in this diagram but is in some earlier designs:** AgentCore Identity (not used — credentials live in SSM), AgentCore Gateway (not used — agents connect directly to vendor MCP servers), AgentCore Memory (optional — honored via env var if set, not provisioned by the fleet's infra template), AgentCore Browser (not used — no agent needs a browser today). These are all plausible upgrades on the roadmap.
+**What's *not* in this diagram but is in some earlier designs:** AgentCore Identity (not used — credentials live in SSM), AgentCore Memory (optional — honored via env var if set, not provisioned by the fleet's infra template), AgentCore Browser (not used — no agent needs a browser today). These are plausible upgrades on the roadmap. **AgentCore Gateway** is now available as an opt-in (`DeployGateway`): agents route MCP tool calls through it so the Cedar policy engine can enforce the repo allowlist at the tool-call boundary (see § 5.2 and `docs/aws-deploy.md`). Absent the gateway, agents connect directly to the vendor MCP servers.
 
 ---
 
@@ -254,7 +254,7 @@ Every agent ships with a per-agent policy file at `cedar/<agent>.cedar`, plus `c
 | Docwriter | Create PRs (doc files), post comments | All shared forbids; cannot modify code files |
 | Adr | Post issue comments, add labels, post PR review comments | All shared forbids; cannot modify ADR files |
 
-Cedar evaluation today is advisory — the policies document the contract. Hard enforcement via a Cedar evaluator in the invocation path is a roadmap item.
+The per-agent `cedar/*.cedar` files document the contract. Hard enforcement is available via the **AgentCore Gateway policy engine** (opt-in, `DeployGateway`): agents route tool calls through the Gateway, whose Cedar engine evaluates policies in the invocation path (default-deny + forbid-wins). The fleet repo-allowlist policy is generated from the admin config and enforced there — see `docs/aws-deploy.md` § AgentCore Gateway. Rolled out `LOG_ONLY` first; the per-agent tool-scope rules above are folded into the engine (rewritten to gateway `<Target>___<tool>` actions) as part of that migration. Until the gateway is deployed and set to `ACTIVE`, the `cedar/*.cedar` files remain advisory.
 
 ### 5.3 Data Security
 

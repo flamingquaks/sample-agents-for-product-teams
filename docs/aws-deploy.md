@@ -94,8 +94,26 @@ Passed to `sam deploy --parameter-overrides`:
 - **`Stage`** — `dev` / `staging` / `prod`. Embedded in every resource name.
 - **`WorkitemsBotGID`** — Asana user GID that tasks are assigned to to trigger Workitems.
 - **`AgentFieldGID`** — Asana custom field GID for the "Agent" dropdown (optional — empty string is fine if you're not using custom-field triggers).
+- **`DeployDashboard`** — `true`/`false` (default `false`). Provisions the Cognito user pool, the operator/admin read+write APIs, and the CloudFront SPA.
+- **`DeployGateway`** — `true`/`false` (default `false`). Provisions the AgentCore Gateway + Cedar policy engine (the deterministic tool-call boundary). Requires `DeployDashboard=true` (the admin API owns the policy sync).
+- **`GatewayPolicyEnforcement`** — `LOG_ONLY` (default) / `ACTIVE`. The fleet Cedar policy's enforcement mode; roll out `LOG_ONLY` first, watch CloudWatch, then flip to `ACTIVE`.
+- **`GitHubMcpEndpoint`** / **`AsanaMcpEndpoint`** — MCP server endpoints registered as gateway targets (defaults point at the official servers).
 
-Which GitHub repos the fleet acts on is no longer a deploy parameter. The fleet is multi-repo: deploy it once, then an admin onboards repos at runtime in the dashboard's Admin view (stored in the `fleet-config-${Stage}` DynamoDB table). The Dispatch Router reads that allowlist and rejects a GitHub mention from a non-onboarded repo with a `403`. See the dashboard admin docs for the onboarding flow.
+Which GitHub repos the fleet acts on is no longer a deploy parameter. The fleet is multi-repo: deploy it once, then an admin onboards repos at runtime in the dashboard's Admin view (stored in the `fleet-config-${Stage}` DynamoDB table). The Dispatch Router reads that allowlist and rejects a GitHub mention from a non-onboarded repo with a `403`. See § AgentCore Gateway below for the tool-call boundary that complements it.
+
+### 2.3.1 AgentCore Gateway + Cedar policy (the deterministic tool-call boundary)
+
+The dispatch allowlist (above) stops a *mention* from a non-onboarded repo. The Gateway stops a *tool call* against a non-allowlisted repo — even one an over-scoped GitHub PAT could otherwise reach (threat T-11). It is opt-in and rolled out in stages:
+
+1. **Deploy it** — `DeployGateway=true`, `GatewayPolicyEnforcement=LOG_ONLY`. This creates the policy engine, the Gateway (MCP, `AWS_IAM` inbound), and the `GitHubTarget`/`AsanaTarget` MCP targets. `bootstrap.py` offers this when the dashboard is enabled.
+2. **Route agents through it** — set `GATEWAY_MCP_URL` (stack output `FleetGatewayUrl`) on each agent runtime. Absent this env, agents connect direct to the MCP servers (pre-gateway behavior), so this is a deliberate, reversible switch. Wire each agent's inbound auth to the Gateway (SigV4 via its runtime role).
+3. **Confirm the manifest-dependent bits** against the *live* gateway `tools/list`:
+   - the GitHub write-tool names and the target name in `infra/dashboard/fleet_policy.py` (`WRITE_TOOLS`, `GITHUB_TARGET`) — the action ids are `<TargetName>___<toolName>`;
+   - the repo parameter shape (`REPO_PARAM_MODE` — `pair` for separate `owner`/`repo` inputs, `single` for a combined `repo`);
+   - author the per-agent **permit** policies (the folded-in `cedar/*.cedar` rules, rewritten to gateway actions + `context.input.*` conditions). The engine is default-deny + forbid-wins, so without permits nothing is allowed once enforcing — which is why log-only comes first.
+4. **Observe, then enforce** — watch CloudWatch for unexpected `LOG_ONLY` denies, then redeploy with `GatewayPolicyEnforcement=ACTIVE`. The admin API regenerates the fleet repo-policy on every allowlist change (`infra/dashboard/policy_sync.py`) at whatever enforcement mode is set.
+
+The repo-allowlist policy is **owned by the admin Lambda**, not a CloudFormation `Policy` resource — so an admin's runtime edits (onboarding a repo) aren't clobbered by stack drift-correction. The engine, gateway, targets, and gateway role are the CloudFormation scaffold; the fleet policy is a live `bedrock-agentcore-control` call.
 
 ### 2.4 SSM SecureString parameters (populated by connect skills)
 

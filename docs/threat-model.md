@@ -156,7 +156,7 @@ Wildcards (`StringLike: repo:<org>/<repo>:*`) are explicitly called out as anti-
 | T-8 | **Asana PAT lifetime in Lambda execution environment** | — | C-2 | Information Disclosure | Mitigated |
 | T-9 | **Webhook secret self-write during handshake** | — | C-2 | Tampering | Mitigated |
 | T-10 | **OAuth token refresh failure leaves stale credentials** | **Low** | C-4, C-6 | Denial of Service | Accepted |
-| T-11 | **GitHub PAT scope may be overly broad** | **Medium** | C-9 | Elevation of Privilege | Open |
+| T-11 | **GitHub PAT scope may be overly broad** | **Medium** | C-9 | Elevation of Privilege | Partially mitigated |
 
 **T-8 (Mitigated):** `infra/dispatch/asana_webhook.py` fetches the Asana PAT on demand inside `asana_get`, caches it only on an `invocation_state` dict that goes out of scope when the handler returns, and never retains it on a module-level global. The webhook secret is likewise fetched per invocation. A memory-disclosure or verbose-log incident exposes at most the secrets used by the single request that was in flight, not the secrets used by every prior request in the same execution environment.
 
@@ -164,7 +164,7 @@ Wildcards (`StringLike: repo:<org>/<repo>:*`) are explicitly called out as anti-
 
 **T-10 (Accepted):** Agents surface OAuth refresh errors in logs but there is no automated rotation or CloudWatch alarm. Operators are expected to notice failed runs and re-run `pdlc-agents-connect-asana`. Acceptable for a reference architecture; production deployments should add alarms on SSM parameter age.
 
-**T-11 (Open):** The GitHub MCP server is authenticated with either a PAT or a GitHub App installation. The PAT path cannot enforce minimum scopes — a token with `repo` grants write access to every repository the owner can access, not just the target repo. The App path is scope-bounded but requires more setup. Roadmap: recommend (and default to) the App path in documentation; flag overly broad PATs at startup.
+**T-11 (Partially mitigated):** The GitHub MCP server is authenticated with either a PAT or a GitHub App installation. The PAT path cannot enforce minimum scopes — a token with `repo` grants write access to every repository the owner can access, not just the onboarded repos. Two controls now constrain the *use* of that token even when it is over-scoped: (1) the multi-repo transformation routes agent tool calls through an **AgentCore Gateway** whose **Cedar policy engine** enforces the admin repo allowlist — a `forbid` on GitHub write tools whose target repo isn't enabled + multi-repo-eligible (`infra/dashboard/fleet_policy.py`, synced by the admin API on every allowlist change). With enforcement `ACTIVE`, a write against a non-allowlisted repo is denied deterministically at the boundary regardless of the PAT's breadth. (2) The Dispatch Router already rejects mentions from non-onboarded repos (`infra/dispatch/fleet_config.py`). Residual risk (why not fully Mitigated): the underlying PAT is still over-scoped as defense-in-depth, and the gateway is opt-in (`DeployGateway`) and rolled out `LOG_ONLY` first — until enforcement is `ACTIVE`, deny decisions are logged, not blocked. Roadmap: narrow the PAT to the onboarded repos (or move to a GitHub App installation token) so the credential itself is bounded, and default the gateway to `ACTIVE` once per-agent permit policies are validated.
 
 ### 3.4 Network & API Security
 
