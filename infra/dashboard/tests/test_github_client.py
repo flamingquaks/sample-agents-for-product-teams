@@ -73,7 +73,9 @@ def test_generate_manifest_shape():
     assert m["hook_attributes"]["active"] is False  # webhook disabled
     assert m["default_permissions"] == github_client.APP_PERMISSIONS
     assert "contents" in m["default_permissions"]
-    assert m["redirect_url"].endswith("#/admin/github-app/setup-callback")
+    # redirect_url must be fragment-free (GitHub rejects "#..."); a real path.
+    assert m["redirect_url"] == "https://d.cf/github-app-callback"
+    assert "#" not in m["redirect_url"]
 
 
 def test_get_owner_type(monkeypatch):

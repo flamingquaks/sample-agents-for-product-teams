@@ -197,11 +197,17 @@ def generate_manifest(app_name: str, api_base_url: str, frontend_url: str) -> di
     """The GitHub App manifest the admin UI POSTs to github.com. Least-privilege
     permissions; webhook disabled (the fleet dispatches via @mention, not the
     App webhook — spec §8)."""
+    # redirect_url must be a fragment-free URL — GitHub rejects a "#..." hash
+    # ("redirect_url must be a valid URL"). The SPA is hash-routed, but CloudFront
+    # serves any path as index.html (403/404 → /), so we use a real PATH
+    # (/github-app-callback) and the SPA detects it on load, exchanges ?code, then
+    # navigates to the #/admin hash route.
+    base = frontend_url.rstrip("/")
     return {
         "name": app_name,
         "url": frontend_url,
         "hook_attributes": {"url": f"{api_base_url}/webhooks/github", "active": False},
-        "redirect_url": f"{frontend_url}#/admin/github-app/setup-callback",
+        "redirect_url": f"{base}/github-app-callback",
         "public": False,
         "default_permissions": APP_PERMISSIONS,
         "default_events": APP_EVENTS,

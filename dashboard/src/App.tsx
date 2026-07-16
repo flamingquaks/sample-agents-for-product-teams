@@ -54,9 +54,27 @@ function groupsFromProfile(profile: Record<string, unknown> | undefined): string
   return [];
 }
 
+/** GitHub's manifest flow returns to the fragment-free path /github-app-callback
+ *  (a "#..." redirect_url is rejected by GitHub). CloudFront serves that path as
+ *  the SPA; here we translate it — once, on load — into the hash route AdminView
+ *  already handles (#/admin/github-app/setup-callback?code=...), preserving the
+ *  code, so there's a single exchange path. */
+function normalizeGitHubAppCallback() {
+  if (window.location.pathname.replace(/\/$/, "").endsWith("/github-app-callback")) {
+    const search = window.location.search; // ?code=...&state=...
+    window.history.replaceState(
+      {},
+      document.title,
+      `/#/admin/github-app/setup-callback${search}`,
+    );
+  }
+}
+
 export function App({ config }: { config: AppConfig }) {
   const auth = useAuth();
   const api = useApi(config);
+  // Translate the GitHub App manifest callback path → hash route before routing.
+  normalizeGitHubAppCallback();
   // View is derived from the URL hash so it survives refresh + deep-links.
   const [view, setViewState] = useState<View>(() => hashToView(window.location.hash));
 
