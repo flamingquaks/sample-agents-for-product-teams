@@ -10,11 +10,13 @@ import { useApi } from "./hooks";
 import { FleetView } from "./FleetView";
 import { RunDetailView } from "./RunDetailView";
 import { TraceView } from "./TraceView";
+import { AdminView } from "./AdminView";
 
 type View =
   | { name: "fleet" }
   | { name: "run"; assignmentId: string }
-  | { name: "trace"; dimension: string; value: string };
+  | { name: "trace"; dimension: string; value: string }
+  | { name: "admin" };
 
 /** Decode the `cognito:groups` claim to show whether the user is an operator.
  *  The API is the real gate; this only drives a friendly message. */
@@ -56,7 +58,11 @@ export function App({ config }: { config: AppConfig }) {
   }
 
   const profile = auth.user?.profile as Record<string, unknown> | undefined;
-  const isOperator = groupsFromProfile(profile).includes("operators");
+  const groups = groupsFromProfile(profile);
+  const isAdmin = groups.includes("admins");
+  // Admins can view the operator surfaces too (the read API accepts either
+  // group), so treat an admin as an operator for the not-in-group banner.
+  const isOperator = groups.includes("operators") || isAdmin;
   const email = (profile?.email as string) ?? profile?.sub ?? "operator";
 
   const signOut = () => {
@@ -77,6 +83,13 @@ export function App({ config }: { config: AppConfig }) {
           SDLC Agent Fleet
         </h1>
         <div className="who">
+          {isAdmin && (
+            <button
+              onClick={() => setView((v) => (v.name === "admin" ? { name: "fleet" } : { name: "admin" }))}
+            >
+              {view.name === "admin" ? "Fleet" : "Admin"}
+            </button>
+          )}
           <span>{String(email)}</span>
           <button onClick={signOut}>Sign out</button>
         </div>
@@ -115,6 +128,14 @@ export function App({ config }: { config: AppConfig }) {
             onAuthError={() => void auth.signinRedirect()}
           />
         )}
+        {view.name === "admin" &&
+          (isAdmin ? (
+            <AdminView api={api} onAuthError={() => void auth.signinRedirect()} />
+          ) : (
+            <div className="banner error">
+              Your account is not in the <b>admins</b> group.
+            </div>
+          ))}
       </main>
     </>
   );
