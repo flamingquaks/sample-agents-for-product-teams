@@ -15,19 +15,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 ENGINE = "sdlcEngine-abcdef0123"
 
 
-def _load(monkeypatch, *, engine_id=ENGINE, enforcement="LOG_ONLY", allowed=None):
+def _load(monkeypatch, *, engine_id=ENGINE, allowed=None):
     for m in ("policy_sync", "admin", "config_store", "fleet_policy", "http_responses"):
         sys.modules.pop(m, None)
     if engine_id is None:
         monkeypatch.delenv("POLICY_ENGINE_ID", raising=False)
     else:
         monkeypatch.setenv("POLICY_ENGINE_ID", engine_id)
-    monkeypatch.setenv("FLEET_POLICY_ENFORCEMENT", enforcement)
     monkeypatch.setenv("FLEET_CONFIG_TABLE", "unused-in-these-tests")
-    # Per-agent permit sync is opt-in on these two env vars; default tests run
-    # with them UNSET (permit path skipped) so the fleet-policy assertions below
-    # see exactly one create/update. test_syncs_agent_permits sets them.
-    monkeypatch.delenv("FLEET_GATEWAY_ARN", raising=False)
+    # FLEET_GATEWAY_ARN is required for the sync (Cedar needs the concrete gateway
+    # resource). AWS_ACCOUNT_ID is opt-in for the per-agent permit path; default
+    # tests leave it UNSET so only the two fleet forbid policies are written.
+    monkeypatch.setenv(
+        "FLEET_GATEWAY_ARN",
+        "arn:aws:bedrock-agentcore:us-east-1:111122223333:gateway/sdlcfleetstaging-abc",
+    )
     monkeypatch.delenv("AWS_ACCOUNT_ID", raising=False)
     import config_store
     import policy_sync
@@ -78,27 +80,35 @@ def test_noop_when_engine_unset(monkeypatch):
 
 def test_creates_policy_when_absent(monkeypatch):
     ps = _load(monkeypatch)
-    fake = _FakeClient(existing=[], statuses=["CREATING", "LOG_ONLY"])
+    fake = _FakeClient(existing=[], statuses=["ACTIVE"])
     monkeypatch.setattr(ps, "_get_client", lambda: fake)
     ps.sync_fleet_policy()
-    assert len(fake.created) == 1
-    assert fake.created[0]["name"] == ps.FLEET_POLICY_NAME
-    assert fake.created[0]["enforcementMode"] == "LOG_ONLY"
-    assert "cedar" in fake.created[0]["definition"]
+    # Two fleet forbid policies (one Cedar statement each): allowlist + destructive.
+    names = [c["name"] for c in fake.created]
+    assert names == ["sdlc_allowed_repos", "sdlc_forbid_destructive"]
+    # enforcementMode is NOT sent — it lives on the gateway→engine attachment,
+    # and CreatePolicy in the deployed SDK rejects the parameter.
+    for c in fake.created:
+        assert "enforcementMode" not in c
+        assert "cedar" in c["definition"]
     assert not fake.updated
 
 
 def test_updates_policy_when_present(monkeypatch):
-    ps = _load(monkeypatch, enforcement="ACTIVE")
+    ps = _load(monkeypatch)
     fake = _FakeClient(
-        existing=[{"name": ps.FLEET_POLICY_NAME, "policyId": "pol-1"}],
-        statuses=["UPDATING", "ACTIVE"],
+        existing=[
+            {"name": "sdlc_allowed_repos", "policyId": "pol-1"},
+            {"name": "sdlc_forbid_destructive", "policyId": "pol-2"},
+        ],
+        statuses=["ACTIVE"],
     )
     monkeypatch.setattr(ps, "_get_client", lambda: fake)
     ps.sync_fleet_policy()
-    assert len(fake.updated) == 1
-    assert fake.updated[0]["policyId"] == "pol-1"
-    assert fake.updated[0]["enforcementMode"] == "ACTIVE"
+    updated_ids = {u["policyId"] for u in fake.updated}
+    assert updated_ids == {"pol-1", "pol-2"}
+    for u in fake.updated:
+        assert "enforcementMode" not in u
     assert not fake.created
 
 
@@ -164,11 +174,14 @@ def test_syncs_agent_permits_when_gateway_env_set(monkeypatch):
     )
 
 
-def test_permits_skipped_without_gateway_env(monkeypatch):
-    # Default _load leaves FLEET_GATEWAY_ARN/AWS_ACCOUNT_ID unset → only the
-    # fleet allowlist policy is written, no permits.
+def test_permits_skipped_without_account(monkeypatch):
+    # Default _load sets FLEET_GATEWAY_ARN but leaves AWS_ACCOUNT_ID unset → the
+    # two fleet forbid policies are written, but no per-agent permits.
     ps = _load(monkeypatch)
     fake = _FakeClient(existing=[], statuses=["ACTIVE"])
     monkeypatch.setattr(ps, "_get_client", lambda: fake)
     ps.sync_fleet_policy()
-    assert [c["name"] for c in fake.created] == [ps.FLEET_POLICY_NAME]
+    assert [c["name"] for c in fake.created] == [
+        "sdlc_allowed_repos",
+        "sdlc_forbid_destructive",
+    ]

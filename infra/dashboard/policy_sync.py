@@ -38,10 +38,13 @@ import fleet_policy
 logger = logging.getLogger(__name__)
 
 FLEET_POLICY_NAME = os.environ.get("FLEET_POLICY_NAME", "sdlc_allowed_repos")
-# LOG_ONLY | ACTIVE — per-policy enforcement (NOT the gateway-attachment enum).
-_DEFAULT_ENFORCEMENT = "LOG_ONLY"
 
-_TERMINAL_OK = {"ACTIVE", "LOG_ONLY"}
+# Enforcement (LOG_ONLY vs enforce) is controlled ONCE, at the gateway→engine
+# attachment (template's PolicyEngineConfiguration.Mode, from the
+# GatewayPolicyEnforcement parameter) — NOT per policy. CreatePolicy/UpdatePolicy
+# in the deployed SDK don't accept an enforcementMode parameter, and a per-policy
+# mode would be a second, conflicting control anyway.
+_TERMINAL_OK = {"ACTIVE"}
 _TERMINAL_FAIL = {"CREATE_FAILED", "UPDATE_FAILED", "DELETE_FAILED"}
 _POLL_ATTEMPTS = 30
 _POLL_SLEEP_SECONDS = 2
@@ -54,11 +57,6 @@ def _get_client():
     if _client is None:
         _client = boto3.client("bedrock-agentcore-control")
     return _client
-
-
-def _enforcement_mode() -> str:
-    mode = os.environ.get("FLEET_POLICY_ENFORCEMENT", _DEFAULT_ENFORCEMENT).upper()
-    return mode if mode in {"ACTIVE", "LOG_ONLY"} else _DEFAULT_ENFORCEMENT
 
 
 def _find_policy_id(
@@ -94,10 +92,11 @@ def _poll_until_ready(client, engine_id: str, policy_id: str) -> str:
     )
 
 
-def _upsert_policy(client, engine_id: str, name: str, statement: str, mode: str) -> str:
+def _upsert_policy(client, engine_id: str, name: str, statement: str) -> str:
     """Create-or-update the named policy with ``statement``, then poll to ready.
     Returns the policy id. Raises PolicySyncError (via _poll_until_ready) or the
-    underlying ClientError on failure — callers wrap those.
+    underlying ClientError on failure — callers wrap those. Enforcement mode is
+    NOT set here — it lives on the gateway→engine attachment.
 
     Concurrency: an update is last-writer-wins but always writes the FULL current
     statement (not a diff), so a re-sync converges. The one non-convergent race
@@ -112,10 +111,9 @@ def _upsert_policy(client, engine_id: str, name: str, statement: str, mode: str)
                 policyEngineId=engine_id,
                 name=name,
                 definition=definition,
-                enforcementMode=mode,
             )
             policy_id = resp.get("policyId") or resp.get("id")
-            logger.info("Created policy %s (%s, mode=%s)", name, policy_id, mode)
+            logger.info("Created policy %s (%s)", name, policy_id)
         except ClientError as exc:
             code = exc.response.get("Error", {}).get("Code", "")
             if code not in ("ConflictException", "ResourceConflictException"):
@@ -127,7 +125,6 @@ def _upsert_policy(client, engine_id: str, name: str, statement: str, mode: str)
                 policyEngineId=engine_id,
                 policyId=policy_id,
                 definition=definition,
-                enforcementMode=mode,
             )
             logger.info("Adopted+updated policy %s after create conflict", name)
     else:
@@ -135,9 +132,8 @@ def _upsert_policy(client, engine_id: str, name: str, statement: str, mode: str)
             policyEngineId=engine_id,
             policyId=policy_id,
             definition=definition,
-            enforcementMode=mode,
         )
-        logger.info("Updated policy %s (%s, mode=%s)", name, policy_id, mode)
+        logger.info("Updated policy %s (%s)", name, policy_id)
     _poll_until_ready(client, engine_id, policy_id)
     return policy_id
 
@@ -147,30 +143,33 @@ def sync_fleet_policy() -> None:
     per-agent permit policies.
 
     No-op (logged) when POLICY_ENGINE_ID is unset. Raises PolicySyncError on any
-    failure reaching the engine or the intended enforcement state.
+    failure reaching the engine. Enforcement (LOG_ONLY vs enforce) is set on the
+    gateway→engine attachment, not here.
     """
     from admin import PolicySyncError
 
     engine_id = os.environ.get("POLICY_ENGINE_ID", "").strip()
+    gateway_arn = os.environ.get("FLEET_GATEWAY_ARN", "").strip()
+    account_id = os.environ.get("AWS_ACCOUNT_ID", "").strip()
     allowed = config_store.allowed_repos()
-    if not engine_id:
+    if not engine_id or not gateway_arn:
+        # Cedar policies require the concrete gateway ARN as their resource
+        # (wildcards are rejected), so we can't render them without it. Absent the
+        # gateway, only the dispatch allowlist applies.
         logger.info(
-            "POLICY_ENGINE_ID unset — skipping Gateway policy sync (allowed=%s)",
+            "POLICY_ENGINE_ID/FLEET_GATEWAY_ARN unset — skipping Gateway policy "
+            "sync (allowed=%s)",
             allowed,
         )
         return
 
-    mode = _enforcement_mode()
     client = _get_client()
     try:
-        _upsert_policy(
-            client,
-            engine_id,
-            FLEET_POLICY_NAME,
-            fleet_policy.render_fleet_policy(allowed),
-            mode,
-        )
-        _sync_agent_permits(client, engine_id, mode)
+        for name, statement in fleet_policy.render_fleet_policies(
+            allowed, gateway_arn
+        ).items():
+            _upsert_policy(client, engine_id, name, statement)
+        _sync_agent_permits(client, engine_id, account_id, gateway_arn)
     except (ClientError, BotoCoreError) as exc:
         # A Cedar-analysis rejection surfaces here (validation is at create/update
         # time); treat every control-plane error as a sync failure.
@@ -179,21 +178,15 @@ def sync_fleet_policy() -> None:
     logger.info("Fleet policy set synced (allowed=%s)", allowed)
 
 
-def _sync_agent_permits(client, engine_id: str, mode: str) -> None:
+def _sync_agent_permits(client, engine_id: str, account_id: str, gateway_arn: str) -> None:
     """Provision one permit policy per agent (default-deny means the fleet does
-    nothing without them). Skipped when the gateway ARN / account are unknown —
-    the forbid policies still apply, but under ENFORCE nothing is permitted until
-    the permits land, which is why rollout is LOG_ONLY first. The gateway ARN and
-    account come from the admin Lambda's env (set by the template when the gateway
-    is deployed)."""
-    gateway_arn = os.environ.get("FLEET_GATEWAY_ARN", "").strip()
-    account_id = os.environ.get("AWS_ACCOUNT_ID", "").strip()
-    if not gateway_arn or not account_id:
-        logger.info(
-            "FLEET_GATEWAY_ARN/AWS_ACCOUNT_ID unset — skipping per-agent permits"
-        )
+    nothing without them). Skipped when the account is unknown — the forbid
+    policies still apply, but under ENFORCE nothing is permitted until the permits
+    land, which is why rollout is LOG_ONLY first."""
+    if not account_id:
+        logger.info("AWS_ACCOUNT_ID unset — skipping per-agent permits")
         return
     for name, statement in fleet_policy.agent_permit_policies(
         account_id, gateway_arn
     ).items():
-        _upsert_policy(client, engine_id, name, statement, mode)
+        _upsert_policy(client, engine_id, name, statement)

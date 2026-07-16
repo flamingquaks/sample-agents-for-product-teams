@@ -23,6 +23,7 @@ still denies (or vice-versa).
 
 import json
 import logging
+import os
 import re
 from urllib.parse import unquote
 
@@ -49,21 +50,48 @@ class PolicySyncError(Exception):
 
 
 def _sync_repo_policy() -> None:
-    """Regenerate + push the single fleet Cedar policy from the current allowed
-    set to the Gateway policy engine.
+    """Regenerate + push the fleet Cedar policies from the current allowed set to
+    the Gateway policy engine.
 
-    Delegates to policy_sync.sync_fleet_policy, which renders the forbid-unless-in
-    Cedar statement from config_store.allowed_repos() and CreatePolicy/updates the
-    named fleet policy via bedrock-agentcore-control — raising PolicySyncError on
-    failure, Cedar-analysis rejection, or not reaching the intended enforcement
-    mode. A no-op (logged) until the gateway is provisioned (POLICY_ENGINE_ID
-    unset), so the dispatch allowlist still works before WS5's gateway lands.
+    Delegates to policy_sync.sync_fleet_policy, which renders the forbid/permit
+    statements from config_store.allowed_repos() and CreatePolicy/updates the
+    named policies via bedrock-agentcore-control — raising PolicySyncError on
+    failure or Cedar-analysis rejection. A no-op (logged) until the gateway is
+    provisioned (POLICY_ENGINE_ID unset), so the dispatch allowlist still works
+    before the gateway lands.
 
     Imported lazily so the admin API's config routes don't hard-depend on the
     control-plane client (and tests can monkeypatch this seam directly)."""
     import policy_sync
 
     policy_sync.sync_fleet_policy()
+
+
+def _gateway_enforcing() -> bool:
+    """Whether the Gateway policy engine is actually blocking tool calls
+    (ENFORCE / ACTIVE) vs merely logging (LOG_ONLY). Set from the same parameter
+    that drives the gateway→engine attachment mode. When NOT enforcing, a policy
+    sync failure can't cause a dispatch-vs-tool-call split (the policy blocks
+    nothing), so onboarding treats it as a non-fatal warning rather than failing
+    the whole operation."""
+    mode = os.environ.get("GATEWAY_ENFORCEMENT", "LOG_ONLY").upper()
+    return mode == "ACTIVE"
+
+
+def _sync_after_write(log_msg: str, error_msg: str) -> dict | None:
+    """Run the policy sync after a config write that has already been persisted
+    (delete/settings). Returns a 502 error response only when the gateway is
+    ENFORCING (a stale policy then actually matters); in LOG_ONLY it logs and
+    returns None so the caller reports success. Returns None on sync success."""
+    try:
+        _sync_repo_policy()
+        return None
+    except PolicySyncError:
+        if _gateway_enforcing():
+            logger.exception(log_msg)
+            return error(502, error_msg)
+        logger.warning("%s (gateway not enforcing; will re-sync on next change)", log_msg)
+        return None
 
 
 def _parse_body(event: dict) -> dict:
@@ -124,12 +152,31 @@ def _route(event: dict) -> dict:
             try:
                 _sync_repo_policy()
             except PolicySyncError:
-                logger.exception("policy sync failed for %s; rolling back", repo)
-                config_store.set_repo_status(repo, "pending")
-                return error(
-                    502,
-                    f"repo recorded but policy update failed for {repo}; left pending, retry",
+                # When the gateway is ENFORCING, a sync failure means dispatch
+                # would widen ahead of a tool-call policy that still denies — roll
+                # back to pending and fail. When it's LOG_ONLY (or the gateway
+                # isn't fully wired yet), the policy blocks nothing, so onboarding
+                # succeeds and the sync is retried on the next admin action; we
+                # return the repo with a warning rather than failing.
+                if _gateway_enforcing():
+                    logger.exception("policy sync failed for %s; rolling back", repo)
+                    config_store.set_repo_status(repo, "pending")
+                    return error(
+                        502,
+                        f"repo recorded but policy update failed for {repo}; "
+                        "left pending, retry",
+                    )
+                logger.warning(
+                    "policy sync failed for %s but gateway is not enforcing; "
+                    "repo left active, policy will re-sync on next change",
+                    repo,
                 )
+                rec = config_store.get_repo(repo)
+                rec["policy_sync_warning"] = (
+                    "onboarded; Gateway policy not yet synced (gateway in LOG_ONLY "
+                    "or not fully wired)"
+                )
+                return ok(rec)
             return ok(config_store.get_repo(repo))
 
     # Greedy {repo+} so an "owner/repo" (with its slash) is one path parameter;
@@ -146,15 +193,15 @@ def _route(event: dict) -> dict:
             repo = unquote(raw)
             deleted = config_store.delete_repo(repo)
             # Removing a repo narrows the allowlist — sync the policy so its tool
-            # calls stop being allowed. A sync failure here is non-fatal to the
-            # delete (the repo is already gone from dispatch) but is reported.
-            try:
-                _sync_repo_policy()
-            except PolicySyncError:
-                logger.exception("policy sync failed after deleting %s", repo)
-                return error(
-                    502, "repo removed from dispatch but policy update failed; retry"
-                )
+            # calls stop being allowed. Delete has already narrowed dispatch (the
+            # safe direction), so a sync failure is only reported as fatal when the
+            # gateway is enforcing; in LOG_ONLY it's a non-fatal warning.
+            failure = _sync_after_write(
+                f"policy sync failed after deleting {repo}",
+                "repo removed from dispatch but policy update failed; retry",
+            )
+            if failure is not None:
+                return failure
             return ok({"repo": repo, "deleted": deleted})
 
     if resource == "/admin/settings":
@@ -166,11 +213,12 @@ def _route(event: dict) -> dict:
             settings = config_store.put_settings(
                 restrict_repos=bool(body["restrict_repos"])
             )
-            try:
-                _sync_repo_policy()
-            except PolicySyncError:
-                logger.exception("policy sync failed after settings change")
-                return error(502, "settings saved but policy update failed; retry")
+            failure = _sync_after_write(
+                "policy sync failed after settings change",
+                "settings saved but policy update failed; retry",
+            )
+            if failure is not None:
+                return failure
             return ok(settings)
 
     return error(404, f"no such admin route: {method} {resource}")

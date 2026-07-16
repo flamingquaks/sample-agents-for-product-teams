@@ -1,8 +1,10 @@
 // Top-level app: gate on Cognito auth + operator role, then render the fleet /
-// run-detail / trace views. Navigation is a tiny in-memory view state (no
-// router dep) since there are only a few views.
+// run-detail / trace / admin views. Navigation is hash-based (#/, #/admin,
+// #/run/<id>, #/trace/<dim>/<value>) so each view has a real URL you can
+// bookmark, deep-link, and refresh — no router dependency, and it survives a
+// hard refresh on the S3/CloudFront SPA without relying on error-page rewrites.
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useAuth } from "react-oidc-context";
 import type { AppConfig } from "./config";
 import { cognitoLogoutUrl } from "./auth";
@@ -18,6 +20,31 @@ type View =
   | { name: "trace"; dimension: string; value: string }
   | { name: "admin" };
 
+/** Serialize a view to its URL hash. */
+function viewToHash(view: View): string {
+  switch (view.name) {
+    case "admin":
+      return "#/admin";
+    case "run":
+      return `#/run/${encodeURIComponent(view.assignmentId)}`;
+    case "trace":
+      return `#/trace/${encodeURIComponent(view.dimension)}/${encodeURIComponent(view.value)}`;
+    default:
+      return "#/";
+  }
+}
+
+/** Parse the current URL hash into a view. Unknown/empty hashes → fleet. */
+function hashToView(hash: string): View {
+  const parts = hash.replace(/^#\/?/, "").split("/").filter(Boolean).map(decodeURIComponent);
+  if (parts[0] === "admin") return { name: "admin" };
+  if (parts[0] === "run" && parts[1]) return { name: "run", assignmentId: parts[1] };
+  if (parts[0] === "trace" && parts[1] && parts[2]) {
+    return { name: "trace", dimension: parts[1], value: parts[2] };
+  }
+  return { name: "fleet" };
+}
+
 /** Decode the `cognito:groups` claim to show whether the user is an operator.
  *  The API is the real gate; this only drives a friendly message. */
 function groupsFromProfile(profile: Record<string, unknown> | undefined): string[] {
@@ -30,7 +57,22 @@ function groupsFromProfile(profile: Record<string, unknown> | undefined): string
 export function App({ config }: { config: AppConfig }) {
   const auth = useAuth();
   const api = useApi(config);
-  const [view, setView] = useState<View>({ name: "fleet" });
+  // View is derived from the URL hash so it survives refresh + deep-links.
+  const [view, setViewState] = useState<View>(() => hashToView(window.location.hash));
+
+  // Keep the hash in sync when navigating in-app, and react to back/forward or
+  // a manually edited hash.
+  const navigate = (next: View) => {
+    const hash = viewToHash(next);
+    if (window.location.hash !== hash) window.location.hash = hash;
+    setViewState(next);
+  };
+  useEffect(() => {
+    const onHashChange = () => setViewState(hashToView(window.location.hash));
+    window.addEventListener("hashchange", onHashChange);
+    return () => window.removeEventListener("hashchange", onHashChange);
+  }, []);
+  const setView = navigate;
 
   if (auth.isLoading) {
     return <Centered>Signing in…</Centered>;
@@ -85,7 +127,7 @@ export function App({ config }: { config: AppConfig }) {
         <div className="who">
           {isAdmin && (
             <button
-              onClick={() => setView((v) => (v.name === "admin" ? { name: "fleet" } : { name: "admin" }))}
+              onClick={() => setView(view.name === "admin" ? { name: "fleet" } : { name: "admin" })}
             >
               {view.name === "admin" ? "Fleet" : "Admin"}
             </button>

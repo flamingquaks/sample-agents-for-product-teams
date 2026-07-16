@@ -122,37 +122,44 @@ def _allow_condition(allowed_repos: list[str]) -> str:
     return f"context.input has owner && context.input has repo &&\n  ({clauses})"
 
 
-def render_fleet_policy(allowed_repos: list[str]) -> str:
-    """Render the fleet Cedar policy SET for the given allowed repo set.
+def render_fleet_policies(allowed_repos: list[str], gateway_arn: str) -> dict[str, str]:
+    """Render the fleet forbid policies, keyed by the policy name to sync each
+    under. TWO SEPARATE policies (AgentCore allows one Cedar statement per
+    policy — a two-statement string is rejected with "unexpected token forbid"):
 
-    Two forbid policies:
-      1. Repo-allowlist forbid — GitHub write tools (WRITE_TOOLS) are forbidden
-         unless the call's target repo is in ``allowed_repos``.
-      2. Unconditional destructive forbid — DESTRUCTIVE_TOOLS (delete/merge/…)
-         are forbidden for EVERY repo, no exception. Kept separate so an
-         allowlisted repo never lifts the destructive forbid (finding: delete_file
-         was previously in the per-repo list, so an allowed repo could delete
-         files, contradicting CLAUDE.md's "agents NEVER … delete").
+      - sdlc_allowed_repos — GitHub write tools (WRITE_TOOLS) forbidden unless the
+        call's target repo is in ``allowed_repos``.
+      - sdlc_forbid_destructive — DESTRUCTIVE_TOOLS (delete/merge/…) forbidden for
+        EVERY repo, no exception. Separate so an allowlisted repo never lifts the
+        destructive forbid (delete_file must not be per-repo-liftable — CLAUDE.md
+        "agents NEVER … delete").
+
+    Each statement pins a CONCRETE resource — ``resource == AgentCore::Gateway::``
+    — because AgentCore rejects a wildcard/unconstrained resource ("a wildcard
+    resource was detected"). ``gateway_arn`` is the literal fleet gateway ARN.
 
     ``allowed_repos`` is the enabled + multi_repo_eligible + active set from
-    config_store.allowed_repos(). Deterministic: same input → same output, so an
-    idempotent update never churns the policy needlessly.
+    config_store.allowed_repos(). Deterministic: same input → same output.
     """
+    resource = f'AgentCore::Gateway::"{gateway_arn}"'
     allowlist_forbid = (
         "forbid(\n"
         "  principal,\n"
         f"  action in {_actions_block(WRITE_TOOLS)},\n"
-        "  resource\n"
+        f"  resource == {resource}\n"
         f") unless {{\n  {_allow_condition(allowed_repos)}\n}};"
     )
     destructive_forbid = (
         "forbid(\n"
         "  principal,\n"
         f"  action in {_actions_block(DESTRUCTIVE_TOOLS)},\n"
-        "  resource\n"
+        f"  resource == {resource}\n"
         ");"
     )
-    return f"{allowlist_forbid}\n\n{destructive_forbid}"
+    return {
+        "sdlc_allowed_repos": allowlist_forbid,
+        "sdlc_forbid_destructive": destructive_forbid,
+    }
 
 
 # --- per-agent permit policies -----------------------------------------------

@@ -777,7 +777,11 @@ Resources:
           # policy on every repo/settings change. Unset otherwise → policy_sync
           # is a logged no-op and only the dispatch allowlist is affected.
           POLICY_ENGINE_ID: !If [GatewayEnabled, !GetAtt FleetPolicyEngine.PolicyEngineId, !Ref "AWS::NoValue"]
-          FLEET_POLICY_ENFORCEMENT: !If [GatewayEnabled, !Ref GatewayPolicyEnforcement, !Ref "AWS::NoValue"]
+          # Whether the gateway is actually enforcing (ACTIVE) vs LOG_ONLY. Drives
+          # whether a policy-sync failure fails onboarding: enforcing → fail
+          # (avoid dispatch widening ahead of a denying policy); log-only → the
+          # policy blocks nothing, so onboarding succeeds and re-syncs later.
+          GATEWAY_ENFORCEMENT: !If [GatewayEnabled, !Ref GatewayPolicyEnforcement, !Ref "AWS::NoValue"]
           # Gateway ARN + account for the per-agent permit policies (principals
           # are the agents' runtime-role ARNs, resource is the literal gateway).
           FLEET_GATEWAY_ARN: !If [GatewayEnabled, !GetAtt FleetGateway.GatewayArn, !Ref "AWS::NoValue"]
@@ -888,6 +892,36 @@ Resources:
                 Resource:
                   - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/github-mcp-token
                   - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/asana-pat
+        - PolicyName: policy-engine-eval
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Attaching the gateway to a policy engine requires the gateway's
+              # own role to read that engine (CloudFormation calls GetPolicyEngine
+              # with this role during gateway create) and to authorize actions
+              # against it at runtime. Actions per the AgentCore "Gateway and
+              # Policy IAM Permissions" doc (policy-permissions.html).
+              - Sid: PolicyEngineConfiguration
+                Effect: Allow
+                Action: bedrock-agentcore:GetPolicyEngine
+                Resource:
+                  - !GetAtt FleetPolicyEngine.PolicyEngineArn
+              - Sid: PolicyEngineAuthorization
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:AuthorizeAction
+                  - bedrock-agentcore:PartiallyAuthorizeActions
+                Resource:
+                  - !GetAtt FleetPolicyEngine.PolicyEngineArn
+                  # Gateway by account/region wildcard, NOT !GetAtt
+                  # FleetGateway.GatewayArn — the gateway takes this role as its
+                  # RoleArn, so referencing it here creates a CloudFormation
+                  # dependency cycle. A name-prefixed pattern also fails: the
+                  # service lowercases the gateway name into the id
+                  # (sdlcFleetstaging -> sdlcfleetstaging-<suffix>) and IAM
+                  # matching is case-sensitive. `gateway/*` (per the AgentCore IAM
+                  # doc's own example) scopes to this account+region.
+                  - !Sub arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/*
 
   FleetGateway:
     Type: AWS::BedrockAgentCore::Gateway

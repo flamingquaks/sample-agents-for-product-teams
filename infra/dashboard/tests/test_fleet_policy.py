@@ -8,69 +8,79 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import fleet_policy  # noqa: E402
 
 
+GW = "arn:aws:bedrock-agentcore:us-east-1:111122223333:gateway/sdlcfleetstaging-abc123"
+
+
 def _reset_pair_mode():
     fleet_policy.REPO_PARAM_MODE = "pair"
 
 
+def _allow(repos):
+    """The repo-allowlist forbid statement for the given repos."""
+    return fleet_policy.render_fleet_policies(repos, GW)["sdlc_allowed_repos"]
+
+
+def _destructive(repos=("acme/web",)):
+    return fleet_policy.render_fleet_policies(list(repos), GW)["sdlc_forbid_destructive"]
+
+
+def test_renders_two_separate_single_statement_policies():
+    # AgentCore accepts one Cedar statement per policy, so the fleet forbids are
+    # TWO separate named policies — each exactly one `forbid(`, no packed set.
+    _reset_pair_mode()
+    policies = fleet_policy.render_fleet_policies(["acme/web"], GW)
+    assert set(policies) == {"sdlc_allowed_repos", "sdlc_forbid_destructive"}
+    for stmt in policies.values():
+        assert stmt.count("forbid(") == 1
+
+
+def test_policies_pin_concrete_gateway_resource():
+    # A wildcard/unconstrained resource is rejected by the engine — every policy
+    # must name the literal gateway ARN.
+    _reset_pair_mode()
+    for stmt in fleet_policy.render_fleet_policies(["acme/web"], GW).values():
+        assert f'resource == AgentCore::Gateway::"{GW}"' in stmt
+        # no bare `resource\n` (unconstrained) and no wildcard.
+        assert "  resource\n" not in stmt
+
+
 def test_empty_allowlist_forbids_all_writes():
     _reset_pair_mode()
-    stmt = fleet_policy.render_fleet_policy([])
+    stmt = _allow([])
     # With nothing allowed, the unless-clause is `false` → every write is forbidden.
     assert "unless {\n  false\n}" in stmt
-    assert stmt.startswith("forbid(")
-    # Write actions are enumerated with the target prefix + triple underscore.
     assert 'AgentCore::Action::"GitHubTarget___create_issue"' in stmt
 
 
 def test_destructive_tools_unconditionally_forbidden():
     _reset_pair_mode()
-    # delete_file (and merge/delete-branch) get an UNCONDITIONAL forbid — even
-    # for an allowlisted repo — so an allowed repo can't lift the destructive
-    # forbid. It must NOT appear in the repo-allowlist (unless-guarded) forbid.
-    stmt = fleet_policy.render_fleet_policy(["acme/web"])
-    assert 'AgentCore::Action::"GitHubTarget___delete_file"' in stmt
-    assert "delete_file" not in _allowlist_forbid(stmt)
-    assert "delete_file" in _destructive_forbid(stmt)
-    # The destructive forbid has no `unless` clause.
-    assert not _destructive_forbid(stmt).rstrip().endswith("unless {")
-    assert "unless" not in _destructive_forbid(stmt)
-
-
-def _allowlist_forbid(stmt: str) -> str:
-    # The rendered set is two forbids separated by a blank line; the first is the
-    # repo-allowlist (unless-guarded) one, the second the unconditional destructive.
-    return stmt.split("\n\n", 1)[0]
-
-
-def _destructive_forbid(stmt: str) -> str:
-    return stmt.split("\n\n", 1)[1]
-
-
-def test_two_forbid_policies_rendered():
-    _reset_pair_mode()
-    stmt = fleet_policy.render_fleet_policy(["acme/web"])
-    assert stmt.count("forbid(") == 2
+    # delete_file (and merge/delete-branch) are in the SEPARATE destructive
+    # forbid (no `unless`), never in the repo-allowlist forbid — so an allowlisted
+    # repo can't lift them.
+    allow = _allow(["acme/web"])
+    dest = _destructive()
+    assert "delete_file" not in allow
+    assert 'AgentCore::Action::"GitHubTarget___delete_file"' in dest
+    assert "unless" not in dest
 
 
 def test_repo_literals_lowercased():
     _reset_pair_mode()
-    # config_store stores lowercase, but render defensively lowercases too so the
-    # policy agrees with the casefolding dispatch layer.
-    stmt = fleet_policy.render_fleet_policy(["Acme/Web"])
+    stmt = _allow(["Acme/Web"])
     assert '(context.input.owner == "acme" && context.input.repo == "web")' in stmt
     assert "Acme" not in stmt and "Web" not in stmt
 
 
 def test_pair_mode_conditions_on_owner_and_repo():
     _reset_pair_mode()
-    stmt = fleet_policy.render_fleet_policy(["acme/web"])
+    stmt = _allow(["acme/web"])
     assert '(context.input.owner == "acme" && context.input.repo == "web")' in stmt
     assert "context.input has owner && context.input has repo" in stmt
 
 
 def test_pair_mode_disjoins_multiple_repos():
     _reset_pair_mode()
-    stmt = fleet_policy.render_fleet_policy(["acme/web", "acme/api"])
+    stmt = _allow(["acme/web", "acme/api"])
     assert '(context.input.owner == "acme" && context.input.repo == "web")' in stmt
     assert '(context.input.owner == "acme" && context.input.repo == "api")' in stmt
     assert " ||\n" in stmt
@@ -78,15 +88,13 @@ def test_pair_mode_disjoins_multiple_repos():
 
 def test_malformed_repo_skipped_falls_back_to_forbid_all():
     _reset_pair_mode()
-    # A single malformed entry yields no valid pairs → forbid-all (`false`).
-    stmt = fleet_policy.render_fleet_policy(["noslash"])
-    assert "unless {\n  false\n}" in stmt
+    assert "unless {\n  false\n}" in _allow(["noslash"])
 
 
 def test_single_mode_uses_repo_in_list():
     try:
         fleet_policy.REPO_PARAM_MODE = "single"
-        stmt = fleet_policy.render_fleet_policy(["acme/web", "acme/api"])
+        stmt = _allow(["acme/web", "acme/api"])
         assert 'context.input.repo in ["acme/web", "acme/api"]' in stmt
         assert "context.input has repo" in stmt
     finally:
@@ -95,15 +103,15 @@ def test_single_mode_uses_repo_in_list():
 
 def test_statement_within_cedar_length_bounds():
     _reset_pair_mode()
-    # AWS::BedrockAgentCore::Policy Cedar Statement must be 35..10000 chars.
-    stmt = fleet_policy.render_fleet_policy(["acme/web"])
-    assert 35 <= len(stmt) <= 10000
+    # Each policy's Cedar Statement must be within 10 KB.
+    for stmt in fleet_policy.render_fleet_policies(["acme/web"], GW).values():
+        assert 20 <= len(stmt) <= 10000
 
 
 def test_deterministic_output():
     _reset_pair_mode()
-    a = fleet_policy.render_fleet_policy(["acme/web", "acme/api"])
-    b = fleet_policy.render_fleet_policy(["acme/web", "acme/api"])
+    a = fleet_policy.render_fleet_policies(["acme/web", "acme/api"], GW)
+    b = fleet_policy.render_fleet_policies(["acme/web", "acme/api"], GW)
     assert a == b
 
 

@@ -8,13 +8,19 @@ import { DashboardApi } from "./api";
 import type { AppConfig } from "./config";
 
 /**
- * A DashboardApi bound to the live Cognito access token. Memoized on the token
- * so a token refresh produces a client that sends the new token, but re-renders
- * don't churn the instance.
+ * A DashboardApi bound to the live Cognito ID token. Memoized on the token so a
+ * token refresh produces a client that sends the new token, but re-renders don't
+ * churn the instance.
+ *
+ * We send the ID token, not the access token: the REST API's COGNITO_USER_POOLS
+ * authorizer rejects this pool's access token with 401 (it carries no
+ * resource-server scope), while the ID token validates and carries the
+ * `cognito:groups` claim the operator/admin checks read. Sending the access
+ * token produced a 401 → re-login → redirect loop.
  */
 export function useApi(config: AppConfig): DashboardApi {
   const auth = useAuth();
-  const token = auth.user?.access_token ?? null;
+  const token = auth.user?.id_token ?? null;
   return useMemo(
     () => new DashboardApi(config.apiBaseUrl, () => token),
     [config.apiBaseUrl, token],

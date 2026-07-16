@@ -212,7 +212,10 @@ def test_onboard_eligible_false_is_dispatchable_not_eligible():
 
 
 @mock_aws
-def test_pending_left_on_policy_sync_failure(monkeypatch):
+def test_pending_left_on_policy_sync_failure_when_enforcing(monkeypatch):
+    # ENFORCE: a sync failure must roll the repo back to pending and 502, so
+    # dispatch never widens ahead of a tool-call policy that still denies.
+    monkeypatch.setenv("GATEWAY_ENFORCEMENT", "ACTIVE")
     _make_table()
     admin = _load_admin()
 
@@ -227,6 +230,28 @@ def test_pending_left_on_policy_sync_failure(monkeypatch):
     # left pending → NOT allowed (dispatch won't treat a pending repo as active)
     assert config_store.get_repo("acme/web")["status"] == "pending"
     assert config_store.allowed_repos() == []
+
+
+@mock_aws
+def test_onboard_succeeds_on_sync_failure_when_log_only(monkeypatch):
+    # LOG_ONLY (default): the policy blocks nothing, so a sync failure must NOT
+    # fail onboarding — the repo stays active and the response carries a warning.
+    monkeypatch.setenv("GATEWAY_ENFORCEMENT", "LOG_ONLY")
+    _make_table()
+    admin = _load_admin()
+
+    def boom():
+        raise admin.PolicySyncError("gateway not fully wired")
+
+    monkeypatch.setattr(admin, "_sync_repo_policy", boom)
+    resp = admin.handler(_event("POST", "/admin/repos", body={"repo": "acme/web"}))
+    assert resp["statusCode"] == 200
+    rec = _body(resp)
+    assert rec["status"] == "active"
+    assert "policy_sync_warning" in rec
+    import config_store
+
+    assert config_store.allowed_repos() == ["acme/web"]
 
 
 # --- settings ----------------------------------------------------------------

@@ -1,10 +1,11 @@
 // Cognito Hosted-UI auth via oidc-client-ts / react-oidc-context.
 //
 // Authorization Code + PKCE against the Cognito user pool's OIDC issuer. We
-// request the openid/email/profile scopes; the access token carries the
-// `cognito:groups` claim the API's operator check reads. Tokens live in
-// sessionStorage (cleared when the tab closes) rather than localStorage, to
-// shrink the window a stolen token is usable.
+// request the openid/email/profile scopes. The API is called with the ID token
+// (see hooks.useApi) — it carries the `cognito:groups` claim the operator/admin
+// checks read and is what the REST Cognito authorizer accepts for this pool.
+// Tokens live in sessionStorage (cleared when the tab closes) rather than
+// localStorage, to shrink the window a stolen token is usable.
 
 import { WebStorageStateStore } from "oidc-client-ts";
 import type { AuthProviderProps } from "react-oidc-context";
