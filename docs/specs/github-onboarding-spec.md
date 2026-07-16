@@ -109,19 +109,33 @@ authoritative block on merge/delete/close, since a GitHub App with PR write
 *can* technically merge. **The Cedar destructive forbid is still load-bearing —
 the App permissions do not replace it.**
 
-### 3.2 Credential storage (SSM)
+### 3.2 Credential storage (Secrets Manager for the key, SSM for IDs)
 
-Retire `/sdlc-agents/github-mcp-token`. New params:
+Retire `/sdlc-agents/github-mcp-token`. The store is chosen per-value by
+sensitivity + lifecycle, not one-size-fits-all:
 
-| Param | Type | Scope |
+| Value | Store | Why |
 |---|---|---|
-| `/sdlc-agents/github-app-id` | String | one, fleet-wide |
-| `/sdlc-agents/github-app-private-key` | SecureString (PEM) | one, fleet-wide |
+| App **private key** (PEM) | **Secrets Manager** `sdlc-agents/github-app/private-key` | The one true long-lived secret. Secrets Manager gives native rotation (versioned `AWSCURRENT`/`AWSPENDING` staging labels — resolves O-5), per-secret **resource policies** (lock read to exactly the agent/reply/admin roles, which SSM's identity-only model can't), and staged versions. Read via `secretsmanager:GetSecretValue`. |
+| `github-app-id` | **SSM String** (plain) `/sdlc-agents/github-app-id` | Not a secret — an integer App ID. SecureString/SM would be over-engineering. |
+| `github-app-slug` | **SSM String** (plain) `/sdlc-agents/github-app-slug` | Not a secret — the public app slug, used to build the install deep-link (O-3). |
+| `installation_id` (per owner) | **DynamoDB** | Not a secret — config; resolved at onboard, keyed per owner (see below). |
 
-**Installation IDs are NOT a single SSM param.** They are **per-owner**, resolved
-at onboard time and stored on the DynamoDB repo record (§3.3). This is the key
-departure from the SKILL.md Path B design and the thing that lets one App span
-many individual + org owners.
+**Why the split rather than all-Secrets-Manager or all-SSM:** the existing fleet
+keeps its Asana PAT / webhook secret and the old GitHub PAT in **SSM
+SecureString** (`reply.py`, `asana_webhook.py`, `template.yaml`), so SM is *new*
+to this codebase — the private key is the value that actually justifies it
+(rotation + resource policy), and it matches the store the `ai-dlc-platform`
+reference used for the same App secrets. The non-secret IDs stay in cheap SSM
+String; putting a public app-id/slug in Secrets Manager would be waste. This
+does introduce a **second secret store** (SM for the App key, SSM for the Asana
+secrets) — a deliberate, documented choice (note in threat-model), not drift.
+Fleet-wide standardization on one store (migrating the Asana secrets to SM too)
+is a possible later workstream, out of scope here.
+
+**Installation IDs are NOT a single param.** They are **per-owner**, resolved at
+onboard time and stored in DynamoDB (§3.3) — the key departure from the SKILL.md
+Path B design and the thing that lets one App span many individual + org owners.
 
 > Open question O-1: store `installation_id` per repo record, or dedupe into a
 > per-owner record (`pk="owner#<owner>"`)? Per-owner is cleaner (one install
@@ -155,10 +169,16 @@ mint_installation_token(installation_id) -> (token, expires_at)
   3. cache (token, expires_at) keyed by installation_id; refresh at exp-60s
 ```
 
+- The private-key PEM is read from **Secrets Manager**
+  (`sdlc-agents/github-app/private-key`) via `secretsmanager:GetSecretValue`, and
+  the App ID from SSM String (`/sdlc-agents/github-app-id`). The key is cached
+  in-memory (short TTL) so signing doesn't call SM on every mint.
 - Reuses the existing per-invocation-cache discipline the code already favors
-  (see `github_mcp._cached_token`); cache keyed by `installation_id`, honoring
-  `expires_at`.
-- `PyJWT` + `cryptography` are new agent dependencies (RS256 signing).
+  (see `github_mcp._cached_token`); token cache keyed by `installation_id`,
+  honoring `expires_at`.
+- `PyJWT` + `cryptography` are new agent dependencies (RS256 signing); the code
+  gains a `boto3.client("secretsmanager")` path (first Secrets Manager use in
+  this repo — see §3.2).
 
 ### 3.5 How each call site changes
 
@@ -166,7 +186,7 @@ mint_installation_token(installation_id) -> (token, expires_at)
 |---|---|---|
 | **Agents, direct mode** (`github_mcp.get_github_token`) | reads PAT | `github_app.mint_installation_token(installation_id)` for the **dispatched repo's owner**; the dispatch context already carries `owner/repo` (`docwriter/project_config.py`), so the agent knows which installation to mint for |
 | **Agents, gateway mode** | Gateway holds PAT for outbound | Gateway outbound auth must mint per-owner tokens too — **see O-2**, this is the hardest piece |
-| **Dispatch reply Lambda** (`reply.post_github_comment`) | reads PAT | mint token for the repo it's replying to (it has `repo`); needs its own copy of minting logic + SSM read of app-id/private-key |
+| **Dispatch reply Lambda** (`reply.post_github_comment`) | reads PAT | mint token for the repo it's replying to (it has `repo`); needs its own copy of minting logic + Secrets Manager read of the private key + SSM read of app-id |
 | **Bootstrap SSM grants** (`AGENT_SSM`, `bootstrap.py:183`) | grants `github-mcp-*` | grant `github-app-*`; the current prefix does **not** match the new param names, so roles can't read them until updated |
 
 > Open question O-2 (Gateway outbound): the AgentCore Gateway target holds one
@@ -231,8 +251,8 @@ The modal from the just-shipped change is the entry point. Additions:
 | `infra/dashboard/admin.py` | POST /admin/repos: add steps 2-4 verification; new 409 shapes |
 | `infra/dashboard/config_store.py` | `put_repo` accepts + stores `owner_type`, `installation_id`, `install_verified_at` |
 | `infra/dashboard/github_client.py` | **new** — App-JWT'd GitHub REST calls for owner-type + installation lookup |
-| `infra/foundation/template.yaml` | SSM param resources + IAM: admin/reply/agent roles read `github-app-*`; drop `github-mcp-token` grants; admin role needs outbound GitHub reachability (it calls api.github.com — no IAM, just egress) |
-| `scripts/bootstrap.py` | `AGENT_SSM` / `AGENT_REQUIRED_SSM`: `github-mcp-*` → `github-app-*`; preflight probes new params |
+| `infra/foundation/template.yaml` | **Secrets Manager** secret `sdlc-agents/github-app/private-key` (empty, populated out-of-band or at App registration) + `secretsmanager:GetSecretValue` grants on admin/reply/agent roles (optionally a resource policy scoping the secret to just those roles); **SSM String** params `github-app-id` + `github-app-slug` + read grants; drop the `github-mcp-token` SSM param + grants; admin role needs outbound GitHub reachability (calls api.github.com — no IAM, just egress) |
+| `scripts/bootstrap.py` | `AGENT_SSM` / `AGENT_REQUIRED_SSM`: drop `github-mcp-*`; add the app-id/slug SSM reads + the Secrets Manager `GetSecretValue` grant for the private key; preflight probes the new secret + params |
 | `dashboard/src/AdminView.tsx` | install-deep-link + re-check in the modal; owner_type chip |
 | `skills/sdlc-agents-connect-github/SKILL.md` | correct the false "reads either shape" claim; document per-owner installs; retire PAT path |
 | `docs/threat-model.md` | T-11 → **Mitigated** once shipped (credential now bounded) |
@@ -271,8 +291,10 @@ The modal from the just-shipped change is the entry point. Additions:
 - **O-4** Rate limits: installation tokens have per-install rate limits;
   per-owner minting + caching should stay well under, but worth noting for
   many-owner fleets.
-- **O-5** Private-key rotation: PEM in SSM SecureString; document rotation and
-  who can `PutParameter` (should be no one in steady state, like the Asana
+- **O-5** Private-key rotation: PEM in Secrets Manager — use its native rotation
+  (a rotation Lambda that registers a new GitHub App private key and stages it
+  `AWSPENDING` → `AWSCURRENT`), and restrict who can `PutSecretValue` in steady
+  state (should be no one, like the Asana
   webhook secret pattern).
 
 ---
