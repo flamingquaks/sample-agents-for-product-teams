@@ -46,6 +46,9 @@ logger.setLevel(logging.INFO)
 
 GITHUB_API = "https://api.github.com"
 _ACCEPT = "application/vnd.github+json"
+# Raw unified-diff media type — GitHub returns the PR diff as text/plain, not
+# JSON, under this Accept. Used by get_pull_request_diff.
+_DIFF_ACCEPT = "application/vnd.github.v3.diff"
 _API_VERSION = "2022-11-28"
 _TOOL_DELIM = "___"
 
@@ -77,7 +80,14 @@ AGENT_GITHUB_PERMISSIONS = {
     "adr": {
         "contents": "read",
         "issues": "write",
-        "pull_requests": "read",
+        # write is required to POST a PR review. NOTE: a pull_requests:write App
+        # token can itself approve/request-changes — the credential does NOT
+        # bound the review event. "adr may only COMMENT" is enforced elsewhere:
+        # the broker forces event=COMMENT (create_pull_request_review) and a
+        # Cedar forbid (fleet_policy.COMMENT_ONLY_REVIEW_TOOLS) rejects any
+        # non-COMMENT event. Merge stays impossible: it needs contents:write,
+        # which adr lacks.
+        "pull_requests": "write",
         "metadata": "read",
     },
     "researcher": {},
@@ -95,22 +105,27 @@ class BrokerError(Exception):
 # --- GitHub REST helper ------------------------------------------------------
 
 
-def _gh(method: str, path: str, token: str, *, params=None, body=None):
-    """Call the GitHub REST API and return ``(status, parsed_json)``. ``path`` is
-    relative to the API base. Never logs the token or the response body (either
-    can carry credential material)."""
+def _gh(method: str, path: str, token: str, *, params=None, body=None, accept=_ACCEPT, raw=False):
+    """Call the GitHub REST API and return ``(status, payload)``. ``path`` is
+    relative to the API base. With ``raw=True`` the payload is the response body
+    as text (for non-JSON representations like a PR unified diff, selected via
+    ``accept``); otherwise it is the parsed JSON (``{}`` on empty/unparseable).
+    Never logs the token or the response body (either can carry credential
+    material)."""
     resp = requests.request(
         method,
         f"{GITHUB_API}{path}",
         headers={
             "Authorization": f"Bearer {token}",
-            "Accept": _ACCEPT,
+            "Accept": accept,
             "X-GitHub-Api-Version": _API_VERSION,
         },
         params=params or None,
         json=body if body is not None else None,
         timeout=15,
     )
+    if raw:
+        return resp.status_code, (resp.text if resp.content else "")
     try:
         data = resp.json() if resp.content else {}
     except ValueError:
@@ -147,6 +162,42 @@ def _get_pull_request(token, owner, repo, args):
 def _list_pull_requests(token, owner, repo, args):
     params = {k: args[k] for k in ("state", "base", "head", "sort") if k in args}
     _s, d = _gh("GET", f"/repos/{owner}/{repo}/pulls", token, params=params)
+    return d
+
+
+def _get_pull_request_diff(token, owner, repo, args):
+    # The unified diff is a text representation of the PR, returned under the
+    # diff media type (not JSON). Wrap it so the tool result stays a JSON object.
+    # Unlike the JSON tools (where GitHub's error body is itself a structured
+    # {"message": ...} the agent can recognize), a raw-text error body would be
+    # indistinguishable from a real diff — so surface a non-2xx as an explicit
+    # error result instead of handing the error text back as the "diff".
+    status, text = _gh(
+        "GET",
+        f"/repos/{owner}/{repo}/pulls/{args['pull_number']}",
+        token,
+        accept=_DIFF_ACCEPT,
+        raw=True,
+    )
+    if not 200 <= status < 300:
+        return {
+            "isError": True,
+            "message": f"could not fetch diff for PR #{args['pull_number']} (HTTP {status})",
+        }
+    return {"pull_number": args["pull_number"], "diff": text}
+
+
+def _list_pull_request_files(token, owner, repo, args):
+    # Changed files + per-file patch hunks for a PR. Returns GitHub's default
+    # first page (30 files) as-is — enough for the ADR reviewer's scoping, and
+    # get_pull_request_diff carries the whole-PR diff when a fuller view is
+    # needed. (No per_page/page inputs: the tool schema advertises only the
+    # required args, so exposing them here would be unreachable dead code.)
+    _s, d = _gh(
+        "GET",
+        f"/repos/{owner}/{repo}/pulls/{args['pull_number']}/files",
+        token,
+    )
     return d
 
 
@@ -229,9 +280,24 @@ def _create_pull_request(token, owner, repo, args):
 
 
 def _create_pull_request_review(token, owner, repo, args):
-    body = {"event": args.get("event", "COMMENT")}
-    if "body" in args:
-        body["body"] = args["body"]
+    # A single PR review that can carry both a summary ``body`` and per-hunk
+    # ``comments`` ([{path, line|position, body, ...}]) — the ADR reviewer posts
+    # diff-anchored findings plus a summary in one call. The review event is
+    # FORCED to COMMENT here: the fleet never approves or requests changes on a
+    # PR (CLAUDE.md "agents NEVER … merge PRs"), and pinning it in the broker
+    # means an APPROVE/REQUEST_CHANGES can't be issued even if a caller asks for
+    # it. This is the last line of defense; a Cedar forbid on any non-COMMENT
+    # event (fleet_policy.render_fleet_policies) is the primary control.
+    #
+    # GitHub REQUIRES a top-level body for a COMMENT-event review (a blank body
+    # 422s), so default one when the caller supplies only anchored comments.
+    comments = args.get("comments")
+    body = {
+        "event": "COMMENT",
+        "body": args.get("body") or "🏛️ **[ADR Agent]** See inline review comments.",
+    }
+    if comments:
+        body["comments"] = comments
     _s, d = _gh(
         "POST",
         f"/repos/{owner}/{repo}/pulls/{args['pull_number']}/reviews",
@@ -341,6 +407,8 @@ _TOOL_PERMISSIONS = {
     "list_issues": {"issues": _READ},
     "get_pull_request": {"pull_requests": _READ},
     "list_pull_requests": {"pull_requests": _READ},
+    "get_pull_request_diff": {"pull_requests": _READ},
+    "list_pull_request_files": {"pull_requests": _READ},
     "list_milestones": {"issues": _READ},
     "list_commits": {"contents": _READ},
     "get_file_contents": {"contents": _READ},
@@ -375,6 +443,11 @@ _TOOLS = {
     "list_issues": (_list_issues, {"owner", "repo"}),
     "get_pull_request": (_get_pull_request, {"owner", "repo", "pull_number"}),
     "list_pull_requests": (_list_pull_requests, {"owner", "repo"}),
+    "get_pull_request_diff": (_get_pull_request_diff, {"owner", "repo", "pull_number"}),
+    "list_pull_request_files": (
+        _list_pull_request_files,
+        {"owner", "repo", "pull_number"},
+    ),
     "list_milestones": (_list_milestones, {"owner", "repo"}),
     "list_commits": (_list_commits, {"owner", "repo"}),
     "get_file_contents": (_get_file_contents, {"owner", "repo", "path"}),

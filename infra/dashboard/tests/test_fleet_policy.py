@@ -24,14 +24,31 @@ def _destructive(repos=("acme/web",)):
     return fleet_policy.render_fleet_policies(list(repos), GW)["sdlc_forbid_destructive"]
 
 
-def test_renders_two_separate_single_statement_policies():
+def test_renders_separate_single_statement_policies():
     # AgentCore accepts one Cedar statement per policy, so the fleet forbids are
-    # TWO separate named policies — each exactly one `forbid(`, no packed set.
+    # SEPARATE named policies — each exactly one `forbid(`, no packed set.
     _reset_pair_mode()
     policies = fleet_policy.render_fleet_policies(["acme/web"], GW)
-    assert set(policies) == {"sdlc_allowed_repos", "sdlc_forbid_destructive"}
+    assert set(policies) == {
+        "sdlc_allowed_repos",
+        "sdlc_forbid_destructive",
+        "sdlc_forbid_noncomment_review",
+    }
     for stmt in policies.values():
         assert stmt.count("forbid(") == 1
+
+
+def test_noncomment_review_forbidden_by_event():
+    # The PR-review tool is forbidden when the review event is not COMMENT —
+    # the policy-layer backstop for the broker's forced event=COMMENT.
+    _reset_pair_mode()
+    stmt = fleet_policy.render_fleet_policies(["acme/web"], GW)[
+        "sdlc_forbid_noncomment_review"
+    ]
+    assert 'AgentCore::Action::"GitHubTarget___create_pull_request_review"' in stmt
+    assert 'context.input.event != "COMMENT"' in stmt
+    # It's a when-conditioned forbid (fires on non-COMMENT), not repo-allowlisted.
+    assert "unless" not in stmt
 
 
 def test_policies_pin_concrete_gateway_resource():
@@ -154,12 +171,35 @@ def test_permit_grants_no_destructive_tools():
         assert not (tools & destructive), f"{agent} grants a destructive tool"
 
 
-def test_adr_permit_has_no_write_beyond_labels_and_comments():
-    # adr is comment/label-only on GitHub (no create_issue/PR/file).
+def test_adr_permit_has_no_write_beyond_labels_comments_and_review():
+    # adr writes only labels, issue comments, and diff-anchored PR review
+    # comments (create_pull_request_review, forced to event=COMMENT in the
+    # broker). It never creates issues/PRs or writes code/files.
     tools = {a.split("___", 1)[1] for a in fleet_policy.AGENT_TOOL_GRANTS["adr"]}
     assert "create_issue" not in tools
     assert "create_pull_request" not in tools
+    assert "create_or_update_file" not in tools
+    assert "push_files" not in tools
+    assert "create_branch" not in tools
     assert "add_issue_comment" in tools and "add_labels_to_issue" in tools
+    # Mode 2/3 capability: read the PR diff/files + post an anchored review.
+    assert "get_pull_request_diff" in tools
+    assert "list_pull_request_files" in tools
+    assert "create_pull_request_review" in tools
+
+
+def test_no_orphaned_write_tools():
+    # Every enforced WRITE_TOOL must be granted to at least one agent — otherwise
+    # it's dead surface (implemented + forbid-gated but no principal can call it).
+    # create_pull_request_review was previously orphaned; adr now owns it.
+    granted = {
+        a.split("___", 1)[1]
+        for actions in fleet_policy.AGENT_TOOL_GRANTS.values()
+        for a in actions
+        if a.startswith(fleet_policy.GITHUB_TARGET + "___")
+    }
+    orphans = set(fleet_policy.WRITE_TOOLS) - granted
+    assert not orphans, f"WRITE_TOOLS granted to no agent (dead surface): {sorted(orphans)}"
 
 
 def test_researcher_permit_is_asana_only():

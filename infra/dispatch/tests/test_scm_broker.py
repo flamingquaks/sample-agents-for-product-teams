@@ -63,9 +63,10 @@ def _args(agent="docwriter", origin="acme/web", **extra):
     return base
 
 
-def _capture_requests(status=200, payload=None):
+def _capture_requests(status=200, payload=None, text=None):
     """Patch scm_broker.requests.request, capturing the call and returning a
-    canned JSON response."""
+    canned response. ``payload`` feeds resp.json(); ``text`` feeds resp.text (for
+    raw/diff endpoints)."""
     calls = []
 
     def fake(method, url, headers=None, params=None, json=None, timeout=None):
@@ -76,6 +77,7 @@ def _capture_requests(status=200, payload=None):
         resp.status_code = status
         resp.content = b"{}"
         resp.json.return_value = payload if payload is not None else {"ok": True}
+        resp.text = text if text is not None else "diff --git a/x b/x"
         return resp
 
     return patch.object(scm_broker.requests, "request", side_effect=fake), calls
@@ -213,6 +215,98 @@ def test_create_or_update_file_base64_encodes_content():
     assert calls[0]["method"] == "PUT"
 
 
+def test_get_pull_request_diff_requests_diff_media_type():
+    # The PR diff is fetched under the diff Accept header and wrapped as JSON so
+    # the tool result stays an object. adr reads this to review hunks (Modes 2/3).
+    p, calls = _capture_requests()
+    with p:
+        out = scm_broker.handler(
+            _args(agent="adr", owner="acme", repo="web", pull_number=7),
+            _ctx("GitHubTarget___get_pull_request_diff"),
+        )
+    call = calls[0]
+    assert call["method"] == "GET"
+    assert call["url"] == "https://api.github.com/repos/acme/web/pulls/7"
+    assert call["headers"]["Accept"] == scm_broker._DIFF_ACCEPT
+    assert out["pull_number"] == 7 and "diff" in out
+    # a diff read is pull_requests:read — never write.
+    assert scm_broker._last_minted["permissions"] == {"pull_requests": "read"}
+
+
+def test_get_pull_request_diff_surfaces_http_error():
+    # A non-2xx diff fetch (deleted PR → 404, oversized diff → 406) must be
+    # returned as an explicit error, NOT wrapped as if the error body were the
+    # diff (else adr would "review" the error string).
+    p, calls = _capture_requests(status=404, payload={"message": "Not Found"})
+    with p:
+        out = scm_broker.handler(
+            _args(agent="adr", owner="acme", repo="web", pull_number=7),
+            _ctx("GitHubTarget___get_pull_request_diff"),
+        )
+    assert out.get("isError") is True
+    assert "diff" not in out
+
+
+def test_list_pull_request_files_hits_files_endpoint():
+    p, calls = _capture_requests(payload=[{"filename": "x.py", "patch": "@@"}])
+    with p:
+        scm_broker.handler(
+            _args(agent="adr", owner="acme", repo="web", pull_number=7),
+            _ctx("GitHubTarget___list_pull_request_files"),
+        )
+    assert calls[0]["url"] == "https://api.github.com/repos/acme/web/pulls/7/files"
+    assert scm_broker._last_minted["permissions"] == {"pull_requests": "read"}
+
+
+def test_adr_can_post_anchored_review_and_event_forced_to_comment():
+    # adr's Mode 2/3 output: a PR review carrying a summary body + per-hunk
+    # comments. The broker FORCES event=COMMENT so adr can never approve, request
+    # changes, or merge — even if the arguments ask for APPROVE.
+    p, calls = _capture_requests(payload={"id": 99, "state": "COMMENTED"})
+    with p:
+        scm_broker.handler(
+            _args(
+                agent="adr",
+                owner="acme",
+                repo="web",
+                pull_number=7,
+                event="APPROVE",  # must be ignored/overridden
+                body="Reviewed against ADR-0012.",
+                comments=[{"path": "api.py", "line": 10, "body": "Conflicts with ADR-0012."}],
+            ),
+            _ctx("GitHubTarget___create_pull_request_review"),
+        )
+    sent = calls[0]["json"]
+    assert calls[0]["url"] == "https://api.github.com/repos/acme/web/pulls/7/reviews"
+    assert sent["event"] == "COMMENT"  # forced, not APPROVE
+    assert sent["body"] == "Reviewed against ADR-0012."
+    assert sent["comments"][0]["path"] == "api.py"
+    # adr's tier grants pull_requests:write; the review tool needs write → write.
+    assert scm_broker._last_minted["permissions"] == {"pull_requests": "write"}
+
+
+def test_review_defaults_body_when_only_comments_given():
+    # GitHub 422s a COMMENT-event review with no top-level body. When the caller
+    # supplies only anchored comments and no summary, the broker must send a
+    # non-empty body so the review posts (all the anchored findings survive).
+    p, calls = _capture_requests(payload={"id": 1})
+    with p:
+        scm_broker.handler(
+            _args(
+                agent="adr",
+                owner="acme",
+                repo="web",
+                pull_number=7,
+                comments=[{"path": "api.py", "line": 10, "body": "Conflicts with ADR-0012."}],
+            ),
+            _ctx("GitHubTarget___create_pull_request_review"),
+        )
+    sent = calls[0]["json"]
+    assert sent["event"] == "COMMENT"
+    assert sent.get("body")  # non-empty default, not missing/blank
+    assert sent["comments"][0]["path"] == "api.py"
+
+
 def test_search_code_scopes_query_to_repo():
     p, calls = _capture_requests(payload={"items": []})
     with p:
@@ -327,9 +421,12 @@ def test_permission_tiers_enforce_access_differentiation():
     # workitems: issues only — no code, no PR write
     assert "contents" not in perms["workitems"]
     assert perms["workitems"].get("pull_requests") != "write"
-    # adr: read code + comment; no code/PR write
+    # adr: read code (never writes code), comments, and posts diff-anchored PR
+    # review comments. Its pull_requests:write is comment-only — the broker
+    # forces create_pull_request_review to event=COMMENT (no approve/merge),
+    # asserted by test_create_pull_request_review_forces_comment_event.
     assert perms["adr"]["contents"] == "read"
-    assert perms["adr"].get("pull_requests") != "write"
+    assert perms["adr"].get("pull_requests") == "write"
     # researcher: no GitHub
     assert perms["researcher"] == {}
 

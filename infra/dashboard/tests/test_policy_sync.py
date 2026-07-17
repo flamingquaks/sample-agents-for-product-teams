@@ -83,9 +83,14 @@ def test_creates_policy_when_absent(monkeypatch):
     fake = _FakeClient(existing=[], statuses=["ACTIVE"])
     monkeypatch.setattr(ps, "_get_client", lambda: fake)
     ps.sync_fleet_policy()
-    # Two fleet forbid policies (one Cedar statement each): allowlist + destructive.
+    # Fleet forbid policies (one Cedar statement each): allowlist + destructive +
+    # non-COMMENT-review backstop.
     names = [c["name"] for c in fake.created]
-    assert names == ["sdlc_allowed_repos", "sdlc_forbid_destructive"]
+    assert names == [
+        "sdlc_allowed_repos",
+        "sdlc_forbid_destructive",
+        "sdlc_forbid_noncomment_review",
+    ]
     # enforcementMode is NOT sent — it lives on the gateway→engine attachment,
     # and CreatePolicy in the deployed SDK rejects the parameter.
     for c in fake.created:
@@ -100,13 +105,14 @@ def test_updates_policy_when_present(monkeypatch):
         existing=[
             {"name": "sdlc_allowed_repos", "policyId": "pol-1"},
             {"name": "sdlc_forbid_destructive", "policyId": "pol-2"},
+            {"name": "sdlc_forbid_noncomment_review", "policyId": "pol-3"},
         ],
         statuses=["ACTIVE"],
     )
     monkeypatch.setattr(ps, "_get_client", lambda: fake)
     ps.sync_fleet_policy()
     updated_ids = {u["policyId"] for u in fake.updated}
-    assert updated_ids == {"pol-1", "pol-2"}
+    assert updated_ids == {"pol-1", "pol-2", "pol-3"}
     for u in fake.updated:
         assert "enforcementMode" not in u
     assert not fake.created
@@ -176,7 +182,7 @@ def test_syncs_agent_permits_when_gateway_env_set(monkeypatch):
 
 def test_permits_skipped_without_account(monkeypatch):
     # Default _load sets FLEET_GATEWAY_ARN but leaves AWS_ACCOUNT_ID unset → the
-    # two fleet forbid policies are written, but no per-agent permits.
+    # fleet forbid policies are written, but no per-agent permits.
     ps = _load(monkeypatch)
     fake = _FakeClient(existing=[], statuses=["ACTIVE"])
     monkeypatch.setattr(ps, "_get_client", lambda: fake)
@@ -184,4 +190,5 @@ def test_permits_skipped_without_account(monkeypatch):
     assert [c["name"] for c in fake.created] == [
         "sdlc_allowed_repos",
         "sdlc_forbid_destructive",
+        "sdlc_forbid_noncomment_review",
     ]

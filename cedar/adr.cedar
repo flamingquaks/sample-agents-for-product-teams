@@ -25,7 +25,10 @@ permit(
     resource.toolName == "github_get_pr_diff" ||
     resource.toolName == "github_list_pr_files" ||
     resource.toolName == "github_list_commits" ||
-    // GitHub — write (labels + comments only; no merges, no closes)
+    // GitHub — write (labels + comments only; no merges, no closes). The
+    // enforced stack posts PR review comments via create_pull_request_review
+    // with the review event forced to COMMENT (see scm_broker.py) — adr can
+    // annotate a diff hunk but never approve/request-changes/merge.
     resource.toolName == "github_add_label" ||
     resource.toolName == "github_remove_label" ||
     resource.toolName == "github_add_comment" ||
@@ -45,4 +48,16 @@ forbid(
      resource.toolName == "github_delete_file" ||
      resource.toolName == "github_create_pr") &&
     resource.path like "*/adr*"
+};
+
+// Hard forbid: a PR review may only COMMENT — never approve or request changes
+// (an approving review is an implicit sign-off). The enforced equivalent is
+// fleet_policy.COMMENT_ONLY_REVIEW_TOOLS; the broker also forces event=COMMENT.
+forbid(
+    principal == AgentCore::Agent::"adr",
+    action == AgentCore::Action::"InvokeTool",
+    resource
+) when {
+    resource.toolName == "github_add_pr_review_comment" &&
+    context.input has event && context.input.event != "COMMENT"
 };

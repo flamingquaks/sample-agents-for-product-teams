@@ -1322,6 +1322,18 @@ Resources:
                     repo:
                       Type: string
                   Required: [owner, pull_number, repo]
+              - Name: get_pull_request_diff
+                Description: GitHub get pull request diff (per-owner App token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    owner:
+                      Type: string
+                    pull_number:
+                      Type: integer
+                    repo:
+                      Type: string
+                  Required: [owner, pull_number, repo]
               - Name: list_commits
                 Description: GitHub list commits (per-owner App token).
                 InputSchema:
@@ -1352,6 +1364,18 @@ Resources:
                     repo:
                       Type: string
                   Required: [owner, repo]
+              - Name: list_pull_request_files
+                Description: GitHub list pull request files (per-owner App token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    owner:
+                      Type: string
+                    pull_number:
+                      Type: integer
+                    repo:
+                      Type: string
+                  Required: [owner, pull_number, repo]
               - Name: list_pull_requests
                 Description: GitHub list pull requests (per-owner App token).
                 InputSchema:

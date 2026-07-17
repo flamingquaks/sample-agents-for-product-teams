@@ -68,6 +68,16 @@ DESTRUCTIVE_TOOLS = (
     "delete_branch",
 )
 
+# GitHub PR-review tools whose review *event* must be COMMENT — the fleet posts
+# review comments but NEVER approves or requests changes (an approving review is
+# an implicit sign-off, adjacent to the "agents NEVER … merge PRs" rule). The
+# broker also hard-forces event=COMMENT (scm_broker._create_pull_request_review),
+# but that is a single line of application code; this forbid is the policy-layer
+# backstop so an APPROVE/REQUEST_CHANGES can't slip through if that code ever
+# regresses — the same defense-in-depth the destructive tools get. Conditioned on
+# the tool-call input ``event`` (addressed as context.input.event by the engine).
+COMMENT_ONLY_REVIEW_TOOLS = ("create_pull_request_review",)
+
 # "pair"  → GitHub MCP exposes separate owner + repo params (the default/common
 #           shape); condition on both.
 # "single"→ a combined "owner/repo" repo param; condition on context.input.repo.
@@ -133,6 +143,10 @@ def render_fleet_policies(allowed_repos: list[str], gateway_arn: str) -> dict[st
         EVERY repo, no exception. Separate so an allowlisted repo never lifts the
         destructive forbid (delete_file must not be per-repo-liftable — CLAUDE.md
         "agents NEVER … delete").
+      - sdlc_forbid_noncomment_review — COMMENT_ONLY_REVIEW_TOOLS forbidden for
+        EVERY repo when the review ``event`` is anything but COMMENT. The
+        policy-layer backstop for the broker's forced event=COMMENT, so an
+        APPROVE/REQUEST_CHANGES can't slip through even if the broker regresses.
 
     Each statement pins a CONCRETE resource — ``resource == AgentCore::Gateway::``
     — because AgentCore rejects a wildcard/unconstrained resource ("a wildcard
@@ -156,9 +170,21 @@ def render_fleet_policies(allowed_repos: list[str], gateway_arn: str) -> dict[st
         f"  resource == {resource}\n"
         ");"
     )
+    # Forbid a review unless its event is COMMENT. ``when { has event && event
+    # != "COMMENT" }`` fires only when the caller supplies a non-COMMENT event;
+    # a review with no event, or event == "COMMENT", is not caught here (it is
+    # still repo-allowlist-gated by sdlc_allowed_repos).
+    noncomment_review_forbid = (
+        "forbid(\n"
+        "  principal,\n"
+        f"  action in {_actions_block(COMMENT_ONLY_REVIEW_TOOLS)},\n"
+        f"  resource == {resource}\n"
+        ') when {\n  context.input has event && context.input.event != "COMMENT"\n};'
+    )
     return {
         "sdlc_allowed_repos": allowlist_forbid,
         "sdlc_forbid_destructive": destructive_forbid,
+        "sdlc_forbid_noncomment_review": noncomment_review_forbid,
     }
 
 
@@ -229,9 +255,14 @@ AGENT_TOOL_GRANTS = {
         f"{_GH}___list_issues",
         f"{_GH}___get_pull_request",
         f"{_GH}___list_pull_requests",
+        f"{_GH}___get_pull_request_diff",
+        f"{_GH}___list_pull_request_files",
         f"{_GH}___list_commits",
         f"{_GH}___add_issue_comment",
         f"{_GH}___add_labels_to_issue",
+        # Diff-anchored PR review (Modes 2/3). The broker forces event=COMMENT,
+        # so this is comment-only — never approve/request-changes/merge.
+        f"{_GH}___create_pull_request_review",
     ],
     "researcher": [
         f"{_AS}___get_task",
@@ -266,7 +297,13 @@ AGENT_GITHUB_PERMISSIONS = {
     "adr": {
         "contents": "read",
         "issues": "write",
-        "pull_requests": "read",
+        # write is required to POST a PR review. NOTE: a pull_requests:write App
+        # token can itself approve/request-changes — the credential does NOT
+        # bound the review event. "adr may only COMMENT" is enforced elsewhere:
+        # the broker forces event=COMMENT (create_pull_request_review) and a
+        # Cedar forbid (COMMENT_ONLY_REVIEW_TOOLS) rejects any non-COMMENT event.
+        # Merge stays impossible because it needs contents:write, which adr lacks.
+        "pull_requests": "write",
         "metadata": "read",
     },
     "researcher": {},
