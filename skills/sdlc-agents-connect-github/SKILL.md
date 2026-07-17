@@ -9,7 +9,7 @@ description: Use when the user needs to connect SDLC agents to GitHub. Walks thr
 
 Like Asana, GitHub access splits:
 
-- **Agent runtime → GitHub MCP server** (`https://api.githubcopilot.com/mcp/`). Uses a **GitHub App** installation token, OR a PAT stored at `/sdlc-agents/github-mcp-token`. GitHub's official MCP supports both.
+- **Agent runtime → GitHub MCP server** (`https://api.githubcopilot.com/mcp/`). Today the agents read a PAT at `/sdlc-agents/github-mcp-token`. A **GitHub App** is the production direction and is already used for repo onboarding/verification (Path B); cutting the *agent* call sites over to per-owner App installation tokens is a tracked, not-yet-built step (see Path B's scope note).
 - **CI (deploy workflow) → AWS** (no GitHub side needed beyond OIDC). The deploy role is assumed via GitHub Actions OIDC. No secret stored in GitHub beyond `AWS_DEPLOY_ROLE_ARN` and `AWS_ACCOUNT_ID`.
 
 ## Decide: PAT or GitHub App?
@@ -48,25 +48,39 @@ For a demo, PAT is fine. For production, push toward GitHub App.
 
 ## Path B — GitHub App (production path)
 
-1. User goes to https://github.com/organizations/<org>/settings/apps → **New GitHub App**
-2. Fill the required fields:
-   - Name: `SDLC Agent Fleet (<stage>)`
-   - Homepage: any URL
-   - Webhook: can be disabled for MCP-only usage (the agent-dispatch workflow is what listens for `@agent` mentions, not this app)
-   - Permissions (Repository): Contents Read & Write, Issues R&W, Pull requests R&W, Metadata Read
-   - Permissions (Organization): Members Read (optional, for routing by team)
-3. Generate a private key. Download the PEM.
-4. Install the app on the target repos.
-5. Store the App ID, installation ID, and PEM in SSM:
+The App path is driven from the **dashboard admin UI**, not hand-run `put-parameter`
+commands — the UI's manifest flow registers the App and stores its credentials for
+you, and onboarding then verifies a per-owner installation. Prerequisite: deploy the
+foundation stack with `DeployDashboard=true` and `GitHubAuthMode=app`.
 
-   ```bash
-   aws ssm put-parameter --name /sdlc-agents/github-app-id --value "<app_id>" --type String --region "$REGION" --overwrite
-   aws ssm put-parameter --name /sdlc-agents/github-app-installation-id --value "<installation_id>" --type String --region "$REGION" --overwrite
-   aws ssm put-parameter --name /sdlc-agents/github-app-private-key --value "$(cat app.pem)" --type SecureString --region "$REGION" --overwrite
-   rm app.pem  # don't leave it on disk
-   ```
+1. In the dashboard **Admin → GitHub App** panel, click **Set up GitHub App**
+   (optionally enter an org to install org-wide vs. on your user account). This
+   POSTs a GitHub App *manifest* to GitHub; you confirm the App's permissions
+   there and are redirected back.
+   - The manifest requests: Contents R&W, Issues R&W, Pull requests R&W,
+     Metadata Read (see `github_client.APP_PERMISSIONS`). Webhook disabled — the
+     `agent-dispatch.yml` workflow, not this App, listens for `@agent` mentions.
+2. On return, the admin API's manifest exchange persists the credentials
+   automatically: the **private key → Secrets Manager**
+   (`sdlc-agents/github-app/private-key`), and the **app id + slug → SSM String**
+   (`/sdlc-agents/github-app-id`, `…-slug`). You do **not** store these by hand.
+3. Click **Install on GitHub** and install the App on each user/org whose repos
+   you'll onboard. Installation IDs are **not** a single SSM param — they are
+   resolved per owner at onboard time and recorded per owner in DynamoDB, so one
+   App spans many individual and org owners.
+4. Onboard a repo (Admin → **Onboard repository**). In App mode the API verifies
+   the App is installed on the repo's owner and can reach the repo *before*
+   activating it; if it isn't installed it returns an install deep-link + Re-check.
 
-6. The agents mint installation tokens at runtime via JWT signed with the PEM; existing tool code in `agents/*/tools/github_mcp.py` reads either SSM shape.
+> **Scope note (current state):** the admin/onboarding path above is implemented
+> and mints installation tokens server-side for its own verification calls
+> (`infra/dashboard/github_client.py`). The **agent runtime** and dispatch **reply
+> Lambda** still read the PAT at `/sdlc-agents/github-mcp-token` — cutting those
+> call sites over to per-owner App installation tokens (and the Gateway-mode SCM
+> broker) is a tracked, not-yet-built workstream. See
+> `docs/specs/github-onboarding-spec.md` (§3.5–§3.6, §6). So today: use **App mode
+> for onboarding + verification**, and keep the agents in **direct/PAT mode** until
+> the agent-side minting lands.
 
 ## Verify
 
