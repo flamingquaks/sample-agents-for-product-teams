@@ -187,6 +187,14 @@ AGENT_SSM: dict[str, list[str]] = {
     "adr": ["github-mcp-*"],
 }
 
+# Agents that talk to GitHub — get the GitHub App credential grants (Secrets
+# Manager key + app-id SSM + per-owner install record) for GITHUB_AUTH_MODE=app.
+# Derived from AGENT_SSM so it can't drift from the PAT grant set. (researcher is
+# Asana-only, so it's excluded.)
+GITHUB_AGENTS: set[str] = {
+    a for a, s in AGENT_SSM.items() if any(x.startswith("github-mcp") for x in s)
+}
+
 # Concrete leaf SSM params the secret preflight probes (agents fail at
 # invocation, not deploy, when these are absent).
 AGENT_REQUIRED_SSM: dict[str, list[str]] = {
@@ -296,6 +304,39 @@ def agent_role_policies(
                         for s in suffixes
                     ],
                 }
+            ],
+        }
+    # GitHub App mode (GITHUB_AUTH_MODE=app): the GitHub-touching agents mint
+    # per-owner installation tokens, which needs the App private key (Secrets
+    # Manager), the app-id (SSM String), and the per-owner install record
+    # (fleet-config table). Granted to every agent that reads GitHub; the grants
+    # are harmless in PAT mode (the code just doesn't call them). The resource
+    # names mirror the DashboardEnabled resources in the foundation template.
+    if agent in GITHUB_AGENTS:
+        policies["github-app"] = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": "secretsmanager:GetSecretValue",
+                    "Resource": (
+                        f"arn:aws:secretsmanager:{region}:{account}:secret:"
+                        f"sdlc-agents/{stage}/github-app/private-key-*"
+                    ),
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": "ssm:GetParameter",
+                    "Resource": (
+                        f"arn:aws:ssm:{region}:{account}:parameter"
+                        f"/sdlc-agents/{stage}/github-app-id"
+                    ),
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": "dynamodb:GetItem",
+                    "Resource": f"arn:aws:dynamodb:{region}:{account}:table/fleet-config-{stage}",
+                },
             ],
         }
     return policies

@@ -5,3 +5,4 @@ mcp>=1.0.0
 aws-opentelemetry-distro>=0.10.1
 boto3
 mcp-proxy-for-aws>=0.1.0
+cryptography>=42.0.0

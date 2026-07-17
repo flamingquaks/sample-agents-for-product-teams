@@ -35,7 +35,7 @@ def post_github_comment(repo: str, issue_number: str | int, body: str) -> bool:
         logger.error("post_github_comment missing repo or issue_number")
         return False
 
-    token = _get_secret(os.environ.get(GITHUB_PAT_PARAM_ENV, "/sdlc-agents/github-pat"))
+    token = _github_token(repo)
     if not token:
         return False
 
@@ -84,6 +84,22 @@ def post_asana_comment(task_gid: str, body: str) -> bool:
     except requests.RequestException as exc:
         logger.error("Failed to post Asana comment to task %s: %s", task_gid, exc)
         return False
+
+
+def _github_token(repo: str) -> Optional[str]:
+    """The GitHub bearer token for posting to ``repo``. In GITHUB_AUTH_MODE=app,
+    mint a per-owner installation token (bounded to that owner's installed repos);
+    otherwise fall back to the shared PAT. Returns None on failure (the caller
+    treats a failed reply as non-fatal — the block decision already stands)."""
+    import github_app
+
+    if github_app.app_mode():
+        try:
+            return github_app.installation_token_for_repo(repo)
+        except github_app.GitHubAppError as exc:
+            logger.error("Failed to mint GitHub App token for %s: %s", repo, exc)
+            return None
+    return _get_secret(os.environ.get(GITHUB_PAT_PARAM_ENV, "/sdlc-agents/github-pat"))
 
 
 def _get_secret(param_name: str) -> Optional[str]:

@@ -33,7 +33,7 @@ from tools.generate_release_notes import generate_release_notes
 from tools.detect_doc_gaps import detect_doc_gaps
 from tools.check_doc_freshness import check_doc_freshness
 from tools.post_results import post_results
-from tools.github_mcp import get_github_token, GITHUB_MCP_URL
+from tools.github_mcp import github_bearer_token, GITHUB_MCP_URL
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +134,9 @@ def invoke(payload, context=None):
             mcp_tools = gw.list_tools_sync()
         else:
             github_client = stack.enter_context(
-                gateway.build_bearer_client(GITHUB_MCP_URL, get_github_token())
+                gateway.build_bearer_client(
+                    GITHUB_MCP_URL, github_bearer_token(dispatch_repo)
+                )
             )
             mcp_tools = github_client.list_tools_sync()
         all_tools = [*mcp_tools, *tools]

@@ -1,11 +1,15 @@
 # GitHub Repo Onboarding & GitHub App Credential Model
 ## Supporting individual and organization repos with a bounded, per-owner credential
 
-Status: **Partially implemented.** Direct-mode GitHub App onboarding is built +
-deployed to staging (manifest flow, per-owner install verification, token
-minting behind `GITHUB_AUTH_MODE=app`; commits on `feat/v2-multi-repo`).
-Remaining: the §3.6 broker Lambda target for gateway mode, PAT retirement/
-backfill (§6), and GitLab/Bitbucket providers.
+Status: **Direct mode complete.** GitHub App onboarding (manifest flow,
+per-owner install verification) AND the agent-runtime + reply-Lambda credential
+cutover are built behind `GITHUB_AUTH_MODE=app` (default `pat`): in app mode the
+three GitHub agents and the dispatch reply Lambda mint per-owner installation
+tokens for the dispatched repo's owner instead of reading the shared PAT
+(`agents/shared/tools/github_app.py`, `infra/dispatch/github_app.py`), with IAM +
+env wired in the template, bootstrap, and the agent deploy workflow. Remaining:
+the §3.6 broker Lambda target for **gateway** mode, PAT decommission once all
+stages run `app` (§6), and GitLab/Bitbucket providers.
 Owner: fleet infra. Related: `docs/threat-model.md` T-11, `docs/roadmap.md`,
 `skills/sdlc-agents-connect-github/SKILL.md` (Path B).
 
@@ -188,10 +192,10 @@ mint_installation_token(installation_id) -> (token, expires_at)
 
 | Call site | Today | Target |
 |---|---|---|
-| **Agents, direct mode** (`github_mcp.get_github_token`) | reads PAT | `github_app.mint_installation_token(installation_id)` for the **dispatched repo's owner**; the dispatch context already carries `owner/repo` (`docwriter/project_config.py`), so the agent knows which installation to mint for |
-| **Agents, gateway mode** | Gateway holds PAT for outbound | Route through a **broker Lambda target** that mints the per-owner token per call — see §3.6 (this replaces the old "static gateway credential" dead-end; O-2 resolved) |
-| **Dispatch reply Lambda** (`reply.post_github_comment`) | reads PAT | mint token for the repo it's replying to (it has `repo`); needs its own copy of minting logic + Secrets Manager read of the private key + SSM read of app-id |
-| **Bootstrap SSM grants** (`AGENT_SSM`, `bootstrap.py:183`) | grants `github-mcp-*` | grant `github-app-*`; the current prefix does **not** match the new param names, so roles can't read them until updated |
+| **Agents, direct mode** (`github_mcp.github_bearer_token`) | reads PAT | ✅ **DONE** — in app mode, `github_app.token_for_dispatch(owner/repo)` mints a token for the **dispatched repo's owner**; `agent.py` resolves `dispatch_repo` before building the GitHub client and passes it in. PAT path preserved as default. |
+| **Agents, gateway mode** | Gateway holds PAT for outbound | Route through a **broker Lambda target** that mints the per-owner token per call — see §3.6 (this replaces the old "static gateway credential" dead-end; O-2 resolved). **Not yet built** — keep GitHub in direct mode. |
+| **Dispatch reply Lambda** (`reply.post_github_comment`) | reads PAT | ✅ **DONE** — `reply._github_token(repo)` mints per-owner via `infra/dispatch/github_app.py` in app mode, PAT otherwise. |
+| **Bootstrap + template IAM/env** | grants `github-mcp-*` | ✅ **DONE** — agent runtime roles (bootstrap `GITHUB_AGENTS`) + the dispatch router role get `secretsmanager:GetSecretValue` (key), `ssm:GetParameter` (app-id), `dynamodb:GetItem` (per-owner install record); `GITHUB_AUTH_MODE`/param/table env set on the router (template) and agents (deploy-agent.yml, from stack outputs). A deploy Rule requires `DeployDashboard=true` when `GitHubAuthMode=app`. |
 
 > O-2 (Gateway outbound per-owner token) — **RESOLVED** (see §3.6). The static
 > per-target credential genuinely can't vary per call, and AgentCore Identity
@@ -326,9 +330,13 @@ The modal from the just-shipped change is the entry point. Additions:
    the App isn't installed on — the admin gets a list to install).
 3. **Cut over** each call site to token minting behind a flag
    (`GITHUB_AUTH_MODE=app|pat`), default `pat` → flip to `app` per stage after
-   verifying live.
+   verifying live. ✅ **DONE for direct mode** — the three GitHub agents and the
+   reply Lambda mint per-owner tokens in app mode (gateway mode still pending the
+   §3.6 broker). Flip a stage by setting `GitHubAuthMode=app` on the foundation
+   stack and the `GITHUB_AUTH_MODE=app` repo var for agent deploys.
 4. **Retire the PAT**: delete the SSM param + IAM grants once all stages are on
-   `app` and the reply Lambda + gateway path are confirmed.
+   `app` and the gateway path (§3.6) is confirmed. Still pending — the PAT
+   remains the default and the fallback while `app` rolls out per stage.
 5. Gateway mode lags direct mode: it needs the broker Lambda target (§3.6), a
    separate workstream. Until it ships, gateway mode stays `LOG_ONLY` and GitHub
    calls that route through the gateway use whatever outbound cred the target has

@@ -133,11 +133,43 @@ jobs:
         env:
           STAGE: dev
 
+      - name: Resolve GitHub App env vars from foundation stack
+        id: githubapp
+        run: |
+          # GitHub credential model for the agent runtime. Default "pat" (shared
+          # token) unless the GITHUB_AUTH_MODE repo var is "app", in which case the
+          # agent mints per-owner GitHub App installation tokens and needs the App
+          # id param, key secret ARN, and the fleet-config table (per-owner install
+          # records). These come from the foundation stack's outputs — same stack
+          # the guardrail is read from. Non-github agents (researcher) ignore them.
+          MODE="${GITHUB_AUTH_MODE:-pat}"
+          STACK_NAME="sdlc-agents-${STAGE:-dev}"
+          get() { aws cloudformation describe-stacks --stack-name "${STACK_NAME}" --region "${AWS_REGION}" --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue | [0]" --output text 2>/dev/null || echo "None"; }
+          CONFIG_TABLE=$(get FleetConfigTableName)
+          APP_ENV="GITHUB_AUTH_MODE=${MODE}"
+          if [ -n "${CONFIG_TABLE}" ] && [ "${CONFIG_TABLE}" != "None" ]; then
+            APP_ENV="${APP_ENV},FLEET_CONFIG_TABLE=${CONFIG_TABLE}"
+          fi
+          if [ "${MODE}" = "app" ]; then
+            APP_ID_PARAM=$(get GitHubAppIdParamName)
+            KEY_ARN=$(get GitHubAppPrivateKeySecretArn)
+            if [ "${APP_ID_PARAM}" = "None" ] || [ "${KEY_ARN}" = "None" ] || [ -z "${APP_ID_PARAM}" ] || [ -z "${KEY_ARN}" ]; then
+              echo "::error::GITHUB_AUTH_MODE=app but the foundation stack has no GitHub App outputs. Deploy the foundation stack with DeployDashboard=true first."
+              exit 1
+            fi
+            APP_ENV="${APP_ENV},GITHUB_APP_ID_PARAM=${APP_ID_PARAM},GITHUB_APP_PRIVATE_KEY_SECRET_ARN=${KEY_ARN}"
+          fi
+          echo "app_env=${APP_ENV}" >> "$GITHUB_OUTPUT"
+        env:
+          STAGE: dev
+          GITHUB_AUTH_MODE: ${{ vars.GITHUB_AUTH_MODE }}
+
       - name: Deploy to AgentCore Runtime (create or update)
         id: deploy
         env:
           ENV_VARS: ${{ inputs.env_vars }}
           GUARDRAIL_ENV: ${{ steps.guardrail.outputs.guardrail_env }}
+          APP_ENV: ${{ steps.githubapp.outputs.app_env }}
         run: |
           AGENT_NAME="${{ inputs.agent_name }}"
           IMAGE_URI="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ github.sha }}"
@@ -145,15 +177,18 @@ jobs:
           ARTIFACT="containerConfiguration={containerUri=${IMAGE_URI}}"
           NETWORK="networkMode=PUBLIC"
 
-          # Merge caller env_vars with the guardrail env from the foundation stack.
+          # Merge caller env_vars with the guardrail + GitHub App env from the
+          # foundation stack.
           COMBINED="${ENV_VARS}"
-          if [ -n "${GUARDRAIL_ENV}" ]; then
-            if [ -n "${COMBINED}" ]; then
-              COMBINED="${COMBINED},${GUARDRAIL_ENV}"
-            else
-              COMBINED="${GUARDRAIL_ENV}"
+          for EXTRA in "${GUARDRAIL_ENV}" "${APP_ENV}"; do
+            if [ -n "${EXTRA}" ]; then
+              if [ -n "${COMBINED}" ]; then
+                COMBINED="${COMBINED},${EXTRA}"
+              else
+                COMBINED="${EXTRA}"
+              fi
             fi
-          fi
+          done
 
           ENV_ARGS=()
           if [ -n "${COMBINED}" ]; then

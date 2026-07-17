@@ -101,6 +101,20 @@ Rules:
           DeployGateway=true requires DeployDashboard=true — the admin API owns
           the Gateway Cedar policy sync.
 
+  # GitHub App mode depends on the App credential resources (Secrets Manager key,
+  # app-id SSM param) and the per-owner install records, all owned by the
+  # dashboard/admin onboarding path. Enabling app mode without the dashboard
+  # would point the agents + reply Lambda at a secret/param/table that isn't
+  # provisioned. Fail fast instead of shipping a stack that 500s at first use.
+  GitHubAppModeRequiresDashboard:
+    RuleCondition: !Equals [!Ref GitHubAuthMode, "app"]
+    Assertions:
+      - Assert: !Equals [!Ref DeployDashboard, "true"]
+        AssertDescription: >-
+          GitHubAuthMode=app requires DeployDashboard=true — the GitHub App
+          credential + per-owner install records are provisioned by the admin
+          onboarding path.
+
 Globals:
   Function:
     Runtime: python3.12
@@ -362,6 +376,15 @@ Resources:
           ASANA_PAT_PARAM: /sdlc-agents/asana-pat
           CLOUDWATCH_NAMESPACE: SDLCAgents/Dispatch
           FLEET_CONFIG_TABLE: !Ref FleetConfigTable
+          # GitHub credential model for reply.py. "app" mints per-owner GitHub
+          # App installation tokens (needs the App resources below, dashboard-
+          # gated); default "pat" uses the shared token. The App id param + key
+          # secret ARN are only real when the dashboard is deployed — the App
+          # resources are DashboardEnabled-gated and a deploy Rule requires
+          # DeployDashboard=true whenever GitHubAuthMode=app.
+          GITHUB_AUTH_MODE: !Ref GitHubAuthMode
+          GITHUB_APP_ID_PARAM: !If [DashboardEnabled, !Ref GitHubAppIdParam, !Ref "AWS::NoValue"]
+          GITHUB_APP_PRIVATE_KEY_SECRET_ARN: !If [DashboardEnabled, !Ref GitHubAppPrivateKey, !Ref "AWS::NoValue"]
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref AssignmentsTable
@@ -369,6 +392,22 @@ Resources:
             TableName: !Ref FleetConfigTable
         - SSMParameterReadPolicy:
             ParameterName: !Sub sdlc-agents/${Stage}/registry
+        # GitHub App mode (reply.py): read the App private key + app-id to mint
+        # per-owner installation tokens. Dashboard-gated (the resources are), and
+        # a deploy Rule requires the dashboard when GitHubAuthMode=app. The
+        # per-owner install record read is already covered by DynamoDBReadPolicy
+        # on FleetConfigTable above.
+        - !If
+          - DashboardEnabled
+          - Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref GitHubAppPrivateKey
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource:
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/github-app-id
+          - !Ref "AWS::NoValue"
         - Statement:
             - Effect: Allow
               Action:
@@ -1184,6 +1223,22 @@ Outputs:
     Value: !Ref AssignmentsTable
     Export:
       Name: !Sub ${AWS::StackName}-AssignmentsTable
+
+  # Consumed by deploy-agent.yml to set the GitHub App env on agent runtimes
+  # (GITHUB_AUTH_MODE=app). The App id/key are only present when the dashboard is
+  # deployed; the fleet-config table (holding per-owner install records) always is.
+  FleetConfigTableName:
+    Value: !Ref FleetConfigTable
+    Export:
+      Name: !Sub ${AWS::StackName}-FleetConfigTable
+
+  GitHubAppIdParamName:
+    Condition: DashboardEnabled
+    Value: !Ref GitHubAppIdParam
+
+  GitHubAppPrivateKeySecretArn:
+    Condition: DashboardEnabled
+    Value: !Ref GitHubAppPrivateKey
 
   ArtifactsBucketName:
     Value: !Ref ArtifactsBucket

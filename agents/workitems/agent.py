@@ -34,7 +34,7 @@ from tools.risk_detection import detect_risks
 from tools.sync import reconcile_sync
 from tools.post_results import post_results
 from tools.asana_mcp import get_access_token, ASANA_MCP_URL
-from tools.github_mcp import get_github_token, GITHUB_MCP_URL
+from tools.github_mcp import github_bearer_token, GITHUB_MCP_URL
 
 # --- Logging -----------------------------------------------------------------
 # Configure root logger to emit to stdout so AgentCore's OTel sidecar captures
@@ -121,6 +121,12 @@ def invoke(payload, context=None):
         )
         tools.extend(memory_provider.tools)
 
+    # The repo to act on comes from the dispatch (multi-repo fleet), not a
+    # baked env var. Absent for non-GitHub dispatches — the project context
+    # then defers to the Current Dispatch block. Resolved before the MCP clients
+    # so the GitHub credential can be scoped to this dispatch's owner (App mode).
+    dispatch_repo = source_context.get("repo") if source == "github" else None
+
     # MCP connectivity: one gateway client (SigV4, Cedar-enforced) when
     # GATEWAY_MCP_URL is set, else direct per-vendor bearer clients. See
     # agents/shared/tools/gateway.py.
@@ -135,7 +141,9 @@ def invoke(payload, context=None):
                 gateway.build_bearer_client(ASANA_MCP_URL, get_access_token())
             )
             github_client = stack.enter_context(
-                gateway.build_bearer_client(GITHUB_MCP_URL, get_github_token())
+                gateway.build_bearer_client(
+                    GITHUB_MCP_URL, github_bearer_token(dispatch_repo)
+                )
             )
             asana_tools = asana_client.list_tools_sync()
             github_tools = github_client.list_tools_sync()
@@ -147,10 +155,6 @@ def invoke(payload, context=None):
             ]
             all_tools = [*asana_tools, *github_tools, *tools]
 
-        # The repo to act on comes from the dispatch (multi-repo fleet), not a
-        # baked env var. Absent for non-GitHub dispatches — the project context
-        # then defers to the Current Dispatch block.
-        dispatch_repo = source_context.get("repo") if source == "github" else None
         system_prompt = (
             SYSTEM_PROMPT.format(project_context=build_project_context(dispatch_repo))
             + dispatch_context_block

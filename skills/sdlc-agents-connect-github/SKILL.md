@@ -9,7 +9,7 @@ description: Use when the user needs to connect SDLC agents to GitHub. Walks thr
 
 Like Asana, GitHub access splits:
 
-- **Agent runtime → GitHub MCP server** (`https://api.githubcopilot.com/mcp/`). Today the agents read a PAT at `/sdlc-agents/github-mcp-token`. A **GitHub App** is the production direction and is already used for repo onboarding/verification (Path B); cutting the *agent* call sites over to per-owner App installation tokens is a tracked, not-yet-built step (see Path B's scope note).
+- **Agent runtime → GitHub MCP server** (`https://api.githubcopilot.com/mcp/`). Selected by `GITHUB_AUTH_MODE`: `pat` (default) reads the shared token at `/sdlc-agents/github-mcp-token`; `app` mints a per-owner **GitHub App** installation token for the dispatched repo's owner (direct mode is fully wired — see Path B). Gateway mode still uses the broker workstream (spec §3.6).
 - **CI (deploy workflow) → AWS** (no GitHub side needed beyond OIDC). The deploy role is assumed via GitHub Actions OIDC. No secret stored in GitHub beyond `AWS_DEPLOY_ROLE_ARN` and `AWS_ACCOUNT_ID`.
 
 ## Decide: PAT or GitHub App?
@@ -72,15 +72,15 @@ foundation stack with `DeployDashboard=true` and `GitHubAuthMode=app`.
    the App is installed on the repo's owner and can reach the repo *before*
    activating it; if it isn't installed it returns an install deep-link + Re-check.
 
-> **Scope note (current state):** the admin/onboarding path above is implemented
-> and mints installation tokens server-side for its own verification calls
-> (`infra/dashboard/github_client.py`). The **agent runtime** and dispatch **reply
-> Lambda** still read the PAT at `/sdlc-agents/github-mcp-token` — cutting those
-> call sites over to per-owner App installation tokens (and the Gateway-mode SCM
-> broker) is a tracked, not-yet-built workstream. See
-> `docs/specs/github-onboarding-spec.md` (§3.5–§3.6, §6). So today: use **App mode
-> for onboarding + verification**, and keep the agents in **direct/PAT mode** until
-> the agent-side minting lands.
+> **Scope note (current state):** in **direct mode** the credential model is
+> complete end-to-end — onboarding/verification (`infra/dashboard/github_client.py`)
+> AND the **agent runtime** + dispatch **reply Lambda** mint per-owner GitHub App
+> installation tokens for the dispatched repo's owner when `GITHUB_AUTH_MODE=app`
+> (`agents/shared/tools/github_app.py`, `infra/dispatch/github_app.py`). The shared
+> PAT remains the default (`pat`) and the fallback until `app` is rolled out per
+> stage. Still pending: **gateway mode** needs the SCM broker Lambda target
+> (spec §3.6) — until it lands, keep GitHub in **direct mode** — and PAT
+> decommission (§6). See `docs/specs/github-onboarding-spec.md`.
 
 ## Verify
 
