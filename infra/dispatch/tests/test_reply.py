@@ -18,6 +18,19 @@ def _mock_ssm():
         yield mock
 
 
+@pytest.fixture(autouse=True)
+def _mock_github_app(monkeypatch):
+    # GitHub replies always authenticate with a per-owner GitHub App installation
+    # token (the shared PAT was retired). Stub the minter so the GitHub-comment
+    # tests exercise the posting logic without AWS/network; the Asana tests are
+    # unaffected (they read the Asana PAT via _get_secret / _ssm).
+    import github_app
+
+    monkeypatch.setattr(
+        github_app, "installation_token_for_repo", lambda repo: "fake-token"
+    )
+
+
 def _mock_response(status_code: int = 200):
     resp = MagicMock()
     resp.status_code = status_code
@@ -67,10 +80,9 @@ def test_asana_comment_swallows_http_error():
     assert ok is False
 
 
-def test_github_comment_uses_app_token_in_app_mode(monkeypatch):
-    # In GITHUB_AUTH_MODE=app the reply must authenticate with a per-owner App
-    # installation token (not the shared PAT), scoped to the target repo.
-    monkeypatch.setenv("GITHUB_AUTH_MODE", "app")
+def test_github_comment_uses_per_owner_app_token(monkeypatch):
+    # The reply authenticates with a per-owner GitHub App installation token
+    # scoped to the target repo (the shared PAT was retired).
     import github_app
 
     monkeypatch.setattr(
@@ -85,7 +97,6 @@ def test_github_comment_uses_app_token_in_app_mode(monkeypatch):
 def test_github_comment_app_mint_failure_is_nonfatal(monkeypatch):
     # If minting fails, the reply returns False (non-fatal — the block decision
     # already stands) and never posts with a bad/missing token.
-    monkeypatch.setenv("GITHUB_AUTH_MODE", "app")
     import github_app
 
     def boom(repo):

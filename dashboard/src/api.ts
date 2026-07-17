@@ -130,6 +130,8 @@ export class DashboardApi {
     repo: string;
     enabled?: boolean;
     multi_repo_eligible?: boolean;
+    co_repo_mode?: "isolated" | "group" | "all";
+    repo_group?: string;
   }): Promise<RepoConfig> {
     return this.request<RepoConfig>("POST", "/admin/repos", { body });
   }

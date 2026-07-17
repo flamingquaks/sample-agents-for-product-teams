@@ -33,8 +33,6 @@ from tools.status_report import generate_status_report
 from tools.risk_detection import detect_risks
 from tools.sync import reconcile_sync
 from tools.post_results import post_results
-from tools.asana_mcp import get_access_token, ASANA_MCP_URL
-from tools.github_mcp import github_bearer_token, GITHUB_MCP_URL
 
 # --- Logging -----------------------------------------------------------------
 # Configure root logger to emit to stdout so AgentCore's OTel sidecar captures
@@ -123,37 +121,25 @@ def invoke(payload, context=None):
 
     # The repo to act on comes from the dispatch (multi-repo fleet), not a
     # baked env var. Absent for non-GitHub dispatches — the project context
-    # then defers to the Current Dispatch block. Resolved before the MCP clients
-    # so the GitHub credential can be scoped to this dispatch's owner (App mode).
+    # then defers to the Current Dispatch block. Resolved before the MCP client
+    # (and before the model) so it can be stamped as the trusted dispatch origin
+    # the gateway interceptor/broker use to scope GitHub access to this owner.
     dispatch_repo = source_context.get("repo") if source == "github" else None
 
-    # MCP connectivity: one gateway client (SigV4, Cedar-enforced) when
-    # GATEWAY_MCP_URL is set, else direct per-vendor bearer clients. See
-    # agents/shared/tools/gateway.py.
+    # MCP connectivity: one gateway client (SigV4, Cedar-enforced) — the fleet is
+    # gateway-only, so ALL tool calls route through the AgentCore Gateway (policy
+    # engine + SCM interceptor + observability). No direct-to-vendor path. The
+    # origin + agent headers let the gateway enforce co-repo grouping and
+    # per-agent GitHub access. See agents/shared/tools/gateway.py.
     with ExitStack() as stack:
-        if gateway.gateway_enabled():
-            # Single gateway client — targets are aggregated + per-principal
-            # filtered at the gateway, so no client-side dedup is needed.
-            gw = stack.enter_context(gateway.build_gateway_client())
-            all_tools = [*gw.list_tools_sync(), *tools]
-        else:
-            asana_client = stack.enter_context(
-                gateway.build_bearer_client(ASANA_MCP_URL, get_access_token())
+        # Single gateway client — targets are aggregated + per-principal filtered
+        # at the gateway, so no client-side dedup is needed.
+        gw = stack.enter_context(
+            gateway.build_gateway_client(
+                dispatch_origin=dispatch_repo, agent=ACTOR_ID
             )
-            github_client = stack.enter_context(
-                gateway.build_bearer_client(
-                    GITHUB_MCP_URL, github_bearer_token(dispatch_repo)
-                )
-            )
-            asana_tools = asana_client.list_tools_sync()
-            github_tools = github_client.list_tools_sync()
-            # Drop GitHub tools that collide with Asana tool names
-            # (e.g. both servers expose get_me — keep the Asana version)
-            asana_names = {t.tool_name for t in asana_tools}
-            github_tools = [
-                gt for gt in github_tools if gt.tool_name not in asana_names
-            ]
-            all_tools = [*asana_tools, *github_tools, *tools]
+        )
+        all_tools = [*gw.list_tools_sync(), *tools]
 
         system_prompt = (
             SYSTEM_PROMPT.format(project_context=build_project_context(dispatch_repo))

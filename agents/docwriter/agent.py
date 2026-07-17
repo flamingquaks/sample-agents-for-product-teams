@@ -33,7 +33,6 @@ from tools.generate_release_notes import generate_release_notes
 from tools.detect_doc_gaps import detect_doc_gaps
 from tools.check_doc_freshness import check_doc_freshness
 from tools.post_results import post_results
-from tools.github_mcp import github_bearer_token, GITHUB_MCP_URL
 
 logger = logging.getLogger(__name__)
 
@@ -125,21 +124,18 @@ def invoke(payload, context=None):
         )
         tools.extend(memory_provider.tools)
 
-    # MCP connectivity: one gateway client (SigV4, Cedar-enforced) when
-    # GATEWAY_MCP_URL is set, else the direct GitHub bearer client. See
+    # MCP connectivity: one gateway client (SigV4, Cedar-enforced) — the fleet is
+    # gateway-only, so all tool calls route through the AgentCore Gateway (policy
+    # engine + SCM interceptor + observability). The origin + agent headers let
+    # the gateway enforce co-repo grouping + per-agent access. See
     # agents/shared/tools/gateway.py.
     with ExitStack() as stack:
-        if gateway.gateway_enabled():
-            gw = stack.enter_context(gateway.build_gateway_client())
-            mcp_tools = gw.list_tools_sync()
-        else:
-            github_client = stack.enter_context(
-                gateway.build_bearer_client(
-                    GITHUB_MCP_URL, github_bearer_token(dispatch_repo)
-                )
+        gw = stack.enter_context(
+            gateway.build_gateway_client(
+                dispatch_origin=dispatch_repo, agent=ACTOR_ID
             )
-            mcp_tools = github_client.list_tools_sync()
-        all_tools = [*mcp_tools, *tools]
+        )
+        all_tools = [*gw.list_tools_sync(), *tools]
 
         agent = Agent(
             model=model,

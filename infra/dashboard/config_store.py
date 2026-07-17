@@ -7,20 +7,43 @@ contract). It replaces the deploy-time ``FLEET_GITHUB_REPO`` parameter.
 
 Table shape (single table, ``FLEET_CONFIG_TABLE`` env var). Partition key ``pk``:
   - Repo record:   pk="repo#<owner/repo>",  {kind:"repo", repo, enabled(bool),
-                   multi_repo_eligible(bool), onboarded_by, onboarded_at,
-                   status: "pending"|"active", owner, installation_id?,
-                   install_verified_at?}
+                   multi_repo_eligible(bool), co_repo_mode, repo_group?,
+                   onboarded_by, onboarded_at, status: "pending"|"active", owner,
+                   installation_id?, install_verified_at?}
   - Install record: pk="owner#<owner>",     {kind:"install", owner,
                    owner_type: "User"|"Organization", installation_id(int),
                    install_verified_at(epoch)}
   - Settings:      pk="settings",           {kind:"settings", restrict_repos(bool)}
 
 ``enabled``            — the repo is dispatchable (a mention from it is routed).
-``multi_repo_eligible``— the repo may be targeted by cross-repo tool actions
-                         (the set the Gateway Cedar policy allows). A repo can be
-                         enabled-but-not-eligible: dispatchable, tool-calls denied.
-``restrict_repos``     — when False, any enabled repo is allowed; when True, only
-                         enabled + eligible repos (the allowlist) are.
+``multi_repo_eligible``— the master switch: the repo may participate in cross-repo
+                         tool actions at all. A repo can be enabled-but-not-eligible:
+                         dispatchable, but a dispatch that originates elsewhere can
+                         never reach it, and it can never reach another repo.
+``co_repo_mode``       — HOW a dispatch that ORIGINATES in this repo may reach other
+                         repos (the "approved to run with" rule). One of:
+                           - "isolated" (default): only itself. A dispatch from this
+                             repo may act on this repo alone — no cross-repo reach.
+                           - "group": itself + every other active, eligible repo in
+                             the SAME ``repo_group``. Mutual: A reaches B iff both
+                             share a group (and both are eligible).
+                           - "all": itself + every other active, eligible repo in the
+                             fleet (across owners/orgs). The "run with all" option.
+                         Only meaningful when ``multi_repo_eligible`` is True.
+``repo_group``         — a free-form label (e.g. "acme-platform"); repos sharing it
+                         and in ``co_repo_mode="group"`` may operate on each other.
+``restrict_repos``     — when False, any enabled repo is dispatchable; when True,
+                         only enabled + eligible repos are (the master allowlist).
+                         Independent of the per-origin co-repo rules above, which
+                         always apply to cross-repo REACH.
+
+Co-repo model (the "approved to run with specific others OR all" requirement): a
+repo isn't merely a boolean "multi-repo" flag. Each repo declares, for a dispatch
+that originates in it, which OTHER repos that dispatch may touch — none (isolated),
+a named group, or all. ``coreachable_repos(origin)`` resolves that set, and it is
+enforced at the credential layer: the GitHub App token minted for a dispatch is
+scoped to exactly this repo set, so a dispatch physically cannot reach a repo it
+isn't approved to run with (spec §3.3, threat-model T-11/T-12).
 
 Per-owner install record (O-1): the GitHub App is installed per OWNER (a user or
 an org), so one installation serves all of that owner's onboarded repos. We key
@@ -37,6 +60,12 @@ import boto3
 _REPO_PK_PREFIX = "repo#"
 _OWNER_PK_PREFIX = "owner#"
 _SETTINGS_PK = "settings"
+
+# How a dispatch that ORIGINATES in a repo may reach OTHER repos.
+CO_REPO_ISOLATED = "isolated"  # only itself (default — safest)
+CO_REPO_GROUP = "group"  # itself + same repo_group (mutual)
+CO_REPO_ALL = "all"  # itself + every eligible repo in the fleet
+CO_REPO_MODES = (CO_REPO_ISOLATED, CO_REPO_GROUP, CO_REPO_ALL)
 
 _table = None
 
@@ -123,6 +152,8 @@ def put_repo(
     *,
     enabled: bool = True,
     multi_repo_eligible: bool = True,
+    co_repo_mode: str = CO_REPO_ISOLATED,
+    repo_group: str | None = None,
     onboarded_by: str = "",
     status: str = "pending",
     installation_id: int | None = None,
@@ -134,10 +165,16 @@ def put_repo(
     ``active`` rows, so syncing while ``pending`` would omit the very repo being
     onboarded. See admin.py's POST /admin/repos.
 
+    ``co_repo_mode`` / ``repo_group`` declare which OTHER repos a dispatch that
+    originates HERE may reach (see module docstring + ``coreachable_repos``). The
+    default is ``isolated`` (only itself) — a repo becomes cross-repo-capable only
+    when an admin explicitly opts it into a group or ``all``.
+
     ``installation_id`` / ``install_verified_at`` are set once onboarding has
     verified the GitHub App is installed on the repo's owner and can reach the
     repo. They're denormalized onto the repo row for convenience; the per-owner
     install record (put_installation) is the source of truth."""
+    mode = co_repo_mode if co_repo_mode in CO_REPO_MODES else CO_REPO_ISOLATED
     normalized = _normalize_repo(repo)
     item = {
         "pk": _repo_pk(normalized),
@@ -146,10 +183,16 @@ def put_repo(
         "owner": _owner_of(normalized),
         "enabled": bool(enabled),
         "multi_repo_eligible": bool(multi_repo_eligible),
+        "co_repo_mode": mode,
         "onboarded_by": onboarded_by,
         "onboarded_at": int(time.time()),
         "status": status,
     }
+    # Store the group label only in group mode, normalized like a repo half so it
+    # can't smuggle Cedar metacharacters (it's compared, never rendered into
+    # policy, but keep the invariant tight).
+    if mode == CO_REPO_GROUP and repo_group:
+        item["repo_group"] = repo_group.strip().casefold()
     if installation_id is not None:
         item["installation_id"] = int(installation_id)
     if install_verified_at is not None:
@@ -230,13 +273,59 @@ def put_settings(*, restrict_repos: bool) -> dict:
 # --- derived -----------------------------------------------------------------
 
 
-def allowed_repos() -> list[str]:
-    """The repos allowed for cross-repo tool actions — the set rendered into the
-    Gateway Cedar policy's ``context.input.repo in [...]``. Enabled + eligible."""
+def _eligible_active_repos() -> list[dict]:
+    """Active, enabled, multi-repo-eligible repo records (the cross-repo pool)."""
     return [
-        r["repo"]
+        r
         for r in list_repos()
         if r.get("enabled")
         and r.get("multi_repo_eligible")
         and r.get("status") == "active"
     ]
+
+
+def allowed_repos() -> list[str]:
+    """The full set of repos that may participate in cross-repo tool actions —
+    rendered into the Gateway Cedar policy. Enabled + eligible + active. This is
+    the master allowlist; the per-origin ``coreachable_repos`` narrows WITHIN it
+    which of these a given dispatch may actually reach."""
+    return [r["repo"] for r in _eligible_active_repos()]
+
+
+def coreachable_repos(origin: str) -> list[str]:
+    """The repos a dispatch that ORIGINATES in ``origin`` (owner/repo) may operate
+    on — the enforced "approved to run with" set. Always includes ``origin`` when
+    it's an onboarded, enabled, active repo; adds others per ``origin``'s
+    ``co_repo_mode``:
+
+      - isolated → just ``origin``.
+      - group    → ``origin`` + every eligible repo sharing ``origin``'s
+                   ``repo_group`` (mutual — both must be group-mode + same label).
+      - all      → ``origin`` + every eligible repo in the fleet (any owner/org).
+
+    Returns lowercased ``owner/repo`` strings, sorted, ``origin`` first. An origin
+    that isn't onboarded/enabled/active returns ``[]`` (fails closed). This spans
+    owners: a group or ``all`` may mix individual and org repos freely — the token
+    minter scopes the credential to exactly this set regardless of owner."""
+    norm = _normalize_repo(origin)
+    rec = get_repo(norm)
+    if not rec or not rec.get("enabled") or rec.get("status") != "active":
+        return []
+
+    reachable = {norm}
+    # An origin that isn't itself eligible can still act on itself, but can never
+    # reach out (cross-repo requires eligibility on the origin).
+    if rec.get("multi_repo_eligible"):
+        mode = rec.get("co_repo_mode", CO_REPO_ISOLATED)
+        if mode == CO_REPO_ALL:
+            reachable.update(r["repo"] for r in _eligible_active_repos())
+        elif mode == CO_REPO_GROUP:
+            group = rec.get("repo_group")
+            if group:
+                reachable.update(
+                    r["repo"]
+                    for r in _eligible_active_repos()
+                    if r.get("co_repo_mode") == CO_REPO_GROUP
+                    and r.get("repo_group") == group
+                )
+    return sorted(reachable, key=lambda r: (r != norm, r))

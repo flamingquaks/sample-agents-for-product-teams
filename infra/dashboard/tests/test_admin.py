@@ -44,10 +44,14 @@ def _make_table():
     )
 
 
-def _load_admin():
+def _load_admin(fake=None):
     # Fresh import per test-run so the cached table handle binds to moto.
-    for m in ("admin", "config_store", "auth", "http_responses"):
+    # Onboarding now ALWAYS verifies a GitHub App installation (the PAT path was
+    # retired), so inject a github_client — a passing _FakeGitHub by default — for
+    # the handler's lazy ``import github_client`` to pick up.
+    for m in ("admin", "config_store", "auth", "http_responses", "github_client"):
         sys.modules.pop(m, None)
+    sys.modules["github_client"] = fake if fake is not None else _FakeGitHub()
     import admin
 
     return admin
@@ -211,6 +215,82 @@ def test_onboard_eligible_false_is_dispatchable_not_eligible():
     assert config_store.allowed_repos() == []
 
 
+# --- co-repo grouping (which repos may run together) --------------------------
+
+
+@mock_aws
+def test_onboard_defaults_to_isolated_co_repo_mode():
+    _make_table()
+    admin = _load_admin()
+    admin.handler(_event("POST", "/admin/repos", body={"repo": "acme/web"}))
+    import config_store
+
+    rec = config_store.get_repo("acme/web")
+    assert rec["co_repo_mode"] == "isolated"
+    # isolated origin reaches only itself
+    assert config_store.coreachable_repos("acme/web") == ["acme/web"]
+
+
+@mock_aws
+def test_onboard_group_requires_repo_group():
+    _make_table()
+    admin = _load_admin()
+    resp = admin.handler(
+        _event("POST", "/admin/repos", body={"repo": "acme/web", "co_repo_mode": "group"})
+    )
+    assert resp["statusCode"] == 400
+    assert "repo_group" in _body(resp)["error"]
+
+
+@mock_aws
+def test_onboard_rejects_bad_co_repo_mode():
+    _make_table()
+    admin = _load_admin()
+    resp = admin.handler(
+        _event("POST", "/admin/repos", body={"repo": "acme/web", "co_repo_mode": "wat"})
+    )
+    assert resp["statusCode"] == 400
+
+
+@mock_aws
+def test_group_mode_spans_owners_and_isolates_other_groups():
+    # acme/web + acme/api + bob/tool in group "platform" (mixed personal + org);
+    # zed/x in a different group; iso/repo isolated. web reaches its whole group
+    # across owners but not the other group or the isolated repo.
+    _make_table()
+    admin = _load_admin()
+    import config_store
+
+    for repo, group in [("acme/web", "platform"), ("acme/api", "platform"), ("bob/tool", "platform"), ("zed/x", "other")]:
+        admin.handler(
+            _event(
+                "POST",
+                "/admin/repos",
+                body={"repo": repo, "co_repo_mode": "group", "repo_group": group},
+            )
+        )
+    admin.handler(_event("POST", "/admin/repos", body={"repo": "iso/repo", "co_repo_mode": "isolated"}))
+
+    reach = config_store.coreachable_repos("acme/web")
+    assert reach[0] == "acme/web"  # origin first
+    assert set(reach) == {"acme/web", "acme/api", "bob/tool"}  # spans acme + bob
+    assert "zed/x" not in reach and "iso/repo" not in reach
+
+
+@mock_aws
+def test_all_mode_reaches_every_eligible_repo():
+    _make_table()
+    admin = _load_admin()
+    import config_store
+
+    admin.handler(_event("POST", "/admin/repos", body={"repo": "acme/hub", "co_repo_mode": "all"}))
+    admin.handler(_event("POST", "/admin/repos", body={"repo": "bob/svc", "co_repo_mode": "isolated"}))
+    admin.handler(_event("POST", "/admin/repos", body={"repo": "zed/lib", "co_repo_mode": "group", "repo_group": "g"}))
+    reach = set(config_store.coreachable_repos("acme/hub"))
+    # all-mode reaches every eligible repo regardless of their own mode/owner
+    assert reach == {"acme/hub", "bob/svc", "zed/lib"}
+
+
 @mock_aws
 def test_pending_left_on_policy_sync_failure_when_enforcing(monkeypatch):
     # ENFORCE: a sync failure must roll the repo back to pending and 502, so
@@ -288,7 +368,7 @@ def test_unknown_route_404():
     assert admin.handler(_event("GET", "/admin/nope"))["statusCode"] == 404
 
 
-# --- GitHub App onboarding verification (GITHUB_AUTH_MODE=app) ----------------
+# --- GitHub App onboarding verification ---------------------------------------
 
 
 class _FakeGitHub:
@@ -321,16 +401,9 @@ class _FakeGitHub:
 
 
 def _load_admin_app_mode(monkeypatch, fake):
-    monkeypatch.setenv("GITHUB_AUTH_MODE", "app")
-    for m in ("admin", "config_store", "auth", "http_responses", "github_client"):
-        sys.modules.pop(m, None)
-    sys.modules["github_client"] = (
-        fake  # handler's `import github_client` picks this up
-    )
-    monkeypatch.setattr("policy_sync.sync_fleet_policy", lambda: None, raising=False)
-    import admin
-
-    # policy sync is a no-op in these tests (no gateway); stub the seam.
+    # Onboarding always verifies a GitHub App install now; this just loads admin
+    # with a specific fake github_client and stubs the policy-sync seam.
+    admin = _load_admin(fake)
     monkeypatch.setattr(admin, "_sync_repo_policy", lambda: None)
     return admin
 
@@ -384,20 +457,6 @@ def test_onboard_409_when_app_not_configured(monkeypatch):
     resp = admin.handler(_event("POST", "/admin/repos", body={"repo": "acme/web"}))
     assert resp["statusCode"] == 409
     assert "not set up" in _body(resp)["error"]
-
-
-@mock_aws
-def test_pat_mode_skips_verification(monkeypatch):
-    # Default (pat) mode: onboarding does NOT call GitHub and stores no install id.
-    monkeypatch.setenv("GITHUB_AUTH_MODE", "pat")
-    _make_table()
-    admin = _load_admin()
-    monkeypatch.setattr(admin, "_sync_repo_policy", lambda: None)
-    resp = admin.handler(_event("POST", "/admin/repos", body={"repo": "acme/web"}))
-    assert resp["statusCode"] == 200
-    import config_store
-
-    assert "installation_id" not in config_store.get_repo("acme/web")
 
 
 @mock_aws

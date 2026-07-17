@@ -23,7 +23,6 @@ logger = logging.getLogger(__name__)
 GITHUB_API = "https://api.github.com"
 ASANA_API = "https://app.asana.com/api/1.0"
 
-GITHUB_PAT_PARAM_ENV = "GITHUB_PAT_PARAM"
 ASANA_PAT_PARAM_ENV = "ASANA_PAT_PARAM"
 
 _ssm = boto3.client("ssm")
@@ -87,19 +86,17 @@ def post_asana_comment(task_gid: str, body: str) -> bool:
 
 
 def _github_token(repo: str) -> Optional[str]:
-    """The GitHub bearer token for posting to ``repo``. In GITHUB_AUTH_MODE=app,
-    mint a per-owner installation token (bounded to that owner's installed repos);
-    otherwise fall back to the shared PAT. Returns None on failure (the caller
-    treats a failed reply as non-fatal — the block decision already stands)."""
+    """The GitHub bearer token for posting to ``repo``: a per-owner GitHub App
+    installation token (bounded to that owner's installed repos — threat-model
+    T-11). Returns None on failure (the caller treats a failed reply as
+    non-fatal — the block decision already stands)."""
     import github_app
 
-    if github_app.app_mode():
-        try:
-            return github_app.installation_token_for_repo(repo)
-        except github_app.GitHubAppError as exc:
-            logger.error("Failed to mint GitHub App token for %s: %s", repo, exc)
-            return None
-    return _get_secret(os.environ.get(GITHUB_PAT_PARAM_ENV, "/sdlc-agents/github-pat"))
+    try:
+        return github_app.installation_token_for_repo(repo)
+    except github_app.GitHubAppError as exc:
+        logger.error("Failed to mint GitHub App token for %s: %s", repo, exc)
+        return None
 
 
 def _get_secret(param_name: str) -> Optional[str]:

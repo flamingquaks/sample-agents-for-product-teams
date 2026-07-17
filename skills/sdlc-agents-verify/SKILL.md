@@ -76,18 +76,33 @@ PY
 
 ### GitHub
 
+GitHub uses a per-owner **GitHub App** (the shared PAT was retired), so there's no
+static token to probe — check that the App is registered and can mint. This signs a
+short App JWT from the stored key/app-id and lists the App's installations.
+
 ```bash
 python3 <<'PY'
-import boto3, requests
-ssm = boto3.client("ssm", region_name="$REGION")
+import os, time, json, base64, boto3, requests
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+region, stage = "$REGION", os.environ.get("STAGE", "dev")
+ssm = boto3.client("ssm", region_name=region)
+sm = boto3.client("secretsmanager", region_name=region)
 try:
-    tok = ssm.get_parameter(Name="/sdlc-agents/github-mcp-token", WithDecryption=True)["Parameter"]["Value"]
-except Exception:
-    print("SKIP github — no PAT found at /sdlc-agents/github-mcp-token (maybe using App auth)")
-else:
-    r = requests.get("https://api.github.com/user",
-        headers={"Authorization": f"Bearer {tok}","Accept":"application/vnd.github+json"}, timeout=15)
-    print(f"{'PASS' if r.ok else 'FAIL'} github-pat — /user: {r.status_code}")
+    app_id = ssm.get_parameter(Name=f"/sdlc-agents/{stage}/github-app-id")["Parameter"]["Value"]
+    pem = sm.get_secret_value(SecretId=f"sdlc-agents/{stage}/github-app/private-key")["SecretString"]
+except Exception as e:
+    print(f"SKIP github — App not set up ({e}); register it in the dashboard Admin → GitHub App panel"); raise SystemExit
+if app_id in ("", "unset") or "PRIVATE KEY" not in pem:
+    print("SKIP github — App not registered yet (dashboard Admin → GitHub App)"); raise SystemExit
+def b64(b): return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+now = int(time.time())
+si = f'{b64(json.dumps({"alg":"RS256","typ":"JWT"}).encode())}.{b64(json.dumps({"iat":now-60,"exp":now+540,"iss":app_id}).encode())}'.encode()
+key = serialization.load_pem_private_key(pem.encode(), password=None)
+jwt = f"{si.decode()}.{b64(key.sign(si, padding.PKCS1v15(), hashes.SHA256()))}"
+r = requests.get("https://api.github.com/app/installations",
+    headers={"Authorization": f"Bearer {jwt}","Accept":"application/vnd.github+json"}, timeout=15)
+print(f"{'PASS' if r.ok else 'FAIL'} github-app — /app/installations: {r.status_code}")
 PY
 ```
 

@@ -189,6 +189,7 @@ export function AdminView({
             <th>Repository</th>
             <th>Dispatchable</th>
             <th>Multi-repo eligible</th>
+            <th>Runs with</th>
             <th>Status</th>
             <th>Onboarded by</th>
             <th>Onboarded</th>
@@ -203,6 +204,15 @@ export function AdminView({
               </td>
               <td>{r.enabled ? "yes" : "no"}</td>
               <td>{r.multi_repo_eligible ? "yes" : "no"}</td>
+              <td>
+                {!r.multi_repo_eligible
+                  ? "—"
+                  : r.co_repo_mode === "all"
+                    ? "all repos"
+                    : r.co_repo_mode === "group"
+                      ? `group: ${r.repo_group ?? "?"}`
+                      : "itself only"}
+              </td>
               <td>
                 <span className={`pill ${r.status === "active" ? "ok" : "unknown"}`}>
                   {r.status ?? "unknown"}
@@ -226,7 +236,7 @@ export function AdminView({
           ))}
           {repos.length === 0 && !reposPoll.loading && (
             <tr>
-              <td colSpan={7} className="muted">
+              <td colSpan={8} className="muted">
                 No repositories onboarded yet. Use “Onboard repository” to add one.
               </td>
             </tr>
@@ -293,6 +303,8 @@ function OnboardModal({
 }) {
   const [repo, setRepo] = useState("");
   const [eligible, setEligible] = useState(true);
+  const [coRepoMode, setCoRepoMode] = useState<"isolated" | "group" | "all">("isolated");
+  const [repoGroup, setRepoGroup] = useState("");
   const [busy, setBusy] = useState(false);
   const [hint, setHint] = useState<string | null>(null);
   const [installUrl, setInstallUrl] = useState<string | null>(null);
@@ -317,6 +329,10 @@ function OnboardModal({
       setHint(`"${trimmed}" isn't a valid owner/repo — one slash, letters/digits/._- only.`);
       return;
     }
+    if (coRepoMode === "group" && !repoGroup.trim()) {
+      setHint("Enter a group name when co-repo mode is “group”.");
+      return;
+    }
     setHint(null);
     setInstallUrl(null);
     setBusy(true);
@@ -325,6 +341,8 @@ function OnboardModal({
         repo: trimmed,
         enabled: true,
         multi_repo_eligible: eligible,
+        co_repo_mode: coRepoMode,
+        repo_group: coRepoMode === "group" ? repoGroup.trim() : undefined,
       })) as { policy_sync_warning?: string };
       onSuccess(trimmed, rec.policy_sync_warning);
     } catch (e) {
@@ -388,6 +406,43 @@ function OnboardModal({
           />{" "}
           Multi-repo eligible
         </label>
+
+        {eligible && (
+          <>
+            <label className="field">
+              <span>Approved to run with</span>
+              <select
+                value={coRepoMode}
+                disabled={busy}
+                onChange={(e) =>
+                  setCoRepoMode(e.target.value as "isolated" | "group" | "all")
+                }
+                aria-label="Co-repo mode"
+              >
+                <option value="isolated">Only itself (isolated)</option>
+                <option value="group">Repos in a named group</option>
+                <option value="all">All eligible repos</option>
+              </select>
+            </label>
+            {coRepoMode === "group" && (
+              <label className="field">
+                <span>Group name</span>
+                <input
+                  placeholder="e.g. acme-platform"
+                  value={repoGroup}
+                  disabled={busy}
+                  onChange={(e) => setRepoGroup(e.target.value)}
+                  aria-label="Repo group name"
+                />
+              </label>
+            )}
+            <p className="muted" style={{ marginTop: 4 }}>
+              Controls which OTHER repos a dispatch from this repo may act on. A
+              group is mutual — repos sharing a group name (and set to “group”)
+              may operate on each other, across owners/orgs.
+            </p>
+          </>
+        )}
 
         {hint && (
           <div className="banner error" role="alert">

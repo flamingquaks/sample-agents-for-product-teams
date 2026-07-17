@@ -1,17 +1,24 @@
 # GitHub Repo Onboarding & GitHub App Credential Model
 ## Supporting individual and organization repos with a bounded, per-owner credential
 
-Status: **Direct mode complete.** GitHub App onboarding (manifest flow,
-per-owner install verification) AND the agent-runtime + reply-Lambda credential
-cutover are built behind `GITHUB_AUTH_MODE=app` (default `pat`): in app mode the
-three GitHub agents and the dispatch reply Lambda mint per-owner installation
-tokens for the dispatched repo's owner instead of reading the shared PAT
-(`agents/shared/tools/github_app.py`, `infra/dispatch/github_app.py`), with IAM +
-env wired in the template, bootstrap, and the agent deploy workflow. Remaining:
-the §3.6 broker Lambda target for **gateway** mode, PAT decommission once all
-stages run `app` (§6), and GitLab/Bitbucket providers.
+Status: **GitHub App is the only credential model (PAT retired) AND the fleet is
+gateway-only.** The `GITHUB_AUTH_MODE` flag and the shared-PAT path are gone.
+Every GitHub tool call flows agent → AgentCore Gateway → REQUEST interceptor →
+SCM broker: agents hold no GitHub credential and SigV4-invoke the gateway
+(`GATEWAY_MCP_URL` required), the interceptor (`infra/dispatch/scm_interceptor.py`)
+enforces per-origin co-repo grouping from a trusted header, and the broker
+(`infra/dispatch/scm_broker.py`) mints a per-owner installation token scoped to
+the called repo + the per-agent∩per-tool permission set. Onboarding verifies the
+App is installed + can reach a repo before activating it
+(`infra/dashboard/github_client.py`); the dispatch reply Lambda mints a
+repo-scoped comment-only token (`infra/dispatch/github_app.py`). The App
+credential resources are **unconditional** stack resources; registering the App
+via the admin manifest flow is a dashboard step (a documented prerequisite).
+Full multi-repo: multi-owner (mixed personal + org), per-origin "approved to run
+with specific others OR all" grouping, and per-agent product access (§3.7).
+Remaining: GitLab/Bitbucket providers.
 Owner: fleet infra. Related: `docs/threat-model.md` T-11, `docs/roadmap.md`,
-`skills/sdlc-agents-connect-github/SKILL.md` (Path B).
+`skills/sdlc-agents-connect-github/SKILL.md`.
 
 ---
 
@@ -160,6 +167,15 @@ installation_id: "<int>"                    # the App's install on that owner
 install_verified_at: <epoch>                # when we last confirmed reachability
 ```
 
+Plus the **co-repo grouping** fields (admin-supplied, validated) that make a repo
+"approved to run with specific others OR all" rather than a bare boolean:
+
+```
+multi_repo_eligible: bool    # master switch: may participate in cross-repo at all
+co_repo_mode: "isolated" | "group" | "all"   # HOW a dispatch from here reaches others
+repo_group:   "<label>"      # only in group mode; group is mutual, spans owners
+```
+
 `_valid_repo` stays as the injection-safe syntax gate (owner/repo flows into
 Cedar literals — unchanged). Existence/installation verification is a **new,
 separate step** (§4), not folded into `_valid_repo`.
@@ -188,14 +204,22 @@ mint_installation_token(installation_id) -> (token, expires_at)
   gains a `boto3.client("secretsmanager")` path (first Secrets Manager use in
   this repo — see §3.2).
 
-### 3.5 How each call site changes
+### 3.5 How each call site works (gateway-only)
 
-| Call site | Today | Target |
+The fleet is **gateway-only**: agents hold NO GitHub credential and have no
+direct-to-vendor path. Every GitHub tool call is SigV4'd to the AgentCore Gateway
+and served by the SCM broker; the interceptor + broker mint the scoped token
+server-side. This is deliberate — the gateway is the policy-enforcement +
+observability chokepoint, and routing everything through it is what gives the
+fleet per-tool-call visibility and the co-repo/per-agent controls.
+
+| Call site | Was | Now |
 |---|---|---|
-| **Agents, direct mode** (`github_mcp.github_bearer_token`) | reads PAT | ✅ **DONE** — in app mode, `github_app.token_for_dispatch(owner/repo)` mints a token for the **dispatched repo's owner**; `agent.py` resolves `dispatch_repo` before building the GitHub client and passes it in. PAT path preserved as default. |
-| **Agents, gateway mode** | Gateway holds PAT for outbound | Route through a **broker Lambda target** that mints the per-owner token per call — see §3.6 (this replaces the old "static gateway credential" dead-end; O-2 resolved). **Not yet built** — keep GitHub in direct mode. |
-| **Dispatch reply Lambda** (`reply.post_github_comment`) | reads PAT | ✅ **DONE** — `reply._github_token(repo)` mints per-owner via `infra/dispatch/github_app.py` in app mode, PAT otherwise. |
-| **Bootstrap + template IAM/env** | grants `github-mcp-*` | ✅ **DONE** — agent runtime roles (bootstrap `GITHUB_AGENTS`) + the dispatch router role get `secretsmanager:GetSecretValue` (key), `ssm:GetParameter` (app-id), `dynamodb:GetItem` (per-owner install record); `GITHUB_AUTH_MODE`/param/table env set on the router (template) and agents (deploy-agent.yml, from stack outputs). A deploy Rule requires `DeployDashboard=true` when `GitHubAuthMode=app`. |
+| **Agents** | read PAT / minted own token | ✅ SigV4-invoke the Gateway only (`gateway.build_gateway_client(dispatch_origin, agent)`); `GATEWAY_MCP_URL` is **required** (agent refuses to start without it). No GitHub creds on the agent role. |
+| **Gateway GitHub target** | held PAT for outbound | ✅ the **SCM broker Lambda** (`scm_broker.py`) mints a per-owner token per call, scoped to the called repo + the per-agent∩per-tool permission set (§3.6). The gateway holds no GitHub credential. |
+| **Gateway REQUEST interceptor** | — (new) | ✅ `scm_interceptor.py` enforces co-repo grouping from the trusted `x-dispatch-origin` header and injects server-truth origin+agent (§3.7). |
+| **Dispatch reply Lambda** (`reply.post_github_comment`) | read PAT | ✅ `reply._github_token(repo)` mints a repo-scoped, comment-only (`issues:write`) token via `infra/dispatch/github_app.py`. |
+| **Bootstrap + template IAM/env** | granted `github-mcp-*` | ✅ PAT grants gone; agent roles get `bedrock-agentcore:InvokeGateway` only (NO GitHub App creds — the broker/interceptor/reply Lambdas hold the App key). App credential resources are **unconditional**; the `GITHUB_AUTH_MODE` param + rule were removed. |
 
 > O-2 (Gateway outbound per-owner token) — **RESOLVED** (see §3.6). The static
 > per-target credential genuinely can't vary per call, and AgentCore Identity
@@ -240,13 +264,16 @@ Credential model: the Lambda target uses `GATEWAY_IAM_ROLE` only (the gateway
 invokes it; the Lambda itself reads the SM private key + mints tokens). NO
 outbound OAuth/API-key credential provider on the target.
 
-**Caller identity caveat (verified):** a Lambda *target* does NOT natively
-receive the Cedar principal / inbound identity — only gateway/target/tool IDs.
-If the broker needs "which agent is calling" (e.g. to scope beyond what Cedar
-already enforces), add a **REQUEST interceptor** (customer Lambda, runs before
-Cedar) that injects the identity into the request. Cedar's per-agent
-`permit`s remain the authoritative per-agent tool scope, so the broker may not
-need identity at all for v1 — confirm during implementation.
+**Caller identity — resolved via the interceptor.** A Lambda *target* does NOT
+natively receive the inbound identity or the dispatch origin — only
+gateway/target/tool IDs. Since per-origin co-repo grouping and per-agent access
+both need that context, the fleet adds a **REQUEST interceptor**
+(`scm_interceptor.py`) that reads the trusted `x-dispatch-origin` /
+`x-dispatch-agent` headers (stamped by the agent runtime before the model runs),
+enforces grouping, and injects the origin + agent into the tool args as server
+truth. The broker reads those injected values (never the model-visible owner/repo)
+to scope the credential. So the broker DOES use identity — supplied by the
+interceptor, not guessed.
 
 **Why not the alternatives** (recorded so we don't relitigate):
 - *Per-owner gateway targets / per-owner gateways* — a gateway scales to many
@@ -258,11 +285,89 @@ need identity at all for v1 — confirm during implementation.
   may serve those providers' credential storage even though the broker owns the
   GitHub App path.
 
-**Rollout:** direct mode (built) is unaffected and ships first. The broker is a
-distinct, later workstream (its own tool-surface implementation per provider);
-gateway mode stays `LOG_ONLY` until it lands. `github_client`'s minting is shared
-between direct mode and the broker (extract to `agents/shared` or an importable
-module).
+**Rollout (done):** the broker is built (`infra/dispatch/scm_broker.py`) and is
+the GitHub gateway target. It curates exactly the tools the agents' Cedar grants
+use (`fleet_policy.AGENT_TOOL_GRANTS` ∪ `WRITE_TOOLS`), exposes NO destructive
+tool, keeps the target Name `GitHubTarget` (so the existing Cedar action names and
+`fleet_policy` are unchanged), and reuses `infra/dispatch/github_app.py`'s
+per-owner minting — the same minting direct-mode uses. The gateway can flip to
+`ACTIVE` once the live `tools/list` is reconciled; the broker's inline tool schema
+is generated from `scm_broker.tool_definitions()` and guarded by
+`test_scm_broker.py` against drift. GitLab/Bitbucket plug in behind the same
+provider-agnostic tool surface later.
+
+---
+
+### 3.7 Full multi-repo model — co-repo grouping + per-agent access
+
+Two orthogonal controls make the fleet "full multi-repo" in the sense the fleet
+requires: (a) **which repos may run together**, and (b) **which agent gets which
+access to each product**. Both are enforced deterministically, and — critically —
+at the layer that can actually see the trusted inputs.
+
+**Multi-owner / mixed personal + org.** The per-owner installation model (§3.2,
+O-1) already spans owners: one App, N installations keyed by owner. A group or
+`all` set freely mixes `alice/x`, `acme/y`, `bob/z` — the token minter resolves
+each repo to its owner's installation and mints per owner. Nothing here is
+single-owner.
+
+**(a) Co-repo grouping — "approved to run with specific others OR all."** A repo
+is not a bare `multi_repo_eligible` boolean. Each repo declares, for a dispatch
+that ORIGINATES in it, which other repos that dispatch may act on
+(`co_repo_mode`):
+
+| mode | a dispatch from this repo may act on |
+|---|---|
+| `isolated` (default) | only this repo |
+| `group` | this repo + every eligible repo sharing its `repo_group` (mutual, spans owners) |
+| `all` | this repo + every eligible repo in the fleet |
+
+`config_store.coreachable_repos(origin)` / `fleet_config.coreachable_repos(origin)`
+resolve that set (identical logic, two packages, one schema contract).
+
+**Where it's enforced — the trusted origin header + the interceptor + the token.**
+The fleet is **gateway-only** (§3.5): every tool call flows agent → Gateway →
+interceptor → broker, so there is one enforcement path. Cedar's principal is the
+agent's runtime role, identical across every dispatch, so Cedar **cannot** express
+"a dispatch from A may touch B and C but not D" — it only knows the agent, not the
+origin. The origin travels as a **trusted request header** (`x-dispatch-origin`),
+stamped by the agent runtime when it builds the gateway client — runtime code that
+runs *before* the model, so the model can't forge it (it controls tool arguments,
+never transport headers). Enforcement is then layered:
+
+1. **REQUEST interceptor** (`scm_interceptor.py`, runs at the gateway before the
+   broker): reads `x-dispatch-origin`, computes `coreachable_repos(origin)`, and
+   **rejects** any tool call whose `owner/repo` isn't co-approved — with an MCP
+   error, before it reaches GitHub. It injects the trusted origin + agent into the
+   tool args as server truth.
+2. **Broker** (`scm_broker.py`): re-checks the same grouping (defense in depth),
+   then mints an installation token scoped to *that one repo* with the per-agent∩
+   per-tool permission set — so even a bug in layer 1 can't yield a broad
+   credential.
+
+Cedar's `allowed_repos()` allowlist remains a further defense-in-depth master gate
+(eligible+active set, not the per-origin group).
+
+**(b) Per-agent product access.** Each agent gets exactly the GitHub access its
+role needs, enforced two ways: Cedar per-agent tool grants at the gateway
+(`AGENT_TOOL_GRANTS`) AND the minted token's `permissions` — the broker intersects
+the agent's tier with the specific tool's least-privilege need, so the credential
+itself can't exceed the role (e.g. adr calling a code-write tool still only gets
+`contents:read`). Source of truth: `fleet_policy.AGENT_GITHUB_PERMISSIONS`,
+mirrored (with an equality test) by `scm_broker.AGENT_GITHUB_PERMISSIONS`:
+
+| Agent | contents | issues | pull_requests | Net capability |
+|---|---|---|---|---|
+| **workitems** | — | write | read | manage issues; **no code, no PRs** |
+| **docwriter** | write | write | write | open doc **PRs** + push code |
+| **adr** | read | write | read | read code + comment/label; **no code write, no PR** |
+| **researcher** | — | — | — | **no GitHub at all** (Asana-only) |
+
+The gateway broker additionally scopes each *tool call* to the least permission
+that specific tool needs (a read tool's token can't write). So access is bounded
+three ways — per-agent tier (credential), per-tool least privilege (broker), and
+the Cedar tool-grant allowlist (gateway) — and the destructive forbid still blocks
+merge/delete/close everywhere.
 
 ---
 
@@ -328,19 +433,16 @@ The modal from the just-shipped change is the entry point. Additions:
 2. **Backfill** existing repo records: a one-shot that resolves `owner_type` +
    `installation_id` for each already-onboarded repo (fails loudly for any repo
    the App isn't installed on — the admin gets a list to install).
-3. **Cut over** each call site to token minting behind a flag
-   (`GITHUB_AUTH_MODE=app|pat`), default `pat` → flip to `app` per stage after
-   verifying live. ✅ **DONE for direct mode** — the three GitHub agents and the
-   reply Lambda mint per-owner tokens in app mode (gateway mode still pending the
-   §3.6 broker). Flip a stage by setting `GitHubAuthMode=app` on the foundation
-   stack and the `GITHUB_AUTH_MODE=app` repo var for agent deploys.
-4. **Retire the PAT**: delete the SSM param + IAM grants once all stages are on
-   `app` and the gateway path (§3.6) is confirmed. Still pending — the PAT
-   remains the default and the fallback while `app` rolls out per stage.
-5. Gateway mode lags direct mode: it needs the broker Lambda target (§3.6), a
-   separate workstream. Until it ships, gateway mode stays `LOG_ONLY` and GitHub
-   calls that route through the gateway use whatever outbound cred the target has
-   — so keep GitHub in **direct mode** until the broker lands.
+3. **Cut over** each call site to token minting. ✅ **DONE** — the three GitHub
+   agents and the reply Lambda mint per-owner tokens unconditionally; the
+   `GITHUB_AUTH_MODE` flag has been removed (there is no PAT path left to select).
+4. **Retire the PAT**: ✅ **DONE** — the `/sdlc-agents/github-mcp-token` SSM param
+   and every IAM grant on it are gone (router, gateway role, bootstrap, agent
+   runtime roles). Agents/reply/broker all mint per-owner App tokens.
+5. Gateway mode: ✅ **DONE** — the SCM broker Lambda target (§3.6) is the GitHub
+   gateway target and mints per-owner tokens per call, so gateway mode no longer
+   lags direct mode. The engine can move `LOG_ONLY → ACTIVE` once the live tool
+   manifest is reconciled (`scripts/check_gateway_manifest.py`).
 
 ---
 

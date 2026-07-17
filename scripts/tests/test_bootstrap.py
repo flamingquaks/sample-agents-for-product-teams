@@ -105,17 +105,23 @@ def test_agent_role_policies_baseline_and_ssm():
     )
     assert "table/dispatch-assignments-dev" in json.dumps(pols["dynamodb-assignments"])
     ssm = json.dumps(pols["ssm-read"])
-    assert "asana-mcp-*" in ssm and "github-mcp-*" in ssm and "asana-pat" in ssm
+    # ssm-read covers only Asana credentials; no GitHub PAT (retired).
+    assert "asana-mcp-*" in ssm and "asana-pat" in ssm and "github-mcp" not in ssm
+    # Gateway-only: agents do NOT hold GitHub App credentials (the broker mints
+    # server-side). No github-app policy on any agent role.
+    assert "github-app" not in pols
+    # They CAN invoke the gateway (SigV4) — that's how they reach GitHub tools.
+    assert "agentcore-gateway-invoke" in pols
+    assert "bedrock-agentcore:InvokeGateway" in json.dumps(pols["agentcore-gateway-invoke"])
 
 
-def test_adr_role_is_github_only():
-    ssm = json.dumps(
-        bootstrap.agent_role_policies("adr", "us-west-2", "123456789012", "dev")[
-            "ssm-read"
-        ]
-    )
-    assert "github-mcp-*" in ssm
-    assert "asana" not in ssm
+def test_adr_role_has_no_github_creds_or_asana():
+    pols = bootstrap.agent_role_policies("adr", "us-west-2", "123456789012", "dev")
+    # adr touches GitHub only, but gateway-only means no App creds and (having no
+    # Asana) no ssm-read at all — it reaches GitHub purely via the gateway.
+    assert "ssm-read" not in pols
+    assert "github-app" not in pols
+    assert "agentcore-gateway-invoke" in pols
 
 
 def test_agent_role_policies_stage_scopes_table():
@@ -176,16 +182,18 @@ def test_deploy_role_policy_is_scoped_not_admin():
     assert "AdministratorAccess" not in blob
     assert not any(s.get("Action") == "*" for s in pol["Statement"])
     sids = {s.get("Sid") for s in pol["Statement"]}
-    assert {"EcrPushPull", "AgentCoreRuntime", "PassAgentRuntimeRoles"} <= sids
+    assert {"EcrPushPull", "AgentCoreRuntime", "PassAgentCoreRoles"} <= sids
     # The @mention dispatch path (agent-dispatch.yml) invokes the router Lambda —
     # the scoped role must grant it (regression: it was missing, so every
     # dispatch would have 403'd under the scoped role).
     invoke = next(s for s in pol["Statement"] if s["Sid"] == "InvokeDispatchRouter")
     assert invoke["Action"] == "lambda:InvokeFunction"
     assert ":function:dispatch-router-*" in invoke["Resource"]
-    # PassRole is limited to the per-agent runtime roles + the agentcore service.
-    passrole = next(s for s in pol["Statement"] if s["Sid"] == "PassAgentRuntimeRoles")
-    assert passrole["Resource"].endswith(":role/*-agentcore-runtime")
+    # PassRole is limited to the per-agent runtime roles + the gateway service
+    # role (both passed to bedrock-agentcore), never a wildcard.
+    passrole = next(s for s in pol["Statement"] if s["Sid"] == "PassAgentCoreRoles")
+    assert any(r.endswith(":role/*-agentcore-runtime") for r in passrole["Resource"])
+    assert any(r.endswith(":role/sdlc-fleet-gateway-*") for r in passrole["Resource"])
     assert (
         passrole["Condition"]["StringEquals"]["iam:PassedToService"]
         == "bedrock-agentcore.amazonaws.com"

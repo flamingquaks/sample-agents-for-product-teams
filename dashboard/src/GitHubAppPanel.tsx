@@ -78,20 +78,6 @@ export function GitHubAppPanel({
     }
   };
 
-  // Only shown when the fleet is in App auth mode; PAT mode has no App to set up.
-  if (status && status.auth_mode !== "app") {
-    return (
-      <div className="panel">
-        <h3>GitHub access</h3>
-        <p className="muted">
-          Fleet is in <code>pat</code> mode (shared token). Set{" "}
-          <code>GitHubAuthMode=app</code> on the stack to use per-owner GitHub App
-          credentials, then set up the App here.
-        </p>
-      </div>
-    );
-  }
-
   return (
     <div className="panel">
       <h3>GitHub App</h3>

@@ -12,8 +12,6 @@ import os
 import sys
 
 from strands import Agent
-from strands.tools.mcp import MCPClient
-from mcp.client.streamable_http import streamablehttp_client
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from strands_tools.agent_core_memory import AgentCoreMemoryToolProvider
 
@@ -28,7 +26,7 @@ from tools.analyze_backlog import analyze_backlog
 from tools.draft_user_stories import draft_user_stories
 from tools.post_results import post_results
 from tools.web_search import web_search
-from tools.asana_mcp import get_access_token, ASANA_MCP_URL
+from shared.tools import gateway
 
 # --- Logging -----------------------------------------------------------------
 # Configure root logger to emit to stdout so AgentCore's OTel sidecar captures
@@ -114,18 +112,11 @@ def invoke(payload, context=None):
         )
         tools.extend(memory_provider.tools)
 
-    # Asana MCP — official server with OAuth (Researcher's only external platform)
-    asana_token = get_access_token()
-    asana_client = MCPClient(
-        lambda: streamablehttp_client(
-            ASANA_MCP_URL,
-            headers={"Authorization": f"Bearer {asana_token}"},
-        )
-    )
-
-    with asana_client:
-        asana_tools = asana_client.list_tools_sync()
-        all_tools = [*asana_tools, *tools]
+    # Gateway-only: route through the AgentCore Gateway (Cedar-enforced, SigV4).
+    # Researcher is Asana-only and touches no GitHub, so no dispatch origin — just
+    # its agent id (for per-principal tool filtering at the gateway).
+    with gateway.build_gateway_client(agent=ACTOR_ID) as gw:
+        all_tools = [*gw.list_tools_sync(), *tools]
 
         agent = Agent(
             model=model,

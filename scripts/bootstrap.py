@@ -181,29 +181,23 @@ def save_config(cfg: dict) -> None:
 
 
 AGENT_SSM: dict[str, list[str]] = {
-    "workitems": ["asana-mcp-*", "asana-pat", "github-mcp-*"],
+    "workitems": ["asana-mcp-*", "asana-pat"],
     "researcher": ["asana-mcp-*", "researcher-tavily-api-key"],
-    "docwriter": ["asana-mcp-*", "github-mcp-*"],
-    "adr": ["github-mcp-*"],
-}
-
-# Agents that talk to GitHub — get the GitHub App credential grants (Secrets
-# Manager key + app-id SSM + per-owner install record) for GITHUB_AUTH_MODE=app.
-# Derived from AGENT_SSM so it can't drift from the PAT grant set. (researcher is
-# Asana-only, so it's excluded.)
-GITHUB_AGENTS: set[str] = {
-    a for a, s in AGENT_SSM.items() if any(x.startswith("github-mcp") for x in s)
+    "docwriter": ["asana-mcp-*"],
+    "adr": [],
 }
 
 # Concrete leaf SSM params the secret preflight probes (agents fail at
-# invocation, not deploy, when these are absent).
+# invocation, not deploy, when these are absent). GitHub agents authenticate via
+# the App (app-id SSM param + private-key secret), not a PAT — those are seeded
+# by the stack and populated by the admin manifest flow, so they're not probed as
+# operator-set secrets here.
 AGENT_REQUIRED_SSM: dict[str, list[str]] = {
     "workitems": [
         "asana-pat",
         "asana-mcp-client-id",
         "asana-mcp-client-secret",
         "asana-mcp-refresh-token",
-        "github-mcp-token",
     ],
     "researcher": [
         "asana-mcp-client-id",
@@ -215,9 +209,8 @@ AGENT_REQUIRED_SSM: dict[str, list[str]] = {
         "asana-mcp-client-id",
         "asana-mcp-client-secret",
         "asana-mcp-refresh-token",
-        "github-mcp-token",
     ],
-    "adr": ["github-mcp-token"],
+    "adr": [],
 }
 
 
@@ -306,39 +299,12 @@ def agent_role_policies(
                 }
             ],
         }
-    # GitHub App mode (GITHUB_AUTH_MODE=app): the GitHub-touching agents mint
-    # per-owner installation tokens, which needs the App private key (Secrets
-    # Manager), the app-id (SSM String), and the per-owner install record
-    # (fleet-config table). Granted to every agent that reads GitHub; the grants
-    # are harmless in PAT mode (the code just doesn't call them). The resource
-    # names mirror the DashboardEnabled resources in the foundation template.
-    if agent in GITHUB_AGENTS:
-        policies["github-app"] = {
-            "Version": "2012-10-17",
-            "Statement": [
-                {
-                    "Effect": "Allow",
-                    "Action": "secretsmanager:GetSecretValue",
-                    "Resource": (
-                        f"arn:aws:secretsmanager:{region}:{account}:secret:"
-                        f"sdlc-agents/{stage}/github-app/private-key-*"
-                    ),
-                },
-                {
-                    "Effect": "Allow",
-                    "Action": "ssm:GetParameter",
-                    "Resource": (
-                        f"arn:aws:ssm:{region}:{account}:parameter"
-                        f"/sdlc-agents/{stage}/github-app-id"
-                    ),
-                },
-                {
-                    "Effect": "Allow",
-                    "Action": "dynamodb:GetItem",
-                    "Resource": f"arn:aws:dynamodb:{region}:{account}:table/fleet-config-{stage}",
-                },
-            ],
-        }
+    # NOTE: agents do NOT get GitHub App credential grants. The fleet is
+    # gateway-only — agents never mint GitHub tokens; they SigV4-invoke the
+    # gateway (agentcore-gateway-invoke, above), and the SCM broker + interceptor
+    # Lambdas (in the foundation stack) hold the App key + mint per-owner,
+    # repo-and-permission-scoped tokens server-side. Keeping GitHub creds off the
+    # agent roles is the least-privilege win of the gateway-only model.
     return policies
 
 
@@ -1012,7 +978,8 @@ def check_secrets(runner: Runner, agents: list[str]) -> None:
             "    Asana:  python scripts/bootstrap_asana_oauth.py  (+ asana-pat / MCP client creds)"
         )
         print(
-            "    GitHub: set /sdlc-agents/github-mcp-token (PAT) or the GitHub App params"
+            "    GitHub: register the fleet GitHub App in the dashboard admin UI "
+            "(populates the app-id SSM param + private-key secret)"
         )
         print("    Tavily: set /sdlc-agents/researcher-tavily-api-key")
 

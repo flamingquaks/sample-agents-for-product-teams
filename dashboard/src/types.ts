@@ -71,6 +71,10 @@ export interface RepoConfig {
   repo: string;
   enabled: boolean;
   multi_repo_eligible: boolean;
+  /** Which OTHER repos a dispatch originating here may act on:
+   *  "isolated" (only itself), "group" (its repo_group peers), "all". */
+  co_repo_mode?: "isolated" | "group" | "all" | string;
+  repo_group?: string;
   status?: string;
   onboarded_by?: string;
   onboarded_at?: number;
@@ -85,7 +89,6 @@ export interface FleetSettings {
 /** GitHub App registration status for the admin setup panel. */
 export interface GitHubAppStatus {
   configured: boolean;
-  auth_mode: "pat" | "app" | string;
   slug?: string | null;
   install_url?: string | null;
 }

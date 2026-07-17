@@ -7,7 +7,7 @@ closed); the read API's operators can view but not configure.
 
 Routes (all admin-only):
     GET    /admin/repos                  list onboarded repos
-    POST   /admin/repos                  onboard/update a repo (body: repo, enabled?, multi_repo_eligible?)
+    POST   /admin/repos                  onboard/update a repo (body: repo, enabled?, multi_repo_eligible?, co_repo_mode?, repo_group?)
     DELETE /admin/repos/{repo}           remove a repo
     GET    /admin/settings               get fleet settings
     PUT    /admin/settings               update settings (body: restrict_repos)
@@ -97,24 +97,13 @@ def _sync_after_write(log_msg: str, error_msg: str) -> dict | None:
         return None
 
 
-def _github_app_mode() -> bool:
-    """Whether onboarding must verify a GitHub App installation (GITHUB_AUTH_MODE
-    =app) vs the legacy PAT path (default). Behind a flag so the App capability
-    rolls out per stage without breaking existing PAT-mode deploys (spec §6)."""
-    return os.environ.get("GITHUB_AUTH_MODE", "pat").lower() == "app"
-
-
 def _verify_github_install(repo: str):
     """Verify the GitHub App is installed on ``repo``'s owner and can reach the
-    repo. Returns ``(installation_id, None)`` on success, ``(None, None)`` when
-    App mode is off (no verification), or ``(None, <response>)`` where response is
-    a ready 409/502 to return to the caller.
+    repo. Returns ``(installation_id, None)`` on success, or ``(None, <response>)``
+    where response is a ready 409/502 to return to the caller.
 
     409s are actionable: "not installed" carries the install deep-link; "not
     covered" tells the admin the repo isn't in the installation's selection."""
-    if not _github_app_mode():
-        return None, None  # PAT mode — skip verification (legacy behavior)
-
     import github_client
 
     if not github_client.app_configured():
@@ -209,8 +198,24 @@ def _route(event: dict) -> dict:
                 return error(400, "body.repo must be 'owner/repo'")
             enabled = bool(body.get("enabled", True))
             eligible = bool(body.get("multi_repo_eligible", True))
-            # GitHub App verification (when GITHUB_AUTH_MODE=app) gates bringing a
-            # repo INTO the fleet — confirm the App is installed on the owner and
+            # Co-repo rule: which OTHER repos a dispatch originating here may reach
+            # (isolated|group|all). Validate the enum and the group-label shape so
+            # a bad value can't silently widen reach or smuggle metacharacters.
+            co_repo_mode = (body.get("co_repo_mode") or config_store.CO_REPO_ISOLATED).strip()
+            if co_repo_mode not in config_store.CO_REPO_MODES:
+                return error(
+                    400,
+                    "body.co_repo_mode must be one of "
+                    f"{list(config_store.CO_REPO_MODES)}",
+                )
+            repo_group = (body.get("repo_group") or "").strip() or None
+            if co_repo_mode == config_store.CO_REPO_GROUP:
+                if not repo_group:
+                    return error(400, "body.repo_group is required when co_repo_mode='group'")
+                if not _REPO_SEGMENT.match(repo_group):
+                    return error(400, "body.repo_group must match [A-Za-z0-9._-]")
+            # GitHub App verification gates bringing a repo INTO the fleet —
+            # confirm the App is installed on the owner and
             # can reach the repo BEFORE a NEW onboard, so we never silently
             # activate an unreachable repo. It must NOT gate UPDATES to an
             # already-onboarded repo: an admin has to be able to disable/adjust a
@@ -244,6 +249,8 @@ def _route(event: dict) -> dict:
                 repo,
                 enabled=enabled,
                 multi_repo_eligible=eligible,
+                co_repo_mode=co_repo_mode,
+                repo_group=repo_group,
                 onboarded_by=auth.caller_sub(event),
                 status="active",
                 installation_id=installation_id,
@@ -342,7 +349,6 @@ def _route(event: dict) -> dict:
         return ok(
             {
                 "configured": configured,
-                "auth_mode": os.environ.get("GITHUB_AUTH_MODE", "pat").lower(),
                 "slug": slug,
                 "install_url": install,
             }

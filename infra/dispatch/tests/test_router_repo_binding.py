@@ -33,17 +33,27 @@ def _make_table():
     )
 
 
-def _put_repo(repo, *, enabled=True, eligible=True, status="active"):
-    boto3.resource("dynamodb", region_name=REGION).Table(TABLE).put_item(
-        Item={
-            "pk": f"repo#{repo.casefold()}",
-            "kind": "repo",
-            "repo": repo,
-            "enabled": enabled,
-            "multi_repo_eligible": eligible,
-            "status": status,
-        }
-    )
+def _put_repo(
+    repo,
+    *,
+    enabled=True,
+    eligible=True,
+    status="active",
+    co_repo_mode="isolated",
+    repo_group=None,
+):
+    item = {
+        "pk": f"repo#{repo.casefold()}",
+        "kind": "repo",
+        "repo": repo.casefold(),
+        "enabled": enabled,
+        "multi_repo_eligible": eligible,
+        "status": status,
+        "co_repo_mode": co_repo_mode,
+    }
+    if repo_group:
+        item["repo_group"] = repo_group
+    boto3.resource("dynamodb", region_name=REGION).Table(TABLE).put_item(Item=item)
 
 
 def _put_settings(*, restrict_repos):
@@ -144,6 +154,52 @@ def test_restricted_allows_eligible_repo(modules):
     _put_repo("acme/web", eligible=True)
     fc.reset_cache()
     assert router.check_repo_allowed("github", {"repo": "acme/web"}) is True
+
+
+# --- co-repo reach (dispatch-side mirror) ------------------------------------
+
+
+def test_coreachable_isolated_is_self_only(modules):
+    _, fc = modules
+    _put_repo("acme/web", co_repo_mode="isolated")
+    fc.reset_cache()
+    assert fc.coreachable_repos("acme/web") == ["acme/web"]
+
+
+def test_coreachable_group_spans_owners(modules):
+    _, fc = modules
+    _put_repo("acme/web", co_repo_mode="group", repo_group="platform")
+    _put_repo("acme/api", co_repo_mode="group", repo_group="platform")
+    _put_repo("bob/tool", co_repo_mode="group", repo_group="platform")
+    _put_repo("zed/x", co_repo_mode="group", repo_group="other")
+    fc.reset_cache()
+    reach = fc.coreachable_repos("acme/web")
+    assert reach[0] == "acme/web"  # origin first
+    assert set(reach) == {"acme/web", "acme/api", "bob/tool"}
+    assert "zed/x" not in reach
+
+
+def test_coreachable_all_mode(modules):
+    _, fc = modules
+    _put_repo("acme/hub", co_repo_mode="all")
+    _put_repo("bob/svc", co_repo_mode="isolated")
+    fc.reset_cache()
+    assert set(fc.coreachable_repos("acme/hub")) == {"acme/hub", "bob/svc"}
+
+
+def test_coreachable_unknown_origin_fails_closed(modules):
+    _, fc = modules
+    assert fc.coreachable_repos("ghost/x") == []
+
+
+def test_cross_repo_eligible_gate(modules):
+    _, fc = modules
+    _put_repo("acme/web", eligible=True)
+    _put_repo("acme/ro", eligible=False)
+    fc.reset_cache()
+    assert fc.is_repo_cross_repo_eligible("acme/web") is True
+    assert fc.is_repo_cross_repo_eligible("acme/ro") is False
+    assert fc.is_repo_cross_repo_eligible("ghost/x") is False
 
 
 # --- non-GitHub sources always pass ------------------------------------------

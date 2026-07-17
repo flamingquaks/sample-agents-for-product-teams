@@ -245,6 +245,34 @@ AGENT_TOOL_GRANTS = {
 }
 
 
+# Per-agent GitHub App PERMISSION tier — the credential-layer form of the
+# per-agent access differentiation (a docwriter may push code + open PRs; a
+# workitems may only manage issues; an adr may read code + comment but never
+# write code or PRs; researcher touches no GitHub). This is the SOURCE OF TRUTH,
+# mirrored by infra/dispatch/scm_broker.AGENT_GITHUB_PERMISSIONS (the broker mints
+# the scoped token from it); a cross-package test asserts they're equal.
+# It complements AGENT_TOOL_GRANTS (the gateway tool allowlist): the Cedar grants
+# scope WHICH TOOLS an agent may call at the gateway, and these permissions scope
+# WHAT THE CREDENTIAL CAN DO — so even in direct mode (no gateway) an agent can't
+# exceed its tier. metadata:read is implicit for every installation token.
+AGENT_GITHUB_PERMISSIONS = {
+    "workitems": {"issues": "write", "pull_requests": "read", "metadata": "read"},
+    "docwriter": {
+        "contents": "write",
+        "issues": "write",
+        "pull_requests": "write",
+        "metadata": "read",
+    },
+    "adr": {
+        "contents": "read",
+        "issues": "write",
+        "pull_requests": "read",
+        "metadata": "read",
+    },
+    "researcher": {},
+}
+
+
 def runtime_role_arn(account_id: str, agent: str) -> str:
     """The assumed-role ARN an agent's runtime presents to the gateway. Matches
     the ``<agent>-agentcore-runtime`` role bootstrap creates; the ``assumed-role``

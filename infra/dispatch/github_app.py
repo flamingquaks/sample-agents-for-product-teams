@@ -1,14 +1,15 @@
-"""GitHub App installation-token minting for the dispatch reply Lambda.
+"""GitHub App installation-token minting for the dispatch-side Lambdas.
 
-The reply Lambda posts a short "blocked by safety filter" note back to the
-originating GitHub issue/PR. When ``GITHUB_AUTH_MODE=app`` it authenticates as
-the fleet's GitHub App with a per-owner installation token (bounded to that
-owner's installed repos — threat-model T-11) instead of the shared PAT.
+Used by BOTH the dispatch reply Lambda (posts a "blocked by safety filter" note
+to the originating issue/PR) and the SCM broker (``scm_broker.py``, the gateway's
+GitHub tool target). Both mint a per-owner GitHub App installation token via
+``scoped_installation_token`` — bounded to a single repo + an explicit permission
+set (threat-model T-11). The legacy shared PAT and its ``GITHUB_AUTH_MODE``
+selector have been retired — the App is the only credential model.
 
-This is the dispatch-side mirror of infra/dashboard/github_client.py and
-agents/shared/tools/github_app.py — same JWT/token mechanics, but built on
-``requests`` (already a dispatch dependency) and resolving the installation id
-from the fleet-config DynamoDB table's per-owner record (written at onboard).
+This is the dispatch-side mirror of infra/dashboard/github_client.py — same
+JWT/token mechanics, built on ``requests`` (a dispatch dependency), resolving the
+installation id from the fleet-config DynamoDB table's per-owner record.
 """
 
 import calendar
@@ -41,10 +42,6 @@ _TOKEN_REFRESH_MARGIN = 60
 
 class GitHubAppError(Exception):
     """Minting a GitHub App installation token failed."""
-
-
-def app_mode() -> bool:
-    return os.environ.get("GITHUB_AUTH_MODE", "pat").lower() == "app"
 
 
 def _sm():
@@ -150,16 +147,31 @@ def _installation_id_for(owner: str) -> int:
     raise GitHubAppError(f"no GitHub App installation found for owner '{owner}'")
 
 
-def installation_token_for_repo(repo: str) -> str:
-    """A short-lived installation token scoped to ``repo``'s owner. ``repo`` is
-    ``owner/repo``. Raises GitHubAppError on failure."""
-    owner = (repo or "").split("/", 1)[0]
-    if not owner:
-        raise GitHubAppError("repo/owner required to mint an installation token")
+# The reply Lambda only posts a "blocked by safety filter" comment on the repo
+# the mention originated in — so its token is scoped to THAT ONE repo with only
+# issues:write (the minimum to comment). It never touches code or other repos, so
+# there's no co-repo set to resolve here — just the single origin repo.
+_REPLY_PERMISSIONS = {"issues": "write", "metadata": "read"}
+
+
+def scoped_installation_token(repo: str, *, permissions: dict[str, str]) -> str:
+    """A short-lived installation token scoped to EXACTLY ``repo`` (``owner/repo``)
+    with exactly ``permissions`` (a subset of the App's permission set). Cached per
+    (installation, repo, permission-set). This is the least-privilege primitive the
+    reply Lambda and the SCM broker both mint through — the token can touch only
+    the one named repo and only with the permissions the caller asked for.
+    Raises GitHubAppError on failure."""
+    parts = (repo or "").split("/", 1)
+    owner = parts[0]
+    name = parts[1] if len(parts) == 2 else ""
+    if not owner or not name:
+        raise GitHubAppError("owner/repo required to mint an installation token")
     installation_id = _installation_id_for(owner)
 
     now = time.time()
-    cached = _token_cache.get(installation_id)
+    perm_key = tuple(sorted(permissions.items()))
+    cache_key = (installation_id, name, perm_key)
+    cached = _token_cache.get(cache_key)
     if cached and now < cached[1] - _TOKEN_REFRESH_MARGIN:
         return cached[0]
 
@@ -170,6 +182,7 @@ def installation_token_for_repo(repo: str) -> str:
             "Accept": _ACCEPT,
             "X-GitHub-Api-Version": _API_VERSION,
         },
+        json={"repositories": [name], "permissions": permissions},
         timeout=10,
     )
     if resp.status_code not in (200, 201):
@@ -187,5 +200,11 @@ def installation_token_for_repo(repo: str) -> str:
         )
     except (ValueError, TypeError):
         exp_epoch = now + 3300
-    _token_cache[installation_id] = (token, exp_epoch)
+    _token_cache[cache_key] = (token, exp_epoch)
     return token
+
+
+def installation_token_for_repo(repo: str) -> str:
+    """Reply-Lambda token: scoped to exactly ``repo`` with comment-only
+    permissions (issues:write). Thin wrapper over ``scoped_installation_token``."""
+    return scoped_installation_token(repo, permissions=_REPLY_PERMISSIONS)

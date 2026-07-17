@@ -52,32 +52,17 @@ Parameters:
       before flipping to ACTIVE. Applied to both the initial CFN policy and the
       admin Lambda's runtime policy sync (via FLEET_POLICY_ENFORCEMENT).
 
-  GitHubMcpEndpoint:
-    Type: String
-    Default: "https://api.githubcopilot.com/mcp/"
-    Description: GitHub MCP server endpoint registered as a gateway target.
-
   AsanaMcpEndpoint:
     Type: String
     Default: "https://mcp.asana.com/v2/mcp"
     Description: Asana MCP server endpoint registered as a gateway target.
-
-  GitHubAuthMode:
-    Type: String
-    Default: "pat"
-    AllowedValues: ["pat", "app"]
-    Description: >
-      GitHub credential model. "pat" (default) = the legacy shared SSM token.
-      "app" = per-owner GitHub App installation tokens; onboarding then verifies
-      the App is installed on a repo's owner and can reach the repo before
-      activating it. Roll out per stage after registering the App in the admin UI.
 
   GitHubAppName:
     Type: String
     Default: "SDLC Agent Fleet"
     Description: >
       Display name used when registering the fleet's GitHub App from the admin
-      UI manifest flow (GitHubAuthMode=app). Must be unique across GitHub.
+      UI manifest flow. Must be unique across GitHub.
 
 Conditions:
   DashboardEnabled: !Equals [!Ref DeployDashboard, "true"]
@@ -100,20 +85,6 @@ Rules:
         AssertDescription: >-
           DeployGateway=true requires DeployDashboard=true — the admin API owns
           the Gateway Cedar policy sync.
-
-  # GitHub App mode depends on the App credential resources (Secrets Manager key,
-  # app-id SSM param) and the per-owner install records, all owned by the
-  # dashboard/admin onboarding path. Enabling app mode without the dashboard
-  # would point the agents + reply Lambda at a secret/param/table that isn't
-  # provisioned. Fail fast instead of shipping a stack that 500s at first use.
-  GitHubAppModeRequiresDashboard:
-    RuleCondition: !Equals [!Ref GitHubAuthMode, "app"]
-    Assertions:
-      - Assert: !Equals [!Ref DeployDashboard, "true"]
-        AssertDescription: >-
-          GitHubAuthMode=app requires DeployDashboard=true — the GitHub App
-          credential + per-owner install records are provisioned by the admin
-          onboarding path.
 
 Globals:
   Function:
@@ -222,16 +193,21 @@ Resources:
           Value: sdlc-agents
 
   # ---------------------------------------------------------------------------
-  # GitHub App credentials (GitHubAuthMode=app) — created empty, populated by
-  # the admin manifest flow. Private key → Secrets Manager (rotation, resource
-  # policy, staged versions); app id + slug → SSM String (not secret). See
-  # docs/specs/github-onboarding-spec.md §3.2. Gated on DashboardEnabled — the
-  # admin Lambda is what reads/writes them.
+  # GitHub App credentials — the fleet's ONLY GitHub credential model (the shared
+  # PAT was retired). Created empty; populated by the admin manifest flow. Private
+  # key → Secrets Manager (rotation, resource policy, staged versions); app id +
+  # slug → SSM String (not secret). See docs/specs/github-onboarding-spec.md §3.2.
+  #
+  # UNCONDITIONAL (not DashboardEnabled-gated): the agent runtimes and the
+  # always-on dispatch reply Lambda mint per-owner installation tokens from these
+  # resources, so they must exist whether or not the dashboard is deployed. Only
+  # REGISTERING/populating the App (the manifest flow) lives in the opt-in
+  # dashboard — deploying the dashboard once is the documented prerequisite to
+  # actually use GitHub (like the manual GitHub-App registration step itself).
   # ---------------------------------------------------------------------------
 
   GitHubAppPrivateKey:
     Type: AWS::SecretsManager::Secret
-    Condition: DashboardEnabled
     Properties:
       Name: !Sub sdlc-agents/${Stage}/github-app/private-key
       Description: GitHub App private key (PEM) — written by the admin manifest flow
@@ -241,7 +217,6 @@ Resources:
 
   GitHubAppIdParam:
     Type: AWS::SSM::Parameter
-    Condition: DashboardEnabled
     Properties:
       Name: !Sub /sdlc-agents/${Stage}/github-app-id
       Type: String
@@ -251,7 +226,6 @@ Resources:
 
   GitHubAppSlugParam:
     Type: AWS::SSM::Parameter
-    Condition: DashboardEnabled
     Properties:
       Name: !Sub /sdlc-agents/${Stage}/github-app-slug
       Type: String
@@ -372,19 +346,16 @@ Resources:
           REGISTRY_PARAM: !Sub /sdlc-agents/${Stage}/registry
           BEDROCK_GUARDRAIL_ID: !Ref PromptInjectionGuardrail
           BEDROCK_GUARDRAIL_VERSION: DRAFT
-          GITHUB_PAT_PARAM: /sdlc-agents/github-mcp-token
           ASANA_PAT_PARAM: /sdlc-agents/asana-pat
           CLOUDWATCH_NAMESPACE: SDLCAgents/Dispatch
           FLEET_CONFIG_TABLE: !Ref FleetConfigTable
-          # GitHub credential model for reply.py. "app" mints per-owner GitHub
-          # App installation tokens (needs the App resources below, dashboard-
-          # gated); default "pat" uses the shared token. The App id param + key
-          # secret ARN are only real when the dashboard is deployed — the App
-          # resources are DashboardEnabled-gated and a deploy Rule requires
-          # DeployDashboard=true whenever GitHubAuthMode=app.
-          GITHUB_AUTH_MODE: !Ref GitHubAuthMode
-          GITHUB_APP_ID_PARAM: !If [DashboardEnabled, !Ref GitHubAppIdParam, !Ref "AWS::NoValue"]
-          GITHUB_APP_PRIVATE_KEY_SECRET_ARN: !If [DashboardEnabled, !Ref GitHubAppPrivateKey, !Ref "AWS::NoValue"]
+          # reply.py mints per-owner GitHub App installation tokens (the shared
+          # PAT was retired). The App id param + key secret ARN are unconditional
+          # resources; the per-owner install record it reads lives in the
+          # fleet-config table (DynamoDBReadPolicy below). Registering the App
+          # (populating these) is a dashboard-only step — a documented prereq.
+          GITHUB_APP_ID_PARAM: !Ref GitHubAppIdParam
+          GITHUB_APP_PRIVATE_KEY_SECRET_ARN: !Ref GitHubAppPrivateKey
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref AssignmentsTable
@@ -392,22 +363,18 @@ Resources:
             TableName: !Ref FleetConfigTable
         - SSMParameterReadPolicy:
             ParameterName: !Sub sdlc-agents/${Stage}/registry
-        # GitHub App mode (reply.py): read the App private key + app-id to mint
-        # per-owner installation tokens. Dashboard-gated (the resources are), and
-        # a deploy Rule requires the dashboard when GitHubAuthMode=app. The
-        # per-owner install record read is already covered by DynamoDBReadPolicy
-        # on FleetConfigTable above.
-        - !If
-          - DashboardEnabled
-          - Statement:
-              - Effect: Allow
-                Action: secretsmanager:GetSecretValue
-                Resource: !Ref GitHubAppPrivateKey
-              - Effect: Allow
-                Action: ssm:GetParameter
-                Resource:
-                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/github-app-id
-          - !Ref "AWS::NoValue"
+        # GitHub App (reply.py): read the App private key + app-id to mint
+        # per-owner installation tokens (the shared PAT was retired). The App
+        # credential resources are unconditional; the per-owner install record
+        # read is already covered by DynamoDBReadPolicy on FleetConfigTable above.
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref GitHubAppPrivateKey
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/github-app-id
         - Statement:
             - Effect: Allow
               Action:
@@ -424,7 +391,6 @@ Resources:
               Action:
                 - ssm:GetParameter
               Resource:
-                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/github-mcp-token
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/asana-pat
             - Effect: Allow
               Action:
@@ -886,10 +852,9 @@ Resources:
           # are the agents' runtime-role ARNs, resource is the literal gateway).
           FLEET_GATEWAY_ARN: !If [GatewayEnabled, !GetAtt FleetGateway.GatewayArn, !Ref "AWS::NoValue"]
           AWS_ACCOUNT_ID: !If [GatewayEnabled, !Ref "AWS::AccountId", !Ref "AWS::NoValue"]
-          # GitHub App: onboarding verification + manifest flow. Param/secret
-          # names are always passed (the resources exist when the dashboard is
-          # on); GITHUB_AUTH_MODE gates whether verification actually runs.
-          GITHUB_AUTH_MODE: !Ref GitHubAuthMode
+          # GitHub App: onboarding verification + manifest flow. Onboarding
+          # ALWAYS verifies the App is installed on a repo's owner and can reach
+          # the repo before activating it (the PAT path was retired).
           GITHUB_APP_NAME: !Ref GitHubAppName
           GITHUB_APP_ID_PARAM: !Ref GitHubAppIdParam
           GITHUB_APP_SLUG_PARAM: !Ref GitHubAppSlugParam
@@ -1038,11 +1003,13 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              # Read the shared MCP credentials for outbound auth to the targets.
+              # Outbound auth to the Asana target (still a direct McpServer). The
+              # GitHub target is the SCM broker Lambda, which mints its OWN
+              # per-owner App token — the gateway role holds no GitHub credential
+              # (the shared PAT was retired).
               - Effect: Allow
                 Action: ssm:GetParameter
                 Resource:
-                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/github-mcp-token
                   - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/asana-pat
         - PolicyName: policy-engine-eval
           PolicyDocument:
@@ -1095,10 +1062,116 @@ Resources:
       PolicyEngineConfiguration:
         Arn: !GetAtt FleetPolicyEngine.PolicyEngineArn
         Mode: !If [GatewayEnforceActive, "ENFORCE", "LOG_ONLY"]
+      # REQUEST interceptor: enforces per-origin co-repo grouping from the trusted
+      # x-dispatch-origin header (passRequestHeaders lets it see the headers).
+      # Runs before the broker; injects server-truth origin+agent into the call.
+      InterceptorConfigurations:
+        - InterceptionPoints:
+            - REQUEST
+          InputConfiguration:
+            PassRequestHeaders: true
+          Interceptor:
+            Lambda:
+              Arn: !GetAtt ScmInterceptorFunction.Arn
       Tags:
         Project: sdlc-agents
 
-  # GitHub MCP target — the "<TargetName>" (GitHubTarget) that prefixes the
+  # SCM broker Lambda — the GitHub tool target (spec §3.6). Replaces the direct
+  # McpServer→api.githubcopilot.com target, which needed the retired shared PAT
+  # on the gateway role. The broker mints a per-owner GitHub App installation
+  # token per call (bounded to that owner's install — threat-model T-11) and
+  # calls GitHub's REST API. Its Name stays "GitHubTarget" so the generated Cedar
+  # action names (GitHubTarget___<tool>) and fleet_policy keep working unchanged.
+  #
+  # CredentialProviderConfigurations = GATEWAY_IAM_ROLE only (no outbound
+  # OAuth/API-key provider on the target): the gateway invokes the Lambda with
+  # its role; the Lambda itself reads the App key + mints tokens. Cedar still
+  # evaluates every call, so the broker doesn't need the caller identity.
+  #
+  # ToolSchema.InlinePayload is the CURATED tool set (what the agents' Cedar
+  # grants use — fleet_policy.AGENT_TOOL_GRANTS/WRITE_TOOLS), NOT the full GitHub
+  # MCP surface, and NO destructive tools. Generated from scm_broker.tool_
+  # definitions(); infra/dispatch/tests/test_scm_broker.py asserts this inline
+  # copy matches, so regenerate it (python infra/dispatch/scm_broker.py) if the
+  # broker's tool set changes.
+  ScmBrokerFunction:
+    Type: AWS::Serverless::Function
+    Condition: GatewayEnabled
+    # cryptography (github_app signs App JWTs) is a native wheel — build for the
+    # Lambda target, not the build host (same reason as DashboardAdminFunction).
+    Metadata:
+      BuildMethod: python3.12
+    Properties:
+      FunctionName: !Sub scm-broker-${Stage}
+      CodeUri: ../dispatch/
+      Handler: scm_broker.handler
+      Timeout: 30
+      Environment:
+        Variables:
+          FLEET_CONFIG_TABLE: !Ref FleetConfigTable
+          GITHUB_APP_ID_PARAM: !Ref GitHubAppIdParam
+          GITHUB_APP_PRIVATE_KEY_SECRET_ARN: !Ref GitHubAppPrivateKey
+      Policies:
+        # Mint per-owner GitHub App installation tokens: read the App private key
+        # + app-id, and the per-owner install record from the fleet-config table.
+        - DynamoDBReadPolicy:
+            TableName: !Ref FleetConfigTable
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref GitHubAppPrivateKey
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/github-app-id
+
+  # The gateway invokes the broker; allow it (bedrock-agentcore) to call the fn.
+  ScmBrokerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: GatewayEnabled
+    Properties:
+      FunctionName: !Ref ScmBrokerFunction
+      Action: lambda:InvokeFunction
+      Principal: bedrock-agentcore.amazonaws.com
+      SourceArn: !GetAtt FleetGateway.GatewayArn
+
+  # SCM co-repo REQUEST interceptor — runs at the gateway BEFORE the broker (and
+  # before Cedar's target authorization). Reads the trusted x-dispatch-origin
+  # header the agent stamps, enforces per-origin co-repo grouping (which OTHER
+  # repos a dispatch may act on — a rule Cedar can't express because its principal
+  # is the agent role, identical across dispatches), and injects the server-truth
+  # origin+agent into the tool args so the broker scopes the credential from those,
+  # not from anything the model set. See infra/dispatch/scm_interceptor.py.
+  ScmInterceptorFunction:
+    Type: AWS::Serverless::Function
+    Condition: GatewayEnabled
+    Properties:
+      FunctionName: !Sub scm-interceptor-${Stage}
+      CodeUri: ../dispatch/
+      Handler: scm_interceptor.handler
+      Timeout: 15
+      Environment:
+        Variables:
+          FLEET_CONFIG_TABLE: !Ref FleetConfigTable
+      Policies:
+        # Resolve coreachable_repos(origin) from the fleet-config table.
+        - DynamoDBReadPolicy:
+            TableName: !Ref FleetConfigTable
+
+  ScmInterceptorInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: GatewayEnabled
+    Properties:
+      FunctionName: !Ref ScmInterceptorFunction
+      Action: lambda:InvokeFunction
+      Principal: bedrock-agentcore.amazonaws.com
+      # The gateway references this interceptor (InterceptorConfigurations), so
+      # SourceArn must NOT be !GetAtt FleetGateway.GatewayArn — that would be a
+      # dependency cycle. Scope to the fleet gateway by account/region pattern
+      # (same approach the gateway role uses for the same reason).
+      SourceArn: !Sub arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/*
+
+  # GitHub tool target — the "<TargetName>" (GitHubTarget) that prefixes the
   # generated Cedar action names. Must match fleet_policy.GITHUB_TARGET.
   GitHubGatewayTarget:
     Type: AWS::BedrockAgentCore::GatewayTarget
@@ -1106,14 +1179,237 @@ Resources:
     Properties:
       GatewayIdentifier: !GetAtt FleetGateway.GatewayIdentifier
       Name: GitHubTarget
-      Description: GitHub official remote MCP server
+      Description: GitHub tools via the SCM broker (per-owner GitHub App tokens)
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
       TargetConfiguration:
         Mcp:
-          McpServer:
-            Endpoint: !Ref GitHubMcpEndpoint
-            # DYNAMIC listing aggregates + preserves tool annotations at the
-            # gateway root (vs an empty tools/list).
-            ListingMode: DYNAMIC
+          Lambda:
+            LambdaArn: !GetAtt ScmBrokerFunction.Arn
+            ToolSchema:
+              InlinePayload:
+              - Name: add_issue_comment
+                Description: GitHub add issue comment (per-owner App token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    body:
+                      Type: string
+                    issue_number:
+                      Type: integer
+                    owner:
+                      Type: string
+                    repo:
+                      Type: string
+                  Required: [body, issue_number, owner, repo]
+              - Name: add_labels_to_issue
+                Description: GitHub add labels to issue (per-owner App token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    issue_number:
+                      Type: integer
+                    labels:
+                      Type: array
+                      Items:
+                        Type: string
+                    owner:
+                      Type: string
+                    repo:
+                      Type: string
+                  Required: [issue_number, labels, owner, repo]
+              - Name: create_branch
+                Description: GitHub create branch (per-owner App token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    branch:
+                      Type: string
+                    owner:
+                      Type: string
+                    repo:
+                      Type: string
+                  Required: [branch, owner, repo]
+              - Name: create_issue
+                Description: GitHub create issue (per-owner App token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    owner:
+                      Type: string
+                    repo:
+                      Type: string
+                    title:
+                      Type: string
+                  Required: [owner, repo, title]
+              - Name: create_or_update_file
+                Description: GitHub create or update file (per-owner App token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    content:
+                      Type: string
+                    message:
+                      Type: string
+                    owner:
+                      Type: string
+                    path:
+                      Type: string
+                    repo:
+                      Type: string
+                  Required: [content, message, owner, path, repo]
+              - Name: create_pull_request
+                Description: GitHub create pull request (per-owner App token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    base:
+                      Type: string
+                    head:
+                      Type: string
+                    owner:
+                      Type: string
+                    repo:
+                      Type: string
+                    title:
+                      Type: string
+                  Required: [base, head, owner, repo, title]
+              - Name: create_pull_request_review
+                Description: GitHub create pull request review (per-owner App token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    owner:
+                      Type: string
+                    pull_number:
+                      Type: integer
+                    repo:
+                      Type: string
+                  Required: [owner, pull_number, repo]
+              - Name: get_file_contents
+                Description: GitHub get file contents (per-owner App token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    owner:
+                      Type: string
+                    path:
+                      Type: string
+                    repo:
+                      Type: string
+                  Required: [owner, path, repo]
+              - Name: get_issue
+                Description: GitHub get issue (per-owner App token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    issue_number:
+                      Type: integer
+                    owner:
+                      Type: string
+                    repo:
+                      Type: string
+                  Required: [issue_number, owner, repo]
+              - Name: get_pull_request
+                Description: GitHub get pull request (per-owner App token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    owner:
+                      Type: string
+                    pull_number:
+                      Type: integer
+                    repo:
+                      Type: string
+                  Required: [owner, pull_number, repo]
+              - Name: list_commits
+                Description: GitHub list commits (per-owner App token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    owner:
+                      Type: string
+                    repo:
+                      Type: string
+                  Required: [owner, repo]
+              - Name: list_issues
+                Description: GitHub list issues (per-owner App token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    owner:
+                      Type: string
+                    repo:
+                      Type: string
+                  Required: [owner, repo]
+              - Name: list_milestones
+                Description: GitHub list milestones (per-owner App token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    owner:
+                      Type: string
+                    repo:
+                      Type: string
+                  Required: [owner, repo]
+              - Name: list_pull_requests
+                Description: GitHub list pull requests (per-owner App token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    owner:
+                      Type: string
+                    repo:
+                      Type: string
+                  Required: [owner, repo]
+              - Name: push_files
+                Description: GitHub push files (per-owner App token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    branch:
+                      Type: string
+                    files:
+                      Type: array
+                      Items:
+                        Type: object
+                        Properties:
+                          path:
+                            Type: string
+                          content:
+                            Type: string
+                        Required: [path, content]
+                    message:
+                      Type: string
+                    owner:
+                      Type: string
+                    repo:
+                      Type: string
+                  Required: [branch, files, message, owner, repo]
+              - Name: search_code
+                Description: GitHub search code (per-owner App token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    owner:
+                      Type: string
+                    query:
+                      Type: string
+                    repo:
+                      Type: string
+                  Required: [owner, query, repo]
+              - Name: update_issue
+                Description: GitHub update issue (per-owner App token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    issue_number:
+                      Type: integer
+                    owner:
+                      Type: string
+                    repo:
+                      Type: string
+                  Required: [issue_number, owner, repo]
 
   AsanaGatewayTarget:
     Type: AWS::BedrockAgentCore::GatewayTarget
@@ -1224,20 +1520,19 @@ Outputs:
     Export:
       Name: !Sub ${AWS::StackName}-AssignmentsTable
 
-  # Consumed by deploy-agent.yml to set the GitHub App env on agent runtimes
-  # (GITHUB_AUTH_MODE=app). The App id/key are only present when the dashboard is
-  # deployed; the fleet-config table (holding per-owner install records) always is.
+  # Consumed by deploy-agent.yml to set the GitHub App env on agent runtimes.
+  # All three are unconditional: the App credential resources exist regardless of
+  # the dashboard (agents + reply Lambda mint tokens from them), and the
+  # fleet-config table holds the per-owner install records.
   FleetConfigTableName:
     Value: !Ref FleetConfigTable
     Export:
       Name: !Sub ${AWS::StackName}-FleetConfigTable
 
   GitHubAppIdParamName:
-    Condition: DashboardEnabled
     Value: !Ref GitHubAppIdParam
 
   GitHubAppPrivateKeySecretArn:
-    Condition: DashboardEnabled
     Value: !Ref GitHubAppPrivateKey
 
   ArtifactsBucketName:
