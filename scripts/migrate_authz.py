@@ -36,13 +36,23 @@ def _connector_for(subject: str) -> str:
     return "github"
 
 
-def plan_migration(rows: list[dict]) -> list[dict]:
+def plan_migration(rows: list[dict]) -> tuple[list[dict], list[tuple]]:
     """Pure planner (unit-tested): given the raw config-table items, return the
     list of trigger_rule permit rows to write. One rule per (agent, user) in a
-    capability's legacy ``authorization_users`` list. The wildcard ``"*"`` maps to
-    a permit for the wildcard subject so an open capability stays open. Skips
-    empty / already-migrated entries."""
+    capability's legacy ``authorization_users`` list.
+
+    The subject is NAMESPACED by source (``github:<login>`` / ``asana:<gid>``,
+    Slack ids already carry ``slack:``) to match the principal the router
+    authorizes on (router.namespaced_principal) and the form the dashboard rule
+    editor writes — a bare id would never match and silently deny.
+
+    The legacy wildcard ``"*"`` (allow-all) has NO equivalent in the
+    principal-grant model — Cedar P1 matches a principal exactly, so a literal
+    ``"*"`` subject can never match a real sender. Rather than write a dead rule
+    that claims openness, we SKIP ``"*"`` and record it in ``skipped`` so the CLI
+    can warn the operator to re-express that access explicitly (e.g. a group)."""
     planned: list[dict] = []
+    skipped: list[tuple] = []
     seen: set[tuple] = set()
     for item in rows:
         if item.get("kind") != "capability":
@@ -54,6 +64,13 @@ def plan_migration(rows: list[dict]) -> list[dict]:
             subject = str(user).strip()
             if not subject:
                 continue
+            if subject == "*":
+                skipped.append((agent_id, "*"))
+                continue
+            connector = _connector_for(subject)
+            # Namespace bare github/asana ids so they match the router principal.
+            if connector in ("github", "asana") and not subject.startswith(f"{connector}:"):
+                subject = f"{connector}:{subject}"
             key = (agent_id, subject)
             if key in seen:
                 continue
@@ -65,7 +82,7 @@ def plan_migration(rows: list[dict]) -> list[dict]:
                     "pk": f"trigger_rule#migrated-{digest}",
                     "kind": "trigger_rule",
                     "rule_id": f"migrated-{digest}",
-                    "connector": _connector_for(subject),
+                    "connector": connector,
                     "subject_type": "user",
                     "subject_id": subject,
                     "agent_id": agent_id,
@@ -75,7 +92,7 @@ def plan_migration(rows: list[dict]) -> list[dict]:
                     "created_at": 0,  # stamped at write time
                 }
             )
-    return planned
+    return planned, skipped
 
 
 def _scan_all(table) -> list[dict]:
@@ -102,10 +119,16 @@ def main(argv=None) -> int:
 
     table = boto3.resource("dynamodb", region_name=args.region).Table(args.table)
     rows = _scan_all(table)
-    planned = plan_migration(rows)
+    planned, skipped = plan_migration(rows)
+
+    if skipped:
+        print(f"⚠ Skipped {len(skipped)} allow-all ('*') entries — the wildcard has")
+        print("  no principal-grant equivalent. Re-express as an explicit group grant:")
+        for agent_id, _ in skipped:
+            print(f"    {agent_id} was open-to-all")
 
     if not planned:
-        print("No legacy authorization_users to migrate.")
+        print("No per-user legacy authorization_users to migrate.")
         return 0
 
     print(f"{'APPLYING' if args.apply else 'DRY-RUN'} — {len(planned)} permit rows:")

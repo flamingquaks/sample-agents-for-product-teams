@@ -89,6 +89,28 @@ def test_check_authorization_bool_wrapper(router_module):
         assert router_module.check_authorization(_AGENT, "github:octocat", "github") is False
 
 
+def test_namespaced_principal(router_module):
+    ns = router_module.namespaced_principal
+    # github/asana bare ids get their source prefix
+    assert ns("octocat", "github") == "github:octocat"
+    assert ns("1202334567890", "asana") == "asana:1202334567890"
+    # already-namespaced (slack, or a re-dispatch) is left as-is
+    assert ns("slack:T0ACME:U1", "slack") == "slack:T0ACME:U1"
+    assert ns("github:octocat", "github") == "github:octocat"
+    # empty passes through (the unresolved-sender guard handles it upstream)
+    assert ns("", "github") == ""
+
+
+def test_authorize_passes_namespaced_principal_to_cedar(router_module):
+    from trigger_authz import Decision
+
+    with patch.object(
+        router_module.trigger_authz, "is_authorized", return_value=Decision(allow=True)
+    ) as spy:
+        router_module.authorize_trigger(_AGENT, "octocat", "github", {})
+    assert spy.call_args.kwargs["principal"] == "github:octocat"
+
+
 def test_all_sources_use_one_cedar_path(router_module):
     # github / asana / slack all authorize through the same call — only the
     # namespaced principal + context differ.

@@ -289,9 +289,14 @@ def authorize_trigger(agent_config, sender, source, source_context=None):
 ```
 
 - **One mechanism, all sources.** There is no per-capability allowlist and no
-  back-compat branch. GitHub, Asana, and Slack all authorize here; the principal
-  namespaces the source (`github:<login>` / `asana:<gid>` / `slack:<team>:<uid>`),
-  and GitHub/Asana simply carry no workspace/channel context.
+  back-compat branch. GitHub, Asana, and Slack all authorize here. The principal
+  is **namespaced by source** (`github:<login>` / `asana:<gid>` /
+  `slack:<team>:<uid>`) so ids from different sources can't collide. The
+  receivers emit source-native ids (GitHub login, Asana gid) and Slack already
+  namespaces; the router applies the `github:`/`asana:` prefix centrally via
+  `namespaced_principal(sender, source)` — one place, so a hand-authored rule and
+  the live principal always use the same form. GitHub/Asana carry no
+  workspace/channel context (those Cedar clauses no-op for them).
 - The unresolved-sender sentinel is rejected **before** any AVP call, so it is
   never passed as a principal (T-4).
 - On deny, the handler records `blocked_authz`, emits `TriggerDenied`, and posts
@@ -325,8 +330,9 @@ Mirrors `asana_webhook.py` / `github_webhook.py` as a thin source adapter.
 
 - **3-second ack.** Verify → dedup → async `Event`-invoke the router → return 200 immediately. The user-visible "on it" ack is posted by the **router** (§3.1 step 12), never on the receiver's request path — so a slow `chat.postMessage` can't blow the 3 s budget.
 - **Signature scheme.** Slack signs a constructed basestring, not the raw body:
-  `expected = "v0=" + hmac_sha256(signing_secret, f"v0:{timestamp}:{raw_body}")`, compared timing-safe; reject if `|now - X-Slack-Request-Timestamp| > 300`. Add `verify_slack_signature(signing_secret, timestamp, raw_body, provided, *, max_skew=300)` to `mentions.py` so all signing logic stays in one hardened module. Base64-decode the API-Gateway body **before** building the basestring (parity with the fix already in both existing receivers).
-- **Multi-workspace secret selection.** Parse `team_id` from the (pre-verification) envelope, look up the workspace row, and verify against **that workspace's** signing secret. Unknown/disabled workspace → 200 no-op (events) / 401 — never dispatch. This is the crux of multi-workspace support.
+  `expected = "v0=" + hmac_sha256(signing_secret, f"v0:{timestamp}:{raw_body}")`, compared timing-safe; reject if `|now - X-Slack-Request-Timestamp| > 300`. `verify_slack_signature(signing_secret, timestamp, raw_body, provided, *, max_skew=300)` lives in `mentions.py`. Base64-decode the API-Gateway body **before** building the basestring.
+- **App-level signing secret, verify FIRST.** The signing secret is **per-app** (one per Slack app — only *bot tokens* are per-workspace), stored at `/sdlc-agents/<stage>/slack/signing-secret`. Crucially, the `url_verification` handshake payload carries **no `team_id`**, so verification must not depend on one: the receiver verifies the signature (app-level) and answers the challenge *before* resolving the workspace. An unconfigured signing secret → 503. After verification, real events/commands resolve `team_id` and require the workspace to be onboarded + enabled (`is_workspace_enabled`); unknown/disabled → no-op (events) / ephemeral notice (commands). Multi-workspace lives in the **bot token** (per-workspace, for replies) + the workspace/channel/grant rows, not the signing secret.
+- **Route by path, not content.** Classify events vs slash commands by the API-Gateway resource path only — never by sniffing the body (a JSON `app_mention` whose text contains `command=` must not be mis-parsed as a form command).
 - **Retry & dedup.** Slack retries with `X-Slack-Retry-Num` and re-sends the same `event_id`. Dedup on `event_id` via a conditional `PutItem` on a TTL'd `slack_event#<id>` item; a duplicate acks 200 and no-ops.
 - **Bot-loop prevention.** Ignore events with `bot_id`, `subtype=="bot_message"`, or authored by our own bot user — else the agent's reply re-triggers it.
 - **Two inbound shapes.** `event_callback` (JSON: `app_mention`, `message`) incl. the `url_verification` `challenge` handshake (parity with Asana's `X-Hook-Secret`); and **slash commands** (`application/x-www-form-urlencoded`: `command`, `text`, `channel_id`, `user_id`, `trigger_id`, `response_url`) — agent id from the command name (`/workitems` → validated against the registry), text as instruction.
