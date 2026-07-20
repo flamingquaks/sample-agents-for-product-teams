@@ -199,6 +199,7 @@ def put_repo(
     status: str = "pending",
     installation_id: int | None = None,
     install_verified_at: int | None = None,
+    mantle_project: str | None = None,
 ) -> dict:
     """Create/replace a repo record. ``status`` defaults to ``pending``; the
     admin onboarding flow instead writes ``active`` and rolls back to ``pending``
@@ -214,7 +215,12 @@ def put_repo(
     ``installation_id`` / ``install_verified_at`` are set once onboarding has
     verified the GitHub App is installed on the repo's owner and can reach the
     repo. They're denormalized onto the repo row for convenience; the per-owner
-    install record (put_installation) is the source of truth."""
+    install record (put_installation) is the source of truth.
+
+    ``mantle_project`` is the repo's Bedrock Mantle project id (per-repo cost
+    attribution). Since put_repo does a full-item replace, a value present on the
+    existing row is carried forward when not explicitly passed — so an admin edit
+    (enable/disable, co-repo mode) never drops the project binding."""
     mode = co_repo_mode if co_repo_mode in CO_REPO_MODES else CO_REPO_ISOLATED
     normalized = _normalize_repo(repo)
     item = {
@@ -238,6 +244,12 @@ def put_repo(
         item["installation_id"] = int(installation_id)
     if install_verified_at is not None:
         item["install_verified_at"] = int(install_verified_at)
+    # Carry forward an existing project binding on an update if none is passed.
+    if mantle_project is None:
+        existing = get_repo(normalized)
+        mantle_project = existing.get("mantle_project") if existing else None
+    if mantle_project:
+        item["mantle_project"] = mantle_project
     _get_table().put_item(Item=item)
     return item
 

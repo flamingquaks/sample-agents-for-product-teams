@@ -196,6 +196,35 @@ def _ensure_runtime_role(agent_id: str) -> str:
                 }
             ],
         },
+        # Model access via Bedrock Mantle (the fleet's primary path): inference on
+        # any project (cost attribution scopes at the project level; inference is
+        # account-wide) + short-term bearer-token minting. Plus bedrock:ApplyGuardrail
+        # (guardrail applied via Mantle headers) and bedrock:InvokeModel for the ADR
+        # agent's Titan embeddings, which stay on the classic bedrock-runtime path.
+        "model-access": {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "bedrock-mantle:CreateInference",
+                        "bedrock-mantle:GetInference",
+                        "bedrock-mantle:ListInferences",
+                    ],
+                    "Resource": f"arn:aws:bedrock-mantle:{region}:{account}:project/*",
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": "bedrock-mantle:CallWithBearerToken",
+                    "Resource": "*",
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": ["bedrock:ApplyGuardrail", "bedrock:InvokeModel"],
+                    "Resource": "*",
+                },
+            ],
+        },
     }
     for name, doc in policies.items():
         iam.put_role_policy(
@@ -203,11 +232,6 @@ def _ensure_runtime_role(agent_id: str) -> str:
             PolicyName=name,
             PolicyDocument=json.dumps(doc),
         )
-    # Bedrock model access — same managed policy the agents have always used.
-    iam.attach_role_policy(
-        RoleName=role_name,
-        PolicyArn="arn:aws:iam::aws:policy/AmazonBedrockFullAccess",
-    )
     return _runtime_role_arn(agent_id)
 
 

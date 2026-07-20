@@ -1014,6 +1014,10 @@ Resources:
           CAPABILITY_BUILD_PROJECT: !Ref CapabilityBuildProject
           # AVP authorizes every write (auth.is_admin → Cedar Write action).
           AVP_POLICY_STORE_ID: !GetAtt DashboardPolicyStore.PolicyStoreId
+          # Per-repo Bedrock Mantle project creation on repo onboard (cost
+          # attribution). STAGE + repo name the project; the flag gates rollout.
+          STAGE: !Ref Stage
+          SDLC_MANTLE_ENABLED: "true"
       Policies:
         # Read+write the config table (onboard/enable/disable repos, settings,
         # capabilities).
@@ -1024,6 +1028,14 @@ Resources:
             - Effect: Allow
               Action: verifiedpermissions:IsAuthorized
               Resource: !GetAtt DashboardPolicyStore.Arn
+        # Create + tag a per-repo Mantle project on repo onboard (best-effort).
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock-mantle:CreateProject
+                - bedrock-mantle:ListProjects
+                - bedrock-mantle:TagResource
+              Resource: "*"
         # Publish the rendered agent registry to the SSM param the Dispatch Router
         # reads (capability onboard/edit/disable regenerates it).
         - Statement:
@@ -1214,9 +1226,16 @@ Resources:
               - ecr:BatchCheckLayerAvailability
               - ecr:GetAuthorizationToken
               - bedrock-agentcore:InvokeGateway
-              - bedrock:InvokeModel
-              - bedrock:InvokeModelWithResponseStream
+              # Mantle inference (the fleet's primary model path — OpenAI-compatible
+              # bedrock-mantle endpoint) + short-term bearer-token minting.
+              - bedrock-mantle:CreateInference
+              - bedrock-mantle:CallWithBearerToken
+              - bedrock-mantle:GetInference
+              - bedrock-mantle:ListInferences
+              # Guardrail eval (applied via Mantle headers) + classic InvokeModel
+              # kept for the ADR agent's Titan embeddings (bedrock-runtime, not Mantle).
               - bedrock:ApplyGuardrail
+              - bedrock:InvokeModel
             Resource: "*"
 
   CapabilityBuildRole:
@@ -1360,23 +1379,16 @@ Resources:
               Condition:
                 StringEquals:
                   iam:PermissionsBoundary: !Ref CapabilityRuntimeBoundary
+            # Runtime roles get ALL their permissions via inline put_role_policy
+            # (logs / dynamodb / ecr / gateway-invoke / model-access), so no
+            # iam:AttachRolePolicy is granted — the deployer can't attach an
+            # arbitrary managed policy, and the permissions boundary caps the rest.
             - Sid: ConfigureRuntimeRole
               Effect: Allow
               Action:
                 - iam:PutRolePolicy
                 - iam:GetRole
               Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/sdlc-agents/capabilities/*
-            # AttachRolePolicy is split out and pinned to the ONE managed policy the
-            # deployer attaches, so it can't attach an arbitrary (e.g. admin) policy.
-            # The permissions boundary already caps effective permissions, but this
-            # removes the unnecessary latitude.
-            - Sid: AttachBedrockManagedPolicy
-              Effect: Allow
-              Action: iam:AttachRolePolicy
-              Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/sdlc-agents/capabilities/*
-              Condition:
-                ArnEquals:
-                  iam:PolicyARN: arn:aws:iam::aws:policy/AmazonBedrockFullAccess
             # PassRole so create/update-agent-runtime can hand the runtime role to
             # the AgentCore service — scoped to the same path + service.
             - Sid: PassRuntimeRole

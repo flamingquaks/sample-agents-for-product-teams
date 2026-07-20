@@ -91,7 +91,8 @@ def invoke(payload, context=None):
         project_context=build_project_context(),
     ) + dispatch_context_block
 
-    model = build_model()
+    mantle_project = source_context.get("mantle_project") if source_context else None
+    model = build_model(project=mantle_project)
     tools = [
         synthesize_research,
         competitive_scan,

@@ -6,3 +6,5 @@ aws-opentelemetry-distro>=0.10.1
 boto3
 mcp-proxy-for-aws>=0.1.0
 cryptography>=42.0.0
+openai>=2.0.0
+aws-bedrock-token-generator>=1.0.0

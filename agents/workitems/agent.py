@@ -106,7 +106,10 @@ def invoke(payload, context=None):
             f"on {source_context.get('repo', 'unknown')}\n"
         )
 
-    model = build_model()
+    # Per-repo Mantle project for cost attribution — set by the Dispatch Router
+    # from the repo's record; absent for non-repo dispatches (default project).
+    mantle_project = source_context.get("mantle_project") if source_context else None
+    model = build_model(project=mantle_project)
     tools = [generate_status_report, detect_risks, reconcile_sync, post_results]
 
     # Memory — optional until Memory resource is created

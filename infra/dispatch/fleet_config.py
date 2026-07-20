@@ -130,6 +130,18 @@ def is_repo_allowed(repo: str) -> bool:
     return True
 
 
+def mantle_project_for(repo: str) -> str | None:
+    """The Bedrock Mantle project id onboarded for ``repo`` (owner/repo), or None.
+    The router injects this into the dispatch context so the agent attributes its
+    model cost/usage to the repo's project. Fails soft: unknown repo → None (the
+    agent then uses the account's default project)."""
+    norm = (repo or "").strip().casefold()
+    if not norm:
+        return None
+    rec = _snapshot()["repos"].get(norm)
+    return rec.get("mantle_project") if rec else None
+
+
 def _is_eligible_active(record: dict) -> bool:
     return bool(
         record.get("enabled")
