@@ -1,7 +1,7 @@
 # Connectors: Multi-Workspace Slack + Cedar-Backed Trigger Authorization
 ## Admin-managed event sources with per-connector access rules
 
-> **Status: target design — not yet built.** This spec defines (1) a first-class **Slack** dispatch source at parity with GitHub and Asana, (2) a **Cedar-backed trigger-authorization** layer (a third AVP policy store, evaluated by the Dispatch Router) that decides *who* may trigger *which* agent *where*, and (3) a **Connectors** section **inside the Admin panel** of the dashboard SPA, with a dedicated sub-page per connector (Slack, Asana, GitHub) that owns that connector's connection, triggers, and **per-connector access rules**. It supersedes the Slack sections of `dispatch-agent-assignment-spec.md` §4c and closes roadmap items around Slack dispatch and connector UX. Nothing here ships until the phases in §12 land; the router, receivers, config store, and SPA described as "today" are the current code under `infra/dispatch/`, `infra/dashboard/`, and `dashboard/`.
+> **Status: BUILT (behind `DeploySlack`).** This spec defines (1) a first-class **Slack** dispatch source at parity with GitHub and Asana, (2) a **Cedar-backed, data-driven trigger-authorization** layer (a third AVP policy store, evaluated by the Dispatch Router) that decides *who* may trigger *which* agent *where*, (3) a **channel onboarding request** flow — users request channel access via the `/onboard-channel` slash command and admins approve/deny in the panel (§4.5), and (4) a **Connectors** section **inside the Admin panel** of the dashboard SPA, with a dedicated sub-page per connector (Slack, Asana, GitHub) that owns that connector's connection, triggers, and **per-connector access rules**. It supersedes the Slack sections of `dispatch-agent-assignment-spec.md` §4c. Implemented under `infra/dispatch/` (`slack_webhook.py`, `trigger_authz.py`, `trigger_grants.py`, `reply.py`, `mentions.py`), `infra/dashboard/` (`config_store.py`, `admin.py`), `infra/foundation/template.yaml` (`TriggerPolicyStore` + `SlackWebhookFunction`), `dashboard/src/connectors/`, and `scripts/` (`bootstrap_slack.py`, `migrate_authz.py`). The Slack receiver is gated by `DeploySlack` (default off); the trigger-authz store is always-on foundation.
 
 ---
 
@@ -146,7 +146,18 @@ The unit an admin creates on a connector's **Access rules** tab — the **WHO** 
 ### 4.4 New `config_store` functions
 
 Mirror the existing `put_/get_/list_/delete_` style, each paged like `list_repos`/`list_capabilities` and each validating ids:
-`list_slack_workspaces` / `get_slack_workspace` / `put_slack_workspace` / `set_slack_workspace_status` / `delete_slack_workspace`; `list_channels(team_id)` / `put_channel_policy` / `delete_channel_policy`; `list_trigger_rules(connector=None)` / `get_trigger_rule` / `put_trigger_rule` / `delete_trigger_rule`.
+`list_slack_workspaces` / `get_slack_workspace` / `put_slack_workspace` / `set_slack_workspace_status` / `delete_slack_workspace`; `list_channels(team_id)` / `put_channel_policy` / `delete_channel_policy`; `list_trigger_rules(connector=None)` / `get_trigger_rule` / `put_trigger_rule` / `delete_trigger_rule`; `list_channel_requests(status=None)` / `get_channel_request` / `put_channel_request` / `resolve_channel_request` / `delete_channel_request`.
+
+### 4.5 Channel onboarding requests (user-initiated, admin-approved)
+
+A user in a Slack channel runs **`/onboard-channel [agent …]`** to request that *their* channel be onboarded for specific agents. The request is captured `pending` (`channel_request` record, §4.3-adjacent) — it grants nothing on its own; **approval by an admin is the only path to access** (a user cannot self-serve). Flow:
+
+1. **Request** — the Slack receiver (`slack_webhook._record_channel_request`) writes a `channel_request` row via the dispatch-side `trigger_grants.put_channel_request` (validates the Slack ids + agent ids). The requester is the immutable `slack:<team>:<user>` (T-4, auditable). The receiver replies ephemerally: *"📨 Request filed… an admin will review it."*
+2. **Review** — the request appears in the Slack connector page's **Requests** tab (`GET /admin/channel-requests?status=pending`).
+3. **Approve** (`POST /admin/channel-requests/{id}/approve`) — `admin._decide_channel_request` composes the effect explicitly: (a) `put_channel_policy(mode="allow")` for the channel (the WHERE axis), (b) a **permit** `trigger_rule` per requested agent, keyed on the **channel group** `channel:<team>:<channel>` (so anyone triggering *from that channel* is permitted — the receiver stamps that group into `principal_groups`), and (c) `resolve_channel_request(status="approved")`. An admin may override the agent scope via `approved_agents`.
+4. **Deny** (`POST /admin/channel-requests/{id}/deny`) — records the decision; grants nothing.
+
+Record shape: `pk="chan_req#<uuid>"` → `{kind:"channel_request", team_id, channel_id, channel_name, requested_by, requested_agents[], status:"pending"|"approved"|"denied", created_at, decided_by, decided_at}`.
 
 ---
 
@@ -435,10 +446,10 @@ Admin Lambda IAM gains `verifiedpermissions:CreatePolicy/DeletePolicy/ListPolici
 Slack-specific pieces are gated by `DeploySlack`; the Cedar trigger-authz store is core (always on).
 
 1. **Trigger-authz spine — DONE (data-driven).** `trigger_authz.py` (fixed policy set + entity assembly), `trigger_grants.py` (dispatch-side DDB reader for the WHO grants + WHERE channel posture), the single `authorize_trigger` router path (no allowlist, no back-compat), config-store workspace/channel/rule records. The flat `authorization.users` source was removed from config_store/admin/registry. Grants are DynamoDB data — no per-rule AVP policy. 346 tests green.
-2. **Foundation infra + authz migration.** Add `TriggerPolicyStore` to the foundation stack (always provisioned) + router `TRIGGER_POLICY_STORE_ID`/IAM; ship the one-time migration that seeds existing capabilities' `authorization.users` as `trigger_rule` permit rows so GitHub/Asana authorize on first deploy (unseeded ⇒ default-deny). Optionally a `TriggerAuthzEnforcement` LOG_ONLY→enforce rollout knob.
-3. **Slack receiver + multi-workspace onboarding** behind `DeploySlack=false`: `slack_webhook.py`, `verify_slack_signature`, `reply.post_slack_message`, enrichment slack branch, admin routes + config-store secret handling, `bootstrap_slack.py`.
-4. **Connectors UI inside Admin** (`dashboard/`): registry + routing + `ConnectorLayout`, GitHub page (relocate `GitHubAppPanel`), Asana page (surface existing state), Slack page. Ship the GitHub relocation first (pure refactor, no backend dep).
-5. **Wire it live in dev.** Deploy with `DeploySlack=true` in a dev stage; onboard a test workspace, author rules, exercise the simulator, verify allow + every reject reason in-thread.
+2. **Foundation infra + authz migration — DONE.** `TriggerPolicyStore` (always-on) + the 3 fixed policies in the stack; router `TRIGGER_POLICY_STORE_ID`/IAM; `scripts/migrate_authz.py` seeds legacy `authorization.users` → `trigger_rule` permit rows (idempotent, dry-run default). `sam validate` clean.
+3. **Slack receiver + multi-workspace onboarding — DONE** (behind `DeploySlack`): `slack_webhook.py`, `mentions.verify_slack_signature`, `reply.post_slack_message`, enrichment slack branch, admin routes, `scripts/bootstrap_slack.py`. **Plus the channel-onboarding request flow (§4.5).**
+4. **Connectors UI inside Admin — DONE** (`dashboard/src/connectors/`): registry + routing + `ConnectorLayout`, GitHub page (relocated `GitHubAppPanel`), Asana page, Slack page (workspaces / channels / access rules / requests queue / simulator). `npm run build` clean.
+5. **Wire it live in dev.** Deploy with `DeploySlack=true` in a dev stage; onboard a test workspace, author rules, exercise the simulator, verify allow + every reject reason in-thread. *(Deploy-time step — not a code change.)*
 6. **Docs/skills**, threat-model rows, then enable in gamma/prod.
 
 ---
