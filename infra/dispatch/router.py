@@ -11,7 +11,9 @@ from GitHub Actions, Asana webhook receiver, and Slack, then:
 6. Returns acknowledgment to caller
 
 The router is intentionally simple — all intelligence lives in the agents.
-Adding a new agent is a config change in .dispatch/agents.yaml, not a code change.
+Adding a new agent is a self-service onboard in the Admin dashboard (which builds
+its container, stands up its runtime, and republishes this registry), not a code
+change.
 """
 
 import json
@@ -63,7 +65,8 @@ GUARDRAIL_ERROR_MESSAGE_TEMPLATE = (
 )
 
 # --- Agent Registry ----------------------------------------------------------
-# Loaded from SSM Parameter Store (synced from .dispatch/agents.yaml on deploy).
+# Loaded from SSM Parameter Store (rendered from the capability rows by the
+# dashboard admin API on every capability change).
 # Cached for the lifetime of the Lambda execution environment.
 
 _registry_cache = None
@@ -147,7 +150,7 @@ def check_authorization(agent_config: dict, sender: str, source: str) -> bool:
     if not allowed_users:
         logger.warning(
             "Agent '%s' has an empty authorization.users list; rejecting sender '%s'. "
-            "Populate .dispatch/agents.yaml and re-run scripts/sync_registry.py.",
+            "Set the capability's authorization users in the dashboard Admin view.",
             agent_config.get("agent_id", "?"),
             sender,
         )
@@ -293,7 +296,8 @@ def invoke_agent(
     if "${" in runtime_arn or not runtime_arn.startswith("arn:"):
         raise ValueError(
             f"Agent '{agent_config.get('agent_id', '?')}' has an unresolved runtime_arn "
-            f"({runtime_arn!r}). Run scripts/sync_registry.py to substitute placeholders."
+            f"({runtime_arn!r}). The dashboard renders only capabilities with a live "
+            "runtime into the registry; re-onboard the agent if this persists."
         )
 
     payload = json.dumps(
