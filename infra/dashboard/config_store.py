@@ -115,9 +115,9 @@ CO_REPO_MODES = (CO_REPO_ISOLATED, CO_REPO_GROUP, CO_REPO_ALL)
 
 # --- Connectors: Slack workspaces + channels, and trigger-authz rules --------
 # (docs/specs/slack-connectors-spec.md §4). Every id below flows into a Cedar
-# policy literal (trigger_policy_sync) and/or an SSM parameter path, so each is
-# pinned to its provider's shape to keep an onboard from injecting a Cedar
-# metacharacter, a path traversal, or a bogus resource name.
+# entity value (read by the router into IsAuthorized) and/or an SSM parameter
+# path, so each is pinned to its provider's shape to keep an onboard from
+# injecting a Cedar metacharacter, a path traversal, or a bogus resource name.
 
 # Slack ids: team T…, channel C…, user U…, usergroup S… — Slack uses uppercase
 # base-36 (min ~8 chars in practice; we require ≥6 after the type letter).
@@ -899,11 +899,18 @@ def delete_channel_policy(team_id: str, channel_id: str) -> bool:
 
 
 # --- Trigger-authz rules -----------------------------------------------------
-# The admin-authored unit of "who may trigger which agent, where" (spec §4.3).
-# Stored here as the source of truth + audit record; PROJECTED into an AVP
-# template-linked Cedar policy by trigger_policy_sync (which stamps avp_policy_id
-# back via set_trigger_rule_policy_id). Scoped to exactly one connector so each
-# connector sub-page manages only its own rules (per-connector rules).
+# The admin-authored unit of "WHO may trigger which agent" — subject (user or
+# group) → agent → workspace, permit or forbid. These rows are pure DATA: the
+# Dispatch Router reads them and assembles the granted/denied principal + group
+# sets as Cedar ENTITY ATTRIBUTES for a fixed AVP policy set (spec §5). Granting
+# access is therefore a plain DynamoDB write — NO per-rule AVP CreatePolicy, so
+# the policy count stays constant no matter how many users/rules exist (this is
+# the model AVP is built for; a policy-per-user would be an anti-pattern).
+#
+# The "WHERE" axis (which channels) is a SEPARATE concern carried by the
+# slack_channel rows above — a trigger rule is WHO-only, so the two axes compose
+# without overlap. Scoped to one connector so each connector sub-page manages
+# only its own rules (per-connector rules).
 
 
 def _trigger_rule_pk(rule_id: str) -> str:
@@ -959,19 +966,21 @@ def put_trigger_rule(
     subject_id: str,
     agent_id: str = "*",
     workspace: str = "*",
-    channels: list[str] | None = None,
     effect: str = RULE_PERMIT,
     created_by: str = "",
     rule_id: str | None = None,
 ) -> dict:
-    """Create (or replace, when rule_id is given) a trigger rule row.
+    """Create (or replace, when rule_id is given) a WHO trigger rule row.
 
-    Validates the enum fields and the ids that become Cedar literals: agent_id
-    (unless the "*" wildcard) against _AGENT_ID_RE, a concrete workspace against
-    the Slack team shape, and each concrete channel against the Slack channel
-    shape. ``channels`` defaults to ``["*"]`` (any channel). Does NOT project to
-    AVP — that's trigger_policy_sync's job; the admin API calls it after this and
-    stamps avp_policy_id via set_trigger_rule_policy_id."""
+    A rule grants (permit) or blocks (forbid) a subject — a ``user`` (principal
+    id like ``slack:T:U``) or a ``group`` — on an agent (``"*"`` = any) within a
+    workspace (``"*"`` = any). The channel/"where" axis is NOT here; it lives on
+    the slack_channel rows. Validates the enum fields and the ids that become
+    Cedar entity values: agent_id (unless ``"*"``) against _AGENT_ID_RE, a
+    concrete workspace against the Slack team shape.
+
+    Pure data: the router reads these rows into Cedar entity attributes for a
+    fixed policy set (no per-rule AVP policy)."""
     err = valid_rule_shape(
         connector=connector, subject_type=subject_type, effect=effect
     )
@@ -983,11 +992,6 @@ def put_trigger_rule(
         raise ValueError(f"invalid agent_id {agent_id!r}")
     if workspace != "*" and not valid_slack_team(workspace):
         raise ValueError(f"invalid workspace {workspace!r}")
-    chans = channels or ["*"]
-    if chans != ["*"]:
-        for c in chans:
-            if not valid_slack_channel(c):
-                raise ValueError(f"invalid channel id {c!r}")
     if rule_id is None:
         import uuid
 
@@ -1002,36 +1006,12 @@ def put_trigger_rule(
         "subject_id": subject_id.strip(),
         "agent_id": agent_id,
         "workspace": workspace,
-        "channels": list(chans),
         "effect": effect,
         "created_by": created_by or existing.get("created_by", ""),
         "created_at": existing.get("created_at", int(time.time())),
     }
-    # Preserve the AVP linkage across a replace so a re-put doesn't orphan the
-    # projected policy (the sync reconciles it).
-    if "avp_policy_id" in existing:
-        item["avp_policy_id"] = existing["avp_policy_id"]
     _get_table().put_item(Item=item)
     return item
-
-
-def set_trigger_rule_policy_id(rule_id: str, avp_policy_id: str | None) -> None:
-    """Stamp (or clear) the AVP policy id projected from this rule. Called by
-    trigger_policy_sync after a successful CreatePolicy / before a DeletePolicy so
-    the row and the enforced Cedar policy stay linked."""
-    if avp_policy_id is None:
-        _get_table().update_item(
-            Key={"pk": _trigger_rule_pk(rule_id)},
-            UpdateExpression="REMOVE avp_policy_id",
-            ConditionExpression="attribute_exists(pk)",
-        )
-        return
-    _get_table().update_item(
-        Key={"pk": _trigger_rule_pk(rule_id)},
-        UpdateExpression="SET avp_policy_id = :p",
-        ExpressionAttributeValues={":p": avp_policy_id},
-        ConditionExpression="attribute_exists(pk)",
-    )
 
 
 def delete_trigger_rule(rule_id: str) -> bool:

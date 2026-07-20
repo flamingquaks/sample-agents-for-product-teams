@@ -125,7 +125,7 @@ Both are expressible in Cedar (§5.2). The **allowlist** posture is recommended 
 
 ### 4.3 Trigger rule — `pk="trigger_rule#<uuid>"`
 
-The unit an admin creates on a connector's **Access rules** tab.
+The unit an admin creates on a connector's **Access rules** tab — the **WHO** axis only. It is pure data (no `avp_policy_id`; grants aren't projected to per-rule policies). Channel gating ("WHERE") is a *separate* axis carried by the `slack_channel` rows (§4.2), so the two compose without overlap.
 
 ```jsonc
 {
@@ -136,9 +136,7 @@ The unit an admin creates on a connector's **Access rules** tab.
   subject_id: "slack:T0ACME:U123" | "group:eng-oncall",
   agent_id: "workitems" | "*",                // "*" = any agent
   workspace: "T0ACME" | "*",                  // slack only; "*" = any (or absent for non-slack)
-  channels: ["C0ENG","C0REL"] | ["*"],        // slack only; ["*"] = any channel
   effect: "permit" | "forbid",
-  avp_policy_id: "<id>",                       // set after AVP projection (§5.5)
   created_by, created_at
 }
 ```
@@ -148,7 +146,7 @@ The unit an admin creates on a connector's **Access rules** tab.
 ### 4.4 New `config_store` functions
 
 Mirror the existing `put_/get_/list_/delete_` style, each paged like `list_repos`/`list_capabilities` and each validating ids:
-`list_slack_workspaces` / `get_slack_workspace` / `put_slack_workspace` / `set_slack_workspace_status` / `delete_slack_workspace`; `list_channels(team_id)` / `put_channel_policy` / `delete_channel_policy`; `list_trigger_rules(connector=None)` / `get_trigger_rule` / `put_trigger_rule` / `set_trigger_rule_policy_id` / `delete_trigger_rule`.
+`list_slack_workspaces` / `get_slack_workspace` / `put_slack_workspace` / `set_slack_workspace_status` / `delete_slack_workspace`; `list_channels(team_id)` / `put_channel_policy` / `delete_channel_policy`; `list_trigger_rules(connector=None)` / `get_trigger_rule` / `put_trigger_rule` / `delete_trigger_rule`.
 
 ---
 
@@ -158,14 +156,23 @@ Mirror the existing `put_/get_/list_/delete_` style, each paged like `list_repos
 
 A **new** AVP policy store, `TriggerPolicyStore`, namespace `SdlcTrigger`, `ValidationSettings.Mode: STRICT`. Because it is the *only* trigger-authz mechanism (no allowlist fallback), it is **required foundation infrastructure** — provisioned alongside the dashboard's existing `DashboardPolicyStore`, not gated behind a toggle. (`DeploySlack` still gates the Slack-specific receiver + secrets; that's a separate axis. An unset `TRIGGER_POLICY_STORE_ID` is a deployment error and, being fail-closed, denies every trigger.) Schema:
 
+The design is **data-driven**: the store holds a small **fixed** policy set (§5.2); the WHO grants + WHERE channel posture are DATA (DynamoDB rows) the router reads and passes to `IsAuthorized` as **entity attributes** — so granting a user is a DynamoDB write, never a `CreatePolicy`, and the policy count stays constant regardless of user/rule count. A policy-per-user is the AVP anti-pattern this avoids. Schema:
+
 ```jsonc
 {
   "SdlcTrigger": {
     "entityTypes": {
       "Group":  { "shape": {"type":"Record","attributes":{}} },
       "User":   { "memberOfTypes": ["Group"],
-                  "shape": {"type":"Record","attributes":{ "email": {"type":"String","required":false} }} },
-      "Agent":  { "shape": {"type":"Record","attributes":{}} }
+                  "shape": {"type":"Record","attributes":{
+                    "groups": {"type":"Set","element":{"type":"String"}},
+                    "email":  {"type":"String","required":false} }} },
+      "Agent":  { "shape": {"type":"Record","attributes":{
+                    // the agent's resolved grant sets (from trigger_rule rows)
+                    "allowedPrincipals": {"type":"Set","element":{"type":"String"}},
+                    "deniedPrincipals":  {"type":"Set","element":{"type":"String"}},
+                    "allowedGroups":     {"type":"Set","element":{"type":"String"}},
+                    "deniedGroups":      {"type":"Set","element":{"type":"String"}} }} }
     },
     "actions": {
       "Trigger": {
@@ -173,9 +180,10 @@ A **new** AVP policy store, `TriggerPolicyStore`, namespace `SdlcTrigger`, `Vali
           "principalTypes": ["User"],
           "resourceTypes": ["Agent"],
           "context": { "type":"Record", "attributes": {
-            "workspace": {"type":"String"},
-            "channel":   {"type":"String"},
-            "source":    {"type":"String"}
+            "workspace":      {"type":"String"},
+            "channel":        {"type":"String"},
+            "source":         {"type":"String"},
+            "channelAllowed": {"type":"Boolean"}   // WHERE posture, resolved in Python
           }}
         }
       }
@@ -184,33 +192,46 @@ A **new** AVP policy store, `TriggerPolicyStore`, namespace `SdlcTrigger`, `Vali
 }
 ```
 
-### 5.2 Policy templates (authored once, in the CFN template)
+### 5.2 The fixed policy set (authored once, in the CFN template)
 
-Fine-grained rules are unbounded and admin-authored, so they map to AVP **policy templates** + **template-linked policies** — the AVP-native "grant this principal this action on this resource under condition Z" mechanism. Templates (`AWS::VerifiedPermissions::PolicyTemplate`) are static scaffold; the admin API instantiates one linked policy per rule row.
+Three static policies, authored once, that **never change** as users/rules are added (`trigger_authz.FIXED_POLICIES` is the source of truth + template contents):
 
-- **`TplPermitInChannels`** (per-user, allowlist channel posture):
-  ```cedar
-  permit(principal == ?principal, action == SdlcTrigger::Action::"Trigger", resource == ?resource)
-  when {
-    context.workspace == "<WS>" &&
-    (["*"] == ["<CH...>"] || context.channel in [<CH...>])
-  };
-  ```
-  Rendered per rule with the workspace literal and channel-id list (or an unconditional channel clause when `channels == ["*"]`).
-- **`TplPermitGroupInChannels`** — same, but `principal in ?principal` (a `Group` entity), for `subject_type=="group"`.
-- **`TplForbidChannels`** — `forbid(...) when { context.workspace == "<WS>" && context.channel in [<CH...>] };` — backs `deny`-mode channels and per-user forbids. Cedar's **forbid-wins** makes a deny beat any permit.
-- The store has **no blanket permit**: default-deny is the posture. An admin opts subjects in with permit rules.
+```cedar
+// P1 permit — principal is granted directly, or via a granted group
+permit(principal, action == SdlcTrigger::Action::"Trigger", resource)
+when {
+  resource.allowedPrincipals.contains(principal) ||
+  principal.groups.containsAny(resource.allowedGroups)
+};
 
-Denylist channel posture is expressed as a workspace-level permit (`context.workspace == "<WS>"`, any channel) plus `TplForbidChannels` rows for the denied channels.
+// P2 forbid (wins) — principal or one of its groups is explicitly denied
+forbid(principal, action == SdlcTrigger::Action::"Trigger", resource)
+when {
+  resource.deniedPrincipals.contains(principal) ||
+  principal.groups.containsAny(resource.deniedGroups)
+};
 
-### 5.3 Router evaluation — `infra/dispatch/trigger_authz.py` (new)
+// P3 forbid (wins) — the channel isn't allowed for the workspace
+forbid(principal, action == SdlcTrigger::Action::"Trigger", resource)
+when { !context.channelAllowed };
+```
+
+- **Default-deny**: no allowed membership ⇒ no permit ⇒ deny. An admin opts subjects in by writing `trigger_rule` permit rows (which become `allowedPrincipals`/`allowedGroups` data).
+- **Two axes compose**: WHO (P1/P2, from `trigger_rule` rows) and WHERE (P3, from the `slack_channel` allow/deny rows resolved to one `channelAllowed` boolean). Cedar **forbid-wins** gives an explicit deny — or a blocked channel — precedence over any permit.
+- The channel-posture math (allowlist vs denylist + the allow/deny rows) is resolved in **Python** (`trigger_grants.channel_allowed`) rather than Cedar, so the posture logic is unit-testable and Cedar stays a single boolean check.
+
+### 5.3 Router evaluation — `infra/dispatch/trigger_authz.py` + `trigger_grants.py`
+
+`trigger_grants.py` (a dispatch-side reader mirroring `fleet_config.py`, short-TTL cached) resolves the DATA per request: `agent_grants(agent, workspace)` → the four grant sets from `trigger_rule` rows; `channel_allowed(workspace, channel)` → the WHERE boolean from workspace policy + `slack_channel` rows. `trigger_authz.is_authorized` assembles those into the `Agent` resource attributes + the principal's `groups` + `context.channelAllowed`, then calls AVP against the fixed policy set:
 
 ```python
-def is_authorized(*, principal: str, agent_id: str, source: str, context: dict) -> Decision:
+def is_authorized(*, principal, agent_id, source, context) -> Decision:
     store = os.environ.get("TRIGGER_POLICY_STORE_ID")
     if not store:
         return Decision(allow=False, reason="authz-store-unconfigured")  # fail closed
-    groups = context.get("principal_groups", [])   # from receiver/enrichment
+    grants = trigger_grants.agent_grants(agent_id, context.get("workspace", ""))      # DDB
+    channel_ok = trigger_grants.channel_allowed(context.get("workspace",""),          # DDB
+                                                context.get("channel_id",""))
     resp = avp.is_authorized(
         policyStoreId=store,
         principal={"entityType":"SdlcTrigger::User","entityId":principal},
@@ -218,19 +239,23 @@ def is_authorized(*, principal: str, agent_id: str, source: str, context: dict) 
         resource={"entityType":"SdlcTrigger::Agent","entityId":agent_id},
         context={"contextMap": {
             "workspace":{"string":context.get("workspace","")},
-            "channel":  {"string":context.get("channel_id","")},
-            "source":   {"string":source},
-        }},
-        entities={"entityList":[{
-            "identifier":{"entityType":"SdlcTrigger::User","entityId":principal},
-            "parents":[{"entityType":"SdlcTrigger::Group","entityId":g} for g in groups],
-            "attributes": ({"email":{"string":context["requester_email"]}}
-                           if context.get("requester_email") else {}),
-        }]},
+            "channel":{"string":context.get("channel_id","")},
+            "source":{"string":source},
+            "channelAllowed":{"boolean": channel_ok}}},
+        entities={"entityList":[
+            {"identifier":{...User...}, "parents":[Group... per group],
+             "attributes":{"groups": set(groups), "email": ...}},
+            {"identifier":{...Agent...}, "attributes":{
+                "allowedPrincipals": set(grants.allowed_principals),
+                "deniedPrincipals":  set(grants.denied_principals),
+                "allowedGroups":     set(grants.allowed_groups),
+                "deniedGroups":      set(grants.denied_groups)}}]},
     )
     return Decision(allow=(resp["decision"]=="ALLOW"),
                     reason=_reason_from(resp.get("determiningPolicies")))
 ```
+
+A grant-read failure fails closed (`authz-unavailable`) before AVP is called.
 
 Fails closed on any exception, a non-ALLOW decision, OR an unconfigured store —
 identical discipline to `auth._authorize`. `Decision.allow` is a plain bool (there
@@ -263,21 +288,21 @@ def authorize_trigger(agent_config, sender, source, source_context=None):
 - Router IAM gains `verifiedpermissions:IsAuthorized` on the trigger store; env
   gains `TRIGGER_POLICY_STORE_ID` (required).
 
-### 5.5 Rule management + the divergence invariant (`infra/dashboard`)
+### 5.5 Rule management (`infra/dashboard`)
 
-A new `trigger_policy_sync.py` (parallel to `policy_sync.py`) projects a rule row into AVP:
-- **create rule** → `config_store.put_trigger_rule` (persist), then AVP `CreatePolicy` (a **static** policy whose full Cedar statement is rendered from the row — see below), then `set_trigger_rule_policy_id`.
-- **delete rule** → AVP `DeletePolicy(avp_policy_id)`, then `delete_trigger_rule`.
-- **On AVP failure, roll back the row**, so **enforcement and config never diverge** — the same invariant `admin.py` upholds for repo→gateway sync ("an admin action never widens dispatch while the policy lags"). The direction matters: on *create*, persist-then-project and roll back the row if projection fails (never leave a rule the UI shows but Cedar doesn't enforce); on *delete*, revoke-in-AVP-first (never leave Cedar enforcing a rule the UI thinks is gone).
-- **Static, not template-linked:** an AVP template can only substitute `?principal`/`?resource`, but a rule also pins the *workspace* and *channel set* as `when` conditions — so each rule renders to one static policy (`render_rule_statement`). A replace deletes the superseded policy so a rule maps to exactly one live policy.
-- No-op with a logged warning when `TRIGGER_POLICY_STORE_ID` is unset — the admin can still author rows; they project once the store id is wired.
+Because grants are **data**, rule management is just DynamoDB writes — there is **no** per-rule AVP sync, no `CreatePolicy`/`DeletePolicy`, and therefore no persist↔project divergence to guard against:
+- **create/edit rule** → `config_store.put_trigger_rule` (a single `PutItem`).
+- **delete rule** → `config_store.delete_trigger_rule` (a single `DeleteItem`).
+- **channel policy** → `put_channel_policy` / `delete_channel_policy`.
+
+The router picks the change up on its next grant-cache refresh (short TTL, `trigger_grants.reset_cache` in tests) — the same propagation model as the repo allowlist (`fleet_config`). This is strictly simpler than the earlier per-rule-policy design *and* avoids the AVP policy-count anti-pattern. (`trigger_policy_sync.py` from the first cut was deleted.)
 
 ### 5.6 Principal identity & groups
 
 - **Principal:** `slack:<team_id>:<user_id>` — workspace-scoped and immutable (Slack user ids aren't self-editable; parallels the Asana `.gid` rationale, threat T-4). Never the display name.
 - **Email attribute:** best-effort `users.info` resolution, passed as the Cedar `User.email` attribute so admins may *also* write email-based rules.
 - **Groups (`memberOfTypes`):** source of membership is **dashboard-maintained role mappings** (admin maps a Slack user/usergroup → a fleet role) — simplest, no extra Slack scopes, admin-controlled. Slack **usergroups** (`usergroups.users.list`) are a documented fast-follow. The receiver/enrichment resolves the principal's groups and passes them as `principal_groups` in context.
-- **Cross-source unification (core, not optional):** GitHub (`github:<login>`) and Asana (`asana:<gid>`) authorize through the same `Trigger` action from day one; their `context.channel`/`workspace` are absent so channel/workspace clauses no-op. The flat `authorization.users` list is **removed** (config_store no longer stores it and `render_registry` no longer emits an `authorization` block). Since v2 is unreleased, there's nothing to deprecate — a one-time migration seeds each existing capability's `authorization.users` values as Cedar permit rules so GitHub/Asana keep working on first deploy; anything unseeded is default-deny.
+- **Cross-source unification (core, not optional):** GitHub (`github:<login>`) and Asana (`asana:<gid>`) authorize through the same `Trigger` action from day one; their `context.channel`/`workspace` are absent so channel/workspace clauses no-op. The flat `authorization.users` list is **removed** (config_store no longer stores it and `render_registry` no longer emits an `authorization` block). Since v2 is unreleased, there's nothing to deprecate — a one-time migration seeds each existing capability's `authorization.users` values as `trigger_rule` permit rows (data, not policies) so GitHub/Asana keep working on first deploy; anything unseeded is default-deny.
 
 ---
 
@@ -360,7 +385,7 @@ Reuses existing primitives: `usePolling`/`useApi` (`hooks.ts`), `StatusPill` (`c
 
 ### 9.4 Sub-pages (`dashboard/src/connectors/`)
 
-- **`SlackConnectorPage.tsx`** — *Connection:* onboard **≥1 workspace** (manifest download + install, per-workspace token/secret status, enable/disable/remove). *Access rules:* per-workspace channel allow/deny + trigger rules (subject → agent → workspace → channels → permit/forbid) + the simulator. *Activity:* Slack-sourced runs, `slack-webhook` errors, `TriggerDenied`.
+- **`SlackConnectorPage.tsx`** — *Connection:* onboard **≥1 workspace** (manifest download + install, per-workspace token/secret status, enable/disable/remove). *Access rules:* two composing axes — WHO trigger rules (subject → agent → workspace → permit/forbid) and WHERE per-workspace channel allow/deny — plus the simulator. *Activity:* Slack-sourced runs, `slack-webhook` errors, `TriggerDenied`.
 - **`AsanaConnectorPage.tsx`** — first real UI for what `scripts/bootstrap_asana_webhook.py` does by hand: PAT + webhook-secret status, handshake/registration state, bot-user GIDs + Agent-field enum mapping (currently env-only). Access-rules tab shows Asana trigger rules (channel clauses absent).
 - **`GitHubConnectorPage.tsx`** — absorbs `GitHubAppPanel` verbatim (registration/install status + the manifest-callback exchange effect currently in `AdminView`). Cross-links to **Admin → Fleet config** for repo onboarding (repos stay there — they're a GitHub *resource/authz* concern, not the connection).
 
@@ -368,7 +393,7 @@ Reuses existing primitives: `usePolling`/`useApi` (`hooks.ts`), `StatusPill` (`c
 
 ### 9.5 Access-rules UX & the simulator
 
-The Access-rules tab is the "comprehensive admin capability to ensure the right users get access or a proper reject." It lists this connector's rules, offers a builder (subject user/group → agent → workspace → channels → permit/forbid), and a **Test access** panel wired to `POST /admin/trigger-rules/simulate` that runs a read-only AVP `IsAuthorized` for a hypothetical (subject, agent, workspace, channel) and shows **ALLOW/DENY + the deciding policy** — so an admin can answer "why was this rejected?" before a user ever hits it.
+The Access-rules tab is the "comprehensive admin capability to ensure the right users get access or a proper reject." It surfaces both axes — the WHO rule builder (subject user/group → agent → workspace → permit/forbid) and the WHERE per-workspace channel allow/deny — and a **Test access** panel wired to `POST /admin/trigger-rules/simulate` that runs a read-only AVP `IsAuthorized` for a hypothetical (subject, agent, workspace, channel) and shows **ALLOW/DENY + the deciding policy** — so an admin can answer "why was this rejected?" before a user ever hits it.
 
 ### 9.6 API client & types (`dashboard/src/api.ts`, `types.ts`)
 
@@ -386,7 +411,7 @@ All `auth.is_admin`, fail-closed, using the existing `_route` + `_sync_after_wri
 | `GET/POST /admin/slack/workspaces`, `DELETE …/{team_id}` | Onboard / list / remove workspaces |
 | `GET /admin/slack/workspaces/{team_id}/manifest` | Slack app manifest (parallels `github-app/setup/manifest`) |
 | `GET/POST /admin/slack/channels`, `DELETE …/{team_id}/{channel_id}` | Per-workspace channel allow/deny |
-| `GET/POST /admin/trigger-rules?connector=<id>`, `DELETE …/{rule_id}` | Per-connector rule CRUD (→ AVP via `trigger_policy_sync`, §5.5) |
+| `GET/POST /admin/trigger-rules?connector=<id>`, `DELETE …/{rule_id}` | Per-connector rule CRUD (pure `config_store` writes; no AVP projection — §5.5) |
 | `POST /admin/trigger-rules/simulate` | Read-only AVP `IsAuthorized` dry-run → ALLOW/DENY + deciding policy |
 
 Admin Lambda IAM gains `verifiedpermissions:CreatePolicy/DeletePolicy/ListPolicies/GetPolicy/IsAuthorized` on the trigger store, and SSM read/write for the per-workspace Slack secret paths (`/sdlc-agents/${Stage}/slack/*`).
@@ -409,8 +434,8 @@ Admin Lambda IAM gains `verifiedpermissions:CreatePolicy/DeletePolicy/ListPolici
 
 Slack-specific pieces are gated by `DeploySlack`; the Cedar trigger-authz store is core (always on).
 
-1. **Trigger-authz spine — DONE (commit de549dd, refined in the follow-up).** `trigger_authz.py`, the single `authorize_trigger` path (no allowlist, no back-compat), `trigger_policy_sync.py` (static-policy renderer + project/revoke), config-store workspace/channel/rule records. The flat `authorization.users` source was removed from config_store/admin/registry. 348 tests green.
-2. **Foundation infra + authz migration.** Add `TriggerPolicyStore` to the foundation stack (always provisioned) + router `TRIGGER_POLICY_STORE_ID`/IAM; ship the one-time migration that seeds existing capabilities' `authorization.users` as Cedar permit rules so GitHub/Asana authorize on first deploy (unseeded ⇒ default-deny). Optionally a `TriggerAuthzEnforcement` LOG_ONLY→enforce rollout knob.
+1. **Trigger-authz spine — DONE (data-driven).** `trigger_authz.py` (fixed policy set + entity assembly), `trigger_grants.py` (dispatch-side DDB reader for the WHO grants + WHERE channel posture), the single `authorize_trigger` router path (no allowlist, no back-compat), config-store workspace/channel/rule records. The flat `authorization.users` source was removed from config_store/admin/registry. Grants are DynamoDB data — no per-rule AVP policy. 346 tests green.
+2. **Foundation infra + authz migration.** Add `TriggerPolicyStore` to the foundation stack (always provisioned) + router `TRIGGER_POLICY_STORE_ID`/IAM; ship the one-time migration that seeds existing capabilities' `authorization.users` as `trigger_rule` permit rows so GitHub/Asana authorize on first deploy (unseeded ⇒ default-deny). Optionally a `TriggerAuthzEnforcement` LOG_ONLY→enforce rollout knob.
 3. **Slack receiver + multi-workspace onboarding** behind `DeploySlack=false`: `slack_webhook.py`, `verify_slack_signature`, `reply.post_slack_message`, enrichment slack branch, admin routes + config-store secret handling, `bootstrap_slack.py`.
 4. **Connectors UI inside Admin** (`dashboard/`): registry + routing + `ConnectorLayout`, GitHub page (relocate `GitHubAppPanel`), Asana page (surface existing state), Slack page. Ship the GitHub relocation first (pure refactor, no backend dep).
 5. **Wire it live in dev.** Deploy with `DeploySlack=true` in a dev stage; onboard a test workspace, author rules, exercise the simulator, verify allow + every reject reason in-thread.
@@ -420,11 +445,12 @@ Slack-specific pieces are gated by `DeploySlack`; the Cedar trigger-authz store 
 
 ## 13. Testing
 
-Mirrors the existing receiver/authz suites. The old allowlist tests were rewritten onto the Cedar model (they no longer exist as allowlist assertions); the guardrail/repo-binding tests stub `authorize_trigger` since they aren't about authz. Suite is 348 green after the spine + collapse.
+Mirrors the existing receiver/authz suites. The old allowlist tests were rewritten onto the Cedar model (they no longer exist as allowlist assertions); the guardrail/repo-binding tests stub `authorize_trigger` since they aren't about authz. Suite is 346 green after the spine + collapse + data-driven rework.
 
-- **`trigger_authz`**: ALLOW / deny / forbid-wins / fail-closed on AVP error / **fail-closed when store unset** / group membership / channel+workspace context / missing-channel denial.
+- **`trigger_authz`**: ALLOW / default-deny / fail-closed on AVP error / grant-read error / **fail-closed when store unset**; and the `IsAuthorized` call shape — Agent resource carries the grant sets, principal carries its groups+email, context carries workspace/channel/source/channelAllowed.
 - **`config_store`**: new record CRUD + id validation (reject Cedar-metachar / bad team/channel/user ids).
-- **`admin`**: workspace + channel + rule CRUD; rule→AVP projection and **rollback on AVP failure**; simulate endpoint; `is_admin` gating; connector routes.
+- **`admin`**: workspace + channel + rule CRUD (pure DDB writes, no AVP projection); simulate endpoint; `is_admin` gating; connector routes.
+- **`trigger_grants`**: WHO resolution (permit/forbid, user/group, agent+workspace wildcard matching); WHERE resolution (allowlist/denylist posture, unknown-workspace fail-closed, non-Slack allowed); cache TTL refresh.
 - **`slack_webhook`**: valid signature → correct dispatch payload; bad signature → 401; missing/disabled workspace → no dispatch; **replay** rejected; `url_verification` echoes challenge; slash command (form-encoded) parsed; `app_mention` bot-prefix stripping → correct resolution; unknown mention → 200 no-op; **bot-loop** ignored; **dedup** (same `event_id` twice → one dispatch); base64 body decoded before signature; per-workspace secret selection.
 - **`reply`**: `post_slack_message` success/failure returns bool; per-workspace token fetch.
 - **`mentions.verify_slack_signature`**: timing-safe, skew window, prefix.

@@ -1,5 +1,5 @@
-"""Trigger authorization for the Dispatch Router — Cedar policies via Amazon
-Verified Permissions (AVP).
+"""Trigger authorization for the Dispatch Router — Cedar via Amazon Verified
+Permissions (AVP), data-driven.
 
 This is the THIRD Cedar surface in the fleet, and the one the router consults on
 every inbound dispatch (decision "C" in docs/specs/slack-connectors-spec.md §2):
@@ -10,33 +10,39 @@ every inbound dispatch (decision "C" in docs/specs/slack-connectors-spec.md §2)
   - and THIS module decides whether a given *sender* may *trigger* a given *agent*
     from a given *source / workspace / channel*.
 
-Historically that last decision was a flat in-code allowlist match on a
-capability's ``authorization.users`` (router.check_authorization). That has no
-notion of WHERE a trigger happened (which Slack workspace / channel), which the
-multi-workspace Slack connector needs. So trigger authorization moves to AVP,
-evaluating the ``SdlcTrigger`` policy store the admin API manages (one
-template-linked Cedar policy per admin-authored rule — see
-infra/dashboard/trigger_policy_sync.py).
+Data-driven model (spec §5). The AVP policy store holds a SMALL, FIXED set of
+Cedar policies (authored once, in the foundation template — see FIXED_POLICIES
+below). Admin-authored grants are DATA, not policies: the router reads the
+``trigger_rule`` + ``slack_channel`` rows (via trigger_grants) and passes the
+resolved grant sets to AVP as ENTITY ATTRIBUTES on the ``Agent`` resource, plus
+``context.channelAllowed``. So granting a user access is a DynamoDB write, and
+the AVP policy count stays constant no matter how many users/rules exist — a
+policy-per-user would be the AVP anti-pattern this deliberately avoids.
 
-Mechanism mirrors auth._authorize: build an ``IsAuthorized`` call with the sender
-as the principal, ``Trigger`` as the action, the agent id as the resource, and
-``{workspace, channel, source}`` as the request context; pass the principal's
-group memberships as parent entities so group-scoped rules match. Fail-closed:
-any AVP error, a missing store, or a non-ALLOW decision denies.
+The fixed policies:
+  P1 permit — principal is in the agent's allowed principals, OR a member of one
+     of its allowed groups.
+  P2 forbid — principal is in the agent's denied principals, OR a member of a
+     denied group (forbid-wins gives explicit deny precedence over any permit).
+  P3 forbid — the channel isn't allowed for the workspace (context.channelAllowed
+     is false); the posture math is resolved in trigger_grants, not Cedar.
+Default-deny: no allowed-membership ⇒ no permit ⇒ deny.
 
-This is the fleet's ONLY trigger-authorization mechanism — there is no
-per-capability allowlist fallback. Every source (GitHub, Asana, Slack)
-authorizes through here; the principal namespaces the source (``github:<login>``,
-``asana:<gid>``, ``slack:<team>:<uid>``) and GitHub/Asana simply carry no
-workspace/channel context, so channel-scoped rules no-op for them. The store is
-required infrastructure (provisioned alongside the dashboard's own AVP store); an
-unset store is a deployment error, and — being fail-closed — denies every trigger
-rather than silently allowing one.
+This is the fleet's ONLY trigger-authorization mechanism — no per-capability
+allowlist. Every source authorizes here; the principal namespaces the source
+(``github:<login>``, ``asana:<gid>``, ``slack:<team>:<uid>``) and github/asana
+carry no workspace/channel (channel axis treated as allowed for them).
+
+Fail-closed: any AVP error, a missing store, or a non-ALLOW decision denies. The
+store is required infrastructure (provisioned alongside the dashboard's own AVP
+store); an unset store is a deployment error and denies every trigger.
 """
 
 import logging
 import os
 from dataclasses import dataclass
+
+import trigger_grants
 
 logger = logging.getLogger(__name__)
 
@@ -44,13 +50,47 @@ logger = logging.getLogger(__name__)
 STORE_ENV = "TRIGGER_POLICY_STORE_ID"
 
 # Cedar entity-type namespace + names — must match the SdlcTrigger policy-store
-# schema and the templates in infra/foundation/template.yaml.
+# schema and the fixed policies in infra/foundation/template.yaml.
 CEDAR_NAMESPACE = "SdlcTrigger"
 _USER_TYPE = f"{CEDAR_NAMESPACE}::User"
 _GROUP_TYPE = f"{CEDAR_NAMESPACE}::Group"
 _ACTION_TYPE = f"{CEDAR_NAMESPACE}::Action"
 _AGENT_TYPE = f"{CEDAR_NAMESPACE}::Agent"
 ACTION_TRIGGER = "Trigger"
+
+# The FIXED policy set the SdlcTrigger store is provisioned with (spec §5.2).
+# Authored ONCE in the foundation template; kept here as the source of truth +
+# for the docs/tests. Grants are data (entity attrs), so these never change as
+# users/rules are added. Cedar forbid-wins gives P2/P3 precedence over P1.
+FIXED_POLICIES = {
+    "sdlc_trigger_permit": (
+        "permit(\n"
+        "  principal,\n"
+        '  action == SdlcTrigger::Action::"Trigger",\n'
+        "  resource\n"
+        ") when {\n"
+        "  resource.allowedPrincipals.contains(principal) ||\n"
+        "  principal.groups.containsAny(resource.allowedGroups)\n"
+        "};"
+    ),
+    "sdlc_trigger_forbid_denied": (
+        "forbid(\n"
+        "  principal,\n"
+        '  action == SdlcTrigger::Action::"Trigger",\n'
+        "  resource\n"
+        ") when {\n"
+        "  resource.deniedPrincipals.contains(principal) ||\n"
+        "  principal.groups.containsAny(resource.deniedGroups)\n"
+        "};"
+    ),
+    "sdlc_trigger_forbid_channel": (
+        "forbid(\n"
+        "  principal,\n"
+        '  action == SdlcTrigger::Action::"Trigger",\n'
+        "  resource\n"
+        ") when { !context.channelAllowed };"
+    ),
+}
 
 _avp = None
 
@@ -68,11 +108,9 @@ def _avp_client():
 class Decision:
     """The outcome of a trigger-authz check.
 
-    ``allow`` is a plain bool:
-      - ``True``  — AVP returned ALLOW.
-      - ``False`` — AVP returned a non-ALLOW decision, the store is unconfigured,
-        or the call failed. All three fail closed; ``reason`` names which, for the
-        reject notice + metrics.
+    ``allow`` is a plain bool: True on ALLOW; False (fail-closed) on any
+    non-ALLOW, an AVP error, or an unconfigured store. ``reason`` names which,
+    for the reject notice + metrics.
     """
 
     allow: bool
@@ -84,17 +122,20 @@ def store_id() -> str | None:
     return os.environ.get(STORE_ENV) or None
 
 
+def _set(values) -> dict:
+    """A Cedar set-of-strings attribute value for AVP's entity/attribute JSON."""
+    return {"set": [{"string": v} for v in values]}
+
+
 def _reason_from(determining_policies: list | None) -> str:
-    """A short, human-facing reason derived from the AVP decision's determining
-    policies. AVP returns the ids of the policies that drove the decision; the
-    admin API names each rule's linked policy after the rule, so the id is a
-    usable breadcrumb for the dashboard + the in-thread reject notice. Falls back
-    to a generic reason when AVP returns none (a pure default-deny)."""
+    """A short reason from the AVP decision's determining policies. For a DENY the
+    determining policy is one of the two fixed forbids (denied subject / blocked
+    channel) or empty (default-deny = no matching permit)."""
     if not determining_policies:
-        return "no-matching-rule"
+        return "no-matching-grant"
     ids = [p.get("policyId", "") for p in determining_policies if isinstance(p, dict)]
     ids = [i for i in ids if i]
-    return f"policy:{ids[0]}" if ids else "no-matching-rule"
+    return f"policy:{ids[0]}" if ids else "no-matching-grant"
 
 
 def is_authorized(
@@ -106,22 +147,23 @@ def is_authorized(
 ) -> Decision:
     """Decide whether ``principal`` may trigger ``agent_id`` from ``source``.
 
-    ``context`` carries the request dimensions the Cedar rules condition on:
-      - ``workspace`` — the Slack team id (``""`` for github/asana).
-      - ``channel_id`` — the Slack channel id (``""`` when absent).
-      - ``requester_email`` — optional; passed as the principal's ``email``
-        attribute so email-based rules match.
-      - ``principal_groups`` — optional list of group ids the principal belongs
-        to; passed as Cedar parent entities so group-scoped rules match.
+    ``context`` carries the request dimensions:
+      - ``workspace`` — the Slack team id ("" for github/asana).
+      - ``channel_id`` — the Slack channel id ("" when absent).
+      - ``requester_email`` — optional; passed as the principal's ``email`` attr.
+      - ``principal_groups`` — the group ids the principal belongs to (from the
+        receiver/enrichment); passed as the principal's ``groups`` attribute so
+        the fixed group-membership policies match.
 
-    Returns a Decision (fail-closed everywhere): an unset store, any AVP error,
-    or a non-ALLOW decision all yield ``allow=False`` with a naming ``reason``.
+    The agent's grant sets (allowed/denied principals + groups) and the channel
+    posture are read from DynamoDB (trigger_grants) and passed to AVP as entity
+    attributes + context — the grants are DATA, the policy set is fixed.
+
+    Fail-closed everywhere: an unset store, any AVP error, or a non-ALLOW
+    decision all yield ``allow=False`` with a naming ``reason``.
     """
     sid = store_id()
     if not sid:
-        # The store is required infrastructure; its absence is a deployment
-        # error. Deny (never silently allow) and name it so the misconfig is
-        # visible in the reject notice + metrics.
         logger.error(
             "%s is unset — trigger authorization store not configured; denying "
             "(principal=%s agent=%s source=%s)",
@@ -138,13 +180,37 @@ def is_authorized(
     email = ctx.get("requester_email")
     groups = ctx.get("principal_groups") or []
 
-    principal_entity = {"identifier": {"entityType": _USER_TYPE, "entityId": principal}}
-    principal_entity["parents"] = [
-        {"entityType": _GROUP_TYPE, "entityId": g} for g in sorted(set(groups))
-    ]
+    # Resolve the DATA: the agent's grant sets + whether this channel is allowed.
+    # A read error here must not fail open — trigger_grants reads through a cache
+    # and any exception propagates to the except below (deny).
+    try:
+        grants = trigger_grants.agent_grants(agent_id, workspace)
+        channel_allowed = trigger_grants.channel_allowed(workspace, channel)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "trigger-grant lookup failed (agent=%s workspace=%s); denying", agent_id, workspace
+        )
+        return Decision(allow=False, reason="authz-unavailable")
+
+    principal_entity = {
+        "identifier": {"entityType": _USER_TYPE, "entityId": principal},
+        "parents": [
+            {"entityType": _GROUP_TYPE, "entityId": g} for g in sorted(set(groups))
+        ],
+        "attributes": {"groups": _set(sorted(set(groups)))},
+    }
     if email:
-        # Cedar record attribute; the schema declares User.email as optional.
-        principal_entity["attributes"] = {"email": {"string": str(email)}}
+        principal_entity["attributes"]["email"] = {"string": str(email)}
+
+    agent_entity = {
+        "identifier": {"entityType": _AGENT_TYPE, "entityId": agent_id},
+        "attributes": {
+            "allowedPrincipals": _set(grants.allowed_principals),
+            "deniedPrincipals": _set(grants.denied_principals),
+            "allowedGroups": _set(grants.allowed_groups),
+            "deniedGroups": _set(grants.denied_groups),
+        },
+    }
 
     try:
         resp = _avp_client().is_authorized(
@@ -157,13 +223,12 @@ def is_authorized(
                     "workspace": {"string": workspace},
                     "channel": {"string": channel},
                     "source": {"string": source},
+                    "channelAllowed": {"boolean": bool(channel_allowed)},
                 }
             },
-            entities={"entityList": [principal_entity]},
+            entities={"entityList": [principal_entity, agent_entity]},
         )
     except Exception:  # noqa: BLE001
-        # Never fail open: an AVP outage / permission error denies the trigger
-        # (the fleet stays secure, the sender retries) — mirrors auth._authorize.
         logger.exception(
             "AVP trigger authorization failed (principal=%s agent=%s source=%s); denying",
             principal,

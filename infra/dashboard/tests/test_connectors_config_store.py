@@ -152,12 +152,14 @@ def test_trigger_rule_roundtrip_defaults():
         subject_id="slack:T0ACME123:U0AL1CE",
         agent_id="workitems",
         workspace="T0ACME123",
-        channels=["C0ENG111"],
         effect="permit",
         created_by="admin-1",
     )
     assert rec["rule_id"]
-    assert cs.get_trigger_rule(rec["rule_id"])["agent_id"] == "workitems"
+    got = cs.get_trigger_rule(rec["rule_id"])
+    assert got["agent_id"] == "workitems"
+    # WHO-only: the channel axis lives on slack_channel rows, not on the rule.
+    assert "channels" not in got
 
 
 @mock_aws
@@ -170,10 +172,9 @@ def test_trigger_rule_wildcards_allowed():
         subject_id="group:eng-oncall",
         agent_id="*",
         workspace="*",
-        channels=["*"],
         effect="permit",
     )
-    assert rec["agent_id"] == "*" and rec["workspace"] == "*" and rec["channels"] == ["*"]
+    assert rec["agent_id"] == "*" and rec["workspace"] == "*"
 
 
 @mock_aws
@@ -193,8 +194,6 @@ def test_trigger_rule_validation():
         cs.put_trigger_rule(connector="slack", agent_id="Bad Id", **base)
     with pytest.raises(ValueError):  # bad workspace
         cs.put_trigger_rule(connector="slack", workspace="nope", **base)
-    with pytest.raises(ValueError):  # bad channel
-        cs.put_trigger_rule(connector="slack", channels=["nope"], **base)
 
 
 @mock_aws
@@ -209,18 +208,17 @@ def test_trigger_rule_per_connector_filtering():
 
 
 @mock_aws
-def test_trigger_rule_policy_id_stamp_and_clear_and_preserve():
+def test_trigger_rule_replace_and_delete():
     _make_table()
     cs = _load_store()
     rec = cs.put_trigger_rule(connector="slack", subject_type="user", subject_id="u", effect="permit")
     rid = rec["rule_id"]
-    cs.set_trigger_rule_policy_id(rid, "pol-123")
-    assert cs.get_trigger_rule(rid)["avp_policy_id"] == "pol-123"
-    # a REPLACE (same rule_id) must preserve the AVP linkage
+    created_at = rec["created_at"]
+    # a REPLACE (same rule_id) preserves created_at and updates the effect
     cs.put_trigger_rule(
         connector="slack", subject_type="user", subject_id="u", effect="forbid", rule_id=rid
     )
-    assert cs.get_trigger_rule(rid)["avp_policy_id"] == "pol-123"
-    cs.set_trigger_rule_policy_id(rid, None)
-    assert "avp_policy_id" not in cs.get_trigger_rule(rid)
+    got = cs.get_trigger_rule(rid)
+    assert got["effect"] == "forbid" and got["created_at"] == created_at
     assert cs.delete_trigger_rule(rid) is True
+    assert cs.delete_trigger_rule(rid) is False
