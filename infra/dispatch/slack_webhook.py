@@ -81,33 +81,42 @@ def _signing_secret() -> str | None:
     return resp["Parameter"]["Value"] or None
 
 
-def _seen_event(event_id: str) -> bool:
-    """Record ``event_id``; return True if it was ALREADY seen (a Slack retry).
+def _dedup_key(event_id: str) -> str:
+    return f"slack-event#{event_id}"
 
-    Conditional PutItem on the assignments table with a short TTL — idempotent
-    dedup without a second table. A brand-new id writes and returns False; a
-    repeat hits the condition and returns True."""
+
+def _already_seen(event_id: str) -> bool:
+    """True if ``event_id`` was already recorded as processed (a Slack retry of a
+    delivery we handled). Read-only — the id is recorded by ``_mark_seen`` AFTER
+    successful processing, so a delivery that failed mid-process is NOT marked and
+    Slack's retry is allowed through. A read error fails OPEN (treat as new): a
+    duplicate dispatch is tolerated by the router's assignment id + concurrency
+    guard, but dropping a real mention is not."""
     if not event_id:
         return False
-    now = int(time.time())
+    try:
+        resp = _assignments_table().get_item(Key={"assignment_id": _dedup_key(event_id)})
+        return "Item" in resp
+    except Exception:  # noqa: BLE001
+        logger.exception("event dedup read failed for %s; treating as new", event_id)
+        return False
+
+
+def _mark_seen(event_id: str) -> None:
+    """Record ``event_id`` as processed (short TTL). Best-effort — a write failure
+    only risks a duplicate dispatch on a Slack retry, never a dropped delivery."""
+    if not event_id:
+        return
     try:
         _assignments_table().put_item(
             Item={
-                "assignment_id": f"slack-event#{event_id}",
+                "assignment_id": _dedup_key(event_id),
                 "kind": "slack_event_dedup",
-                "ttl": now + _DEDUP_TTL_SECONDS,
-            },
-            ConditionExpression="attribute_not_exists(assignment_id)",
+                "ttl": int(time.time()) + _DEDUP_TTL_SECONDS,
+            }
         )
-        return False
-    except _ddb.meta.client.exceptions.ConditionalCheckFailedException:
-        return True
     except Exception:  # noqa: BLE001
-        # A dedup-store hiccup must not drop a real delivery; fail OPEN on dedup
-        # only (worst case a duplicate dispatch, which the router's assignment id
-        # + concurrency guard already tolerate).
-        logger.exception("event dedup check failed for %s; treating as new", event_id)
-        return False
+        logger.exception("event dedup write failed for %s", event_id)
 
 
 def _dispatch(agent_id: str, instruction: str, sender: str, context: dict, trigger_type: str):
@@ -336,8 +345,13 @@ def handler(event, context=None):
         logger.info("Slack event from non-onboarded/disabled workspace %s; ignoring", team_id)
         return _ack("ignored")
 
-    # De-dup Slack retries on the delivery's event_id.
-    if _seen_event(payload.get("event_id", "")):
+    # De-dup Slack retries on the delivery's event_id. Check-only here (no write
+    # yet): a duplicate short-circuits, but we must NOT record the id until the
+    # event actually processed — otherwise a transient dispatch failure (which
+    # returns 500 and asks Slack to retry) would be swallowed by its own marker
+    # on the retry and the mention silently lost.
+    event_id = payload.get("event_id", "")
+    if _already_seen(event_id):
         return _ack("duplicate")
 
     event_data = payload.get("event", {}) or {}
@@ -346,5 +360,8 @@ def handler(event, context=None):
             _process_app_mention(event_data, team_id)
     except Exception:  # noqa: BLE001
         logger.exception("error processing Slack event")
+        # Do NOT mark seen — let Slack retry the delivery.
         return {"statusCode": 500, "body": "processing error"}
+    # Processed cleanly — now record the id so a Slack retry is a no-op.
+    _mark_seen(event_id)
     return _ack("ok")

@@ -265,6 +265,80 @@ def test_channel_request_approve_missing_404():
 
 
 @mock_aws
+def test_channel_request_approve_empty_scope_rejected():
+    # A request naming no agents (nor an approved_agents override) must be
+    # rejected — never coerced to a wildcard (over-grant) or a no-op grant.
+    _make_table()
+    admin = _load_admin()
+    import config_store
+
+    req = config_store.put_channel_request(
+        team_id=TEAM, channel_id="C0ENG111", requested_by="slack:T0ACME12:U0ALICE",
+    )  # requested_agents defaults to []
+    resp = admin.handler(_event("POST", "/admin/channel-requests/{request_id}/approve",
+                                path={"request_id": req["request_id"]}))
+    assert resp["statusCode"] == 400
+    # nothing was granted
+    assert config_store.list_channels(TEAM) == []
+    assert config_store.list_trigger_rules("slack") == []
+    # and the request stays pending (not marked approved)
+    assert config_store.get_channel_request(req["request_id"])["status"] == "pending"
+
+
+@mock_aws
+def test_channel_request_wildcard_override_rejected():
+    _make_table()
+    admin = _load_admin()
+    import config_store
+
+    req = config_store.put_channel_request(
+        team_id=TEAM, channel_id="C0ENG111", requested_by="u", requested_agents=["workitems"],
+    )
+    resp = admin.handler(_event("POST", "/admin/channel-requests/{request_id}/approve",
+                                path={"request_id": req["request_id"]},
+                                body={"approved_agents": ["*"]}))
+    assert resp["statusCode"] == 400  # '*' filtered out → empty → rejected
+
+
+@mock_aws
+def test_channel_request_double_approve_409():
+    _make_table()
+    admin = _load_admin()
+    import config_store
+
+    req = config_store.put_channel_request(
+        team_id=TEAM, channel_id="C0ENG111", requested_by="u", requested_agents=["workitems"],
+    )
+    p = {"request_id": req["request_id"]}
+    assert admin.handler(_event("POST", "/admin/channel-requests/{request_id}/approve", path=p))["statusCode"] == 200
+    # a replay is a terminal-state conflict, not a second grant
+    resp2 = admin.handler(_event("POST", "/admin/channel-requests/{request_id}/approve", path=p))
+    assert resp2["statusCode"] == 409
+    # exactly one permit rule exists (deterministic id → no duplicate)
+    assert len(config_store.list_trigger_rules("slack")) == 1
+
+
+@mock_aws
+def test_simulate_denies_disabled_workspace():
+    _make_table()
+    admin = _load_admin()
+    # workspace exists but is disabled; a grant + allowed channel still → DENY
+    admin.handler(_event("POST", "/admin/slack/workspaces",
+                         body={"team_id": TEAM, "enabled": False}))
+    import config_store
+    config_store.set_slack_workspace_status(TEAM, config_store.SLACK_WS_ACTIVE)
+    admin.handler(_event("POST", "/admin/trigger-rules",
+                         body={"connector": "slack", "subject_type": "user",
+                               "subject_id": "slack:T0ACME12:U0ALICE", "agent_id": "workitems",
+                               "workspace": TEAM, "effect": "permit"}))
+    r = _body(admin.handler(_event("POST", "/admin/trigger-rules/simulate",
+                                   body={"principal": "slack:T0ACME12:U0ALICE",
+                                         "agent_id": "workitems", "workspace": TEAM,
+                                         "channel_id": "C0ENG111"})))
+    assert r["decision"] == "DENY" and r["reason"] == "workspace-not-enabled"
+
+
+@mock_aws
 def test_operator_cannot_approve_request():
     _make_table()
     admin = _load_admin()

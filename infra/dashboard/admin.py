@@ -441,6 +441,14 @@ def _simulate_access(body: dict) -> dict:
     if not principal or not agent_id:
         return error(400, "body.principal and body.agent_id are required")
 
+    # The receiver drops every delivery from a workspace that isn't onboarded +
+    # enabled + active, BEFORE authz runs — so a Slack simulation must reflect
+    # that gate first, or the panel would report ALLOW where production is silent.
+    if workspace:
+        ws = config_store.get_slack_workspace(workspace)
+        if ws is None or not ws.get("enabled") or ws.get("status") != config_store.SLACK_WS_ACTIVE:
+            return ok({"decision": "DENY", "reason": "workspace-not-enabled"})
+
     grants = _resolve_agent_grants(agent_id, workspace)
     channel_ok = _channel_allowed(workspace, channel)
 
@@ -458,14 +466,22 @@ def _simulate_access(body: dict) -> dict:
 
 def _decide_channel_request(event: dict, request_id: str, approve: bool, body: dict) -> dict:
     """Approve or deny a channel onboarding request. APPROVAL is the only path
-    that grants access: it creates the channel allow row and — for each requested
-    agent (or none = a workspace-wide permit is intentionally NOT created; an
-    admin scopes agents explicitly) — a permit trigger rule keyed on the channel's
-    workspace, then marks the request approved. Denial just records the decision.
-    All effects are explicit here so the outcome is auditable + testable."""
+    that grants access: it creates the channel allow row and, for each CONCRETE
+    approved agent, a permit trigger rule keyed on the channel group, then marks
+    the request approved. An empty/wildcard scope is rejected (400) — the admin
+    must name the agents, so approval can neither be a silent no-op nor a
+    workspace-wide over-grant. Only a pending request can be decided (409
+    otherwise). Denial just records the decision. All effects are explicit here so
+    the outcome is auditable + testable."""
     req = config_store.get_channel_request(request_id)
     if req is None:
         return error(404, f"no such channel request: {request_id}")
+    # Only a still-pending request can be decided. Without this guard a
+    # double-click / replayed POST re-runs the writes below (duplicate permit
+    # rows), and an approve-then-deny would flip the status while the granted
+    # rules linger. A decided request is terminal.
+    if req.get("status") != config_store.CHAN_REQ_PENDING:
+        return error(409, f"request {request_id} already {req.get('status')}")
     caller = auth.caller_sub(event)
     if not approve:
         rec = config_store.resolve_channel_request(
@@ -475,6 +491,22 @@ def _decide_channel_request(event: dict, request_id: str, approve: bool, body: d
 
     team_id = req["team_id"]
     channel_id = req["channel_id"]
+    # The admin scopes the grant to CONCRETE agents (the requirement is "access
+    # specific things for that channel"). Prefer an explicit approval override,
+    # else the agents the user requested. An empty scope is REJECTED — we never
+    # silently coerce it to a wildcard (that would grant every fleet agent to
+    # everyone in the channel) nor to nothing (a channel-allow with no WHO grant
+    # that still default-denies). The admin must name the agents.
+    agents = body.get("approved_agents")
+    if agents is None:
+        agents = req.get("requested_agents", [])
+    agents = [a for a in agents if a and a != "*"]
+    if not agents:
+        return error(
+            400,
+            "approve requires a concrete agent scope: pass body.approved_agents "
+            "(the request did not name specific agents)",
+        )
     # 1) allow the channel (the WHERE axis) so triggers there pass the channel gate.
     config_store.put_channel_policy(
         team_id, channel_id,
@@ -483,28 +515,21 @@ def _decide_channel_request(event: dict, request_id: str, approve: bool, body: d
         note=f"approved from request {request_id}",
         created_by=caller,
     )
-    # 2) the admin may override the requested agent scope at approval time.
-    agents = body.get("approved_agents")
-    if agents is None:
-        agents = req.get("requested_agents", [])
-    # An empty scope means "any agent" (the request's default + what the user was
-    # told). Model it as a single wildcard-agent permit so approval isn't a silent
-    # no-op (channel allowed but no WHO grant → every trigger still default-denies).
-    if not agents:
-        agents = ["*"]
+    # 2) one permit rule per approved agent, keyed on the channel group (the
+    # receiver stamps `channel:<team>:<chan>` into principal_groups, so this
+    # permits anyone triggering FROM that channel). Deterministic rule_id per
+    # (team, channel, agent) so a retry overwrites rather than duplicates.
     created = []
     for agent_id in agents:
         rule = config_store.put_trigger_rule(
             connector="slack",
             subject_type=config_store.RULE_SUBJECT_GROUP,
-            # A channel-scoped grant is modeled as a group whose members are the
-            # channel's participants; the receiver passes the channel id as a
-            # principal group so this permits anyone triggering FROM that channel.
             subject_id=f"channel:{team_id}:{channel_id}",
             agent_id=agent_id,
             workspace=team_id,
             effect=config_store.RULE_PERMIT,
             created_by=caller,
+            rule_id=f"chan-{team_id}-{channel_id}-{agent_id}",
         )
         created.append(rule["rule_id"])
     rec = config_store.resolve_channel_request(

@@ -27,13 +27,20 @@ import sys
 
 def _connector_for(subject: str) -> str:
     """The connector a legacy subject belongs to, from its namespace prefix, so a
-    migrated rule lands under the right connector sub-page. Asana gids historically
-    have no prefix; a bare numeric string is Asana, anything else defaults GitHub."""
+    migrated rule lands under the right connector sub-page + gets the right
+    principal prefix. Prefixed ids are unambiguous. A BARE id is inherently
+    ambiguous: Asana gids are always all-numeric and GitHub logins are normally
+    non-numeric, so we map bare-numeric → asana, else github. This heuristic can
+    misclassify a rare all-numeric GitHub login (GitHub allows them); such an
+    entry is best migrated by hand to `github:<login>`, or just re-authored in the
+    dashboard. Flagged rather than silently guessed-wrong for the common case."""
     if subject.startswith("slack:"):
         return "slack"
-    if subject.startswith("asana:") or subject.isdigit():
+    if subject.startswith("asana:"):
         return "asana"
-    return "github"
+    if subject.startswith("github:"):
+        return "github"
+    return "asana" if subject.isdigit() else "github"
 
 
 def plan_migration(rows: list[dict]) -> tuple[list[dict], list[tuple]]:

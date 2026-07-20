@@ -70,16 +70,11 @@ def _fresh(monkeypatch, *, secret=SECRET, ws_enabled=True):
         "put_channel_request",
         lambda **kw: state["requests"].append(kw),
     )
-    # Dedup: an in-memory set instead of DynamoDB.
-    def _seen(event_id):
-        if not event_id:
-            return False
-        if event_id in state["seen"]:
-            return True
-        state["seen"].add(event_id)
-        return False
-
-    monkeypatch.setattr(sw, "_seen_event", _seen)
+    # Dedup: an in-memory set instead of DynamoDB. The receiver now checks
+    # (_already_seen) before processing and records (_mark_seen) only after — so
+    # a delivery that fails mid-process is never marked and Slack's retry runs.
+    monkeypatch.setattr(sw, "_already_seen", lambda eid: bool(eid) and eid in state["seen"])
+    monkeypatch.setattr(sw, "_mark_seen", lambda eid: eid and state["seen"].add(eid))
     return sw, state
 
 
@@ -199,6 +194,30 @@ def test_duplicate_event_id_dropped(monkeypatch):
     sw.handler(mk())
     sw.handler(mk())
     assert len(state["dispatched"]) == 1
+
+
+def test_transient_failure_not_marked_seen_so_retry_runs(monkeypatch):
+    # A delivery that fails mid-processing must NOT be recorded as seen, so
+    # Slack's retry of the same event_id is processed rather than dropped.
+    sw, state = _fresh(monkeypatch)
+    ev = _events_event({"type": "event_callback", "team_id": TEAM, "event_id": "retry-me",
+                        "event": {"type": "app_mention", "text": "<@U0BOT> @workitems x",
+                                  "user": "U1", "channel": "C1", "ts": "1.1"}})
+    # First delivery: dispatch raises → 500, id not marked.
+    calls = {"n": 0}
+    orig = sw._process_app_mention
+    def flaky(evd, tid):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("transient")
+        return orig(evd, tid)
+    monkeypatch.setattr(sw, "_process_app_mention", flaky)
+    assert sw.handler(ev)["statusCode"] == 500
+    assert "retry-me" not in state["seen"]
+    # Slack retries: now it processes + dispatches, then marks seen.
+    assert sw.handler(ev)["statusCode"] == 200
+    assert len(state["dispatched"]) == 1
+    assert "retry-me" in state["seen"]
 
 
 # --- slash commands ----------------------------------------------------------
