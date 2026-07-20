@@ -13,18 +13,26 @@ import { FleetView } from "./FleetView";
 import { RunDetailView } from "./RunDetailView";
 import { TraceView } from "./TraceView";
 import { AdminView } from "./AdminView";
+import { ConnectorsView } from "./connectors/ConnectorsView";
+import { findConnector } from "./connectors/registry";
 
 type View =
   | { name: "fleet" }
   | { name: "run"; assignmentId: string }
   | { name: "trace"; dimension: string; value: string }
-  | { name: "admin" };
+  | { name: "admin" }
+  | { name: "connectors" }
+  | { name: "connector"; id: string };
 
 /** Serialize a view to its URL hash. */
 function viewToHash(view: View): string {
   switch (view.name) {
     case "admin":
       return "#/admin";
+    case "connectors":
+      return "#/admin/connectors";
+    case "connector":
+      return `#/admin/connectors/${encodeURIComponent(view.id)}`;
     case "run":
       return `#/run/${encodeURIComponent(view.assignmentId)}`;
     case "trace":
@@ -37,7 +45,17 @@ function viewToHash(view: View): string {
 /** Parse the current URL hash into a view. Unknown/empty hashes → fleet. */
 function hashToView(hash: string): View {
   const parts = hash.replace(/^#\/?/, "").split("/").filter(Boolean).map(decodeURIComponent);
-  if (parts[0] === "admin") return { name: "admin" };
+  if (parts[0] === "admin") {
+    // Connectors live INSIDE the admin panel: #/admin/connectors[/<id>]. An
+    // unknown connector id falls back to the index. (The GitHub App manifest
+    // callback path — #/admin/github-app/... — falls through to the admin view,
+    // which owns the code exchange.)
+    if (parts[1] === "connectors") {
+      if (parts[2] && findConnector(parts[2])) return { name: "connector", id: parts[2] };
+      return { name: "connectors" };
+    }
+    return { name: "admin" };
+  }
   if (parts[0] === "run" && parts[1]) return { name: "run", assignmentId: parts[1] };
   if (parts[0] === "trace" && parts[1] && parts[2]) {
     return { name: "trace", dimension: parts[1], value: parts[2] };
@@ -131,6 +149,9 @@ export function App({ config }: { config: AppConfig }) {
   // group), so treat an admin as an operator for the not-in-group banner.
   const isOperator = groups.includes("operators") || isAdmin;
   const email = (profile?.email as string) ?? profile?.sub ?? "operator";
+  // The admin panel + its nested Connectors sub-pages are all "in admin".
+  const inAdmin =
+    view.name === "admin" || view.name === "connectors" || view.name === "connector";
 
   const signOut = () => {
     // Clear local session, then hit Cognito's Hosted-UI logout to end the IdP
@@ -152,9 +173,9 @@ export function App({ config }: { config: AppConfig }) {
         <div className="who">
           {isAdmin && (
             <button
-              onClick={() => setView(view.name === "admin" ? { name: "fleet" } : { name: "admin" })}
+              onClick={() => setView(inAdmin ? { name: "fleet" } : { name: "admin" })}
             >
-              {view.name === "admin" ? "Fleet" : "Admin"}
+              {inAdmin ? "Fleet" : "Admin"}
             </button>
           )}
           <span>{String(email)}</span>
@@ -195,9 +216,23 @@ export function App({ config }: { config: AppConfig }) {
             onAuthError={() => void auth.signinRedirect()}
           />
         )}
-        {view.name === "admin" &&
+        {inAdmin &&
           (isAdmin ? (
-            <AdminView api={api} onAuthError={() => void auth.signinRedirect()} />
+            view.name === "admin" ? (
+              <AdminView
+                api={api}
+                onAuthError={() => void auth.signinRedirect()}
+                onOpenConnectors={() => setView({ name: "connectors" })}
+              />
+            ) : view.name === "connectors" ? (
+              <ConnectorsView onOpen={(id) => setView({ name: "connector", id })} />
+            ) : (
+              <ConnectorPageHost
+                id={(view as { id: string }).id}
+                api={api}
+                onAuthError={() => void auth.signinRedirect()}
+              />
+            )
           ) : (
             <div className="banner error">
               Your account is not in the <b>admins</b> group.
@@ -206,6 +241,25 @@ export function App({ config }: { config: AppConfig }) {
       </main>
     </>
   );
+}
+
+/** Resolve the connector id to its page from the registry (unknown → index). */
+function ConnectorPageHost({
+  id,
+  api,
+  onAuthError,
+}: {
+  id: string;
+  api: import("./api").DashboardApi;
+  onAuthError: () => void;
+}) {
+  const descriptor = findConnector(id);
+  if (!descriptor) {
+    window.location.hash = "#/admin/connectors";
+    return null;
+  }
+  const Page = descriptor.Page;
+  return <Page api={api} onAuthError={onAuthError} />;
 }
 
 function Centered({ children }: { children: React.ReactNode }) {

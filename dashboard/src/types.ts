@@ -123,3 +123,52 @@ export interface GitHubManifest {
   manifest: Record<string, unknown>;
   post_url: string;
 }
+
+// --- Connectors: Slack workspaces, channel policy, trigger rules, requests ---
+
+/** A Slack workspace onboarded for the fleet. */
+export interface SlackWorkspace {
+  team_id: string;
+  team_name?: string;
+  enabled: boolean;
+  default_channel_policy: "allowlist" | "denylist";
+  status: "pending" | "active" | "disabled";
+  onboarded_by?: string;
+  onboarded_at?: number;
+}
+
+/** A per-workspace channel allow/deny row (the WHERE axis). */
+export interface ChannelPolicy {
+  team_id: string;
+  channel_id: string;
+  channel_name?: string;
+  mode: "allow" | "deny";
+  note?: string;
+}
+
+/** A WHO grant rule: subject → agent → workspace, permit or forbid. */
+export interface TriggerRule {
+  rule_id: string;
+  connector: "slack" | "asana" | "github";
+  subject_type: "user" | "group";
+  subject_id: string;
+  agent_id: string;
+  workspace: string;
+  effect: "permit" | "forbid";
+  created_by?: string;
+  created_at?: number;
+}
+
+/** A channel onboarding request awaiting admin approval. */
+export interface ChannelRequest {
+  request_id: string;
+  team_id: string;
+  channel_id: string;
+  channel_name?: string;
+  requested_by: string;
+  requested_agents: string[];
+  status: "pending" | "approved" | "denied";
+  created_at?: number;
+  decided_by?: string;
+  decided_at?: number | null;
+}

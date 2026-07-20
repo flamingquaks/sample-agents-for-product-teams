@@ -8,6 +8,8 @@
 
 import type {
   CapabilityConfig,
+  ChannelPolicy,
+  ChannelRequest,
   FleetSettings,
   FleetStats,
   GitHubAppStatus,
@@ -15,7 +17,9 @@ import type {
   RepoConfig,
   Run,
   RunsPage,
+  SlackWorkspace,
   TraceResult,
+  TriggerRule,
 } from "./types";
 
 export class ApiError extends Error {
@@ -168,7 +172,6 @@ export class DashboardApi {
     description?: string;
     aliases?: string[];
     triggers?: Record<string, string[]>;
-    authorization_users?: string[];
     limits?: Record<string, number>;
     env?: Record<string, string>;
     enabled?: boolean;
@@ -198,6 +201,98 @@ export class DashboardApi {
   gitHubAppExchange(code: string): Promise<{ app_id: string; slug: string }> {
     return this.request("POST", "/admin/github-app/setup/callback", {
       body: { code },
+    });
+  }
+
+  // --- Slack connector -------------------------------------------------------
+
+  listSlackWorkspaces(): Promise<{ workspaces: SlackWorkspace[] }> {
+    return this.get<{ workspaces: SlackWorkspace[] }>("/admin/slack/workspaces");
+  }
+
+  onboardSlackWorkspace(body: {
+    team_id: string;
+    team_name?: string;
+    default_channel_policy?: "allowlist" | "denylist";
+    enabled?: boolean;
+  }): Promise<SlackWorkspace> {
+    return this.request<SlackWorkspace>("POST", "/admin/slack/workspaces", { body });
+  }
+
+  deleteSlackWorkspace(teamId: string): Promise<{ team_id: string; deleted: boolean }> {
+    return this.request("DELETE", `/admin/slack/workspaces/${encodeURIComponent(teamId)}`);
+  }
+
+  listChannels(teamId: string): Promise<{ channels: ChannelPolicy[] }> {
+    return this.get<{ channels: ChannelPolicy[] }>("/admin/slack/channels", { team_id: teamId });
+  }
+
+  putChannelPolicy(body: {
+    team_id: string;
+    channel_id: string;
+    mode: "allow" | "deny";
+    channel_name?: string;
+    note?: string;
+  }): Promise<ChannelPolicy> {
+    return this.request<ChannelPolicy>("POST", "/admin/slack/channels", { body });
+  }
+
+  deleteChannelPolicy(teamId: string, channelId: string): Promise<{ deleted: boolean }> {
+    return this.request(
+      "DELETE",
+      `/admin/slack/channels/${encodeURIComponent(teamId)}/${encodeURIComponent(channelId)}`,
+    );
+  }
+
+  // --- trigger rules (WHO grants) + access simulator -------------------------
+
+  listTriggerRules(connector?: string): Promise<{ rules: TriggerRule[] }> {
+    return this.get<{ rules: TriggerRule[] }>("/admin/trigger-rules", { connector });
+  }
+
+  createTriggerRule(body: {
+    connector: string;
+    subject_type: "user" | "group";
+    subject_id: string;
+    agent_id?: string;
+    workspace?: string;
+    effect?: "permit" | "forbid";
+  }): Promise<TriggerRule> {
+    return this.request<TriggerRule>("POST", "/admin/trigger-rules", { body });
+  }
+
+  deleteTriggerRule(ruleId: string): Promise<{ rule_id: string; deleted: boolean }> {
+    return this.request("DELETE", `/admin/trigger-rules/${encodeURIComponent(ruleId)}`);
+  }
+
+  simulateAccess(body: {
+    principal: string;
+    agent_id: string;
+    workspace?: string;
+    channel_id?: string;
+    principal_groups?: string[];
+  }): Promise<{ decision: "ALLOW" | "DENY"; reason: string }> {
+    return this.request("POST", "/admin/trigger-rules/simulate", { body });
+  }
+
+  // --- channel onboarding requests (approve/deny queue) ----------------------
+
+  listChannelRequests(status?: string): Promise<{ requests: ChannelRequest[] }> {
+    return this.get<{ requests: ChannelRequest[] }>("/admin/channel-requests", { status });
+  }
+
+  approveChannelRequest(
+    requestId: string,
+    approvedAgents?: string[],
+  ): Promise<{ request: ChannelRequest; created_rules: string[] }> {
+    return this.request("POST", `/admin/channel-requests/${encodeURIComponent(requestId)}/approve`, {
+      body: approvedAgents ? { approved_agents: approvedAgents } : {},
+    });
+  }
+
+  denyChannelRequest(requestId: string): Promise<{ request: ChannelRequest }> {
+    return this.request("POST", `/admin/channel-requests/${encodeURIComponent(requestId)}/deny`, {
+      body: {},
     });
   }
 }

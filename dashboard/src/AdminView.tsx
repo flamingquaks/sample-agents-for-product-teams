@@ -13,17 +13,19 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError, type DashboardApi } from "./api";
 import { CapabilitiesPanel } from "./CapabilitiesPanel";
 import { fmtTime } from "./format";
-import { GitHubAppPanel } from "./GitHubAppPanel";
 import { usePolling } from "./hooks";
 import type { FleetSettings, RepoConfig } from "./types";
 
 export function AdminView({
   api,
   onAuthError,
+  onOpenConnectors,
 }: {
   api: DashboardApi;
   /** Called when the API rejects a request as unauthenticated (expired token). */
   onAuthError: () => void;
+  /** Navigate to the Connectors section (inside the admin panel). */
+  onOpenConnectors: () => void;
 }) {
   const handleError = useCallback(
     (e: unknown) => {
@@ -49,10 +51,6 @@ export function AdminView({
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
   const [onboardOpen, setOnboardOpen] = useState(false);
-  // Bumped after a successful App registration so GitHubAppPanel re-fetches its
-  // status immediately instead of waiting for its idle poll (avoids showing the
-  // stale "Set up" form — and a duplicate-registration click — for ~20s).
-  const [appRefreshKey, setAppRefreshKey] = useState(0);
 
   // Wrap a write so the button disables, the outcome ALWAYS surfaces (success or
   // failure — never a silent no-op), and both affected polls re-fetch. `label`
@@ -114,10 +112,9 @@ export function AdminView({
       .gitHubAppExchange(code)
       .then((r) => {
         setActionMsg(`GitHub App "${r.slug}" registered.`);
-        // Success: burn the code from the URL, and refresh the App panel so it
-        // reflects the newly-registered App immediately (not on the next idle poll).
-        window.location.hash = "#/admin";
-        setAppRefreshKey((k) => k + 1);
+        // Success: burn the code from the URL and land on the GitHub connector
+        // page, where the App panel now lives and re-fetches fresh status on mount.
+        window.location.hash = "#/admin/connectors/github";
       })
       .catch((e) => {
         if (e instanceof ApiError && e.status === 401) onAuthError();
@@ -155,7 +152,12 @@ export function AdminView({
       {actionError && <div className="banner error">{actionError}</div>}
       {actionMsg && <div className="banner ok">{actionMsg}</div>}
 
-      <GitHubAppPanel api={api} onAuthError={onAuthError} refreshKey={appRefreshKey} />
+      <div className="filters" style={{ alignItems: "center" }}>
+        <span>
+          <b>Connectors</b> — Slack, Asana, and GitHub: connections, triggers, and access rules.
+        </span>
+        <button onClick={onOpenConnectors}>Manage connectors →</button>
+      </div>
 
       <SettingsPanel
         restrict={restrict}
