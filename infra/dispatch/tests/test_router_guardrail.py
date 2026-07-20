@@ -17,7 +17,6 @@ REGISTRY = {
     "agents": {
         "workitems": {
             "runtime_arn": "arn:aws:bedrock-agentcore:us-west-2:123:runtime/wi",
-            "authorization": {"users": ["alice"]},
             "limits": {"max_concurrent": 5},
         }
     }
@@ -49,6 +48,10 @@ def router(monkeypatch):
     # The repo allowlist is exercised in test_router_repo_binding; here we assume
     # the dispatch repo is onboarded so these tests focus on guardrail handling.
     monkeypatch.setattr(router_mod, "check_repo_allowed", lambda *a, **k: True)
+    # Trigger authz (Cedar/AVP) is exercised in test_trigger_authz +
+    # test_router_authorization; here we assume the sender is permitted so these
+    # tests focus on guardrail handling.
+    monkeypatch.setattr(router_mod, "authorize_trigger", lambda *a, **k: (True, ""))
     yield router_mod
 
 

@@ -151,47 +151,23 @@ def extract_mention_and_instruction(
 _UNRESOLVED_SENDERS = {"", "unknown"}
 
 
-def _legacy_allowlist(agent_config: dict, sender: str) -> bool:
-    """The pre-Cedar authorization check: match ``sender`` against the
-    capability's flat ``authorization.users`` list. Used when the Cedar trigger
-    policy store is not configured (``TRIGGER_POLICY_STORE_ID`` unset) so the
-    fleet's behavior is unchanged until an operator enables trigger authz.
-
-    Fails closed: an empty/missing ``authorization.users`` list rejects every
-    sender. The wildcard ``"*"`` remains supported for operators who explicitly
-    opt into an open-by-default posture, but it is not the shipping default.
-    (The unresolved-sender guard is applied by ``authorize_trigger`` before this
-    is ever called, so both the Cedar and legacy paths reject "" / "unknown".)"""
-    allowed_users = agent_config.get("authorization", {}).get("users", [])
-    if not allowed_users:
-        logger.warning(
-            "Agent '%s' has an empty authorization.users list; rejecting sender '%s'. "
-            "Set the capability's authorization users in the dashboard Admin view.",
-            agent_config.get("agent_id", "?"),
-            sender,
-        )
-        return False
-    if "*" in allowed_users:
-        return True
-    return sender in allowed_users
-
-
 def authorize_trigger(
     agent_config: dict, sender: str, source: str, source_context: dict | None = None
 ) -> tuple[bool, str]:
     """Authorize a trigger, returning ``(allowed, reason)``.
 
-    Fail-closed on an unresolved sender ("" / "unknown") in BOTH paths — these
-    sentinels mean the upstream receiver couldn't resolve a stable identity, and
-    allowing them would turn a misconfigured policy into a universal bypass
-    (threat T-4). We never pass such a sentinel to AVP as a principal.
+    Trigger authorization is decided ONLY by the Cedar ``SdlcTrigger`` policy
+    store (``trigger_authz.is_authorized``), keyed on the sender, the agent, and
+    the request's source/workspace/channel context. There is no per-capability
+    allowlist — every source (GitHub, Asana, Slack) authorizes through this one
+    path, with the source namespaced into the principal.
 
-    When the Cedar trigger policy store is configured, the decision comes from
-    AVP (``trigger_authz.is_authorized``), keyed on the sender, the agent, and
-    the request's source/workspace/channel context. When it is unset,
-    ``is_authorized`` signals ``allow=None`` and we fall back to the legacy
-    per-capability allowlist — byte-for-byte today's behavior. ``reason`` names
-    why a denial happened, for the reject notice + metrics."""
+    Fail-closed on an unresolved sender ("" / "unknown") BEFORE calling AVP —
+    these sentinels mean the upstream receiver couldn't resolve a stable
+    identity, and allowing them would turn a misconfigured policy into a
+    universal bypass (threat T-4). We never pass such a sentinel to AVP as a
+    principal. ``reason`` names why a denial happened, for the reject notice +
+    metrics."""
     agent_id = agent_config.get("agent_id", "?")
     if not sender or sender in _UNRESOLVED_SENDERS:
         logger.warning(
@@ -207,11 +183,7 @@ def authorize_trigger(
         source=source,
         context=source_context or {},
     )
-    if decision.allow is None:
-        # Store not configured — legacy allowlist (unchanged behavior).
-        allowed = _legacy_allowlist(agent_config, sender)
-        return allowed, ("" if allowed else "not-in-allowlist")
-    return bool(decision.allow), (decision.reason if not decision.allow else "")
+    return decision.allow, ("" if decision.allow else decision.reason)
 
 
 def check_authorization(
@@ -478,10 +450,9 @@ def handler(event, context):
     agent_id = agent_config["agent_id"]
 
     # --- Authorization ---
-    # Cedar-backed when the trigger policy store is configured (decision keys on
-    # sender + agent + source/workspace/channel); the legacy per-capability
-    # allowlist otherwise. `reason` is surfaced for observability + (Phase 2) the
-    # in-thread reject notice.
+    # Cedar-backed trigger authz (the SdlcTrigger AVP store), keyed on sender +
+    # agent + source/workspace/channel. Same path for every source; no allowlist.
+    # `reason` is surfaced for observability + (Phase 3) the in-thread reject notice.
     authorized, authz_reason = authorize_trigger(
         agent_config, sender, source, source_context
     )

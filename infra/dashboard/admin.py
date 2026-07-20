@@ -12,7 +12,7 @@ Routes (all admin-only):
     GET    /admin/settings                  get fleet settings
     PUT    /admin/settings                  update settings (body: restrict_repos)
     GET    /admin/capabilities              list onboarded capabilities (agents)
-    POST   /admin/capabilities              onboard/edit a capability (body: agent_id, description?, aliases?, triggers?, authorization_users?, limits?, env?, enabled?)
+    POST   /admin/capabilities              onboard/edit a capability (body: agent_id, description?, aliases?, triggers?, limits?, env?, enabled?)
     DELETE /admin/capabilities/{agent_id}   remove a capability
 
 Two synchronized effects (see the plan's "exact chain"): a repo change writes
@@ -230,10 +230,6 @@ def _validate_capability_body(body: dict) -> tuple[dict, dict | None]:
         if not isinstance(events, list) or any(not isinstance(e, str) for e in events):
             return {}, error(400, f"body.triggers.{source} must be a list of strings")
 
-    users = body.get("authorization_users", [])
-    if not isinstance(users, list) or any(not isinstance(u, str) for u in users):
-        return {}, error(400, "body.authorization_users must be a list of strings")
-
     limits = body.get("limits", {})
     if not isinstance(limits, dict):
         return {}, error(400, "body.limits must be an object")
@@ -270,7 +266,6 @@ def _validate_capability_body(body: dict) -> tuple[dict, dict | None]:
         "description": description,
         "aliases": aliases,
         "triggers": triggers,
-        "authorization_users": users,
         "limits": limits,
         "env": env,
         "enabled": bool(body.get("enabled", True)),

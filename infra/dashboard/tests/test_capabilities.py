@@ -109,7 +109,6 @@ def test_active_capability_rendered_in_router_shape():
         description="Triage bot",
         aliases=["Tri", "tri", " TRI "],
         triggers={"github": ["issue_comment"]},
-        authorization_users=["alice", ""],
         limits={"max_concurrent": 3, "timeout_minutes": 10},
         env={"FOO": "bar"},
         onboarded_by="admin-1",
@@ -122,18 +121,19 @@ def test_active_capability_rendered_in_router_shape():
     reg = cs.render_registry()
     assert list(reg["agents"]) == ["triage"]
     entry = reg["agents"]["triage"]
-    # Exactly the keys router.py's resolve_agent / limit checks read.
+    # Exactly the keys router.py's resolve_agent / limit checks read. NO
+    # authorization block — who may trigger is decided by Cedar trigger rules,
+    # not a per-capability allowlist carried in the registry.
     assert set(entry) == {
         "description",
         "runtime_arn",
         "aliases",
         "triggers",
-        "authorization",
         "limits",
     }
     assert entry["runtime_arn"] == "arn:runtime/triage-xyz"
     assert entry["aliases"] == ["tri"]  # lowercased + de-duped
-    assert entry["authorization"] == {"users": ["alice"]}  # empty principal dropped
+    assert "authorization" not in entry
     assert entry["triggers"] == {"github": ["issue_comment"]}
     assert entry["limits"] == {"max_concurrent": 3, "timeout_minutes": 10}
     # env is runtime-injected config, NOT part of the router registry.
@@ -286,7 +286,6 @@ def test_onboard_capability_persists_lists_and_starts_build(monkeypatch):
                 "description": "Triage bot",
                 "aliases": ["tri"],
                 "triggers": {"github": ["issue_comment"]},
-                "authorization_users": ["alice"],
                 "limits": {"max_concurrent": 3},
                 "env": {"FOO": "bar"},
             },

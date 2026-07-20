@@ -1,11 +1,11 @@
 """Tests for trigger_authz — the router's Cedar trigger-authorization check via
-AVP (docs/specs/slack-connectors-spec.md §5.3).
+AVP (docs/specs/slack-connectors-spec.md §5.3). This is the fleet's ONLY trigger
+authorization mechanism (no per-capability allowlist).
 
-Covers the tri-state Decision: allow=None when the store is unset (caller falls
-back to the legacy allowlist), allow=True on ALLOW, allow=False on any non-ALLOW
-or AVP error (fail-closed). Also asserts the IsAuthorized call is shaped
-correctly — principal/action/resource, the workspace/channel/source context, and
-group parents + the email attribute.
+Covers the Decision: allow=True on ALLOW; allow=False (fail-closed) on any
+non-ALLOW, an AVP error, OR an unconfigured store. Also asserts the IsAuthorized
+call is shaped correctly — principal/action/resource, the workspace/channel/source
+context, and group parents + the email attribute.
 """
 
 import sys
@@ -24,11 +24,18 @@ def _load():
     return trigger_authz
 
 
-def test_store_unset_returns_none_signal(monkeypatch):
+def test_store_unset_fails_closed(monkeypatch):
+    # The store is required infrastructure; an unset store is a deployment error
+    # and MUST deny (never silently allow). No AVP call is attempted.
     monkeypatch.delenv("TRIGGER_POLICY_STORE_ID", raising=False)
     ta = _load()
-    d = ta.is_authorized(principal="slack:T:U", agent_id="workitems", source="slack", context={})
-    assert d.allow is None
+    avp = MagicMock()
+    with patch.object(ta, "_avp_client", return_value=avp):
+        d = ta.is_authorized(
+            principal="slack:T:U", agent_id="workitems", source="slack", context={}
+        )
+    assert d.allow is False and d.reason == "authz-store-unconfigured"
+    avp.is_authorized.assert_not_called()
 
 
 def test_allow(monkeypatch):

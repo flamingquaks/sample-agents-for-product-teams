@@ -22,14 +22,16 @@ Mechanism mirrors auth._authorize: build an ``IsAuthorized`` call with the sende
 as the principal, ``Trigger`` as the action, the agent id as the resource, and
 ``{workspace, channel, source}`` as the request context; pass the principal's
 group memberships as parent entities so group-scoped rules match. Fail-closed:
-any AVP error, missing store, or non-ALLOW decision denies.
+any AVP error, a missing store, or a non-ALLOW decision denies.
 
-Back-compat: when ``TRIGGER_POLICY_STORE_ID`` is unset (AVP store not deployed,
-the toggle off, or unit tests), ``is_authorized`` returns a decision whose
-``allow`` is ``None`` — the SIGNAL to the caller (router.check_authorization) to
-fall back to the legacy ``authorization.users`` allowlist. This is what keeps the
-whole spine dark until an operator flips ``EnableTriggerAuthz`` on: with the store
-unset, dispatch behavior is byte-for-byte today's.
+This is the fleet's ONLY trigger-authorization mechanism — there is no
+per-capability allowlist fallback. Every source (GitHub, Asana, Slack)
+authorizes through here; the principal namespaces the source (``github:<login>``,
+``asana:<gid>``, ``slack:<team>:<uid>``) and GitHub/Asana simply carry no
+workspace/channel context, so channel-scoped rules no-op for them. The store is
+required infrastructure (provisioned alongside the dashboard's own AVP store); an
+unset store is a deployment error, and — being fail-closed — denies every trigger
+rather than silently allowing one.
 """
 
 import logging
@@ -37,6 +39,9 @@ import os
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
+
+# The env var carrying the store id. Required — an unset store fails closed.
+STORE_ENV = "TRIGGER_POLICY_STORE_ID"
 
 # Cedar entity-type namespace + names — must match the SdlcTrigger policy-store
 # schema and the templates in infra/foundation/template.yaml.
@@ -46,9 +51,6 @@ _GROUP_TYPE = f"{CEDAR_NAMESPACE}::Group"
 _ACTION_TYPE = f"{CEDAR_NAMESPACE}::Action"
 _AGENT_TYPE = f"{CEDAR_NAMESPACE}::Agent"
 ACTION_TRIGGER = "Trigger"
-
-# The env var carrying the store id. Unset ⇒ back-compat (legacy allowlist).
-STORE_ENV = "TRIGGER_POLICY_STORE_ID"
 
 _avp = None
 
@@ -66,15 +68,14 @@ def _avp_client():
 class Decision:
     """The outcome of a trigger-authz check.
 
-    ``allow`` is a tri-state:
+    ``allow`` is a plain bool:
       - ``True``  — AVP returned ALLOW.
-      - ``False`` — AVP returned a non-ALLOW decision, OR the call failed
-        (fail-closed). ``reason`` names why for the reject notice + metrics.
-      - ``None``  — the store is not configured; the caller MUST fall back to the
-        legacy allowlist. NOT a deny — the Cedar path simply isn't active.
+      - ``False`` — AVP returned a non-ALLOW decision, the store is unconfigured,
+        or the call failed. All three fail closed; ``reason`` names which, for the
+        reject notice + metrics.
     """
 
-    allow: bool | None
+    allow: bool
     reason: str = ""
 
 
@@ -113,13 +114,23 @@ def is_authorized(
       - ``principal_groups`` — optional list of group ids the principal belongs
         to; passed as Cedar parent entities so group-scoped rules match.
 
-    Returns a Decision. ``allow=None`` when the store is unset (caller falls back
-    to the legacy allowlist). Fail-closed otherwise: any error ⇒ ``allow=False``.
+    Returns a Decision (fail-closed everywhere): an unset store, any AVP error,
+    or a non-ALLOW decision all yield ``allow=False`` with a naming ``reason``.
     """
     sid = store_id()
     if not sid:
-        # Store not deployed / toggle off / unit test — signal legacy fallback.
-        return Decision(allow=None)
+        # The store is required infrastructure; its absence is a deployment
+        # error. Deny (never silently allow) and name it so the misconfig is
+        # visible in the reject notice + metrics.
+        logger.error(
+            "%s is unset — trigger authorization store not configured; denying "
+            "(principal=%s agent=%s source=%s)",
+            STORE_ENV,
+            principal,
+            agent_id,
+            source,
+        )
+        return Decision(allow=False, reason="authz-store-unconfigured")
 
     ctx = context or {}
     workspace = str(ctx.get("workspace", "") or "")

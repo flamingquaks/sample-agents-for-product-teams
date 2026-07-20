@@ -16,11 +16,13 @@ Table shape (single table, ``FLEET_CONFIG_TABLE`` env var). Partition key ``pk``
   - Settings:      pk="settings",           {kind:"settings", restrict_repos(bool)}
   - Capability:    pk="capability#<agent_id>", {kind:"capability", agent_id,
                    description, aliases[list], triggers{source:[event...]},
-                   authorization_users[list], limits{max_concurrent,
-                   timeout_minutes, daily_token_budget}, env{KEY:val}, enabled(bool),
+                   limits{max_concurrent, timeout_minutes, daily_token_budget},
+                   env{KEY:val}, enabled(bool),
                    status: "pending"|"building"|"active"|"failed"|"disabled",
                    image_tag?, runtime_arn?, build_id?, onboarded_by, onboarded_at,
                    updated_at, status_detail?}
+                   (WHO may trigger the agent is NOT here — it's Cedar trigger
+                   rules, the trigger_rule# records below.)
 
 Capability record (the UI-onboarded agent): a "capability" is an agent the fleet
 can dispatch to. It USED to be spread across code + .dispatch/agents.yaml +
@@ -29,7 +31,7 @@ row here and the dashboard drives the rest (build → runtime → registry → p
 The registry the Dispatch Router reads from SSM is RENDERED from these rows
 (render_registry), so the row is the source of truth that agents.yaml/sync_registry
 previously were. Fields mirror the agents.yaml entry the router consumes
-(description/aliases/triggers/authorization.users/limits) plus the deploy state the
+(description/aliases/triggers/limits) plus the deploy state the
 UI now owns (image_tag, runtime_arn, build_id, status). ``env`` is the per-agent
 runtime environment (e.g. Asana GIDs) the build/runtime step injects — the values
 the deploy scripts previously sourced from the bootstrap config / GitHub vars.
@@ -398,7 +400,6 @@ def put_capability(
     description: str = "",
     aliases: list[str] | None = None,
     triggers: dict | None = None,
-    authorization_users: list[str] | None = None,
     limits: dict | None = None,
     env: dict | None = None,
     enabled: bool = True,
@@ -445,7 +446,6 @@ def put_capability(
         "description": description,
         "aliases": norm_aliases,
         "triggers": triggers or {},
-        "authorization_users": [u for u in (authorization_users or []) if u],
         "limits": limits or {},
         "env": env or {},
         "enabled": bool(enabled),
@@ -528,9 +528,14 @@ def render_registry() -> dict:
     Reproduces exactly the shape the router consumes from SSM (see
     infra/dispatch/router.py load_registry / resolve_agent): a top-level
     ``{"agents": {agent_id: {description, runtime_arn, aliases, triggers,
-    authorization: {users}, limits}}}`` map. This REPLACES .dispatch/agents.yaml +
-    scripts/sync_registry.py — the registry is now generated from the table the
-    admin UI writes, so onboarding an agent needs no code/YAML edit.
+    limits}}}`` map. This REPLACES .dispatch/agents.yaml + scripts/sync_registry.py
+    — the registry is now generated from the table the admin UI writes, so
+    onboarding an agent needs no code/YAML edit.
+
+    Note there is NO ``authorization`` block: WHO may trigger an agent is decided
+    by the Cedar ``SdlcTrigger`` policy store (trigger rules), not a per-capability
+    allowlist carried in the registry. The registry answers "which agent does this
+    mention resolve to, and where is its runtime" — not "may this sender use it".
 
     Routability keys on "has a working runtime + enabled + not disabled", NOT on
     status == active: a capability is included iff it is ``enabled``, not
@@ -553,7 +558,6 @@ def render_registry() -> dict:
             "runtime_arn": arn,
             "aliases": list(cap.get("aliases", [])),
             "triggers": dict(cap.get("triggers", {})),
-            "authorization": {"users": list(cap.get("authorization_users", []))},
             "limits": dict(cap.get("limits", {})),
         }
     return {"agents": agents}
