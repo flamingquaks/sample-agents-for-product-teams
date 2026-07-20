@@ -53,8 +53,10 @@ AGENTS = list(bootstrap.SHIPPING_AGENTS)  # workitems, researcher, docwriter, ad
 
 # Per-agent runtime env beyond the guardrail + gateway URL (which are resolved
 # from stack outputs). Mirrors the env_vars each deploy-<agent>.yml wrapper sets;
-# adr reads no agent-specific env. Asana GIDs come from the foundation stack's
-# parameters so this stays a single source of truth with the deployed stack.
+# adr reads no agent-specific env. The Asana agents additionally need their
+# project/workspace GIDs — the per-agent workflows source these from GitHub
+# Actions vars, and here we read the same values from the bootstrap config
+# (scripts/bootstrap.py wrote both), keeping one local source of truth.
 ASANA_AGENTS = {"workitems", "researcher", "docwriter"}
 
 
@@ -90,21 +92,33 @@ class Runner:
 # --- foundation --------------------------------------------------------------
 
 
-def _existing_stack_params(region: str, stack: str) -> dict[str, str]:
+def _describe_stack(region: str, stack: str) -> dict | None:
+    """The stack's describe-stacks record, or None if it genuinely does not
+    exist yet. A "does not exist" ValidationError is the expected new-stack
+    signal; ANY other ClientError (throttling, AccessDenied) is re-raised — we
+    must NOT mistake a transient/permission failure on a live stack for a
+    brand-new one, or deploy_foundation would silently redeploy it with
+    template defaults and tear down the gateway/dashboard."""
     cfn = boto3.client("cloudformation", region_name=region)
     try:
         stacks = cfn.describe_stacks(StackName=stack)["Stacks"]
-    except cfn.exceptions.ClientError:
-        return {}
-    if not stacks:
-        return {}
-    return {p["ParameterKey"]: p["ParameterValue"] for p in stacks[0].get("Parameters", [])}
+    except cfn.exceptions.ClientError as exc:
+        if "does not exist" in str(exc):
+            return None
+        raise
+    return stacks[0] if stacks else None
 
 
-def _stack_outputs(region: str, stack: str) -> dict[str, str]:
-    cfn = boto3.client("cloudformation", region_name=region)
-    stacks = cfn.describe_stacks(StackName=stack)["Stacks"]
-    return {o["OutputKey"]: o["OutputValue"] for o in stacks[0].get("Outputs", [])}
+def _stack_params(stack: dict | None) -> dict[str, str]:
+    if not stack:
+        return {}
+    return {p["ParameterKey"]: p["ParameterValue"] for p in stack.get("Parameters", [])}
+
+
+def _stack_outputs(stack: dict | None) -> dict[str, str]:
+    if not stack:
+        return {}
+    return {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
 
 
 def deploy_foundation(runner: Runner, stage: str, region: str, auto_approve: bool) -> None:
@@ -114,7 +128,7 @@ def deploy_foundation(runner: Runner, stage: str, region: str, auto_approve: boo
     # DeployDashboard, GitHubAuthMode, the Asana GIDs an operator set, etc.) so a
     # redeploy is a code/template update, not a silent reconfiguration. For a
     # brand-new stack there are none, and the template defaults apply.
-    existing = _existing_stack_params(region, stack)
+    existing = _stack_params(_describe_stack(region, stack))
     runner.run(["sam", "build"], cwd=FOUNDATION_DIR)
     cmd = [
         "sam", "deploy",
@@ -149,48 +163,19 @@ def deploy_foundation(runner: Runner, stage: str, region: str, auto_approve: boo
 
 
 def ensure_agent_roles(runner: Runner, agents: list[str], region: str, account: str, stage: str) -> None:
-    logger.info("== Per-agent runtime IAM roles ==")
-    iam = None if runner.dry_run else boto3.client("iam")
-    for agent in agents:
-        role = f"{agent}-agentcore-runtime"
-        exists = True
-        if not runner.dry_run:
-            try:
-                iam.get_role(RoleName=role)
-            except iam.exceptions.NoSuchEntityException:
-                exists = False
-        if exists:
-            logger.info("role %s: exists (refreshing policies)", role)
-        else:
-            logger.info("role %s: creating", role)
-            trust = {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Effect": "Allow",
-                        "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
-                        "Action": "sts:AssumeRole",
-                    }
-                ],
-            }
-            runner.run([
-                "aws", "iam", "create-role",
-                "--role-name", role,
-                "--assume-role-policy-document", json.dumps(trust),
-                "--description", f"AgentCore runtime role for {agent}",
-            ])
-        runner.run([
-            "aws", "iam", "attach-role-policy",
-            "--role-name", role,
-            "--policy-arn", "arn:aws:iam::aws:policy/AmazonBedrockFullAccess",
-        ])
-        for name, doc in bootstrap.agent_role_policies(agent, region, account, stage).items():
-            runner.run([
-                "aws", "iam", "put-role-policy",
-                "--role-name", role,
-                "--policy-name", name,
-                "--policy-document", json.dumps(doc),
-            ])
+    # Delegate to bootstrap's implementation rather than re-copying the
+    # create-role / attach / put-policy loop — the role shape (trust, policies)
+    # then can't drift from the interactive bootstrap, and we inherit its
+    # careful existence check that skips (rather than blindly creates) a role
+    # when get-role returns an ambiguous/permission error. bootstrap's Runner
+    # collects failures instead of raising, so we re-raise them here to keep
+    # deploy_fleet's fail-loud contract.
+    br = bootstrap.Runner(dry_run=runner.dry_run, profile=None, region=region)
+    bootstrap.ensure_agent_roles(br, agents, region, account, stage)
+    if br.failures:
+        raise DeployError(
+            "agent role setup failed:\n  " + "\n  ".join(br.failures)
+        )
 
 
 def _ecr_login(runner: Runner, region: str, account: str) -> str:
@@ -226,55 +211,101 @@ def _ensure_ecr_repo(runner: Runner, agent: str, region: str) -> None:
     ])
 
 
+def _image_exists(runner: Runner, agent: str, sha: str, region: str) -> bool:
+    """True if the SHA-tagged image is already in ECR. Under --dry-run we assume
+    it does not exist so the build/push commands are printed."""
+    if runner.dry_run:
+        return False
+    ecr = boto3.client("ecr", region_name=region)
+    try:
+        ecr.describe_images(
+            repositoryName=f"sdlc-agents/{agent}", imageIds=[{"imageTag": sha}]
+        )
+        return True
+    except (ecr.exceptions.ImageNotFoundException, ecr.exceptions.RepositoryNotFoundException):
+        return False
+
+
 def _git_sha(runner: Runner) -> str:
     if runner.dry_run:
         return "dryrunsha"
     return runner.run(["git", "rev-parse", "--short", "HEAD"], capture=True)
 
 
-def _agent_env(agent: str, outputs: dict[str, str], stack_params: dict[str, str], region: str) -> str:
+def _agent_env(agent: str, outputs: dict[str, str], asana_gids: dict[str, str]) -> str:
     """Runtime env for an agent: guardrail (all) + gateway URL (all) + Asana GIDs
-    (asana agents). Matches deploy-agent.yml's resolve steps + the per-agent
-    wrapper env_vars, sourced from the deployed stack so there's one truth."""
+    (asana agents). Matches deploy-agent.yml's guardrail/gateway resolve steps
+    plus the per-agent wrapper's env_vars.
+
+    The Asana agents' project_config.py reads ASANA_PROJECT_GID /
+    ASANA_WORKSPACE_GID via os.environ[...] at import time, so a runtime without
+    them KeyErrors on startup and never reaches READY — and because
+    update-agent-runtime REPLACES (not merges) the env, omitting them here would
+    also wipe GIDs a prior deploy set. We therefore require both before touching
+    an Asana agent."""
     pairs = [
         f"BEDROCK_GUARDRAIL_ID={outputs['GuardrailId']}",
         f"BEDROCK_GUARDRAIL_VERSION={outputs['GuardrailVersion']}",
         f"GATEWAY_MCP_URL={outputs['FleetGatewayUrl']}",
     ]
     if agent in ASANA_AGENTS:
-        # The stack doesn't publish the Asana project/workspace GIDs as outputs;
-        # they are operator-set. Pull from SSM if present, else leave unset (the
-        # agent KeyErrors at invocation, which the operator resolves separately).
-        pass
+        project, workspace = asana_gids.get("project", ""), asana_gids.get("workspace", "")
+        if not project or not workspace:
+            raise DeployError(
+                f"{agent} needs ASANA_PROJECT_GID + ASANA_WORKSPACE_GID but the "
+                f"bootstrap config has project={project!r} workspace={workspace!r}. "
+                f"Set asana_project_gid / asana_workspace_gid (re-run "
+                f"scripts/bootstrap.py) before deploying Asana agents."
+            )
+        pairs.append(f"ASANA_PROJECT_GID={project}")
+        pairs.append(f"ASANA_WORKSPACE_GID={workspace}")
     return ",".join(pairs)
 
 
 def deploy_agent(runner: Runner, agent: str, region: str, account: str,
-                 outputs: dict[str, str], stack_params: dict[str, str], sha: str,
+                 outputs: dict[str, str], asana_gids: dict[str, str], sha: str,
                  registry: str) -> None:
     logger.info("== Agent runtime: %s ==", agent)
     repo = f"sdlc-agents/{agent}"
     image = f"{registry}/{repo}:{sha}"
     _ensure_ecr_repo(runner, agent, region)
-    # Build context is agents/ so the shared/ package is included (matches
-    # deploy-agent.yml's working-directory: agents).
-    runner.run(
-        ["docker", "build", "-f", f"{agent}/Dockerfile", "-t", image, "."],
-        cwd=AGENTS_DIR,
-    )
-    runner.run(["docker", "push", image])
+    # ECR repos are IMMUTABLE, and the image tag is the git SHA. On a same-commit
+    # re-run a rebuild can yield a different digest, and pushing it to the
+    # already-present immutable tag is rejected — which would break the "safe to
+    # re-run" contract. So if the SHA tag already exists in ECR, skip build+push
+    # and reuse it (the source at this commit is already published); we still fall
+    # through to the runtime create/update + env refresh below.
+    if _image_exists(runner, agent, sha, region):
+        logger.info("image %s already in ECR — skipping build/push (idempotent re-run)", image)
+    else:
+        # Build context is agents/ so the shared/ package is included (matches
+        # deploy-agent.yml's working-directory: agents).
+        runner.run(
+            ["docker", "build", "-f", f"{agent}/Dockerfile", "-t", image, "."],
+            cwd=AGENTS_DIR,
+        )
+        runner.run(["docker", "push", image])
 
-    env_csv = _agent_env(agent, outputs, stack_params, region)
+    env_csv = _agent_env(agent, outputs, asana_gids)
     role_arn = f"arn:aws:iam::{account}:role/{agent}-agentcore-runtime"
     artifact = f"containerConfiguration={{containerUri={image}}}"
 
     existing_id = ""
     if not runner.dry_run:
         acc = boto3.client("bedrock-agentcore-control", region_name=region)
-        rts = acc.list_agent_runtimes().get("agentRuntimes", [])
-        existing_id = next(
-            (r["agentRuntimeId"] for r in rts if r["agentRuntimeName"] == agent), ""
-        )
+        # Paginate — list_agent_runtimes returns one page, and this account can
+        # hold many runtimes (see module docstring). Missing an existing runtime
+        # on a later page would send us down the create path for a name that
+        # already exists → ConflictException. Matches sync_registry.py.
+        paginator = acc.get_paginator("list_agent_runtimes")
+        for page in paginator.paginate():
+            match = next(
+                (r["agentRuntimeId"] for r in page.get("agentRuntimes", [])
+                 if r["agentRuntimeName"] == agent), ""
+            )
+            if match:
+                existing_id = match
+                break
 
     common = [
         "--agent-runtime-artifact", artifact,
@@ -416,22 +447,32 @@ def main(argv: list[str] | None = None) -> int:
         " [DRY-RUN]" if args.dry_run else "",
     )
 
+    # Asana project/workspace GIDs for the Asana agents' runtime env. The
+    # per-agent workflows read these from GitHub Actions vars; here we read the
+    # same values from the local bootstrap config (scripts/bootstrap.py wrote
+    # them), so there's one local source of truth. _agent_env fails loudly if an
+    # Asana agent is deployed without them.
+    bootstrap_cfg = bootstrap.load_config()
+    asana_gids = {
+        "project": bootstrap_cfg.get("asana_project_gid", ""),
+        "workspace": bootstrap_cfg.get("asana_workspace_gid", ""),
+    }
+
     if not args.skip_foundation:
         deploy_foundation(runner, args.stage, args.region, args.auto_approve)
 
     # Resolve outputs once the foundation exists (agents + dashboard depend on them).
     if args.dry_run:
-        outputs, stack_params = {
+        outputs = {
             "GuardrailId": "<guardrail>", "GuardrailVersion": "<ver>",
             "FleetGatewayUrl": "<gateway-url>",
             "DashboardSiteBucketName": "<bucket>", "DashboardDistributionId": "<dist>",
             "DashboardApiEndpoint": "<api>", "DashboardUserPoolId": "<pool>",
             "DashboardUserPoolClientId": "<client>", "DashboardLoginDomain": "<login>",
             "DashboardUrl": "<url>",
-        }, {}
+        }
     else:
-        outputs = _stack_outputs(args.region, stack)
-        stack_params = _existing_stack_params(args.region, stack)
+        outputs = _stack_outputs(_describe_stack(args.region, stack))
         for req in ("GuardrailId", "GuardrailVersion", "FleetGatewayUrl"):
             if not outputs.get(req):
                 raise DeployError(
@@ -445,7 +486,7 @@ def main(argv: list[str] | None = None) -> int:
         registry = _ecr_login(runner, args.region, account)
         for agent in agents:
             deploy_agent(runner, agent, args.region, account, outputs,
-                         stack_params, sha, registry)
+                         asana_gids, sha, registry)
         sync_registry_to_ssm(runner, args.stage, args.region)
 
     if not args.skip_dashboard:
