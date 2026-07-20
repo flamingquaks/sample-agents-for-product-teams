@@ -31,6 +31,7 @@ import enrichment
 import fleet_config
 import guardrail
 import reply
+import trigger_authz
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -150,22 +151,18 @@ def extract_mention_and_instruction(
 _UNRESOLVED_SENDERS = {"", "unknown"}
 
 
-def check_authorization(agent_config: dict, sender: str, source: str) -> bool:
-    """Check if this user is authorized to invoke this agent from this source.
+def _legacy_allowlist(agent_config: dict, sender: str) -> bool:
+    """The pre-Cedar authorization check: match ``sender`` against the
+    capability's flat ``authorization.users`` list. Used when the Cedar trigger
+    policy store is not configured (``TRIGGER_POLICY_STORE_ID`` unset) so the
+    fleet's behavior is unchanged until an operator enables trigger authz.
 
-    Fails closed:
-    - an empty `authorization.users` list rejects every sender
-    - an empty or "unknown" sender is never allowlistable — these sentinel
-      values indicate the upstream receiver couldn't resolve a stable identity,
-      and allowing them would turn a misconfigured allowlist into a universal
-      bypass.
-
-    The wildcard `"*"` remains supported for operators who explicitly opt into
-    an open-by-default posture, but it is not the shipping default.
-    """
-    auth = agent_config.get("authorization", {})
-    allowed_users = auth.get("users", [])
-
+    Fails closed: an empty/missing ``authorization.users`` list rejects every
+    sender. The wildcard ``"*"`` remains supported for operators who explicitly
+    opt into an open-by-default posture, but it is not the shipping default.
+    (The unresolved-sender guard is applied by ``authorize_trigger`` before this
+    is ever called, so both the Cedar and legacy paths reject "" / "unknown".)"""
+    allowed_users = agent_config.get("authorization", {}).get("users", [])
     if not allowed_users:
         logger.warning(
             "Agent '%s' has an empty authorization.users list; rejecting sender '%s'. "
@@ -174,19 +171,59 @@ def check_authorization(agent_config: dict, sender: str, source: str) -> bool:
             sender,
         )
         return False
+    if "*" in allowed_users:
+        return True
+    return sender in allowed_users
 
+
+def authorize_trigger(
+    agent_config: dict, sender: str, source: str, source_context: dict | None = None
+) -> tuple[bool, str]:
+    """Authorize a trigger, returning ``(allowed, reason)``.
+
+    Fail-closed on an unresolved sender ("" / "unknown") in BOTH paths — these
+    sentinels mean the upstream receiver couldn't resolve a stable identity, and
+    allowing them would turn a misconfigured policy into a universal bypass
+    (threat T-4). We never pass such a sentinel to AVP as a principal.
+
+    When the Cedar trigger policy store is configured, the decision comes from
+    AVP (``trigger_authz.is_authorized``), keyed on the sender, the agent, and
+    the request's source/workspace/channel context. When it is unset,
+    ``is_authorized`` signals ``allow=None`` and we fall back to the legacy
+    per-capability allowlist — byte-for-byte today's behavior. ``reason`` names
+    why a denial happened, for the reject notice + metrics."""
+    agent_id = agent_config.get("agent_id", "?")
     if not sender or sender in _UNRESOLVED_SENDERS:
         logger.warning(
             "Agent '%s' received an unresolved sender (%r); rejecting.",
-            agent_config.get("agent_id", "?"),
+            agent_id,
             sender,
         )
-        return False
+        return False, "unresolved-sender"
 
-    if "*" in allowed_users:
-        return True
+    decision = trigger_authz.is_authorized(
+        principal=sender,
+        agent_id=agent_id,
+        source=source,
+        context=source_context or {},
+    )
+    if decision.allow is None:
+        # Store not configured — legacy allowlist (unchanged behavior).
+        allowed = _legacy_allowlist(agent_config, sender)
+        return allowed, ("" if allowed else "not-in-allowlist")
+    return bool(decision.allow), (decision.reason if not decision.allow else "")
 
-    return sender in allowed_users
+
+def check_authorization(
+    agent_config: dict, sender: str, source: str, source_context: dict | None = None
+) -> bool:
+    """Boolean trigger-authz check (thin wrapper over ``authorize_trigger``).
+
+    Retained as the primary predicate the handler calls; use ``authorize_trigger``
+    directly when the denial ``reason`` is needed (e.g. the in-thread reject
+    notice)."""
+    allowed, _ = authorize_trigger(agent_config, sender, source, source_context)
+    return allowed
 
 
 # --- Repo binding (multi-repo allowlist) -------------------------------------
@@ -441,8 +478,22 @@ def handler(event, context):
     agent_id = agent_config["agent_id"]
 
     # --- Authorization ---
-    if not check_authorization(agent_config, sender, source):
-        return _error(403, f"user '{sender}' not authorized to invoke @{agent_id}")
+    # Cedar-backed when the trigger policy store is configured (decision keys on
+    # sender + agent + source/workspace/channel); the legacy per-capability
+    # allowlist otherwise. `reason` is surfaced for observability + (Phase 2) the
+    # in-thread reject notice.
+    authorized, authz_reason = authorize_trigger(
+        agent_config, sender, source, source_context
+    )
+    if not authorized:
+        _put_metric(
+            "TriggerDenied",
+            dimensions={"Source": source, "AgentId": agent_id, "Reason": authz_reason},
+        )
+        return _error(
+            403,
+            f"user '{sender}' not authorized to invoke @{agent_id} ({authz_reason})",
+        )
 
     # --- Repo binding (single-repo guard) ---
     if not check_repo_allowed(source, source_context):

@@ -82,6 +82,9 @@ _REPO_PK_PREFIX = "repo#"
 _OWNER_PK_PREFIX = "owner#"
 _SETTINGS_PK = "settings"
 _CAPABILITY_PK_PREFIX = "capability#"
+_SLACK_WS_PK_PREFIX = "slack_ws#"
+_SLACK_CHAN_PK_PREFIX = "slack_chan#"
+_TRIGGER_RULE_PK_PREFIX = "trigger_rule#"
 
 # Capability lifecycle. A row starts "pending" the instant it's onboarded, moves
 # to "building" while the shared build pipeline runs, "active" once its runtime is
@@ -107,6 +110,44 @@ CO_REPO_ISOLATED = "isolated"  # only itself (default — safest)
 CO_REPO_GROUP = "group"  # itself + same repo_group (mutual)
 CO_REPO_ALL = "all"  # itself + every eligible repo in the fleet
 CO_REPO_MODES = (CO_REPO_ISOLATED, CO_REPO_GROUP, CO_REPO_ALL)
+
+# --- Connectors: Slack workspaces + channels, and trigger-authz rules --------
+# (docs/specs/slack-connectors-spec.md §4). Every id below flows into a Cedar
+# policy literal (trigger_policy_sync) and/or an SSM parameter path, so each is
+# pinned to its provider's shape to keep an onboard from injecting a Cedar
+# metacharacter, a path traversal, or a bogus resource name.
+
+# Slack ids: team T…, channel C…, user U…, usergroup S… — Slack uses uppercase
+# base-36 (min ~8 chars in practice; we require ≥6 after the type letter).
+_SLACK_TEAM_RE = re.compile(r"^T[A-Z0-9]{6,}$")
+_SLACK_CHANNEL_RE = re.compile(r"^C[A-Z0-9]{6,}$")
+
+# How a workspace's channel rows are interpreted (see put_channel_policy):
+# allowlist → triggers only in channels with an explicit allow row (default-deny
+# per channel — recommended); denylist → any channel except explicit deny rows.
+CHANNEL_POLICY_ALLOWLIST = "allowlist"
+CHANNEL_POLICY_DENYLIST = "denylist"
+CHANNEL_POLICIES = (CHANNEL_POLICY_ALLOWLIST, CHANNEL_POLICY_DENYLIST)
+CHANNEL_MODE_ALLOW = "allow"
+CHANNEL_MODE_DENY = "deny"
+CHANNEL_MODES = (CHANNEL_MODE_ALLOW, CHANNEL_MODE_DENY)
+
+# Workspace + trigger-rule lifecycle / shape.
+SLACK_WS_PENDING = "pending"
+SLACK_WS_ACTIVE = "active"
+SLACK_WS_DISABLED = "disabled"
+SLACK_WS_STATUSES = (SLACK_WS_PENDING, SLACK_WS_ACTIVE, SLACK_WS_DISABLED)
+
+# A trigger rule is scoped to exactly one connector sub-page (per-connector
+# rules, spec §4.3 / §9). Kept as a constant so the admin API can't persist a
+# rule for a connector the router will never evaluate.
+TRIGGER_CONNECTORS = ("slack", "asana", "github")
+RULE_SUBJECT_USER = "user"
+RULE_SUBJECT_GROUP = "group"
+RULE_SUBJECT_TYPES = (RULE_SUBJECT_USER, RULE_SUBJECT_GROUP)
+RULE_PERMIT = "permit"
+RULE_FORBID = "forbid"
+RULE_EFFECTS = (RULE_PERMIT, RULE_FORBID)
 
 _table = None
 
@@ -659,3 +700,338 @@ def coreachable_repos(origin: str) -> list[str]:
                     and r.get("repo_group") == group
                 )
     return sorted(reachable, key=lambda r: (r != norm, r))
+
+
+# --- Slack workspaces --------------------------------------------------------
+# Multi-workspace: an admin onboards one or more workspaces, each with its own
+# bot token + signing secret (stored as SSM SecureStrings — NEVER on the row).
+# The Slack receiver selects the secret by the inbound team_id, so a workspace
+# row is the source of truth for "is this workspace onboarded + enabled, and
+# where are its secrets" (spec §4.1).
+
+
+def valid_slack_team(team_id: str) -> bool:
+    return bool(_SLACK_TEAM_RE.match(team_id or ""))
+
+
+def valid_slack_channel(channel_id: str) -> bool:
+    return bool(_SLACK_CHANNEL_RE.match(channel_id or ""))
+
+
+def _slack_ws_pk(team_id: str) -> str:
+    return f"{_SLACK_WS_PK_PREFIX}{team_id}"
+
+
+def _slack_secret_param(stage: str, team_id: str, leaf: str) -> str:
+    """Canonical SSM SecureString path for a workspace's secret. Kept here so the
+    admin API (which writes the secret) and the receiver (which reads it) agree on
+    one layout. ``leaf`` is ``signing-secret`` | ``bot-token``."""
+    return f"/sdlc-agents/{stage}/slack/{team_id}/{leaf}"
+
+
+def list_slack_workspaces() -> list[dict]:
+    """All onboarded Slack workspace records, newest first. Paged like list_repos
+    so a large fleet never silently drops a workspace from the admin listing."""
+    table = _get_table()
+    rows: list[dict] = []
+    start_key = None
+    while True:
+        kwargs = {
+            "FilterExpression": "kind = :k",
+            "ExpressionAttributeValues": {":k": "slack_workspace"},
+        }
+        if start_key:
+            kwargs["ExclusiveStartKey"] = start_key
+        resp = table.scan(**kwargs)
+        rows.extend(resp.get("Items", []))
+        start_key = resp.get("LastEvaluatedKey")
+        if not start_key:
+            break
+    rows.sort(key=lambda r: r.get("onboarded_at", 0), reverse=True)
+    return rows
+
+
+def get_slack_workspace(team_id: str) -> dict | None:
+    resp = _get_table().get_item(Key={"pk": _slack_ws_pk(team_id)})
+    return resp.get("Item")
+
+
+def put_slack_workspace(
+    team_id: str,
+    *,
+    team_name: str = "",
+    stage: str,
+    enabled: bool = True,
+    default_channel_policy: str = CHANNEL_POLICY_ALLOWLIST,
+    onboarded_by: str = "",
+    status: str = SLACK_WS_PENDING,
+) -> dict:
+    """Create/replace a Slack workspace record. Raises ValueError on a malformed
+    team_id (it flows into the SSM secret path + the Cedar workspace literal) or
+    an invalid channel policy / status. The secret PARAM PATHS are derived + stored
+    on the row; the secret VALUES are written separately by the admin API."""
+    if not valid_slack_team(team_id):
+        raise ValueError(
+            f"invalid Slack team id {team_id!r} — must match {_SLACK_TEAM_RE.pattern}"
+        )
+    if default_channel_policy not in CHANNEL_POLICIES:
+        raise ValueError(f"invalid channel policy {default_channel_policy!r}")
+    if status not in SLACK_WS_STATUSES:
+        raise ValueError(f"invalid workspace status {status!r}")
+    existing = get_slack_workspace(team_id) or {}
+    now = int(time.time())
+    item = {
+        "pk": _slack_ws_pk(team_id),
+        "kind": "slack_workspace",
+        "team_id": team_id,
+        "team_name": team_name or existing.get("team_name", ""),
+        "enabled": bool(enabled),
+        "default_channel_policy": default_channel_policy,
+        "signing_secret_param": _slack_secret_param(stage, team_id, "signing-secret"),
+        "bot_token_param": _slack_secret_param(stage, team_id, "bot-token"),
+        "onboarded_by": onboarded_by or existing.get("onboarded_by", ""),
+        "onboarded_at": existing.get("onboarded_at", now),
+        "updated_at": now,
+        "status": status,
+    }
+    _get_table().put_item(Item=item)
+    return item
+
+
+def set_slack_workspace_status(team_id: str, status: str) -> None:
+    if status not in SLACK_WS_STATUSES:
+        raise ValueError(f"invalid workspace status {status!r}")
+    _get_table().update_item(
+        Key={"pk": _slack_ws_pk(team_id)},
+        UpdateExpression="SET #s = :s, updated_at = :u",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":s": status, ":u": int(time.time())},
+        ConditionExpression="attribute_exists(pk)",
+    )
+
+
+def delete_slack_workspace(team_id: str) -> bool:
+    """Delete a workspace row. Returns True if one existed. Does NOT delete the
+    channel rows or the SSM secrets — the admin API handles that lifecycle so a
+    bare delete here never orphans the record ahead of its dependents."""
+    resp = _get_table().delete_item(
+        Key={"pk": _slack_ws_pk(team_id)}, ReturnValues="ALL_OLD"
+    )
+    return bool(resp.get("Attributes"))
+
+
+# --- Slack channel policy ----------------------------------------------------
+# Per-workspace allow/deny rows. Interpreted against the workspace's
+# default_channel_policy (allowlist ⇒ default-deny per channel; denylist ⇒
+# default-allow). Both are expressible in Cedar (spec §4.2 / §5.2).
+
+
+def _slack_chan_pk(team_id: str, channel_id: str) -> str:
+    return f"{_SLACK_CHAN_PK_PREFIX}{team_id}#{channel_id}"
+
+
+def list_channels(team_id: str) -> list[dict]:
+    """All channel-policy rows for a workspace. The set is small (an admin lists a
+    handful), and we query by pk prefix via a filtered scan; paged for safety."""
+    table = _get_table()
+    prefix = f"{_SLACK_CHAN_PK_PREFIX}{team_id}#"
+    rows: list[dict] = []
+    start_key = None
+    while True:
+        kwargs = {
+            "FilterExpression": "kind = :k AND begins_with(pk, :p)",
+            "ExpressionAttributeValues": {":k": "slack_channel", ":p": prefix},
+        }
+        if start_key:
+            kwargs["ExclusiveStartKey"] = start_key
+        resp = table.scan(**kwargs)
+        rows.extend(resp.get("Items", []))
+        start_key = resp.get("LastEvaluatedKey")
+        if not start_key:
+            break
+    rows.sort(key=lambda r: r.get("channel_id", ""))
+    return rows
+
+
+def put_channel_policy(
+    team_id: str,
+    channel_id: str,
+    *,
+    mode: str,
+    channel_name: str = "",
+    note: str = "",
+    created_by: str = "",
+) -> dict:
+    """Create/replace a channel allow|deny row. Raises ValueError on a malformed
+    team/channel id (both flow into Cedar literals) or an invalid mode."""
+    if not valid_slack_team(team_id):
+        raise ValueError(f"invalid Slack team id {team_id!r}")
+    if not valid_slack_channel(channel_id):
+        raise ValueError(
+            f"invalid Slack channel id {channel_id!r} — must match {_SLACK_CHANNEL_RE.pattern}"
+        )
+    if mode not in CHANNEL_MODES:
+        raise ValueError(f"invalid channel mode {mode!r}")
+    item = {
+        "pk": _slack_chan_pk(team_id, channel_id),
+        "kind": "slack_channel",
+        "team_id": team_id,
+        "channel_id": channel_id,
+        "channel_name": channel_name,
+        "mode": mode,
+        "note": note,
+        "created_by": created_by,
+        "created_at": int(time.time()),
+    }
+    _get_table().put_item(Item=item)
+    return item
+
+
+def delete_channel_policy(team_id: str, channel_id: str) -> bool:
+    resp = _get_table().delete_item(
+        Key={"pk": _slack_chan_pk(team_id, channel_id)}, ReturnValues="ALL_OLD"
+    )
+    return bool(resp.get("Attributes"))
+
+
+# --- Trigger-authz rules -----------------------------------------------------
+# The admin-authored unit of "who may trigger which agent, where" (spec §4.3).
+# Stored here as the source of truth + audit record; PROJECTED into an AVP
+# template-linked Cedar policy by trigger_policy_sync (which stamps avp_policy_id
+# back via set_trigger_rule_policy_id). Scoped to exactly one connector so each
+# connector sub-page manages only its own rules (per-connector rules).
+
+
+def _trigger_rule_pk(rule_id: str) -> str:
+    return f"{_TRIGGER_RULE_PK_PREFIX}{rule_id}"
+
+
+def valid_rule_shape(
+    *, connector: str, subject_type: str, effect: str
+) -> str | None:
+    """Return an error string if the rule's enum fields are invalid, else None."""
+    if connector not in TRIGGER_CONNECTORS:
+        return f"invalid connector {connector!r}"
+    if subject_type not in RULE_SUBJECT_TYPES:
+        return f"invalid subject_type {subject_type!r}"
+    if effect not in RULE_EFFECTS:
+        return f"invalid effect {effect!r}"
+    return None
+
+
+def list_trigger_rules(connector: str | None = None) -> list[dict]:
+    """All trigger rules, or just one connector's (per-connector listing). Newest
+    first. Paged so no rule is silently dropped from the admin UI or a sync."""
+    table = _get_table()
+    rows: list[dict] = []
+    start_key = None
+    while True:
+        kwargs = {
+            "FilterExpression": "kind = :k",
+            "ExpressionAttributeValues": {":k": "trigger_rule"},
+        }
+        if start_key:
+            kwargs["ExclusiveStartKey"] = start_key
+        resp = table.scan(**kwargs)
+        rows.extend(resp.get("Items", []))
+        start_key = resp.get("LastEvaluatedKey")
+        if not start_key:
+            break
+    if connector is not None:
+        rows = [r for r in rows if r.get("connector") == connector]
+    rows.sort(key=lambda r: r.get("created_at", 0), reverse=True)
+    return rows
+
+
+def get_trigger_rule(rule_id: str) -> dict | None:
+    resp = _get_table().get_item(Key={"pk": _trigger_rule_pk(rule_id)})
+    return resp.get("Item")
+
+
+def put_trigger_rule(
+    *,
+    connector: str,
+    subject_type: str,
+    subject_id: str,
+    agent_id: str = "*",
+    workspace: str = "*",
+    channels: list[str] | None = None,
+    effect: str = RULE_PERMIT,
+    created_by: str = "",
+    rule_id: str | None = None,
+) -> dict:
+    """Create (or replace, when rule_id is given) a trigger rule row.
+
+    Validates the enum fields and the ids that become Cedar literals: agent_id
+    (unless the "*" wildcard) against _AGENT_ID_RE, a concrete workspace against
+    the Slack team shape, and each concrete channel against the Slack channel
+    shape. ``channels`` defaults to ``["*"]`` (any channel). Does NOT project to
+    AVP — that's trigger_policy_sync's job; the admin API calls it after this and
+    stamps avp_policy_id via set_trigger_rule_policy_id."""
+    err = valid_rule_shape(
+        connector=connector, subject_type=subject_type, effect=effect
+    )
+    if err:
+        raise ValueError(err)
+    if not (subject_id or "").strip():
+        raise ValueError("subject_id is required")
+    if agent_id != "*" and not valid_agent_id(agent_id):
+        raise ValueError(f"invalid agent_id {agent_id!r}")
+    if workspace != "*" and not valid_slack_team(workspace):
+        raise ValueError(f"invalid workspace {workspace!r}")
+    chans = channels or ["*"]
+    if chans != ["*"]:
+        for c in chans:
+            if not valid_slack_channel(c):
+                raise ValueError(f"invalid channel id {c!r}")
+    if rule_id is None:
+        import uuid
+
+        rule_id = str(uuid.uuid4())
+    existing = get_trigger_rule(rule_id) or {}
+    item = {
+        "pk": _trigger_rule_pk(rule_id),
+        "kind": "trigger_rule",
+        "rule_id": rule_id,
+        "connector": connector,
+        "subject_type": subject_type,
+        "subject_id": subject_id.strip(),
+        "agent_id": agent_id,
+        "workspace": workspace,
+        "channels": list(chans),
+        "effect": effect,
+        "created_by": created_by or existing.get("created_by", ""),
+        "created_at": existing.get("created_at", int(time.time())),
+    }
+    # Preserve the AVP linkage across a replace so a re-put doesn't orphan the
+    # projected policy (the sync reconciles it).
+    if "avp_policy_id" in existing:
+        item["avp_policy_id"] = existing["avp_policy_id"]
+    _get_table().put_item(Item=item)
+    return item
+
+
+def set_trigger_rule_policy_id(rule_id: str, avp_policy_id: str | None) -> None:
+    """Stamp (or clear) the AVP policy id projected from this rule. Called by
+    trigger_policy_sync after a successful CreatePolicy / before a DeletePolicy so
+    the row and the enforced Cedar policy stay linked."""
+    if avp_policy_id is None:
+        _get_table().update_item(
+            Key={"pk": _trigger_rule_pk(rule_id)},
+            UpdateExpression="REMOVE avp_policy_id",
+            ConditionExpression="attribute_exists(pk)",
+        )
+        return
+    _get_table().update_item(
+        Key={"pk": _trigger_rule_pk(rule_id)},
+        UpdateExpression="SET avp_policy_id = :p",
+        ExpressionAttributeValues={":p": avp_policy_id},
+        ConditionExpression="attribute_exists(pk)",
+    )
+
+
+def delete_trigger_rule(rule_id: str) -> bool:
+    resp = _get_table().delete_item(
+        Key={"pk": _trigger_rule_pk(rule_id)}, ReturnValues="ALL_OLD"
+    )
+    return bool(resp.get("Attributes"))

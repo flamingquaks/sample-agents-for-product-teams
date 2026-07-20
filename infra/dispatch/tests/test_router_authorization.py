@@ -67,3 +67,62 @@ def test_asana_gid_match(router_module):
     assert router_module.check_authorization(
         agent_config, "9999999999999999", "asana"
     ) is False
+
+
+# --- Cedar trigger-authz seam (back-compat + delegation) ---------------------
+# With TRIGGER_POLICY_STORE_ID unset (the default, and how the fixture leaves the
+# env), authorize_trigger MUST behave exactly like the legacy allowlist so the
+# whole trigger-authz spine ships dark. When the store IS set, the decision comes
+# from trigger_authz (AVP), not the allowlist.
+
+
+def test_backcompat_uses_legacy_allowlist_when_store_unset(router_module, monkeypatch):
+    monkeypatch.delenv("TRIGGER_POLICY_STORE_ID", raising=False)
+    agent_config = {"agent_id": "workitems", "authorization": {"users": ["alice"]}}
+    ok, reason = router_module.authorize_trigger(agent_config, "alice", "github")
+    assert ok is True and reason == ""
+    ok, reason = router_module.authorize_trigger(agent_config, "mallory", "github")
+    assert ok is False and reason == "not-in-allowlist"
+
+
+def test_unresolved_sender_rejected_before_avp(router_module, monkeypatch):
+    # Even with the store configured, an unresolved sender is rejected locally and
+    # never passed to AVP as a principal (threat T-4).
+    monkeypatch.setenv("TRIGGER_POLICY_STORE_ID", "ps-1")
+    agent_config = {"agent_id": "workitems", "authorization": {"users": ["*"]}}
+    with patch.object(router_module.trigger_authz, "is_authorized") as spy:
+        ok, reason = router_module.authorize_trigger(agent_config, "", "slack", {})
+    assert ok is False and reason == "unresolved-sender"
+    spy.assert_not_called()
+
+
+def test_cedar_path_allows_and_bypasses_allowlist(router_module, monkeypatch):
+    # An empty allowlist would reject under the legacy path; the Cedar ALLOW wins,
+    # proving the decision is delegated, not the allowlist.
+    monkeypatch.setenv("TRIGGER_POLICY_STORE_ID", "ps-1")
+    agent_config = {"agent_id": "workitems", "authorization": {"users": []}}
+    from trigger_authz import Decision
+
+    with patch.object(
+        router_module.trigger_authz, "is_authorized", return_value=Decision(allow=True)
+    ):
+        ok, reason = router_module.authorize_trigger(
+            agent_config, "slack:T0ACME:U0ALICE", "slack", {"channel_id": "C0ENG"}
+        )
+    assert ok is True and reason == ""
+
+
+def test_cedar_path_denies_with_reason(router_module, monkeypatch):
+    monkeypatch.setenv("TRIGGER_POLICY_STORE_ID", "ps-1")
+    agent_config = {"agent_id": "workitems", "authorization": {"users": ["*"]}}
+    from trigger_authz import Decision
+
+    with patch.object(
+        router_module.trigger_authz,
+        "is_authorized",
+        return_value=Decision(allow=False, reason="policy:pol-1"),
+    ):
+        ok, reason = router_module.authorize_trigger(
+            agent_config, "slack:T0ACME:U0MALLORY", "slack", {"channel_id": "C0SECRET"}
+        )
+    assert ok is False and reason == "policy:pol-1"
