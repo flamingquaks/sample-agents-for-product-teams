@@ -151,6 +151,15 @@ Deploy it or not — the fleet works without it.
 
 Agents call models on the OpenAI-compatible **Bedrock Mantle** endpoint (default `anthropic.claude-sonnet-5`); enable Bedrock model access for that model in the Bedrock console → Model access, in the same region as `AWS_REGION`. The Router's edge guardrail and the ADR agent's Titan embeddings use classic `bedrock-runtime` in the same region. Without model access, invocations return `AccessDeniedException`.
 
+**One-time: activate the Mantle project CFN resource type.** The foundation stack provisions the fleet's shared cost-attribution project as `AWS::BedrockMantle::Project` (`DeployMantleProject=true`, the default). That resource type is registered but must be activated per account+region before the first deploy, or the stack fails with a "Resource type not found" error:
+
+```
+aws cloudformation activate-type --type RESOURCE \
+  --type-name AWS::BedrockMantle::Project --region <AWS_REGION>
+```
+
+Run it once per account+region. If you'd rather not manage the project in CloudFormation, set `DeployMantleProject=false` and pass a pre-existing id via `MantleProjectId` (or leave both unset to run on the account's default Mantle project).
+
 ### 2.3 SAM parameters (for the foundation stack)
 
 Passed to `sam deploy --parameter-overrides`:
@@ -161,8 +170,8 @@ Passed to `sam deploy --parameter-overrides`:
 - **`DeployDashboard`** — `true`/`false` (default `false`). Provisions the Cognito user pool, the operator/admin read+write APIs, and the CloudFront SPA.
 - **`DeployGateway`** — `true`/`false` (default `false`). Provisions the AgentCore Gateway + Cedar policy engine (the deterministic tool-call boundary). Requires `DeployDashboard=true` (the admin API owns the policy sync).
 - **`GatewayPolicyEnforcement`** — `LOG_ONLY` (default) / `ACTIVE`. The fleet Cedar policy's enforcement mode; roll out `LOG_ONLY` first, watch CloudWatch, then flip to `ACTIVE`.
-- **`DeployMantleProject`** — `true`/`false` (default `false`). When `true`, provisions the fleet's shared model cost-attribution project as `AWS::BedrockMantle::Project` and injects its id as `MANTLE_PROJECT_ID` on every agent runtime. Off by default because the resource type must be activated in the account+region first (`aws cloudformation activate-type --type RESOURCE --type-name AWS::BedrockMantle::Project`). One project fleet-wide — a dispatch may act across several repos, so per-repo attribution is meaningless.
-- **`MantleProjectId`** — a pre-existing Bedrock Mantle project id, used when `DeployMantleProject=false` (bring-your-own instead of provisioning here). Blank (default) leaves agents on the account's default Mantle project. Ignored when `DeployMantleProject=true`.
+- **`DeployMantleProject`** — `true`/`false` (default `true`). Provisions the fleet's shared model cost-attribution project as `AWS::BedrockMantle::Project` and injects its id as `MANTLE_PROJECT_ID` on every agent runtime. **Prerequisite:** activate the resource type in the account+region once before the first deploy — `aws cloudformation activate-type --type RESOURCE --type-name AWS::BedrockMantle::Project` (see below). One project fleet-wide — a dispatch may act across several repos, so per-repo attribution is meaningless. Set `false` to skip provisioning and bring your own id via `MantleProjectId`.
+- **`MantleProjectId`** — a pre-existing Bedrock Mantle project id, used only when `DeployMantleProject=false`. Blank (default) leaves agents on the account's default Mantle project. Ignored when `DeployMantleProject=true`.
 - **`AsanaMcpEndpoint`** — Asana MCP server endpoint registered as the direct gateway target (default points at the official server). GitHub has no endpoint parameter: its gateway target is the SCM broker Lambda (`infra/dispatch/scm_broker.py`), not a direct MCP server.
 - **`GitHubAppName`** — display name used when registering the fleet's GitHub App from the admin manifest flow (must be unique across GitHub).
 
@@ -226,13 +235,14 @@ The fleet needs **none** — triggers are the GitHub App webhook and build/deplo
 Top-to-bottom, no skipping.
 
 1. **Enable Bedrock model access** (console) for the fleet's Mantle model (`anthropic.claude-sonnet-5`) in `$AWS_REGION`.
-2. **Deploy the base platform** — `python scripts/deploy_fleet.py --stage <stage> --region <region>` (or the interactive `scripts/bootstrap.py`), with the dashboard enabled (`DeployDashboard=true`; add `DeployGateway=true` for the tool-call boundary). This runs `sam deploy` for the foundation stack (Dispatch Router, webhook Lambda, API Gateway, DynamoDB, S3, SSM registry parameter, guardrail, the shared build pipeline + capability deployer/rebuilder, and — when enabled — Cognito + dashboard API/CDN + Gateway), uploads the agent build source, and publishes the dashboard SPA.
-3. **Add dashboard operators/admins** — create Cognito users and add them to the `operators` (view) and `admins` (onboard) groups. Sign in at the `DashboardUrl` output.
-4. **Connect integrations** — run `sdlc-agents-connect-asana` and/or `sdlc-agents-connect-github` to populate SSM parameters.
-5. **Onboard each agent** — in the dashboard Admin view's Capabilities panel, onboard each agent (`agent_id` matching a directory under `agents/` in the build source, plus optional description/aliases/env). Each onboard builds the container, stands up the runtime role + AgentCore runtime, waits READY, and republishes the registry.
-6. **Onboard the repos the fleet may act in** — in the Admin view's repo panel (or `bootstrap.py`'s initial-repo seed when the dashboard is off). Mentions from a non-onboarded repo are rejected at dispatch.
-7. **Register the Asana webhook** — `sdlc-agents-register-triggers` calls the Asana API with the `WebhookEndpoint` stack output.
-8. **Verify** — `sdlc-agents-verify` runs layered smoke tests (runtime health → credential freshness → end-to-end mention).
+2. **Activate the Mantle project CFN resource type** (once per account+region) — `aws cloudformation activate-type --type RESOURCE --type-name AWS::BedrockMantle::Project --region $AWS_REGION`. Required because the base deploy provisions `AWS::BedrockMantle::Project` by default (`DeployMantleProject=true`). Skip only if you set `DeployMantleProject=false`. See § 2.2.
+3. **Deploy the base platform** — `python scripts/deploy_fleet.py --stage <stage> --region <region>` (or the interactive `scripts/bootstrap.py`), with the dashboard enabled (`DeployDashboard=true`; add `DeployGateway=true` for the tool-call boundary). This runs `sam deploy` for the foundation stack (Dispatch Router, webhook Lambda, API Gateway, DynamoDB, S3, SSM registry parameter, guardrail, the shared build pipeline + capability deployer/rebuilder, and — when enabled — Cognito + dashboard API/CDN + Gateway), uploads the agent build source, and publishes the dashboard SPA.
+4. **Add dashboard operators/admins** — create Cognito users and add them to the `operators` (view) and `admins` (onboard) groups. Sign in at the `DashboardUrl` output.
+5. **Connect integrations** — run `sdlc-agents-connect-asana` and/or `sdlc-agents-connect-github` to populate SSM parameters.
+6. **Onboard each agent** — in the dashboard Admin view's Capabilities panel, onboard each agent (`agent_id` matching a directory under `agents/` in the build source, plus optional description/aliases/env). Each onboard builds the container, stands up the runtime role + AgentCore runtime, waits READY, and republishes the registry.
+7. **Onboard the repos the fleet may act in** — in the Admin view's repo panel (or `bootstrap.py`'s initial-repo seed when the dashboard is off). Mentions from a non-onboarded repo are rejected at dispatch.
+8. **Register the Asana webhook** — `sdlc-agents-register-triggers` calls the Asana API with the `WebhookEndpoint` stack output.
+9. **Verify** — `sdlc-agents-verify` runs layered smoke tests (runtime health → credential freshness → end-to-end mention).
 
 Everything except the SSM secrets (populated by the connect skills) and the Asana webhook registration is driven by the base deploy plus dashboard onboarding.
 

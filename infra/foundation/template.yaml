@@ -20,25 +20,27 @@ Parameters:
 
   DeployMantleProject:
     Type: String
-    Default: "false"
+    Default: "true"
     AllowedValues: ["true", "false"]
     Description: >
-      Opt-in flag to provision the fleet's shared Bedrock Mantle project as a
-      CloudFormation resource (AWS::BedrockMantle::Project) and inject its id as
-      MANTLE_PROJECT_ID on every agent runtime. Default "false" because the
-      resource type must be activated in the account+region first; when off,
-      MantleProjectId (below) supplies a pre-existing project id instead.
+      Provision the fleet's shared Bedrock Mantle project as a CloudFormation
+      resource (AWS::BedrockMantle::Project) and inject its id as
+      MANTLE_PROJECT_ID on every agent runtime. Default "true". PREREQUISITE: the
+      resource type must be activated in the account+region first —
+      `aws cloudformation activate-type --type RESOURCE --type-name
+      AWS::BedrockMantle::Project`. Set "false" to skip provisioning and instead
+      supply a pre-existing id via MantleProjectId.
 
   MantleProjectId:
     Type: String
     Default: ""
     Description: >
       A pre-existing Bedrock Mantle project id for model cost/usage attribution,
-      used when DeployMantleProject is "false". Injected as MANTLE_PROJECT_ID on
-      every agent runtime. One project fleet-wide (a dispatch may span repos, so
-      per-repo attribution is meaningless). Blank leaves agents on the account's
-      default project. Ignored when DeployMantleProject is "true" (the created
-      project's id wins).
+      used only when DeployMantleProject is "false". Injected as MANTLE_PROJECT_ID
+      on every agent runtime. One project fleet-wide (a dispatch may span repos,
+      so per-repo attribution is meaningless). Blank leaves agents on the
+      account's default project. Ignored when DeployMantleProject is "true" (the
+      created project's id wins).
 
   DeployDashboard:
     Type: String
@@ -93,13 +95,10 @@ Conditions:
   # type must be activated in the account+region first).
   MantleProjectEnabled: !Equals [!Ref DeployMantleProject, "true"]
   # A manually-supplied project id is present (used when not provisioning here).
+  # The deployer env injects MANTLE_PROJECT_ID from the created project when
+  # MantleProjectEnabled, else from this param, else leaves agents on the
+  # account's default Mantle project.
   HasMantleProjectId: !Not [!Equals [!Ref MantleProjectId, ""]]
-  # Inject MANTLE_PROJECT_ID onto agent runtimes when EITHER we created the
-  # project here OR an operator supplied a pre-existing id; otherwise leave
-  # agents on the account's default Mantle project.
-  HasMantleProject: !Or
-    - !Condition MantleProjectEnabled
-    - !Condition HasMantleProjectId
   # GatewayPolicyEnforcement is expressed in per-policy terms (LOG_ONLY|ACTIVE);
   # the gateway→engine attachment Mode instead uses LOG_ONLY|ENFORCE. This maps
   # the ACTIVE choice to the attachment's ENFORCE value (see FleetGateway).
@@ -602,11 +601,12 @@ Resources:
             OutputStrength: NONE
 
   # The fleet's single shared Bedrock Mantle project for model cost/usage
-  # attribution (opt-in via DeployMantleProject — the resource type must be
-  # activated in the account+region first). One project fleet-wide: a dispatch
-  # may act across several repos (co-repo modes), so per-repo attribution is
-  # meaningless. Its Id is injected as MANTLE_PROJECT_ID on every agent runtime
-  # (see CapabilityDeployerFunction) and sent as the OpenAI-Project header.
+  # attribution (provisioned by default via DeployMantleProject; the resource
+  # type must be activate-type'd in the account+region first). One project
+  # fleet-wide: a dispatch may act across several repos (co-repo modes), so
+  # per-repo attribution is meaningless. Its Id is injected as MANTLE_PROJECT_ID
+  # on every agent runtime (see CapabilityDeployerFunction) and sent as the
+  # OpenAI-Project header.
   FleetMantleProject:
     Type: AWS::BedrockMantle::Project
     Condition: MantleProjectEnabled
