@@ -246,7 +246,7 @@ The real threat is a **chain that doesn't stop** — a prompt-injected or mis-pr
 **Current controls:**
 - `authorization.users` allowlists per agent (T-4) — runaway only propagates between agents the operator has explicitly paired.
 - `max_concurrent` per agent in the registry, enforced by the Dispatch Router. Caps in-flight work but does not bound total volume over time.
-- Mention gating in the webhook receivers (`github_webhook.py` / `asana_webhook.py`) — an event is only forwarded to the Router if it @mentions a known agent token, which bounds the surface but not the volume.
+- Mention gating in the webhook receivers (`github_webhook.py` / `asana_webhook.py`, via the shared `mentions.py` resolver) — an event is only forwarded to the Router if it @mentions an agent present in the live registry, which bounds the surface but not the volume.
 
 **Recommended mitigation (circuit breaker in the Dispatch Router):** thread a `parent_assignment_id` through dispatch and track three signals in DynamoDB; trip on any of them and emit a CloudWatch alarm:
 

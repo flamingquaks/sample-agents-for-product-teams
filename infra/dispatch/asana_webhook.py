@@ -11,15 +11,15 @@ Three trigger types:
 Also handles the Asana handshake protocol for webhook registration.
 """
 
-import hashlib
-import hmac
+import base64
 import json
 import logging
 import os
-import re
 
 import boto3
 import requests
+
+import mentions
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -41,30 +41,33 @@ def _get_ssm_param(name: str) -> str:
 
 ASANA_PAT_PARAM = os.environ.get("ASANA_PAT_PARAM", "/sdlc-agents/asana-pat")
 ASANA_WEBHOOK_SECRET_PARAM = os.environ.get("ASANA_WEBHOOK_SECRET_PARAM", "/sdlc-agents/asana-webhook-secret")
+# The Dispatch Router registry (rendered from the active capability rows). The
+# comment-mention path resolves @mentions against it so a UI-onboarded agent is
+# reachable from Asana with no code change — the same registry every other
+# receiver resolves against (see mentions.py).
+REGISTRY_PARAM = os.environ.get("REGISTRY_PARAM", "/dispatch/agents")
 ASANA_BASE_URL = "https://app.asana.com/api/1.0"
 
 lambda_client = boto3.client("lambda")
 
 # --- Agent Resolution --------------------------------------------------------
 
-MENTION_PATTERN = re.compile(
-    r"@(workitems|uat|researcher|docwriter|feedback|merge|triage|adr|pm|status|plan|qa|test|ba|research|analyze|docs|doc|writer)\b",
-    re.IGNORECASE,
-)
+# Comment @mentions resolve against the LIVE registry via the shared helper —
+# NOT a hardcoded roster — so onboarding an agent in the dashboard makes it
+# mentionable from Asana with no edit here (parity with the GitHub receiver).
+_registry = mentions.RegistryCache(REGISTRY_PARAM, lambda: _ssm)
 
-ALIAS_MAP = {
-    "pm": "workitems",
-    "status": "workitems",
-    "plan": "workitems",
-    "qa": "uat",
-    "test": "uat",
-    "ba": "researcher",
-    "research": "researcher",
-    "analyze": "researcher",
-    "docs": "docwriter",
-    "doc": "docwriter",
-    "writer": "docwriter",
-}
+# The ASSIGNMENT and CUSTOM-FIELD trigger paths below still map explicit,
+# built-in identifiers to agents. These are NOT registry-driven because both
+# depend on Asana-side configuration that self-service onboarding can't create:
+# assignment keys on an Asana bot USER-ACCOUNT gid (an identity provisioned in
+# Asana, per agent), and the custom field keys on the "Agent" dropdown's enum
+# options (configured on the Asana field). A newly-onboarded capability is
+# mentionable immediately, but is assignable / field-selectable only once its
+# Asana-side bot account or dropdown option is added and mapped here. Making
+# these fully data-driven means adding an ``asana_bot_gid`` / ``asana_field``
+# to the capability model AND automating the Asana-side setup — tracked as a
+# follow-up; for now they stay explicit and built-in.
 
 # Bot user GIDs in Asana — set via environment variables
 BOT_USERS = {
@@ -158,13 +161,13 @@ def process_comment_mention(event_data: dict, invocation_state: dict):
     # be an auth bypass. .gid is immutable per user. (Threat T-4.)
     sender = story.get("created_by", {}).get("gid", "")
 
-    match = MENTION_PATTERN.search(text)
-    if not match:
+    # Resolve the @mention against the live registry (shared helper): a
+    # UI-onboarded agent or a new alias resolves the moment it lands in the
+    # registry — no roster to edit here.
+    resolved = _registry.resolve_mention(text)
+    if not resolved:
         return
-
-    agent_id = match.group(1).lower()
-    agent_id = ALIAS_MAP.get(agent_id, agent_id)
-    instruction = text[match.end() :].strip()
+    agent_id, instruction = resolved
 
     # If no explicit instruction, the instruction is "you were mentioned on this task"
     if not instruction:
@@ -274,7 +277,16 @@ def handler(event, context):
     headers = event.get("headers", {})
     # Normalize header keys to lowercase
     headers = {k.lower(): v for k, v in headers.items()}
-    body = event.get("body", "")
+    body = event.get("body", "") or ""
+    # API Gateway base64-encodes the body when the route matches a binary media
+    # type. Asana signs the EXACT decoded bytes, so decode BEFORE the HMAC check
+    # or every affected delivery fails verification (parity with github_webhook).
+    if event.get("isBase64Encoded"):
+        try:
+            body = base64.b64decode(body).decode("utf-8")
+        except Exception:  # noqa: BLE001
+            logger.warning("could not base64-decode webhook body")
+            return {"statusCode": 400, "body": "invalid body encoding"}
 
     # --- Asana handshake protocol ---
     hook_secret = headers.get("x-hook-secret")
@@ -319,11 +331,10 @@ def handler(event, context):
     if not webhook_secret:
         logger.error("Webhook secret %s is empty; refusing to process events.", ASANA_WEBHOOK_SECRET_PARAM)
         return {"statusCode": 503, "body": "webhook not registered"}
+    # Asana signs the raw body as a bare hex digest (no scheme prefix), unlike
+    # GitHub's ``sha256=<hex>``. Shared timing-safe verifier (mentions.py).
     signature = headers.get("x-hook-signature", "")
-    expected = hmac.new(
-        webhook_secret.encode(), body.encode(), hashlib.sha256
-    ).hexdigest()
-    if not hmac.compare_digest(signature, expected):
+    if not mentions.verify_hmac_sha256(webhook_secret, body, signature):
         logger.warning("Invalid webhook signature")
         return {"statusCode": 401, "body": "invalid signature"}
 

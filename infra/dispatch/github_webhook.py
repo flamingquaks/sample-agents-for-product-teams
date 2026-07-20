@@ -23,15 +23,13 @@ Handled events: ``issue_comment`` (created) and ``pull_request_review_comment``
 """
 
 import base64
-import hashlib
-import hmac
 import json
 import logging
 import os
-import re
-import time
 
 import boto3
+
+import mentions
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -54,34 +52,10 @@ REGISTRY_PARAM = os.environ.get("REGISTRY_PARAM", "/dispatch/agents")
 _ssm = boto3.client("ssm")
 _lambda = boto3.client("lambda")
 
-# Any ``@word`` mention. The registry — not a hardcoded roster — decides which
-# words are real agents/aliases; this pattern just enumerates the candidates.
-# (Mirrors router.MENTION_PATTERN; the router does the authoritative resolution.)
-MENTION_PATTERN = re.compile(r"@(\w+)", re.IGNORECASE)
-
-_registry_cache = None
-_registry_expires_at = 0.0
-_REGISTRY_TTL_SECONDS = 30
-
-
-def _load_registry() -> dict:
-    """Load the agent registry from SSM, cached for a short TTL. On a read error
-    returns the last-known-good cache (or an empty registry), so a transient SSM
-    hiccup degrades to 'mention not resolved' rather than an exception."""
-    global _registry_cache, _registry_expires_at
-    now = time.time()
-    if _registry_cache is not None and now < _registry_expires_at:
-        return _registry_cache
-    try:
-        resp = _ssm.get_parameter(Name=REGISTRY_PARAM, WithDecryption=False)
-        # publish_registry writes compact JSON (a YAML subset); parse as JSON to
-        # avoid a PyYAML dependency in this receiver.
-        _registry_cache = json.loads(resp["Parameter"]["Value"]) or {}
-        _registry_expires_at = now + _REGISTRY_TTL_SECONDS
-    except Exception:  # noqa: BLE001
-        logger.exception("could not load agent registry from %s", REGISTRY_PARAM)
-        return _registry_cache if _registry_cache is not None else {}
-    return _registry_cache
+# Registry-backed @mention resolution + a short-TTL cache, shared with the other
+# receivers (mentions.py). The registry — not a hardcoded roster — decides which
+# agents are reachable, so a UI-onboarded agent resolves here with NO code change.
+_registry = mentions.RegistryCache(REGISTRY_PARAM, lambda: _ssm)
 
 
 def _get_secret() -> str | None:
@@ -93,33 +67,13 @@ def _get_secret() -> str | None:
 
 
 def _verify_signature(secret: str, raw_body: str, signature_header: str) -> bool:
-    """Constant-time check of the ``sha256=<hex>`` GitHub signature. GitHub signs
-    the EXACT raw request body, so the caller must pass the unparsed body."""
-    if not signature_header.startswith("sha256="):
-        return False
-    expected = "sha256=" + hmac.new(
-        secret.encode(), raw_body.encode(), hashlib.sha256
-    ).hexdigest()
-    return hmac.compare_digest(signature_header, expected)
+    """Constant-time check of the ``sha256=<hex>`` GitHub signature over the EXACT
+    raw request body (the caller must pass the unparsed body)."""
+    return mentions.verify_hmac_sha256(secret, raw_body, signature_header, prefix="sha256=")
 
 
 def _resolve_agent(body: str) -> str | None:
-    """Resolve the first @mention in ``body`` to a canonical agent id, checking
-    the live registry's agent ids AND their aliases. Returns None if no mention
-    maps to a known agent — a UI-onboarded agent (or a new alias) resolves here
-    the moment it lands in the registry, no code change required."""
-    registry = _load_registry()
-    agents = registry.get("agents", {})
-    if not agents:
-        return None
-    for match in MENTION_PATTERN.finditer(body or ""):
-        name = match.group(1).lower()
-        if name in agents:
-            return name
-        for agent_id, config in agents.items():
-            if name in config.get("aliases", []):
-                return agent_id
-    return None
+    return _registry.resolve_agent(body)
 
 
 def _dispatch(agent_id: str, instruction: str, sender: str, context: dict, trigger_type: str):

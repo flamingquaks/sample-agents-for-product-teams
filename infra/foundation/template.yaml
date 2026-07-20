@@ -451,6 +451,7 @@ Resources:
         Variables:
           ASANA_PAT_PARAM: /sdlc-agents/asana-pat
           ASANA_WEBHOOK_SECRET_PARAM: /sdlc-agents/asana-webhook-secret
+          REGISTRY_PARAM: !Sub /sdlc-agents/${Stage}/registry
           DISPATCH_FUNCTION: !Ref DispatchRouterFunction
           WORKITEMS_BOT_GID: !Ref WorkitemsBotGID
           AGENT_FIELD_GID: !Ref AgentFieldGID
@@ -458,12 +459,13 @@ Resources:
         - LambdaInvokePolicy:
             FunctionName: !Ref DispatchRouterFunction
         - Statement:
-            # Steady-state permissions: read the Asana PAT and the webhook
-            # secret to verify inbound HMAC signatures. ssm:PutParameter is
-            # intentionally NOT granted here — the Asana handshake captures
-            # the webhook secret, and a Lambda that can overwrite it in
-            # steady state is a path an attacker can abuse to replace the
-            # secret with attacker-controlled bytes (threat T-9).
+            # Steady-state permissions: read the Asana PAT + the webhook secret
+            # (verify inbound HMAC signatures) + the agent registry (resolve
+            # @mentions to onboarded agents). ssm:PutParameter is intentionally
+            # NOT granted here — the Asana handshake captures the webhook secret,
+            # and a Lambda that can overwrite it in steady state is a path an
+            # attacker can abuse to replace the secret with attacker-controlled
+            # bytes (threat T-9).
             #
             # The operator runs scripts/bootstrap_asana_webhook.py, which
             # attaches a temporary inline ssm:PutParameter policy for the
@@ -475,6 +477,7 @@ Resources:
               Resource:
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/asana-pat
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/asana-webhook-secret
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/registry
       Events:
         Webhook:
           Type: Api
