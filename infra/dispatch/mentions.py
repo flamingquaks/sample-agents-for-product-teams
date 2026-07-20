@@ -51,6 +51,40 @@ def verify_hmac_sha256(secret: str, raw_body: str, provided_signature: str, *, p
     return hmac.compare_digest(provided_signature, expected)
 
 
+def verify_slack_signature(
+    signing_secret: str,
+    timestamp: str,
+    raw_body: str,
+    provided_signature: str,
+    *,
+    max_skew_seconds: int = 300,
+    now: float | None = None,
+) -> bool:
+    """Constant-time verification of a Slack request signature.
+
+    Slack does NOT sign the bare body: it signs the basestring
+    ``v0:{timestamp}:{raw_body}`` with HMAC-SHA256 and sends
+    ``X-Slack-Signature: v0=<hex>`` plus ``X-Slack-Request-Timestamp: <epoch>``.
+    We (1) reject a missing secret/signature/timestamp, (2) reject a timestamp
+    outside ±``max_skew_seconds`` (replay protection — an old capture can't be
+    re-sent), then (3) timing-safe compare. ``raw_body`` MUST be the exact bytes
+    on the wire (decode API-Gateway base64 BEFORE calling this)."""
+    if not signing_secret or not provided_signature or not timestamp:
+        return False
+    try:
+        ts = int(timestamp)
+    except (TypeError, ValueError):
+        return False
+    current = time.time() if now is None else now
+    if abs(current - ts) > max_skew_seconds:
+        return False
+    basestring = f"v0:{timestamp}:{raw_body}"
+    expected = "v0=" + hmac.new(
+        signing_secret.encode(), basestring.encode(), hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(provided_signature, expected)
+
+
 def resolve_mention(body: str, registry: dict) -> tuple[str, str] | None:
     """Resolve the FIRST @mention in ``body`` that maps to a known agent.
 

@@ -118,6 +118,20 @@ def derive_trace_refs(source: str, source_context: dict, instruction: str = "") 
         if jira_key:
             refs["jira_key"] = jira_key
 
+    elif source == "slack":
+        workspace = _clean(ctx.get("workspace"))
+        channel = _clean(ctx.get("channel_id"))
+        thread_ts = _clean(ctx.get("thread_ts"))
+        if workspace:
+            refs["slack_workspace"] = workspace
+        if channel:
+            refs["slack_channel"] = channel
+        if thread_ts:
+            refs["slack_thread_ts"] = thread_ts
+        jira_key = _extract_jira_key(instruction)
+        if jira_key:
+            refs["jira_key"] = jira_key
+
     # Unknown sources contribute no refs today; a future source adds its own
     # branch above. (This is the extension point referenced in the module docstring.)
     return refs

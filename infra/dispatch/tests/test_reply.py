@@ -107,3 +107,37 @@ def test_github_comment_app_mint_failure_is_nonfatal(monkeypatch):
         ok = reply.post_github_comment("acme/web", 42, "blocked")
     assert ok is False
     mock_post.assert_not_called()
+
+
+# --- Slack (post_slack_message) ---------------------------------------------
+
+
+def test_post_slack_message_success(monkeypatch):
+    monkeypatch.setenv("STAGE", "test")
+    resp = _mock_response()
+    resp.json = lambda: {"ok": True}
+    with patch.object(reply.requests, "post", return_value=resp) as mock_post:
+        ok = reply.post_slack_message("T0ACME12", "C0ENG", "hello", thread_ts="1.2")
+    assert ok is True
+    kw = mock_post.call_args.kwargs
+    assert kw["json"]["channel"] == "C0ENG" and kw["json"]["thread_ts"] == "1.2"
+    assert kw["headers"]["Authorization"] == "Bearer fake-token"
+
+
+def test_post_slack_message_logical_error_is_false(monkeypatch):
+    # Slack returns HTTP 200 with {"ok": false} on a logical failure.
+    monkeypatch.setenv("STAGE", "test")
+    resp = _mock_response()
+    resp.json = lambda: {"ok": False, "error": "channel_not_found"}
+    with patch.object(reply.requests, "post", return_value=resp):
+        assert reply.post_slack_message("T0ACME12", "C0BAD", "hi") is False
+
+
+def test_post_slack_message_missing_args():
+    assert reply.post_slack_message("", "C0ENG", "hi") is False
+    assert reply.post_slack_message("T0ACME12", "", "hi") is False
+
+
+def test_slack_bot_token_param_layout(monkeypatch):
+    monkeypatch.setenv("STAGE", "gamma")
+    assert reply.slack_bot_token_param("T0ACME12") == "/sdlc-agents/gamma/slack/T0ACME12/bot-token"

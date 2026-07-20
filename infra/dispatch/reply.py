@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 GITHUB_API = "https://api.github.com"
 ASANA_API = "https://app.asana.com/api/1.0"
+SLACK_API = "https://slack.com/api"
 
 ASANA_PAT_PARAM_ENV = "ASANA_PAT_PARAM"
 
@@ -82,6 +83,60 @@ def post_asana_comment(task_gid: str, body: str) -> bool:
         return True
     except requests.RequestException as exc:
         logger.error("Failed to post Asana comment to task %s: %s", task_gid, exc)
+        return False
+
+
+def slack_bot_token_param(team_id: str) -> str:
+    """The SSM SecureString path holding a workspace's bot token. Layout matches
+    config_store._slack_secret_param (the admin API writes it). ``STAGE`` names
+    the deploy stage (the receiver Lambda has it in env)."""
+    stage = os.environ.get("STAGE", "dev")
+    return f"/sdlc-agents/{stage}/slack/{team_id}/bot-token"
+
+
+def post_slack_message(
+    team_id: str, channel: str, body: str, thread_ts: str | None = None
+) -> bool:
+    """Post a message to a Slack channel/thread via chat.postMessage. Returns True
+    on success. Multi-workspace: the bot token is fetched per-invocation from the
+    workspace's SSM SecureString (never a module global — threat T-8/T-36).
+    ``thread_ts`` keeps the reply in-thread. Non-fatal on failure — the caller
+    treats a failed reply as best-effort (parity with the GitHub/Asana helpers).
+
+    Slack's Web API returns HTTP 200 even on a logical error (``{"ok": false}``),
+    so we check the ``ok`` field, not just the status code."""
+    if not team_id or not channel:
+        logger.error("post_slack_message missing team_id or channel")
+        return False
+    token = _get_secret(slack_bot_token_param(team_id))
+    if not token:
+        return False
+    payload = {"channel": channel, "text": body}
+    if thread_ts:
+        payload["thread_ts"] = thread_ts
+    try:
+        response = requests.post(
+            f"{SLACK_API}/chat.postMessage",
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not data.get("ok"):
+            logger.error(
+                "Slack chat.postMessage rejected for %s/%s: %s",
+                team_id,
+                channel,
+                data.get("error", "unknown"),
+            )
+            return False
+        return True
+    except (requests.RequestException, ValueError) as exc:
+        logger.error("Failed to post Slack message to %s/%s: %s", team_id, channel, exc)
         return False
 
 

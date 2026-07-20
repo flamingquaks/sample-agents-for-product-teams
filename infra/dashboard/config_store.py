@@ -14,6 +14,10 @@ Table shape (single table, ``FLEET_CONFIG_TABLE`` env var). Partition key ``pk``
                    owner_type: "User"|"Organization", installation_id(int),
                    install_verified_at(epoch)}
   - Settings:      pk="settings",           {kind:"settings", restrict_repos(bool)}
+  - Slack workspace: pk="slack_ws#<team_id>", {kind:"slack_workspace", team_id, ...}
+  - Slack channel:   pk="slack_chan#<team_id>#<chan_id>", {kind:"slack_channel", mode:"allow"|"deny", ...}
+  - Trigger rule:    pk="trigger_rule#<uuid>", {kind:"trigger_rule", subject_type, subject_id, agent_id, workspace, effect, ...} (WHO axis)
+  - Channel request: pk="chan_req#<uuid>",   {kind:"channel_request", team_id, channel_id, requested_by, requested_agents[], status:"pending"|"approved"|"denied", ...}
   - Capability:    pk="capability#<agent_id>", {kind:"capability", agent_id,
                    description, aliases[list], triggers{source:[event...]},
                    limits{max_concurrent, timeout_minutes, daily_token_budget},
@@ -87,6 +91,7 @@ _CAPABILITY_PK_PREFIX = "capability#"
 _SLACK_WS_PK_PREFIX = "slack_ws#"
 _SLACK_CHAN_PK_PREFIX = "slack_chan#"
 _TRIGGER_RULE_PK_PREFIX = "trigger_rule#"
+_CHANNEL_REQUEST_PK_PREFIX = "chan_req#"
 
 # Capability lifecycle. A row starts "pending" the instant it's onboarded, moves
 # to "building" while the shared build pipeline runs, "active" once its runtime is
@@ -150,6 +155,15 @@ RULE_SUBJECT_TYPES = (RULE_SUBJECT_USER, RULE_SUBJECT_GROUP)
 RULE_PERMIT = "permit"
 RULE_FORBID = "forbid"
 RULE_EFFECTS = (RULE_PERMIT, RULE_FORBID)
+
+# Channel onboarding request lifecycle (spec §4.5). A user runs a Slack slash
+# command to REQUEST that their channel be onboarded for specific agents; the
+# request lands here ``pending`` and an admin approves (→ creates the allow row +
+# grant rows) or denies it in the Connectors panel.
+CHAN_REQ_PENDING = "pending"
+CHAN_REQ_APPROVED = "approved"
+CHAN_REQ_DENIED = "denied"
+CHAN_REQ_STATUSES = (CHAN_REQ_PENDING, CHAN_REQ_APPROVED, CHAN_REQ_DENIED)
 
 _table = None
 
@@ -1017,5 +1031,129 @@ def put_trigger_rule(
 def delete_trigger_rule(rule_id: str) -> bool:
     resp = _get_table().delete_item(
         Key={"pk": _trigger_rule_pk(rule_id)}, ReturnValues="ALL_OLD"
+    )
+    return bool(resp.get("Attributes"))
+
+
+# --- Channel onboarding requests ---------------------------------------------
+# A Slack user runs a slash command (/onboard-channel) to REQUEST their channel
+# be onboarded for specific agents (spec §4.5). The request is captured here
+# ``pending``; an admin approves or denies it in the Connectors panel. Approval
+# is the ONLY path that grants access — a request never self-applies. The
+# requester is the immutable Slack user id (T-4), so an approval is auditable.
+
+
+def _channel_request_pk(request_id: str) -> str:
+    return f"{_CHANNEL_REQUEST_PK_PREFIX}{request_id}"
+
+
+def list_channel_requests(status: str | None = None) -> list[dict]:
+    """All channel onboarding requests, or just those in ``status``. Newest first.
+    Paged so a pending request is never silently dropped from the admin queue."""
+    table = _get_table()
+    rows: list[dict] = []
+    start_key = None
+    while True:
+        kwargs = {
+            "FilterExpression": "kind = :k",
+            "ExpressionAttributeValues": {":k": "channel_request"},
+        }
+        if start_key:
+            kwargs["ExclusiveStartKey"] = start_key
+        resp = table.scan(**kwargs)
+        rows.extend(resp.get("Items", []))
+        start_key = resp.get("LastEvaluatedKey")
+        if not start_key:
+            break
+    if status is not None:
+        rows = [r for r in rows if r.get("status") == status]
+    rows.sort(key=lambda r: r.get("created_at", 0), reverse=True)
+    return rows
+
+
+def get_channel_request(request_id: str) -> dict | None:
+    resp = _get_table().get_item(Key={"pk": _channel_request_pk(request_id)})
+    return resp.get("Item")
+
+
+def put_channel_request(
+    *,
+    team_id: str,
+    channel_id: str,
+    channel_name: str = "",
+    requested_by: str,
+    requested_agents: list[str] | None = None,
+    note: str = "",
+    request_id: str | None = None,
+) -> dict:
+    """Record a channel onboarding request (status ``pending``). Validates the
+    Slack ids (they become Cedar/allow-row values on approval) and each requested
+    agent id. ``requested_agents`` is the scope the user is asking for — ``["*"]``
+    or empty means "any agent"; concrete ids are validated. ``requested_by`` is
+    the immutable Slack user id of the requester (for the audit trail)."""
+    if not valid_slack_team(team_id):
+        raise ValueError(f"invalid Slack team id {team_id!r}")
+    if not valid_slack_channel(channel_id):
+        raise ValueError(f"invalid Slack channel id {channel_id!r}")
+    if not (requested_by or "").strip():
+        raise ValueError("requested_by is required")
+    agents = [a for a in (requested_agents or []) if a and a != "*"]
+    for a in agents:
+        if not valid_agent_id(a):
+            raise ValueError(f"invalid requested agent id {a!r}")
+    if request_id is None:
+        import uuid
+
+        request_id = str(uuid.uuid4())
+    existing = get_channel_request(request_id) or {}
+    item = {
+        "pk": _channel_request_pk(request_id),
+        "kind": "channel_request",
+        "request_id": request_id,
+        "team_id": team_id,
+        "channel_id": channel_id,
+        "channel_name": channel_name or existing.get("channel_name", ""),
+        "requested_by": requested_by.strip(),
+        "requested_agents": agents,  # [] = any agent
+        "note": note,
+        "status": existing.get("status", CHAN_REQ_PENDING),
+        "created_at": existing.get("created_at", int(time.time())),
+        "decided_by": existing.get("decided_by", ""),
+        "decided_at": existing.get("decided_at"),
+    }
+    _get_table().put_item(Item=item)
+    return item
+
+
+def resolve_channel_request(
+    request_id: str, *, status: str, decided_by: str
+) -> dict | None:
+    """Mark a request ``approved`` or ``denied`` (records who + when). Returns the
+    updated row, or None if the request doesn't exist. Does NOT itself create the
+    allow row / grants — the admin API composes approval (put_channel_policy +
+    optional put_trigger_rule) with this status write, so the effect is explicit
+    and testable. Condition-guarded so a decision on a deleted request fails
+    rather than resurrecting it."""
+    if status not in (CHAN_REQ_APPROVED, CHAN_REQ_DENIED):
+        raise ValueError(f"invalid decision status {status!r}")
+    if get_channel_request(request_id) is None:
+        return None
+    _get_table().update_item(
+        Key={"pk": _channel_request_pk(request_id)},
+        UpdateExpression="SET #s = :s, decided_by = :b, decided_at = :t",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={
+            ":s": status,
+            ":b": decided_by,
+            ":t": int(time.time()),
+        },
+        ConditionExpression="attribute_exists(pk)",
+    )
+    return get_channel_request(request_id)
+
+
+def delete_channel_request(request_id: str) -> bool:
+    resp = _get_table().delete_item(
+        Key={"pk": _channel_request_pk(request_id)}, ReturnValues="ALL_OLD"
     )
     return bool(resp.get("Attributes"))

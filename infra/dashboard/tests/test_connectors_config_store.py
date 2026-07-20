@@ -222,3 +222,74 @@ def test_trigger_rule_replace_and_delete():
     assert got["effect"] == "forbid" and got["created_at"] == created_at
     assert cs.delete_trigger_rule(rid) is True
     assert cs.delete_trigger_rule(rid) is False
+
+
+# --- Channel onboarding requests ---------------------------------------------
+
+
+@mock_aws
+def test_channel_request_roundtrip_and_defaults():
+    _make_table()
+    cs = _load_store()
+    rec = cs.put_channel_request(
+        team_id="T0ACME123",
+        channel_id="C0ENG111",
+        channel_name="#eng",
+        requested_by="slack:T0ACME123:U0AL1CE",
+        requested_agents=["workitems", "*"],
+        note="need triage here",
+    )
+    assert rec["request_id"] and rec["status"] == cs.CHAN_REQ_PENDING
+    assert rec["requested_agents"] == ["workitems"]  # "*" dropped → concrete only
+    assert cs.get_channel_request(rec["request_id"])["channel_name"] == "#eng"
+
+
+@mock_aws
+def test_channel_request_validation():
+    _make_table()
+    cs = _load_store()
+    base = dict(channel_id="C0ENG111", requested_by="slack:T:U")
+    with pytest.raises(ValueError):
+        cs.put_channel_request(team_id="bad", **base)
+    with pytest.raises(ValueError):
+        cs.put_channel_request(team_id="T0ACME123", channel_id="bad", requested_by="u")
+    with pytest.raises(ValueError):
+        cs.put_channel_request(team_id="T0ACME123", channel_id="C0ENG111", requested_by="")
+    with pytest.raises(ValueError):  # bad requested agent id
+        cs.put_channel_request(
+            team_id="T0ACME123", channel_id="C0ENG111", requested_by="u",
+            requested_agents=["Bad Id"],
+        )
+
+
+@mock_aws
+def test_channel_request_status_filter_and_resolve():
+    _make_table()
+    cs = _load_store()
+    r1 = cs.put_channel_request(team_id="T0ACME123", channel_id="C0AAA111", requested_by="u1")
+    cs.put_channel_request(team_id="T0ACME123", channel_id="C0BBB222", requested_by="u2")
+    assert len(cs.list_channel_requests(status=cs.CHAN_REQ_PENDING)) == 2
+
+    updated = cs.resolve_channel_request(
+        r1["request_id"], status=cs.CHAN_REQ_APPROVED, decided_by="admin-1"
+    )
+    assert updated["status"] == cs.CHAN_REQ_APPROVED
+    assert updated["decided_by"] == "admin-1" and updated["decided_at"]
+    assert len(cs.list_channel_requests(status=cs.CHAN_REQ_PENDING)) == 1
+    assert len(cs.list_channel_requests(status=cs.CHAN_REQ_APPROVED)) == 1
+
+
+@mock_aws
+def test_channel_request_resolve_missing_returns_none():
+    _make_table()
+    cs = _load_store()
+    assert cs.resolve_channel_request("nope", status=cs.CHAN_REQ_DENIED, decided_by="a") is None
+
+
+@mock_aws
+def test_channel_request_resolve_rejects_bad_status():
+    _make_table()
+    cs = _load_store()
+    r = cs.put_channel_request(team_id="T0ACME123", channel_id="C0AAA111", requested_by="u")
+    with pytest.raises(ValueError):
+        cs.resolve_channel_request(r["request_id"], status="pending", decided_by="a")

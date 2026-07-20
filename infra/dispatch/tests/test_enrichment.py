@@ -80,7 +80,33 @@ def test_empty_values_are_omitted():
 
 
 def test_unknown_source_yields_no_refs():
-    assert enrichment.derive_trace_refs("slack", {"channel_id": "C1"}) == {}
+    assert enrichment.derive_trace_refs("teams", {"channel_id": "C1"}) == {}
+
+
+def test_slack_refs():
+    refs = enrichment.derive_trace_refs(
+        "slack",
+        {"workspace": "T0ACME", "channel_id": "C0ENG", "thread_ts": "111.2"},
+        "please look at PROJ-42",
+    )
+    assert refs == {
+        "slack_workspace": "T0ACME",
+        "slack_channel": "C0ENG",
+        "slack_thread_ts": "111.2",
+        "jira_key": "PROJ-42",
+    }
+
+
+def test_slack_refs_omit_empty():
+    refs = enrichment.derive_trace_refs("slack", {"channel_id": "C0ENG"})
+    assert refs == {"slack_channel": "C0ENG"}
+
+
+def test_slack_requester_is_a_participant():
+    parts = enrichment.derive_participants(
+        "slack", "slack:T0ACME:U0ALICE", {"channel_id": "C0ENG"}
+    )
+    assert parts == [{"id": "slack:T0ACME:U0ALICE", "kind": "requester", "source": "slack"}]
 
 
 # --- participants ------------------------------------------------------------

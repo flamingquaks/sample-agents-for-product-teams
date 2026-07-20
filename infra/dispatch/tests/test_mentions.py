@@ -142,3 +142,48 @@ def test_cache_error_with_no_prior_load_is_empty():
     # No cache yet + read error → empty registry → nothing resolves (no raise).
     assert cache.resolve_agent("@workitems go") is None
     assert cache.load() == {}
+
+
+# --- Slack v0 signature (verify_slack_signature) -----------------------------
+
+import time as _time  # noqa: E402
+
+
+def _slack_sig(secret, ts, body):
+    return "v0=" + hmac.new(secret.encode(), f"v0:{ts}:{body}".encode(), hashlib.sha256).hexdigest()
+
+
+def test_slack_signature_valid():
+    ts = str(int(_time.time()))
+    body = '{"a":1}'
+    sig = _slack_sig("sek", ts, body)
+    assert mentions.verify_slack_signature("sek", ts, body, sig) is True
+
+
+def test_slack_signature_wrong_secret():
+    ts = str(int(_time.time()))
+    body = '{"a":1}'
+    assert mentions.verify_slack_signature("other", ts, body, _slack_sig("sek", ts, body)) is False
+
+
+def test_slack_signature_replay_outside_window():
+    ts = str(int(_time.time()) - 10_000)
+    body = "x"
+    sig = _slack_sig("sek", ts, body)
+    assert mentions.verify_slack_signature("sek", ts, body, sig) is False
+
+
+def test_slack_signature_within_window_with_fixed_now():
+    # Pin now so the test is deterministic; ts 100s in the past is inside ±300s.
+    now = 1_000_000.0
+    ts = str(int(now) - 100)
+    body = "hello"
+    sig = _slack_sig("sek", ts, body)
+    assert mentions.verify_slack_signature("sek", ts, body, sig, now=now) is True
+
+
+def test_slack_signature_missing_parts():
+    assert mentions.verify_slack_signature("", "1", "b", "v0=x") is False
+    assert mentions.verify_slack_signature("sek", "", "b", "v0=x") is False
+    assert mentions.verify_slack_signature("sek", "1", "b", "") is False
+    assert mentions.verify_slack_signature("sek", "notanint", "b", "v0=x") is False

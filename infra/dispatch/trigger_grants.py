@@ -169,6 +169,66 @@ def agent_grants(agent_id: str, workspace: str = "") -> AgentGrants:
     )
 
 
+def is_workspace_enabled(team_id: str) -> bool:
+    """Whether ``team_id`` is an onboarded, enabled, active Slack workspace.
+    Fail-closed: unknown / disabled / non-active ⇒ False. Used by the Slack
+    receiver to reject deliveries from a workspace an admin hasn't cleared."""
+    if not team_id:
+        return False
+    ws = _snapshot()["workspaces"].get(team_id)
+    if ws is None:
+        return False
+    return bool(ws.get("enabled")) and ws.get("status") == "active"
+
+
+def put_channel_request(
+    *,
+    team_id: str,
+    channel_id: str,
+    channel_name: str = "",
+    requested_by: str,
+    requested_agents=None,
+) -> None:
+    """Write a pending channel-onboarding request from the Slack receiver.
+
+    The dispatch package can't import the dashboard's config_store (separate
+    deploy), so this writes the same ``channel_request`` row shape directly —
+    the two share the table as a contract (mirrors fleet_config ↔ config_store).
+    Validates the Slack ids so the receiver can't persist a malformed request.
+    Raises ValueError on bad input."""
+    import re
+    import uuid
+
+    if not re.match(r"^T[A-Z0-9]{6,}$", team_id or ""):
+        raise ValueError("invalid team id")
+    if not re.match(r"^C[A-Z0-9]{6,}$", channel_id or ""):
+        raise ValueError("invalid channel id")
+    if not (requested_by or "").strip():
+        raise ValueError("requested_by is required")
+    agents = [a for a in (requested_agents or []) if a and a != "*"]
+    for a in agents:
+        if not re.match(r"^[a-z][a-z0-9-]{0,62}[a-z0-9]$", a):
+            raise ValueError(f"invalid requested agent id {a!r}")
+    request_id = str(uuid.uuid4())
+    _get_table().put_item(
+        Item={
+            "pk": f"chan_req#{request_id}",
+            "kind": "channel_request",
+            "request_id": request_id,
+            "team_id": team_id,
+            "channel_id": channel_id,
+            "channel_name": channel_name,
+            "requested_by": requested_by.strip(),
+            "requested_agents": agents,
+            "note": "",
+            "status": "pending",
+            "created_at": int(time.time()),
+            "decided_by": "",
+            "decided_at": None,
+        }
+    )
+
+
 def channel_allowed(workspace: str, channel_id: str) -> bool:
     """Whether triggering is allowed in this channel, per the workspace's
     ``default_channel_policy`` + the per-channel allow/deny rows.

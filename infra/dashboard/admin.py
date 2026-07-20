@@ -14,6 +14,12 @@ Routes (all admin-only):
     GET    /admin/capabilities              list onboarded capabilities (agents)
     POST   /admin/capabilities              onboard/edit a capability (body: agent_id, description?, aliases?, triggers?, limits?, env?, enabled?)
     DELETE /admin/capabilities/{agent_id}   remove a capability
+    GET/POST /admin/slack/workspaces        list / onboard Slack workspaces; DELETE /{team_id}
+    GET/POST /admin/slack/channels          list / set channel allow-deny; DELETE /{team_id}/{channel_id}
+    GET/POST /admin/trigger-rules           list / create WHO grant rules; DELETE /{rule_id}
+    POST   /admin/trigger-rules/simulate    dry-run an access decision (principal, agent, workspace, channel)
+    GET    /admin/channel-requests          list channel onboarding requests (?status=pending)
+    POST   /admin/channel-requests/{id}/approve|deny   decide a request
 
 Two synchronized effects (see the plan's "exact chain"): a repo change writes
 the config table (drives the Dispatch Router allowlist) AND regenerates the
@@ -45,6 +51,10 @@ _REPO_SEGMENT = re.compile(r"^[A-Za-z0-9._-]+$")
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+
+# Deploy stage — names the per-workspace Slack SSM secret paths a workspace row
+# records (config_store._slack_secret_param). Matches the receiver's STAGE.
+STAGE = os.environ.get("STAGE", "dev")
 
 
 class PolicySyncError(Exception):
@@ -375,6 +385,129 @@ def _publish_registry_safe() -> None:
         logger.exception("registry publish failed; will re-publish on next change")
 
 
+def _resolve_agent_grants(agent_id: str, workspace: str) -> dict:
+    """Resolve an agent's WHO grant sets from the trigger_rule rows — the SAME
+    logic the router's trigger_grants.agent_grants applies (config_store and the
+    dispatch reader share the row shape as a contract). Used by the access
+    simulator so an admin sees exactly what the router would decide."""
+    ap, dp, ag, dg = [], [], [], []
+    for r in config_store.list_trigger_rules():
+        r_agent = r.get("agent_id", "*")
+        if r_agent != "*" and r_agent != agent_id:
+            continue
+        r_ws = r.get("workspace", "*")
+        if r_ws != "*" and r_ws != workspace:
+            continue
+        subject = r.get("subject_id", "")
+        if not subject:
+            continue
+        is_group = r.get("subject_type") == config_store.RULE_SUBJECT_GROUP
+        is_forbid = r.get("effect") == config_store.RULE_FORBID
+        target = (dg if is_group else dp) if is_forbid else (ag if is_group else ap)
+        if subject not in target:
+            target.append(subject)
+    return {"allowedPrincipals": ap, "deniedPrincipals": dp,
+            "allowedGroups": ag, "deniedGroups": dg}
+
+
+def _channel_allowed(workspace: str, channel_id: str) -> bool:
+    """Mirror of trigger_grants.channel_allowed for the simulator (see that
+    function for the posture rules). Non-Slack ⇒ True; unknown workspace ⇒
+    False."""
+    if not workspace:
+        return True
+    ws = config_store.get_slack_workspace(workspace)
+    if ws is None:
+        return False
+    policy = ws.get("default_channel_policy", config_store.CHANNEL_POLICY_ALLOWLIST)
+    rows = {c["channel_id"]: c for c in config_store.list_channels(workspace)}
+    row = rows.get(channel_id)
+    if policy == config_store.CHANNEL_POLICY_DENYLIST:
+        return not (row is not None and row.get("mode") == config_store.CHANNEL_MODE_DENY)
+    return row is not None and row.get("mode") == config_store.CHANNEL_MODE_ALLOW
+
+
+def _simulate_access(body: dict) -> dict:
+    """Dry-run the trigger-authz decision for a hypothetical (principal, agent,
+    workspace, channel, groups) — the "Test access" panel. Evaluates the SAME
+    data-driven logic the router applies (grant sets + channel posture + Cedar
+    forbid-wins), locally, so it needs no AVP round-trip and works before the
+    store is wired. Returns {decision, reason}."""
+    principal = (body.get("principal") or "").strip()
+    agent_id = (body.get("agent_id") or "").strip()
+    workspace = (body.get("workspace") or "").strip()
+    channel = (body.get("channel_id") or "").strip()
+    groups = set(body.get("principal_groups") or [])
+    if not principal or not agent_id:
+        return error(400, "body.principal and body.agent_id are required")
+
+    grants = _resolve_agent_grants(agent_id, workspace)
+    channel_ok = _channel_allowed(workspace, channel)
+
+    # forbid-wins: an explicit deny (principal or group) or a blocked channel
+    # denies regardless of any permit; then a permit requires an allowed
+    # principal or group; else default-deny.
+    if principal in grants["deniedPrincipals"] or (groups & set(grants["deniedGroups"])):
+        return ok({"decision": "DENY", "reason": "explicitly-denied"})
+    if not channel_ok:
+        return ok({"decision": "DENY", "reason": "channel-not-allowed"})
+    if principal in grants["allowedPrincipals"] or (groups & set(grants["allowedGroups"])):
+        return ok({"decision": "ALLOW", "reason": "granted"})
+    return ok({"decision": "DENY", "reason": "no-matching-grant"})
+
+
+def _decide_channel_request(event: dict, request_id: str, approve: bool, body: dict) -> dict:
+    """Approve or deny a channel onboarding request. APPROVAL is the only path
+    that grants access: it creates the channel allow row and — for each requested
+    agent (or none = a workspace-wide permit is intentionally NOT created; an
+    admin scopes agents explicitly) — a permit trigger rule keyed on the channel's
+    workspace, then marks the request approved. Denial just records the decision.
+    All effects are explicit here so the outcome is auditable + testable."""
+    req = config_store.get_channel_request(request_id)
+    if req is None:
+        return error(404, f"no such channel request: {request_id}")
+    caller = auth.caller_sub(event)
+    if not approve:
+        rec = config_store.resolve_channel_request(
+            request_id, status=config_store.CHAN_REQ_DENIED, decided_by=caller
+        )
+        return ok({"request": rec})
+
+    team_id = req["team_id"]
+    channel_id = req["channel_id"]
+    # 1) allow the channel (the WHERE axis) so triggers there pass the channel gate.
+    config_store.put_channel_policy(
+        team_id, channel_id,
+        mode=config_store.CHANNEL_MODE_ALLOW,
+        channel_name=req.get("channel_name", ""),
+        note=f"approved from request {request_id}",
+        created_by=caller,
+    )
+    # 2) the admin may override the requested agent scope at approval time.
+    agents = body.get("approved_agents")
+    if agents is None:
+        agents = req.get("requested_agents", [])
+    created = []
+    for agent_id in agents:
+        rule = config_store.put_trigger_rule(
+            connector="slack",
+            subject_type=config_store.RULE_SUBJECT_GROUP,
+            # A channel-scoped grant is modeled as a group whose members are the
+            # channel's participants; the receiver passes the channel id as a
+            # principal group so this permits anyone triggering FROM that channel.
+            subject_id=f"channel:{team_id}:{channel_id}",
+            agent_id=agent_id,
+            workspace=team_id,
+            effect=config_store.RULE_PERMIT,
+            created_by=caller,
+        )
+        created.append(rule["rule_id"])
+    rec = config_store.resolve_channel_request(
+        request_id, status=config_store.CHAN_REQ_APPROVED, decided_by=caller
+    )
+    return ok({"request": rec, "channel_allowed": True, "created_rules": created})
+
+
 def _route(event: dict) -> dict:
     resource = event.get("resource", "")
     method = event.get("httpMethod", "")
@@ -611,6 +744,104 @@ def _route(event: dict) -> dict:
             logger.exception("manifest code exchange failed")
             return error(502, f"GitHub App creation failed: {exc}")
         return ok(result)
+
+    # --- Slack workspaces ---
+    if resource == "/admin/slack/workspaces":
+        if method == "GET":
+            return ok({"workspaces": config_store.list_slack_workspaces()})
+        if method == "POST":
+            team_id = (body.get("team_id") or "").strip()
+            if not config_store.valid_slack_team(team_id):
+                return error(400, "body.team_id must be a Slack team id (T…)")
+            policy = (body.get("default_channel_policy")
+                      or config_store.CHANNEL_POLICY_ALLOWLIST)
+            if policy not in config_store.CHANNEL_POLICIES:
+                return error(400, f"body.default_channel_policy must be one of {list(config_store.CHANNEL_POLICIES)}")
+            try:
+                rec = config_store.put_slack_workspace(
+                    team_id,
+                    team_name=(body.get("team_name") or "").strip(),
+                    stage=STAGE,
+                    enabled=bool(body.get("enabled", True)),
+                    default_channel_policy=policy,
+                    onboarded_by=auth.caller_sub(event),
+                    status=config_store.SLACK_WS_ACTIVE,
+                )
+            except ValueError as exc:
+                return error(400, str(exc))
+            return ok(rec)
+
+    if resource in ("/admin/slack/workspaces/{team_id}", "/admin/slack/workspaces/{team_id+}"):
+        team_id = (path_params.get("team_id") or path_params.get("team_id+") or "").strip()
+        if method == "DELETE":
+            return ok({"team_id": team_id, "deleted": config_store.delete_slack_workspace(team_id)})
+
+    # --- Slack channel policy ---
+    if resource == "/admin/slack/channels":
+        if method == "GET":
+            team_id = (event.get("queryStringParameters") or {}).get("team_id", "")
+            return ok({"channels": config_store.list_channels(team_id)})
+        if method == "POST":
+            try:
+                rec = config_store.put_channel_policy(
+                    (body.get("team_id") or "").strip(),
+                    (body.get("channel_id") or "").strip(),
+                    mode=(body.get("mode") or "").strip(),
+                    channel_name=(body.get("channel_name") or "").strip(),
+                    note=(body.get("note") or "").strip(),
+                    created_by=auth.caller_sub(event),
+                )
+            except ValueError as exc:
+                return error(400, str(exc))
+            return ok(rec)
+
+    if resource == "/admin/slack/channels/{team_id}/{channel_id}":
+        if method == "DELETE":
+            team_id = (path_params.get("team_id") or "").strip()
+            channel_id = (path_params.get("channel_id") or "").strip()
+            return ok({"deleted": config_store.delete_channel_policy(team_id, channel_id)})
+
+    # --- Trigger rules (WHO axis) ---
+    if resource == "/admin/trigger-rules":
+        if method == "GET":
+            connector = (event.get("queryStringParameters") or {}).get("connector")
+            return ok({"rules": config_store.list_trigger_rules(connector)})
+        if method == "POST":
+            try:
+                rec = config_store.put_trigger_rule(
+                    connector=(body.get("connector") or "").strip(),
+                    subject_type=(body.get("subject_type") or "").strip(),
+                    subject_id=(body.get("subject_id") or "").strip(),
+                    agent_id=(body.get("agent_id") or "*").strip(),
+                    workspace=(body.get("workspace") or "*").strip(),
+                    effect=(body.get("effect") or config_store.RULE_PERMIT).strip(),
+                    created_by=auth.caller_sub(event),
+                    rule_id=(body.get("rule_id") or None),
+                )
+            except ValueError as exc:
+                return error(400, str(exc))
+            return ok(rec)
+
+    if resource in ("/admin/trigger-rules/{rule_id}", "/admin/trigger-rules/{rule_id+}"):
+        rule_id = (path_params.get("rule_id") or path_params.get("rule_id+") or "").strip()
+        if method == "DELETE":
+            return ok({"rule_id": rule_id, "deleted": config_store.delete_trigger_rule(rule_id)})
+
+    if resource == "/admin/trigger-rules/simulate" and method == "POST":
+        return _simulate_access(body)
+
+    # --- Channel onboarding requests (approve/deny queue) ---
+    if resource == "/admin/channel-requests":
+        if method == "GET":
+            status = (event.get("queryStringParameters") or {}).get("status")
+            return ok({"requests": config_store.list_channel_requests(status)})
+
+    if resource in ("/admin/channel-requests/{request_id}/approve",
+                    "/admin/channel-requests/{request_id}/deny"):
+        if method == "POST":
+            request_id = (path_params.get("request_id") or "").strip()
+            approve = resource.endswith("/approve")
+            return _decide_channel_request(event, request_id, approve, body)
 
     return error(404, f"no such admin route: {method} {resource}")
 
