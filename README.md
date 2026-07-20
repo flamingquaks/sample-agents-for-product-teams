@@ -72,6 +72,7 @@ docs/            Specs, roadmap, planning docs
 ## Prerequisites
 
 - AWS account with Bedrock model access enabled for the fleet's Mantle model (`anthropic.claude-sonnet-5`) in your target region
+- The `AWS::BedrockMantle::Project` CloudFormation resource type activated once per account+region (`aws cloudformation activate-type --type RESOURCE --type-name AWS::BedrockMantle::Project`) — the base deploy provisions the fleet's shared cost-attribution project by default (`DeployMantleProject=true`; set `false` to skip). See `docs/aws-deploy.md` §2.2.
 - AWS CLI configured with appropriate credentials
 - [SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html)
 - Docker (for building agent containers)

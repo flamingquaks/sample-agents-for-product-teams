@@ -39,11 +39,11 @@ flowchart TB
     ADR["adr"]
   end
 
-  ROUTER -->|"InvokeAgentRuntime<br/>instruction + source_context<br/>(incl. mantle_project)"| RT
+  ROUTER -->|"InvokeAgentRuntime<br/>instruction + source_context"| RT
 
   %% ---------------- Models: Bedrock Mantle ----------------
   subgraph MDL["Models — Bedrock Mantle (OpenAI-compatible)"]
-    MANTLE["bedrock-mantle endpoint<br/>anthropic.claude-sonnet-5<br/>bearer token (runtime role)<br/>guardrail headers (fail-closed)<br/>OpenAI-Project = per-repo project"]
+    MANTLE["bedrock-mantle endpoint<br/>anthropic.claude-sonnet-5<br/>bearer token (runtime role)<br/>guardrail headers (fail-closed)<br/>OpenAI-Project = shared fleet project"]
   end
   BRT["bedrock-runtime (classic)<br/>ApplyGuardrail · Titan embeddings"]
 
@@ -87,12 +87,13 @@ flowchart TB
     CB["CodeBuild<br/>sdlc-agent-builder-&lt;stage&gt;<br/>(AGENT_NAME param)"]
     ECR["ECR sdlc-agents/&lt;agent&gt;<br/>IMMUTABLE tags"]
     EVT["EventBridge<br/>build-completion / weekly rebuild"]
-    DEP["capability-deployer Lambda<br/>PRIVILEGED: CreateRole/PassRole +<br/>create-agent-runtime<br/>role path /sdlc-agents/capabilities/*<br/>+ CapabilityRuntimeBoundary"]
-    MPRJ["Bedrock Mantle project<br/>(created on repo onboard, mantle.py)"]
+    DEP["capability-deployer Lambda<br/>PRIVILEGED: CreateRole/PassRole +<br/>create-agent-runtime<br/>role path /sdlc-agents/capabilities/*<br/>+ CapabilityRuntimeBoundary<br/>injects MANTLE_PROJECT_ID on runtimes"]
   end
 
+  MPRJ["Bedrock Mantle project (shared, fleet-wide)<br/>AWS::BedrockMantle::Project (foundation stack)<br/>id → MANTLE_PROJECT_ID"]
+
   ADM -->|"StartBuild"| CB
-  ADM -->|"ensure per-repo project"| MPRJ
+  MPRJ -.->|"project id (deploy-time env)"| DEP
   CB --> ECR
   CB -->|"build succeeded"| EVT
   EVT --> DEP
