@@ -1263,6 +1263,40 @@ Resources:
                 project-name:
                   - !Sub sdlc-agent-builder-${Stage}
 
+  # Weekly security rebuild: re-runs the shared build pipeline for every ACTIVE
+  # capability so agent images pick up base-image + dependency security patches.
+  # Only STARTS builds (StartBuild); the build-completion event drives the runtime
+  # update through the deployer. A failed rebuild leaves the running agent on its
+  # previous image (see config_store.render_registry — routability keys on a
+  # working runtime, not on status), so this can never take an agent down.
+  CapabilityRebuilderFunction:
+    Type: AWS::Serverless::Function
+    Condition: DashboardEnabled
+    Properties:
+      FunctionName: !Sub capability-rebuilder-${Stage}
+      CodeUri: ../dashboard/
+      Handler: capability_rebuilder.handler
+      Timeout: 120
+      Environment:
+        Variables:
+          FLEET_CONFIG_TABLE: !Ref FleetConfigTable
+          CAPABILITY_BUILD_PROJECT: !Ref CapabilityBuildProject
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref FleetConfigTable
+        - Statement:
+            - Effect: Allow
+              Action: codebuild:StartBuild
+              Resource: !GetAtt CapabilityBuildProject.Arn
+      Events:
+        Weekly:
+          Type: Schedule
+          Properties:
+            # Sundays 08:00 UTC — a low-traffic window; the rebuild is rolling
+            # (per-agent builds) and non-disruptive, so exact timing isn't critical.
+            Schedule: cron(0 8 ? * SUN *)
+            Description: Weekly security rebuild of active SDLC agent containers
+
   # ===========================================================================
   # AgentCore Gateway + Cedar Policy Engine (opt-in: DeployGateway=true)
   # ===========================================================================

@@ -172,6 +172,33 @@ def test_disable_hides_from_registry_but_keeps_row():
 
 
 @mock_aws
+def test_live_agent_stays_routable_while_rebuilding_or_failed():
+    """A weekly rebuild of a LIVE agent must not drop it from dispatch: while it's
+    building — and even if that rebuild fails — its existing runtime still serves,
+    so it stays in the registry on its current ARN. A first-onboard (no runtime
+    yet) is still excluded while building/failed."""
+    _make_table()
+    cs = _load_store()
+    # Live agent with a working runtime.
+    cs.put_capability("triage")
+    cs.set_capability_deploy_state("triage", runtime_arn="arn:runtime/triage-live")
+    cs.set_capability_status("triage", cs.CAP_ACTIVE)
+
+    # Weekly rebuild marks it building — still routable on the old ARN.
+    cs.set_capability_status("triage", cs.CAP_BUILDING)
+    assert cs.render_registry()["agents"]["triage"]["runtime_arn"] == "arn:runtime/triage-live"
+    # Rebuild fails — STILL routable on the old runtime (never taken down).
+    cs.set_capability_status("triage", cs.CAP_FAILED)
+    assert cs.render_registry()["agents"]["triage"]["runtime_arn"] == "arn:runtime/triage-live"
+
+    # A brand-new agent that never deployed (no runtime_arn) is excluded while
+    # building/failed.
+    cs.put_capability("newbie")
+    cs.set_capability_status("newbie", cs.CAP_BUILDING)
+    assert "newbie" not in cs.render_registry()["agents"]
+
+
+@mock_aws
 def test_status_write_to_missing_row_fails():
     _make_table()
     cs = _load_store()

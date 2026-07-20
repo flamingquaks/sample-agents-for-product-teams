@@ -491,13 +491,18 @@ def render_registry() -> dict:
     scripts/sync_registry.py — the registry is now generated from the table the
     admin UI writes, so onboarding an agent needs no code/YAML edit.
 
-    Only capabilities that are enabled, ``active``, and actually have a resolved
-    ``runtime_arn`` are included: a half-onboarded agent (still building, or whose
-    runtime creation failed) must not appear in the registry, or the router would
-    resolve a mention to it and then fail to invoke a nonexistent runtime."""
+    Routability keys on "has a working runtime + enabled + not disabled", NOT on
+    status == active: a capability is included iff it is ``enabled``, not
+    ``disabled``, and has a resolved ``runtime_arn``. This is deliberate so a
+    WEEKLY REBUILD (or any re-deploy) of a live agent never drops it from dispatch:
+    while it is ``building`` — and even if that rebuild lands in ``failed`` — its
+    previous runtime is still up and serving, so it stays routable on its existing
+    ARN. A brand-new agent that has never deployed has no ``runtime_arn`` yet, so a
+    still-building or failed FIRST onboard is correctly excluded (the router would
+    otherwise resolve a mention to a runtime that isn't up)."""
     agents = {}
     for cap in list_capabilities():
-        if not cap.get("enabled") or cap.get("status") != CAP_ACTIVE:
+        if not cap.get("enabled") or cap.get("status") == CAP_DISABLED:
             continue
         arn = cap.get("runtime_arn")
         if not arn:
