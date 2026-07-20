@@ -547,6 +547,21 @@ def _decimal_default(o):
     raise TypeError(f"not JSON-serializable: {type(o).__name__}")
 
 
+def capability_env_pairs(cap: dict, base_env: dict[str, str]) -> dict[str, str]:
+    """The full runtime environment for a capability: the fleet-wide base env
+    (guardrail id/version + gateway URL — the hard gates every agent needs) merged
+    with the capability's own ``env`` (e.g. Asana GIDs). Capability env wins on a
+    key clash so an operator can override, but the base gates should never be
+    clashed in practice.
+
+    Returned as a plain dict; the caller renders the CSV create/update-agent-runtime
+    wants. Kept here so the onboard path and the weekly rebuild share one
+    definition of an agent's environment."""
+    merged = dict(base_env)
+    merged.update({k: str(v) for k, v in (cap.get("env") or {}).items()})
+    return merged
+
+
 # --- derived -----------------------------------------------------------------
 
 

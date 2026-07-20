@@ -859,6 +859,47 @@ def deploy_foundation(runner: Runner, cfg: dict) -> None:
     runner.run(cmd, cwd=FOUNDATION_DIR)
 
 
+def upload_build_source(runner: Runner, cfg: dict, outputs: dict[str, str]) -> None:
+    """Upload the fleet source (the agents/ tree) to the capability build pipeline's
+    source bucket as source.zip. This is what the shared CodeBuild project unpacks
+    and builds when an agent is onboarded from the dashboard — so it must exist
+    before the first onboard. Re-run whenever agent code changes so the pipeline
+    (and the weekly security rebuild) build the current source.
+
+    No-op when the dashboard isn't deployed (no build pipeline / no source bucket)."""
+    bucket = outputs.get("CapabilitySourceBucketName")
+    if not bucket:
+        return
+    print("\n== Upload agent source for the build pipeline ==")
+    src = REPO_ROOT / "agents"
+    if not src.is_dir():
+        runner.failures.append("agents/ directory not found — cannot upload build source")
+        print("    ⚠️  no agents/ directory to upload")
+        return
+    # Zip agents/ so the archive root contains agents/<name>/... — the buildspec
+    # builds `docker build -f agents/$AGENT_NAME/Dockerfile agents/`.
+    if runner.dry_run:
+        print(f"  [dry-run] zip agents/ → source.zip and upload to s3://{bucket}/source.zip")
+        return
+    import tempfile
+    import zipfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        archive = Path(tmp) / "source.zip"
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+            for path in src.rglob("*"):
+                # Skip caches / build junk so the image build context stays lean.
+                if any(part in {"__pycache__", ".pytest_cache", "build", "node_modules"}
+                       for part in path.parts):
+                    continue
+                if path.is_file():
+                    zf.write(path, path.relative_to(REPO_ROOT))
+        runner.aws_step(
+            "upload build source",
+            ["s3", "cp", str(archive), f"s3://{bucket}/source.zip"],
+        )
+
+
 def stack_outputs(runner: Runner, stack: str) -> dict[str, str]:
     data = runner.aws_json(["cloudformation", "describe-stacks", "--stack-name", stack])
     if not data:
@@ -1070,6 +1111,7 @@ def main() -> int:
     ensure_agent_roles(runner, agents, region, account, cfg["stage"])
     deploy_foundation(runner, cfg)
     outputs = stack_outputs(runner, f"sdlc-agents-{cfg['stage']}")
+    upload_build_source(runner, cfg, outputs)
     seed_fleet_repos(runner, cfg)
     set_github_config(runner, cfg, account, deploy_role_arn)
     check_secrets(runner, agents)

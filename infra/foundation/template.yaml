@@ -486,8 +486,8 @@ Resources:
     Properties:
       Name: !Sub /sdlc-agents/${Stage}/registry
       Type: String
-      Description: Agent fleet registry (synced from .dispatch/agents.yaml)
-      Value: "{}"  # Populated by CI/CD pipeline
+      Description: Agent fleet registry (rendered from capability rows by the dashboard admin API)
+      Value: "{}"  # Populated by the dashboard admin API on every capability change
 
   # ---------------------------------------------------------------------------
   # Bedrock Guardrail — Prompt Injection Defense (T-1, T-2, T-3)
@@ -865,6 +865,10 @@ Resources:
           # same parameter the router reads (RegistryParameter / DispatchRouter's
           # REGISTRY_PARAM). This replaces scripts/sync_registry.py's deploy-time sync.
           REGISTRY_PARAM: !Sub /sdlc-agents/${Stage}/registry
+          # The single shared build pipeline the admin API triggers on a
+          # capability onboard/edit (codebuild:StartBuild only — never runtime/role
+          # creation, which is the deployer Lambda's job off the build event).
+          CAPABILITY_BUILD_PROJECT: !Ref CapabilityBuildProject
       Policies:
         # Read+write the config table (onboard/enable/disable repos, settings,
         # capabilities).
@@ -877,6 +881,15 @@ Resources:
               Action: ssm:PutParameter
               Resource:
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/registry
+        # Trigger the shared agent build pipeline on a capability onboard/edit.
+        # StartBuild ONLY, and only on the single fleet build project — the admin
+        # API deliberately holds NO IAM-role or runtime-creation privilege (those
+        # live on the CapabilityDeployerFunction, reachable only via the build
+        # completion event, not any HTTP path).
+        - Statement:
+            - Effect: Allow
+              Action: codebuild:StartBuild
+              Resource: !GetAtt CapabilityBuildProject.Arn
         # GitHub App: read app id/slug + read/write the private key + update the
         # id/slug params after the manifest flow creates the App.
         - Statement:
@@ -986,6 +999,253 @@ Resources:
             Path: /admin/github-app/setup/callback
             Method: POST
             RestApiId: !Ref DashboardApi
+
+  # ===========================================================================
+  # Capability build pipeline + deployer (gated on DeployDashboard)
+  # ===========================================================================
+  # UI-driven agent onboarding: the admin API triggers ONE shared, agent-agnostic
+  # CodeBuild project (parameterized by AGENT_NAME), which builds agents/<name>
+  # and pushes to ECR. Build completion fires an EventBridge rule that invokes the
+  # CapabilityDeployerFunction, which stands up / updates the AgentCore runtime.
+  # The privileged actions (IAM role + runtime creation) live ONLY on the
+  # deployer's role — reachable via the build event, never via the internet-facing
+  # admin API. See infra/dashboard/capability_deployer.py.
+
+  # Source the pipeline builds from. The thin base deploy (bootstrap) uploads the
+  # fleet source (agents/ + shared/) here as source.zip; the build unpacks it and
+  # builds the requested agent. Keeping the source in S3 (not a GitHub/CodeConnections
+  # source) makes the pipeline self-contained in AWS — consistent with the UI-only,
+  # no-OIDC model.
+  CapabilitySourceBucket:
+    Type: AWS::S3::Bucket
+    Condition: DashboardEnabled
+    Properties:
+      BucketName: !Sub sdlc-agent-source-${AWS::AccountId}-${Stage}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+      VersioningConfiguration:
+        Status: Enabled
+
+  # Permissions boundary that CAPS every per-agent runtime role the deployer
+  # creates. Even a bug in capability_deployer._ensure_runtime_role can't grant a
+  # runtime more than this — the effective permissions of a bounded role are the
+  # INTERSECTION of its policies and this boundary. Scoped to exactly what an
+  # agent runtime legitimately needs: pull its image, log, read/write the
+  # assignments table, invoke the fleet gateway + Bedrock models.
+  CapabilityRuntimeBoundary:
+    Type: AWS::IAM::ManagedPolicy
+    Condition: DashboardEnabled
+    Properties:
+      ManagedPolicyName: !Sub sdlc-capability-runtime-boundary-${Stage}
+      Description: Permissions boundary capping SDLC capability runtime roles.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: RuntimeMaxPermissions
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+              - dynamodb:UpdateItem
+              - dynamodb:Query
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+              - ecr:BatchCheckLayerAvailability
+              - ecr:GetAuthorizationToken
+              - bedrock-agentcore:InvokeGateway
+              - bedrock:InvokeModel
+              - bedrock:InvokeModelWithResponseStream
+              - bedrock:ApplyGuardrail
+            Resource: "*"
+
+  CapabilityBuildRole:
+    Type: AWS::IAM::Role
+    Condition: DashboardEnabled
+    Properties:
+      RoleName: !Sub sdlc-capability-build-${Stage}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: build
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/sdlc-agent-builder-${Stage}*
+              - Sid: SourceRead
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub ${CapabilitySourceBucket.Arn}/*
+              # ECR push for any sdlc-agents/<agent> repo. GetAuthorizationToken
+              # is account-wide (no per-repo scoping possible); the mutating layer
+              # actions are scoped to the fleet's own repo namespace.
+              - Sid: EcrAuth
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: EcrPush
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:CreateRepository
+                  - ecr:DescribeRepositories
+                  - ecr:PutImageScanningConfiguration
+                Resource: !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/sdlc-agents/*
+
+  # The single, agent-agnostic build project. AGENT_NAME (+ IMAGE_TAG) are passed
+  # as environment overrides per StartBuild; the buildspec builds that one agent.
+  # PrivilegedMode is required for the in-container docker build.
+  CapabilityBuildProject:
+    Type: AWS::CodeBuild::Project
+    Condition: DashboardEnabled
+    Properties:
+      Name: !Sub sdlc-agent-builder-${Stage}
+      Description: Shared build pipeline for SDLC fleet agents (parameterized by AGENT_NAME).
+      ServiceRole: !GetAtt CapabilityBuildRole.Arn
+      TimeoutInMinutes: 30
+      Artifacts: { Type: NO_ARTIFACTS }
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - { Name: AWS_ACCOUNT_ID, Value: !Ref AWS::AccountId }
+          - { Name: AWS_DEFAULT_REGION, Value: !Ref AWS::Region }
+          - { Name: ECR_REGISTRY, Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com" }
+          # Defaults; overridden per build by StartBuild. AGENT_NAME empty here so
+          # a mis-triggered build with no override fails fast rather than building
+          # a wrong agent.
+          - { Name: AGENT_NAME, Value: "" }
+          - { Name: IMAGE_TAG, Value: "latest" }
+      Source:
+        Type: S3
+        Location: !Sub ${CapabilitySourceBucket}/source.zip
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - set -euo pipefail
+                - test -n "$AGENT_NAME" || { echo "AGENT_NAME override is required"; exit 1; }
+                - echo "$AGENT_NAME" | grep -Eq '^[a-z][a-z0-9-]{0,62}[a-z0-9]$' || { echo "invalid AGENT_NAME"; exit 1; }
+                - test -f "agents/$AGENT_NAME/Dockerfile" || { echo "no agents/$AGENT_NAME/Dockerfile in source"; exit 1; }
+                - REPO="sdlc-agents/$AGENT_NAME"
+                - aws ecr describe-repositories --repository-names "$REPO" >/dev/null 2>&1 || aws ecr create-repository --repository-name "$REPO" --image-scanning-configuration scanOnPush=true --image-tag-mutability IMMUTABLE
+                - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+            build:
+              commands:
+                # Build context is agents/ so the shared/ package is included
+                # (matches how the agent images were always built).
+                - docker build -f "agents/$AGENT_NAME/Dockerfile" -t "$ECR_REGISTRY/$REPO:$IMAGE_TAG" agents/
+            post_build:
+              commands:
+                - docker push "$ECR_REGISTRY/$REPO:$IMAGE_TAG"
+
+  # Deployer: build completion → stand up / update the AgentCore runtime. This is
+  # the ONLY component holding iam:CreateRole/PassRole + create/update-agent-runtime,
+  # and it is invocable only by the CodeBuild-completion rule below.
+  CapabilityDeployerFunction:
+    Type: AWS::Serverless::Function
+    Condition: DashboardEnabled
+    Properties:
+      FunctionName: !Sub capability-deployer-${Stage}
+      CodeUri: ../dashboard/
+      Handler: capability_deployer.handler
+      Timeout: 900
+      Environment:
+        Variables:
+          FLEET_CONFIG_TABLE: !Ref FleetConfigTable
+          REGISTRY_PARAM: !Sub /sdlc-agents/${Stage}/registry
+          STAGE: !Ref Stage
+          AWS_ACCOUNT_ID: !Ref AWS::AccountId
+          RUNTIME_PERMISSIONS_BOUNDARY_ARN: !Ref CapabilityRuntimeBoundary
+          BEDROCK_GUARDRAIL_ID: !Ref PromptInjectionGuardrail
+          BEDROCK_GUARDRAIL_VERSION: DRAFT
+          GATEWAY_MCP_URL: !If [GatewayEnabled, !GetAtt FleetGateway.GatewayUrl, !Ref "AWS::NoValue"]
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref FleetConfigTable
+        - Statement:
+            - Effect: Allow
+              Action: ssm:PutParameter
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/registry
+            # Create + configure the per-agent runtime role — CONSTRAINED to the
+            # fixed capabilities path, and CreateRole is further required to attach
+            # the runtime permissions boundary (condition below), so a role made
+            # here can never exceed the boundary.
+            - Sid: CreateBoundedRuntimeRole
+              Effect: Allow
+              Action: iam:CreateRole
+              Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/sdlc-agents/capabilities/*
+              Condition:
+                StringEquals:
+                  iam:PermissionsBoundary: !Ref CapabilityRuntimeBoundary
+            - Sid: ConfigureRuntimeRole
+              Effect: Allow
+              Action:
+                - iam:PutRolePolicy
+                - iam:AttachRolePolicy
+                - iam:GetRole
+              Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/sdlc-agents/capabilities/*
+            # PassRole so create/update-agent-runtime can hand the runtime role to
+            # the AgentCore service — scoped to the same path + service.
+            - Sid: PassRuntimeRole
+              Effect: Allow
+              Action: iam:PassRole
+              Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/sdlc-agents/capabilities/*
+              Condition:
+                StringEquals:
+                  iam:PassedToService: bedrock-agentcore.amazonaws.com
+            # Runtime lifecycle. list/get are account-wide (no resource scoping on
+            # those APIs); create/update are the mutating ones the deployer runs.
+            - Sid: AgentCoreRuntime
+              Effect: Allow
+              Action:
+                - bedrock-agentcore-control:CreateAgentRuntime
+                - bedrock-agentcore-control:UpdateAgentRuntime
+                - bedrock-agentcore-control:GetAgentRuntime
+                - bedrock-agentcore-control:ListAgentRuntimes
+              Resource: "*"
+      Events:
+        BuildCompleted:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source: [aws.codebuild]
+              detail-type: ["CodeBuild Build State Change"]
+              detail:
+                build-status: [SUCCEEDED, FAILED, STOPPED, FAULT, TIMED_OUT]
+                project-name:
+                  - !Sub sdlc-agent-builder-${Stage}
 
   # ===========================================================================
   # AgentCore Gateway + Cedar Policy Engine (opt-in: DeployGateway=true)
@@ -1681,6 +1941,11 @@ Outputs:
     Condition: DashboardEnabled
     Value: !Ref DashboardDistribution
     Description: CloudFront distribution id — used to invalidate the cache on deploy
+
+  CapabilitySourceBucketName:
+    Condition: DashboardEnabled
+    Value: !Ref CapabilitySourceBucket
+    Description: S3 bucket the base deploy uploads the fleet source (source.zip) into for the build pipeline
 
   # --- Gateway (only present when DeployGateway=true) ------------------------
 

@@ -267,21 +267,77 @@ def _validate_capability_body(body: dict) -> tuple[dict, dict | None]:
     }, None
 
 
+def _start_capability_build(agent_id: str) -> str:
+    """Trigger the shared build pipeline for ``agent_id`` and return the image tag
+    the build will push (and the runtime will then use). The admin API only ever
+    STARTS the build (codebuild:StartBuild on the single shared project) — it holds
+    no privilege to create the runtime/role; a CodeBuild-completion event drives
+    that via the capability_deployer Lambda. So this returns fast and the caller
+    reports "building"; it does not block on the multi-minute build.
+
+    The image tag is time-based (the caller can't read git SHA here) so each build
+    is a distinct immutable tag. AGENT_NAME + IMAGE_TAG are passed as build env
+    overrides; the deployer reads them back off the completion event.
+
+    No-op returning '' when CAPABILITY_BUILD_PROJECT is unset (gateway/dashboard
+    deployed without the build pipeline) — the capability stays pending and an
+    operator can wire the pipeline later; we don't fail the onboard write."""
+    project = os.environ.get("CAPABILITY_BUILD_PROJECT")
+    if not project:
+        logger.warning("CAPABILITY_BUILD_PROJECT unset — capability %s left pending, "
+                       "no build started", agent_id)
+        return ""
+    import boto3
+
+    image_tag = f"build-{int(time.time())}"
+    boto3.client("codebuild").start_build(
+        projectName=project,
+        environmentVariablesOverride=[
+            {"name": "AGENT_NAME", "value": agent_id, "type": "PLAINTEXT"},
+            {"name": "IMAGE_TAG", "value": image_tag, "type": "PLAINTEXT"},
+        ],
+    )
+    return image_tag
+
+
 def _onboard_capability(event: dict, body: dict) -> dict:
-    """Onboard or edit a capability. Phase 2: persists the declarative row and
-    republishes the router registry. The build → runtime lifecycle (which flips a
-    new capability to ``active``) is wired in later phases; until then a fresh
-    capability stays ``pending`` and does NOT appear in the registry, so editing
-    the fleet's config can never route a mention to a runtime that isn't up."""
+    """Onboard or edit a capability, then kick off its build.
+
+    Persists the declarative row and republishes the router registry (so an edit
+    to a LIVE capability takes effect at once). Then starts the shared build
+    pipeline and marks the row ``building``; the capability_deployer Lambda,
+    triggered by build completion, creates/updates the runtime and flips the row
+    to ``active`` (entering the registry). A brand-new capability therefore stays
+    OUT of the registry until its runtime is actually up — a mention can never
+    resolve to a runtime that isn't ready.
+
+    Starting a build on every onboard/edit is intentional: an edit that changes
+    the runtime env (e.g. new Asana GID) must reach the runtime, and a rebuild is
+    how env is re-applied (update-agent-runtime replaces env wholesale). Editing
+    only registry-level fields (aliases) also rebuilds — cheap, and it keeps one
+    code path. A build failure marks the row ``failed`` without disturbing any
+    existing runtime."""
     fields, err = _validate_capability_body(body)
     if err is not None:
         return err
+    agent_id = fields["agent_id"]
     config_store.put_capability(onboarded_by=auth.caller_sub(event), **fields)
-    # Republish so an edit to a LIVE capability (e.g. new alias, tightened
-    # authorization, disable) takes effect immediately. A pending capability
-    # renders to nothing, so this is a no-op for a brand-new onboard.
     _publish_registry_safe()
-    return ok(config_store.get_capability(fields["agent_id"]))
+
+    try:
+        image_tag = _start_capability_build(agent_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("failed to start build for capability %s", agent_id)
+        config_store.set_capability_status(
+            agent_id, config_store.CAP_FAILED, detail="could not start build pipeline"
+        )
+        return error(502, f"capability {agent_id} saved but the build could not be "
+                          "started; edit it to retry")
+    if image_tag:
+        config_store.set_capability_status(
+            agent_id, config_store.CAP_BUILDING, detail=f"build started ({image_tag})"
+        )
+    return ok(config_store.get_capability(agent_id))
 
 
 def _delete_capability(agent_id: str) -> dict:

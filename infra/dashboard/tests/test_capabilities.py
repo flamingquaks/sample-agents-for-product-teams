@@ -49,6 +49,10 @@ def _load_store():
 def _load_admin():
     for m in ("admin", "config_store", "auth", "http_responses"):
         sys.modules.pop(m, None)
+    # Default to no build pipeline so a test that doesn't stub CodeBuild leaves a
+    # capability pending rather than reaching for a real StartBuild. Tests that
+    # exercise the build path set this via _stub_codebuild.
+    os.environ.pop("CAPABILITY_BUILD_PROJECT", None)
     import admin
 
     return admin
@@ -218,10 +222,34 @@ def test_operator_cannot_touch_capabilities():
     )
 
 
+def _stub_codebuild(admin, monkeypatch, sink):
+    """Make admin's lazily-imported boto3.client('codebuild').start_build record
+    the call instead of hitting AWS. The build project env var is set so the
+    onboard path takes the 'start a build' branch."""
+    os.environ["CAPABILITY_BUILD_PROJECT"] = "sdlc-agent-builder-test"
+    import boto3
+
+    real_client = boto3.client
+
+    class _CB:
+        def start_build(self, **kw):
+            sink.append(kw)
+            return {"build": {"id": "b-1"}}
+
+    def fake_client(name, *a, **k):
+        if name == "codebuild":
+            return _CB()
+        return real_client(name, *a, **k)
+
+    monkeypatch.setattr(boto3, "client", fake_client)
+
+
 @mock_aws
-def test_onboard_capability_persists_and_lists():
+def test_onboard_capability_persists_lists_and_starts_build(monkeypatch):
     _make_table()
     admin = _load_admin()
+    builds: list = []
+    _stub_codebuild(admin, monkeypatch, builds)
     resp = admin.handler(
         _event(
             "POST",
@@ -240,15 +268,34 @@ def test_onboard_capability_persists_and_lists():
     assert resp["statusCode"] == 200, resp["body"]
     body = json.loads(resp["body"])
     assert body["agent_id"] == "triage"
-    assert body["status"] == "pending"  # not active until built (later phases)
+    assert body["status"] == "building"  # build started, not yet active
     assert body["onboarded_by"] == "admin-1"
+
+    # The shared build project was triggered with the AGENT_NAME override.
+    assert len(builds) == 1
+    overrides = {v["name"]: v["value"] for v in builds[0]["environmentVariablesOverride"]}
+    assert overrides["AGENT_NAME"] == "triage"
+    assert overrides["IMAGE_TAG"].startswith("build-")
 
     listed = json.loads(
         admin.handler(_event("GET", "/admin/capabilities"))["body"]
     )["capabilities"]
     assert [c["agent_id"] for c in listed] == ["triage"]
-    # Pending capability is not yet in the published registry.
+    # Building capability is not yet in the published registry (no runtime).
     assert _read_registry() == {"agents": {}}
+
+
+@mock_aws
+def test_onboard_without_build_project_stays_pending(monkeypatch):
+    _make_table()
+    admin = _load_admin()
+    os.environ.pop("CAPABILITY_BUILD_PROJECT", None)
+    resp = admin.handler(
+        _event("POST", "/admin/capabilities", body={"agent_id": "triage"})
+    )
+    assert resp["statusCode"] == 200
+    # No build pipeline wired → left pending, not failed.
+    assert json.loads(resp["body"])["status"] == "pending"
 
 
 @mock_aws
@@ -293,12 +340,14 @@ def test_onboard_rejects_bad_trigger_source_and_env():
 
 
 @mock_aws
-def test_edit_live_capability_republishes_registry():
+def test_edit_live_capability_republishes_registry(monkeypatch):
     """Editing an already-active capability (e.g. add an alias) must take effect
     in the router registry immediately."""
     _make_table()
     admin = _load_admin()
     cs = _load_store()
+    builds: list = []
+    _stub_codebuild(admin, monkeypatch, builds)
     admin.handler(
         _event("POST", "/admin/capabilities", body={"agent_id": "triage", "aliases": ["tri"]})
     )
