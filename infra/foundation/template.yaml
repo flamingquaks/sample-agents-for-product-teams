@@ -720,6 +720,84 @@ Resources:
       Description: Admins authorized to configure the fleet (onboard repos, restrictions)
       UserPoolId: !Ref DashboardUserPool
 
+  # ---------------------------------------------------------------------------
+  # Amazon Verified Permissions — Cedar authorization for the dashboard API
+  # ---------------------------------------------------------------------------
+  # The dashboard API's authz (auth.is_operator / is_admin) is decided by AVP
+  # evaluating these Cedar policies, decoupling permissions from code so new
+  # actions/policies can be added without a code change. Two coarse actions today
+  # (Read for GET routes, Write for POST/PUT/DELETE); the operator/admin split is
+  # expressed as Cedar policies, not hardcoded group checks.
+  DashboardPolicyStore:
+    Type: AWS::VerifiedPermissions::PolicyStore
+    Condition: DashboardEnabled
+    Properties:
+      Description: !Sub SDLC dashboard API authorization (${Stage})
+      ValidationSettings:
+        Mode: STRICT
+      Schema:
+        CedarJson: |
+          {
+            "SdlcDashboard": {
+              "entityTypes": {
+                "Group": {"shape": {"type": "Record", "attributes": {}}},
+                "User": {"memberOfTypes": ["Group"], "shape": {"type": "Record", "attributes": {}}},
+                "Application": {"shape": {"type": "Record", "attributes": {}}}
+              },
+              "actions": {
+                "Read":  {"appliesTo": {"principalTypes": ["User"], "resourceTypes": ["Application"]}},
+                "Write": {"appliesTo": {"principalTypes": ["User"], "resourceTypes": ["Application"]}}
+              }
+            }
+          }
+
+  # operators (and, by membership, admins) may Read fleet activity.
+  DashboardOperatorReadPolicy:
+    Type: AWS::VerifiedPermissions::Policy
+    Condition: DashboardEnabled
+    Properties:
+      PolicyStoreId: !Ref DashboardPolicyStore
+      Definition:
+        Static:
+          Description: operators + admins may Read the dashboard
+          Statement: |
+            permit(
+              principal in SdlcDashboard::Group::"operators",
+              action == SdlcDashboard::Action::"Read",
+              resource == SdlcDashboard::Application::"dashboard"
+            );
+
+  # admins may Read AND Write (superset of operators).
+  DashboardAdminReadPolicy:
+    Type: AWS::VerifiedPermissions::Policy
+    Condition: DashboardEnabled
+    Properties:
+      PolicyStoreId: !Ref DashboardPolicyStore
+      Definition:
+        Static:
+          Description: admins may Read the dashboard
+          Statement: |
+            permit(
+              principal in SdlcDashboard::Group::"admins",
+              action == SdlcDashboard::Action::"Read",
+              resource == SdlcDashboard::Application::"dashboard"
+            );
+
+  DashboardAdminWritePolicy:
+    Type: AWS::VerifiedPermissions::Policy
+    Condition: DashboardEnabled
+    Properties:
+      PolicyStoreId: !Ref DashboardPolicyStore
+      Definition:
+        Static:
+          Description: admins may Write (configure) the fleet
+          Statement: |
+            permit(
+              principal in SdlcDashboard::Group::"admins",
+              action == SdlcDashboard::Action::"Write",
+              resource == SdlcDashboard::Application::"dashboard"
+            );
+
   DashboardUserPoolClient:
     Type: AWS::Cognito::UserPoolClient
     Condition: DashboardEnabled
@@ -835,12 +913,19 @@ Resources:
       Environment:
         Variables:
           ASSIGNMENTS_TABLE: !Ref AssignmentsTable
+          # AVP authorizes every read (auth.is_operator → Cedar Read action).
+          AVP_POLICY_STORE_ID: !GetAtt DashboardPolicyStore.PolicyStoreId
       Policies:
         # Read-only: GetItem on the table + Query on its indexes (the dashboard
         # never writes). DynamoDBReadPolicy covers GetItem/Query/Scan and the
         # table's index/* ARNs.
         - DynamoDBReadPolicy:
             TableName: !Ref AssignmentsTable
+        # Authorize requests against the dashboard Cedar policy store.
+        - Statement:
+            - Effect: Allow
+              Action: verifiedpermissions:IsAuthorized
+              Resource: !GetAtt DashboardPolicyStore.Arn
       Events:
         ListRuns:
           Type: Api
@@ -927,11 +1012,18 @@ Resources:
           # capability onboard/edit (codebuild:StartBuild only — never runtime/role
           # creation, which is the deployer Lambda's job off the build event).
           CAPABILITY_BUILD_PROJECT: !Ref CapabilityBuildProject
+          # AVP authorizes every write (auth.is_admin → Cedar Write action).
+          AVP_POLICY_STORE_ID: !GetAtt DashboardPolicyStore.PolicyStoreId
       Policies:
         # Read+write the config table (onboard/enable/disable repos, settings,
         # capabilities).
         - DynamoDBCrudPolicy:
             TableName: !Ref FleetConfigTable
+        # Authorize requests against the dashboard Cedar policy store.
+        - Statement:
+            - Effect: Allow
+              Action: verifiedpermissions:IsAuthorized
+              Resource: !GetAtt DashboardPolicyStore.Arn
         # Publish the rendered agent registry to the SSM param the Dispatch Router
         # reads (capability onboard/edit/disable regenerates it).
         - Statement:
