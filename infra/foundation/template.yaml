@@ -88,9 +88,22 @@ Parameters:
       Display name used when registering the fleet's GitHub App from the admin
       UI manifest flow. Must be unique across GitHub.
 
+  DeploySlack:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Opt-in flag for the Slack trigger source. When "true", provisions the
+      Slack webhook receiver Lambda (Events API + slash commands) on the webhook
+      API. Default "false"; the trigger-authz store + admin routes exist
+      regardless, so an operator can pre-author rules before pointing Slack here.
+      Per-workspace signing secrets + bot tokens are stored out-of-band via
+      scripts/bootstrap_slack.py.
+
 Conditions:
   DashboardEnabled: !Equals [!Ref DeployDashboard, "true"]
   GatewayEnabled: !Equals [!Ref DeployGateway, "true"]
+  SlackEnabled: !Equals [!Ref DeploySlack, "true"]
   # Provision the shared Mantle project as a CFN resource (opt-in — the resource
   # type must be activated in the account+region first).
   MantleProjectEnabled: !Equals [!Ref DeployMantleProject, "true"]
@@ -388,6 +401,11 @@ Resources:
           # (populating these) is a dashboard-only step — a documented prereq.
           GITHUB_APP_ID_PARAM: !Ref GitHubAppIdParam
           GITHUB_APP_PRIVATE_KEY_SECRET_ARN: !Ref GitHubAppPrivateKey
+          # Trigger authorization (the sole authz mechanism): the router calls
+          # AVP IsAuthorized against this store, passing grant sets read from the
+          # fleet-config table (trigger_grants). Required — unset ⇒ fail-closed.
+          TRIGGER_POLICY_STORE_ID: !GetAtt TriggerPolicyStore.PolicyStoreId
+          STAGE: !Ref Stage
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref AssignmentsTable
@@ -395,6 +413,10 @@ Resources:
             TableName: !Ref FleetConfigTable
         - SSMParameterReadPolicy:
             ParameterName: !Sub sdlc-agents/${Stage}/registry
+        - Statement:
+            - Effect: Allow
+              Action: verifiedpermissions:IsAuthorized
+              Resource: !GetAtt TriggerPolicyStore.Arn
         # GitHub App (reply.py): read the App private key + app-id to mint
         # per-owner installation tokens (the shared PAT was retired). The App
         # credential resources are unconditional; the per-owner install record
@@ -424,6 +446,9 @@ Resources:
                 - ssm:GetParameter
               Resource:
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/asana-pat
+                # Per-workspace Slack bot token — reply.post_slack_message posts
+                # the "on it" ack + reject notices back to the originating thread.
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/slack/*
             - Effect: Allow
               Action:
                 - cloudwatch:PutMetricData
@@ -541,6 +566,61 @@ Resources:
             Method: POST
             RestApiId: !Ref WebhookApi
 
+  # Slack webhook receiver — the Slack trigger source (Events API + slash
+  # commands). Multi-workspace: verifies each delivery against the per-workspace
+  # signing secret and files channel-onboarding requests to the config table.
+  SlackWebhookFunction:
+    Type: AWS::Serverless::Function
+    Condition: SlackEnabled
+    Properties:
+      FunctionName: !Sub slack-webhook-${Stage}
+      CodeUri: ../dispatch/
+      Handler: slack_webhook.handler
+      Timeout: 30
+      ReservedConcurrentExecutions: 10
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt LambdaDeadLetterQueue.Arn
+      Environment:
+        Variables:
+          DISPATCH_FUNCTION: !Ref DispatchRouterFunction
+          REGISTRY_PARAM: !Sub /sdlc-agents/${Stage}/registry
+          FLEET_CONFIG_TABLE: !Ref FleetConfigTable
+          ASSIGNMENTS_TABLE: !Ref AssignmentsTable
+          STAGE: !Ref Stage
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref DispatchRouterFunction
+        # Read workspace/grant rows + write channel-onboarding requests + the
+        # event-dedup marker (both live in their respective tables).
+        - DynamoDBCrudPolicy:
+            TableName: !Ref FleetConfigTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AssignmentsTable
+        - Statement:
+            # Read the per-workspace signing secret to verify inbound signatures +
+            # the registry to resolve @mentions. Secrets are per-workspace under
+            # /sdlc-agents/<stage>/slack/*; writing them is an operator step
+            # (bootstrap_slack.py), never this Lambda (parity with T-9).
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/slack/*
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/registry
+      Events:
+        SlackEvents:
+          Type: Api
+          Properties:
+            Path: /slack/events
+            Method: POST
+            RestApiId: !Ref WebhookApi
+        SlackCommands:
+          Type: Api
+          Properties:
+            Path: /slack/commands
+            Method: POST
+            RestApiId: !Ref WebhookApi
+
   WebhookApiAccessLogs:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -650,6 +730,24 @@ Resources:
       Dimensions:
         - Name: FunctionName
           Value: !Ref AsanaWebhookFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  SlackWebhookErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: SlackEnabled
+    Properties:
+      AlarmName: !Sub slack-webhook-errors-${Stage}
+      AlarmDescription: Slack webhook receiver error rate
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SlackWebhookFunction
       Statistic: Sum
       Period: 300
       EvaluationPeriods: 2
@@ -776,6 +874,102 @@ Resources:
 
   # ---------------------------------------------------------------------------
   # Amazon Verified Permissions — Cedar authorization for the dashboard API
+  # ---------------------------------------------------------------------------
+  # Trigger authorization (AVP) — the sole mechanism deciding who may trigger an
+  # agent from any source. Required foundation (NOT toggle-gated): the router
+  # fails closed if it's absent. Data-driven — a SMALL FIXED policy set evaluates
+  # grant sets the router passes as entity attributes (from the trigger_rule
+  # rows), so granting a user is a DynamoDB write, never a new policy. See
+  # infra/dispatch/trigger_authz.py FIXED_POLICIES + docs/specs/slack-connectors-spec.md §5.
+  TriggerPolicyStore:
+    Type: AWS::VerifiedPermissions::PolicyStore
+    Properties:
+      Description: !Sub SDLC trigger authorization (${Stage})
+      ValidationSettings:
+        Mode: STRICT
+      Schema:
+        CedarJson: |
+          {
+            "SdlcTrigger": {
+              "entityTypes": {
+                "Group": {"shape": {"type": "Record", "attributes": {}}},
+                "User": {"memberOfTypes": ["Group"], "shape": {"type": "Record", "attributes": {
+                  "groups": {"type": "Set", "element": {"type": "String"}},
+                  "email": {"type": "String", "required": false}
+                }}},
+                "Agent": {"shape": {"type": "Record", "attributes": {
+                  "allowedPrincipals": {"type": "Set", "element": {"type": "String"}},
+                  "deniedPrincipals": {"type": "Set", "element": {"type": "String"}},
+                  "allowedGroups": {"type": "Set", "element": {"type": "String"}},
+                  "deniedGroups": {"type": "Set", "element": {"type": "String"}}
+                }}}
+              },
+              "actions": {
+                "Trigger": {"appliesTo": {
+                  "principalTypes": ["User"],
+                  "resourceTypes": ["Agent"],
+                  "context": {"type": "Record", "attributes": {
+                    "workspace": {"type": "String"},
+                    "channel": {"type": "String"},
+                    "source": {"type": "String"},
+                    "channelAllowed": {"type": "Boolean"}
+                  }}
+                }}
+              }
+            }
+          }
+
+  # P1 — permit if the principal is granted directly or via a granted group.
+  TriggerPermitPolicy:
+    Type: AWS::VerifiedPermissions::Policy
+    Properties:
+      PolicyStoreId: !Ref TriggerPolicyStore
+      Definition:
+        Static:
+          Description: permit a granted principal or group
+          Statement: |
+            permit(
+              principal,
+              action == SdlcTrigger::Action::"Trigger",
+              resource
+            ) when {
+              resource.allowedPrincipals.contains(principal) ||
+              principal.groups.containsAny(resource.allowedGroups)
+            };
+
+  # P2 — forbid (wins) an explicitly denied principal or group.
+  TriggerForbidDeniedPolicy:
+    Type: AWS::VerifiedPermissions::Policy
+    Properties:
+      PolicyStoreId: !Ref TriggerPolicyStore
+      Definition:
+        Static:
+          Description: forbid an explicitly denied principal or group
+          Statement: |
+            forbid(
+              principal,
+              action == SdlcTrigger::Action::"Trigger",
+              resource
+            ) when {
+              resource.deniedPrincipals.contains(principal) ||
+              principal.groups.containsAny(resource.deniedGroups)
+            };
+
+  # P3 — forbid (wins) when the channel isn't allowed for the workspace.
+  TriggerForbidChannelPolicy:
+    Type: AWS::VerifiedPermissions::Policy
+    Properties:
+      PolicyStoreId: !Ref TriggerPolicyStore
+      Definition:
+        Static:
+          Description: forbid when the channel is not allowed
+          Statement: |
+            forbid(
+              principal,
+              action == SdlcTrigger::Action::"Trigger",
+              resource
+            ) when { !context.channelAllowed };
+
   # ---------------------------------------------------------------------------
   # The dashboard API's authz (auth.is_operator / is_admin) is decided by AVP
   # evaluating these Cedar policies, decoupling permissions from code so new
@@ -1068,9 +1262,11 @@ Resources:
           CAPABILITY_BUILD_PROJECT: !Ref CapabilityBuildProject
           # AVP authorizes every write (auth.is_admin → Cedar Write action).
           AVP_POLICY_STORE_ID: !GetAtt DashboardPolicyStore.PolicyStoreId
+          # Names the per-workspace Slack secret paths recorded on a workspace row.
+          STAGE: !Ref Stage
       Policies:
         # Read+write the config table (onboard/enable/disable repos, settings,
-        # capabilities).
+        # capabilities, Slack workspaces/channels/trigger-rules/channel-requests).
         - DynamoDBCrudPolicy:
             TableName: !Ref FleetConfigTable
         # Authorize requests against the dashboard Cedar policy store.
@@ -2146,6 +2342,22 @@ Outputs:
   GitHubWebhookEndpoint:
     Value: !Sub https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/github/webhook
     Description: GitHub App webhook URL — the manifest flow sets this as the App's hook automatically
+
+  SlackEventsEndpoint:
+    Condition: SlackEnabled
+    Value: !Sub https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/slack/events
+    Description: Slack Events API request URL — set this in the Slack app's Event Subscriptions
+
+  SlackCommandsEndpoint:
+    Condition: SlackEnabled
+    Value: !Sub https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/slack/commands
+    Description: Slack slash-command request URL — set this on each slash command in the Slack app
+
+  TriggerPolicyStoreId:
+    Value: !GetAtt TriggerPolicyStore.PolicyStoreId
+    Description: AVP policy store id for trigger authorization (router TRIGGER_POLICY_STORE_ID)
+    Export:
+      Name: !Sub ${AWS::StackName}-TriggerPolicyStoreId
 
   WebhookApiId:
     Value: !Ref WebhookApi
