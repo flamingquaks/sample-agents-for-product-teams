@@ -384,6 +384,13 @@ def _post_block_reply(source: str, source_context: dict, message: str) -> bool:
             task_gid=source_context.get("task_gid", ""),
             body=message,
         )
+    if source == "slack":
+        return reply.post_slack_message(
+            team_id=source_context.get("workspace", ""),
+            channel=source_context.get("channel_id", ""),
+            body=message,
+            thread_ts=source_context.get("thread_ts"),
+        )
     logger.warning("No reply channel for source=%s — block notice not posted", source)
     return False
 
@@ -452,7 +459,6 @@ def handler(event, context):
     # --- Authorization ---
     # Cedar-backed trigger authz (the SdlcTrigger AVP store), keyed on sender +
     # agent + source/workspace/channel. Same path for every source; no allowlist.
-    # `reason` is surfaced for observability + (Phase 3) the in-thread reject notice.
     authorized, authz_reason = authorize_trigger(
         agent_config, sender, source, source_context
     )
@@ -461,6 +467,14 @@ def handler(event, context):
             "TriggerDenied",
             dimensions={"Source": source, "AgentId": agent_id, "Reason": authz_reason},
         )
+        # Post a specific reject notice to the originating thread so the sender
+        # isn't left with silence (best-effort; the denial stands regardless).
+        notice = (
+            f"⛔ You're not authorized to trigger @{agent_id} here "
+            f"(reason: {authz_reason}). Ask an admin to grant access in the fleet dashboard."
+        )
+        if not _post_block_reply(source, source_context, notice):
+            _put_metric("TriggerDenyReplyFailed", dimensions={"Source": source})
         return _error(
             403,
             f"user '{sender}' not authorized to invoke @{agent_id} ({authz_reason})",
@@ -569,6 +583,14 @@ def handler(event, context):
         logger.error("Failed to invoke agent %s: %s", agent_id, e)
         update_assignment(assignment_id, status="failed", result_summary=str(e))
         return _error(500, f"failed to invoke @{agent_id}: {e}")
+
+    # Slack dispatches are async (the receiver already 200-acked), so unlike
+    # GitHub/Asana — where the mention comment is itself the acknowledgement —
+    # there's no visible confirmation unless the router posts one. Best-effort.
+    if source == "slack":
+        _post_block_reply(
+            source, source_context, f"🏁 @{agent_id} is on it. (assignment `{assignment_id}`)"
+        )
 
     logger.info("Dispatched assignment %s to %s", assignment_id, agent_id)
 

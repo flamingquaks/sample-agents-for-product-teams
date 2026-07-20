@@ -25,6 +25,17 @@ import hashlib
 import sys
 
 
+def _connector_for(subject: str) -> str:
+    """The connector a legacy subject belongs to, from its namespace prefix, so a
+    migrated rule lands under the right connector sub-page. Asana gids historically
+    have no prefix; a bare numeric string is Asana, anything else defaults GitHub."""
+    if subject.startswith("slack:"):
+        return "slack"
+    if subject.startswith("asana:") or subject.isdigit():
+        return "asana"
+    return "github"
+
+
 def plan_migration(rows: list[dict]) -> list[dict]:
     """Pure planner (unit-tested): given the raw config-table items, return the
     list of trigger_rule permit rows to write. One rule per (agent, user) in a
@@ -54,7 +65,7 @@ def plan_migration(rows: list[dict]) -> list[dict]:
                     "pk": f"trigger_rule#migrated-{digest}",
                     "kind": "trigger_rule",
                     "rule_id": f"migrated-{digest}",
-                    "connector": "slack" if subject.startswith("slack:") else "github",
+                    "connector": _connector_for(subject),
                     "subject_type": "user",
                     "subject_id": subject,
                     "agent_id": agent_id,

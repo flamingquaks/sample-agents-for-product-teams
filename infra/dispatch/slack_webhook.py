@@ -67,8 +67,13 @@ def _assignments_table():
     return _ddb.Table(os.environ.get("ASSIGNMENTS_TABLE", "dispatch-assignments"))
 
 
-def _signing_secret(team_id: str) -> str | None:
-    param = f"/sdlc-agents/{STAGE}/slack/{team_id}/signing-secret"
+def _signing_secret() -> str | None:
+    """The Slack app's signing secret. This is APP-LEVEL (one per Slack app),
+    NOT per-workspace — only bot tokens are per-installation. It also must be
+    resolvable without a team id, because the ``url_verification`` handshake
+    carries no team scope. Stored at /sdlc-agents/<stage>/slack/signing-secret
+    by bootstrap_slack.py."""
+    param = f"/sdlc-agents/{STAGE}/slack/signing-secret"
     try:
         resp = _ssm.get_parameter(Name=param, WithDecryption=True)
     except _ssm.exceptions.ParameterNotFound:
@@ -275,60 +280,60 @@ def handler(event, context=None):
             logger.warning("could not base64-decode Slack body")
             return {"statusCode": 400, "body": "invalid body encoding"}
 
+    # Route by the API-Gateway resource/path ONLY. A content sniff like
+    # "command=" in raw_body would misclassify a JSON app_mention whose text
+    # happens to contain that substring, parse_qs it, and drop the mention.
     resource = event.get("resource", "") or event.get("path", "")
-    is_command = resource.endswith("/commands") or "command=" in raw_body
+    is_command = resource.endswith("/commands")
 
-    # Parse enough to find the team_id BEFORE verifying (we need the per-workspace
-    # secret). Slash commands are form-encoded; events are JSON.
-    form = None
-    payload = None
-    if is_command:
-        form = parse_qs(raw_body)
-        team_id = (form.get("team_id", [""])[0]) or ""
-    else:
-        try:
-            payload = json.loads(raw_body) if raw_body else {}
-        except json.JSONDecodeError:
-            return {"statusCode": 400, "body": "invalid JSON"}
-        # url_verification carries no team scope — but it's signed, so verify with
-        # the challenge's team if present, else fall through to signature failure.
-        team_id = _team_id_from_event(payload)
-
-    # --- authenticate against the workspace's signing secret ---
-    secret = _signing_secret(team_id) if team_id else None
+    # --- authenticate FIRST, against the app-level signing secret ---
+    # The signing secret is per-APP, not per-workspace (only bot tokens are
+    # per-installation), and the ``url_verification`` handshake carries no team
+    # scope — so verification must NOT depend on a team id. Verify over the exact
+    # raw body, then parse.
+    secret = _signing_secret()
     if not secret:
-        # url_verification during first setup may arrive before the workspace row
-        # exists; without a secret we cannot trust it, so refuse (the operator
-        # stores the secret via bootstrap_slack.py before pointing Slack here).
-        logger.error("no signing secret for team %r — refusing Slack delivery", team_id)
-        return {"statusCode": 401, "body": "workspace not configured"}
+        logger.error("Slack signing secret not configured — refusing delivery")
+        return {"statusCode": 503, "body": "slack not configured"}
     if not mentions.verify_slack_signature(
         secret,
         headers.get("x-slack-request-timestamp", ""),
         raw_body,
         headers.get("x-slack-signature", ""),
     ):
-        logger.warning("invalid Slack signature for team %s", team_id)
+        logger.warning("invalid Slack signature")
         return {"statusCode": 401, "body": "invalid signature"}
 
-    # --- workspace must be onboarded + enabled ---
-    if not trigger_grants.is_workspace_enabled(team_id):
-        logger.info("Slack delivery from non-onboarded/disabled workspace %s; ignoring", team_id)
-        return _ack("ignored")
-
-    # --- slash commands ---
+    # --- slash commands (form-encoded) ---
     if is_command:
+        form = parse_qs(raw_body)
+        team_id = (form.get("team_id", [""])[0]) or ""
+        if not trigger_grants.is_workspace_enabled(team_id):
+            logger.info("slash command from non-onboarded/disabled workspace %s", team_id)
+            return _ephemeral("This workspace isn't onboarded for the fleet yet.")
         try:
             return _handle_slash_command(form, team_id)
         except Exception:  # noqa: BLE001
             logger.exception("error handling Slack slash command")
             return _ephemeral("Something went wrong handling that command.")
 
-    # --- events API ---
+    # --- events API (JSON) ---
+    try:
+        payload = json.loads(raw_body) if raw_body else {}
+    except json.JSONDecodeError:
+        return {"statusCode": 400, "body": "invalid JSON"}
     ptype = payload.get("type")
+    # The verification handshake is signed but carries no team scope — answer it
+    # as soon as the signature is verified (before any workspace gate).
     if ptype == "url_verification":
         return {"statusCode": 200, "body": payload.get("challenge", "")}
     if ptype != "event_callback":
+        return _ack("ignored")
+
+    # Now that it's a real event, the workspace must be onboarded + enabled.
+    team_id = _team_id_from_event(payload)
+    if not trigger_grants.is_workspace_enabled(team_id):
+        logger.info("Slack event from non-onboarded/disabled workspace %s; ignoring", team_id)
         return _ack("ignored")
 
     # De-dup Slack retries on the delivery's event_id.

@@ -51,8 +51,9 @@ def test_workspace_roundtrip_and_secret_paths():
         "T0ACME123", team_name="Acme", stage=STAGE, onboarded_by="admin-1"
     )
     assert rec["status"] == cs.SLACK_WS_PENDING
-    assert rec["signing_secret_param"] == "/sdlc-agents/test/slack/T0ACME123/signing-secret"
+    # Bot token is per-workspace; the signing secret is app-level (NOT on the row).
     assert rec["bot_token_param"] == "/sdlc-agents/test/slack/T0ACME123/bot-token"
+    assert "signing_secret_param" not in rec
     # secret VALUES never live on the row
     assert "signing_secret" not in rec and "bot_token" not in rec
     assert cs.get_slack_workspace("T0ACME123")["team_name"] == "Acme"

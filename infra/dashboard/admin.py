@@ -487,6 +487,11 @@ def _decide_channel_request(event: dict, request_id: str, approve: bool, body: d
     agents = body.get("approved_agents")
     if agents is None:
         agents = req.get("requested_agents", [])
+    # An empty scope means "any agent" (the request's default + what the user was
+    # told). Model it as a single wildcard-agent permit so approval isn't a silent
+    # no-op (channel allowed but no WHO grant → every trigger still default-denies).
+    if not agents:
+        agents = ["*"]
     created = []
     for agent_id in agents:
         rule = config_store.put_trigger_rule(

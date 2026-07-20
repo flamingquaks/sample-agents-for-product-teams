@@ -103,6 +103,15 @@ def test_url_verification_challenge(monkeypatch):
     assert resp["statusCode"] == 200 and resp["body"] == "xyz"
 
 
+def test_url_verification_without_team_id(monkeypatch):
+    # Slack's real url_verification payload carries NO team_id. Verification is
+    # app-level, so the challenge must still succeed (regression guard).
+    sw, _ = _fresh(monkeypatch)
+    ev = _events_event({"type": "url_verification", "challenge": "abc"})
+    resp = sw.handler(ev)
+    assert resp["statusCode"] == 200 and resp["body"] == "abc"
+
+
 def test_bad_signature_rejected(monkeypatch):
     sw, _ = _fresh(monkeypatch)
     body = json.dumps({"type": "event_callback", "team_id": TEAM, "event": {}})
@@ -118,10 +127,12 @@ def test_replay_old_timestamp_rejected(monkeypatch):
     assert sw.handler(ev)["statusCode"] == 401
 
 
-def test_unconfigured_workspace_secret_rejected(monkeypatch):
+def test_unconfigured_signing_secret_returns_503(monkeypatch):
+    # The signing secret is app-level; if it isn't stored yet that's a server
+    # misconfiguration (503), not a client auth failure.
     sw, _ = _fresh(monkeypatch, secret=None)
     ev = _events_event({"type": "url_verification", "challenge": "x", "team_id": TEAM})
-    assert sw.handler(ev)["statusCode"] == 401
+    assert sw.handler(ev)["statusCode"] == 503
 
 
 def test_disabled_workspace_ignored(monkeypatch):

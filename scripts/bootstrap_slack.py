@@ -12,7 +12,14 @@ Two steps:
   1. ``manifest`` — print the Slack app manifest (scopes + event subscription +
      slash commands) to paste into api.slack.com/apps → Create from manifest.
      After creating + installing the app, copy its Signing Secret and Bot Token.
-  2. ``store`` — write those two secrets to SSM for a given team id.
+  2. ``store`` — write the app-level signing secret (once per app) and the
+     per-workspace bot token to SSM.
+
+The **signing secret is app-level** (one per Slack app; verifies every inbound
+request incl. the team-less url_verification handshake), stored at
+``/sdlc-agents/<stage>/slack/signing-secret``. The **bot token is
+per-workspace** (posts replies into that workspace), stored at
+``/sdlc-agents/<stage>/slack/<team_id>/bot-token``.
 
 Usage:
     python scripts/bootstrap_slack.py manifest \\
@@ -89,12 +96,14 @@ def _store(stage: str, region: str, team_id: str, signing_secret: str, bot_token
     import boto3
 
     ssm = boto3.client("ssm", region_name=region)
-    base = f"/sdlc-agents/{stage}/slack/{team_id}"
-    for leaf, value in (("signing-secret", signing_secret), ("bot-token", bot_token)):
-        ssm.put_parameter(
-            Name=f"{base}/{leaf}", Value=value, Type="SecureString", Overwrite=True
-        )
-        print(f"stored {base}/{leaf}")
+    # Signing secret is APP-level (one per app); bot token is per-workspace.
+    params = {
+        f"/sdlc-agents/{stage}/slack/signing-secret": signing_secret,
+        f"/sdlc-agents/{stage}/slack/{team_id}/bot-token": bot_token,
+    }
+    for name, value in params.items():
+        ssm.put_parameter(Name=name, Value=value, Type="SecureString", Overwrite=True)
+        print(f"stored {name}")
 
 
 def main(argv=None) -> int:

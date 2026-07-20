@@ -740,11 +740,13 @@ def _slack_ws_pk(team_id: str) -> str:
     return f"{_SLACK_WS_PK_PREFIX}{team_id}"
 
 
-def _slack_secret_param(stage: str, team_id: str, leaf: str) -> str:
-    """Canonical SSM SecureString path for a workspace's secret. Kept here so the
-    admin API (which writes the secret) and the receiver (which reads it) agree on
-    one layout. ``leaf`` is ``signing-secret`` | ``bot-token``."""
-    return f"/sdlc-agents/{stage}/slack/{team_id}/{leaf}"
+def _slack_bot_token_param(stage: str, team_id: str) -> str:
+    """Canonical SSM SecureString path for a workspace's bot token (per-workspace
+    — the receiver/reply reads it by team id). The SIGNING secret is app-level
+    (one per Slack app, at /sdlc-agents/<stage>/slack/signing-secret) and is not
+    recorded per workspace. Kept here so the admin API + receiver agree on the
+    layout."""
+    return f"/sdlc-agents/{stage}/slack/{team_id}/bot-token"
 
 
 def list_slack_workspaces() -> list[dict]:
@@ -785,9 +787,10 @@ def put_slack_workspace(
     status: str = SLACK_WS_PENDING,
 ) -> dict:
     """Create/replace a Slack workspace record. Raises ValueError on a malformed
-    team_id (it flows into the SSM secret path + the Cedar workspace literal) or
-    an invalid channel policy / status. The secret PARAM PATHS are derived + stored
-    on the row; the secret VALUES are written separately by the admin API."""
+    team_id (it flows into the SSM bot-token path + the Cedar workspace literal)
+    or an invalid channel policy / status. The bot-token param PATH is derived +
+    stored on the row; the token VALUE is written out-of-band (bootstrap_slack.py).
+    The signing secret is app-level, not per-workspace, so it isn't on the row."""
     if not valid_slack_team(team_id):
         raise ValueError(
             f"invalid Slack team id {team_id!r} — must match {_SLACK_TEAM_RE.pattern}"
@@ -805,8 +808,7 @@ def put_slack_workspace(
         "team_name": team_name or existing.get("team_name", ""),
         "enabled": bool(enabled),
         "default_channel_policy": default_channel_policy,
-        "signing_secret_param": _slack_secret_param(stage, team_id, "signing-secret"),
-        "bot_token_param": _slack_secret_param(stage, team_id, "bot-token"),
+        "bot_token_param": _slack_bot_token_param(stage, team_id),
         "onboarded_by": onboarded_by or existing.get("onboarded_by", ""),
         "onboarded_at": existing.get("onboarded_at", now),
         "updated_at": now,
