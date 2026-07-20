@@ -184,6 +184,13 @@ td.mono,
   border-color: var(--unknown);
 }
 
+/* Separates the repos section from the capabilities section in the admin view */
+.section-divider {
+  border: none;
+  border-top: 1px solid var(--border, #2a2a2a);
+  margin: 32px 0;
+}
+
 /* Trace-ref chips */
 .chips {
   display: flex;

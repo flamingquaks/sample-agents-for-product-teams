@@ -11,6 +11,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError, type DashboardApi } from "./api";
+import { CapabilitiesPanel } from "./CapabilitiesPanel";
 import { fmtTime } from "./format";
 import { GitHubAppPanel } from "./GitHubAppPanel";
 import { usePolling } from "./hooks";
@@ -243,6 +244,10 @@ export function AdminView({
           )}
         </tbody>
       </table>
+
+      <hr className="section-divider" />
+
+      <CapabilitiesPanel api={api} onAuthError={onAuthError} />
     </div>
   );
 }

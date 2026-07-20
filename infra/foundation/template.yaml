@@ -860,10 +860,23 @@ Resources:
           GITHUB_APP_SLUG_PARAM: !Ref GitHubAppSlugParam
           GITHUB_APP_PRIVATE_KEY_SECRET_ARN: !Ref GitHubAppPrivateKey
           DASHBOARD_URL: !Sub https://${DashboardDistribution.DomainName}/
+          # The admin Lambda renders the Dispatch Router registry from the
+          # capability rows and writes it here on every capability change — the
+          # same parameter the router reads (RegistryParameter / DispatchRouter's
+          # REGISTRY_PARAM). This replaces scripts/sync_registry.py's deploy-time sync.
+          REGISTRY_PARAM: !Sub /sdlc-agents/${Stage}/registry
       Policies:
-        # Read+write the config table (onboard/enable/disable repos, settings).
+        # Read+write the config table (onboard/enable/disable repos, settings,
+        # capabilities).
         - DynamoDBCrudPolicy:
             TableName: !Ref FleetConfigTable
+        # Publish the rendered agent registry to the SSM param the Dispatch Router
+        # reads (capability onboard/edit/disable regenerates it).
+        - Statement:
+            - Effect: Allow
+              Action: ssm:PutParameter
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/registry
         # GitHub App: read app id/slug + read/write the private key + update the
         # id/slug params after the manifest flow creates the App.
         - Statement:
@@ -936,6 +949,24 @@ Resources:
           Properties:
             Path: /admin/settings
             Method: PUT
+            RestApiId: !Ref DashboardApi
+        ListCapabilities:
+          Type: Api
+          Properties:
+            Path: /admin/capabilities
+            Method: GET
+            RestApiId: !Ref DashboardApi
+        OnboardCapability:
+          Type: Api
+          Properties:
+            Path: /admin/capabilities
+            Method: POST
+            RestApiId: !Ref DashboardApi
+        DeleteCapability:
+          Type: Api
+          Properties:
+            Path: /admin/capabilities/{agent_id}
+            Method: DELETE
             RestApiId: !Ref DashboardApi
         GitHubAppStatus:
           Type: Api

@@ -6,11 +6,14 @@ restrict-to-allowlist setting. Every route requires auth.is_admin (fails
 closed); the read API's operators can view but not configure.
 
 Routes (all admin-only):
-    GET    /admin/repos                  list onboarded repos
-    POST   /admin/repos                  onboard/update a repo (body: repo, enabled?, multi_repo_eligible?, co_repo_mode?, repo_group?)
-    DELETE /admin/repos/{repo}           remove a repo
-    GET    /admin/settings               get fleet settings
-    PUT    /admin/settings               update settings (body: restrict_repos)
+    GET    /admin/repos                     list onboarded repos
+    POST   /admin/repos                     onboard/update a repo (body: repo, enabled?, multi_repo_eligible?, co_repo_mode?, repo_group?)
+    DELETE /admin/repos/{repo}              remove a repo
+    GET    /admin/settings                  get fleet settings
+    PUT    /admin/settings                  update settings (body: restrict_repos)
+    GET    /admin/capabilities              list onboarded capabilities (agents)
+    POST   /admin/capabilities              onboard/edit a capability (body: agent_id, description?, aliases?, triggers?, authorization_users?, limits?, env?, enabled?)
+    DELETE /admin/capabilities/{agent_id}   remove a capability
 
 Two synchronized effects (see the plan's "exact chain"): a repo change writes
 the config table (drives the Dispatch Router allowlist) AND regenerates the
@@ -183,6 +186,126 @@ def _valid_repo(repo: str) -> bool:
     return bool(_REPO_SEGMENT.match(owner)) and bool(_REPO_SEGMENT.match(name))
 
 
+# Sources a capability may declare event triggers for — must match the keys the
+# Dispatch Router understands (router.py routes per source). Kept as a constant so
+# an onboard can't register a trigger for a source the router will never fire.
+_TRIGGER_SOURCES = ("github", "asana", "slack")
+
+# A runtime env var key: uppercase/underscore, the conventional shape agents read
+# (project_config.py does os.environ["ASANA_PROJECT_GID"] etc). Validated so an
+# onboard can't smuggle a key that later breaks the runtime's env CSV.
+_ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+
+def _validate_capability_body(body: dict) -> tuple[dict, dict | None]:
+    """Validate + normalize an onboard/edit body. Returns ``(fields, None)`` ready
+    to splat into config_store.put_capability, or ``({}, <error response>)``.
+
+    Everything an admin submits ends up in a resource name, a filesystem path, a
+    Cedar/registry literal, or the runtime env CSV, so each field is shape-checked
+    here at the API boundary (config_store re-validates agent_id as defense in
+    depth)."""
+    agent_id = (body.get("agent_id") or "").strip()
+    if not config_store.valid_agent_id(agent_id):
+        return {}, error(
+            400,
+            "body.agent_id must be lowercase, start with a letter, end "
+            "alphanumeric, [a-z0-9-], 2-64 chars",
+        )
+
+    description = (body.get("description") or "").strip()
+
+    aliases = body.get("aliases", [])
+    if not isinstance(aliases, list) or any(not isinstance(a, str) for a in aliases):
+        return {}, error(400, "body.aliases must be a list of strings")
+
+    triggers = body.get("triggers", {})
+    if not isinstance(triggers, dict):
+        return {}, error(400, "body.triggers must be an object of {source: [events]}")
+    for source, events in triggers.items():
+        if source not in _TRIGGER_SOURCES:
+            return {}, error(
+                400, f"body.triggers source must be one of {list(_TRIGGER_SOURCES)}"
+            )
+        if not isinstance(events, list) or any(not isinstance(e, str) for e in events):
+            return {}, error(400, f"body.triggers.{source} must be a list of strings")
+
+    users = body.get("authorization_users", [])
+    if not isinstance(users, list) or any(not isinstance(u, str) for u in users):
+        return {}, error(400, "body.authorization_users must be a list of strings")
+
+    limits = body.get("limits", {})
+    if not isinstance(limits, dict):
+        return {}, error(400, "body.limits must be an object")
+    for k, v in limits.items():
+        if not isinstance(v, (int, float)) or isinstance(v, bool) or v < 0:
+            return {}, error(400, f"body.limits.{k} must be a non-negative number")
+
+    env = body.get("env", {})
+    if not isinstance(env, dict):
+        return {}, error(400, "body.env must be an object of {KEY: value}")
+    for k, v in env.items():
+        if not isinstance(k, str) or not _ENV_KEY_RE.match(k):
+            return {}, error(400, f"body.env key {k!r} must match [A-Z][A-Z0-9_]*")
+        if not isinstance(v, str):
+            return {}, error(400, f"body.env.{k} must be a string")
+        # The runtime env is passed to create/update-agent-runtime as a
+        # comma-separated KEY=value CSV; a comma in a value would split into a
+        # bogus extra var. Reject it at the boundary.
+        if "," in v:
+            return {}, error(400, f"body.env.{k} must not contain a comma")
+
+    return {
+        "agent_id": agent_id,
+        "description": description,
+        "aliases": aliases,
+        "triggers": triggers,
+        "authorization_users": users,
+        "limits": limits,
+        "env": env,
+        "enabled": bool(body.get("enabled", True)),
+    }, None
+
+
+def _onboard_capability(event: dict, body: dict) -> dict:
+    """Onboard or edit a capability. Phase 2: persists the declarative row and
+    republishes the router registry. The build → runtime lifecycle (which flips a
+    new capability to ``active``) is wired in later phases; until then a fresh
+    capability stays ``pending`` and does NOT appear in the registry, so editing
+    the fleet's config can never route a mention to a runtime that isn't up."""
+    fields, err = _validate_capability_body(body)
+    if err is not None:
+        return err
+    config_store.put_capability(onboarded_by=auth.caller_sub(event), **fields)
+    # Republish so an edit to a LIVE capability (e.g. new alias, tightened
+    # authorization, disable) takes effect immediately. A pending capability
+    # renders to nothing, so this is a no-op for a brand-new onboard.
+    _publish_registry_safe()
+    return ok(config_store.get_capability(fields["agent_id"]))
+
+
+def _delete_capability(agent_id: str) -> dict:
+    """Remove a capability row and republish the registry so the router stops
+    resolving it. Phase 4 adds runtime/role teardown ahead of this delete; for now
+    a delete just removes the row + drops it from the registry."""
+    if not config_store.valid_agent_id(agent_id):
+        return error(400, "invalid agent_id")
+    deleted = config_store.delete_capability(agent_id)
+    _publish_registry_safe()
+    return ok({"agent_id": agent_id, "deleted": deleted})
+
+
+def _publish_registry_safe() -> None:
+    """Publish the rendered registry to SSM. A publish failure is logged but not
+    fatal to the config write: the row is already persisted, and the registry
+    re-publishes on the next capability change (and the router keeps serving its
+    cached copy meanwhile). Mirrors the LOG_ONLY policy-sync tolerance."""
+    try:
+        config_store.publish_registry()
+    except Exception:  # noqa: BLE001
+        logger.exception("registry publish failed; will re-publish on next change")
+
+
 def _route(event: dict) -> dict:
     resource = event.get("resource", "")
     method = event.get("httpMethod", "")
@@ -336,6 +459,20 @@ def _route(event: dict) -> dict:
             if failure is not None:
                 return failure
             return ok(settings)
+
+    # --- Capabilities (UI-onboarded agents) ---
+    if resource == "/admin/capabilities":
+        if method == "GET":
+            return ok({"capabilities": config_store.list_capabilities()})
+        if method == "POST":
+            return _onboard_capability(event, body)
+
+    if resource in ("/admin/capabilities/{agent_id}", "/admin/capabilities/{agent_id+}"):
+        agent_id = (path_params.get("agent_id") or path_params.get("agent_id+") or "").strip()
+        if not agent_id:
+            return error(400, "missing agent_id")
+        if method == "DELETE":
+            return _delete_capability(agent_id)
 
     # --- GitHub App setup (manifest flow) ---
     if resource == "/admin/github-app/status" and method == "GET":

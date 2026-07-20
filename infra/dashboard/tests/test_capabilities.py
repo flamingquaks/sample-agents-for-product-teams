@@ -6,6 +6,7 @@ declarative-vs-deploy-state split, lifecycle status, and that render_registry
 reproduces exactly the shape router.py consumes — against moto, no AWS.
 """
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -18,8 +19,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 REGION = "us-west-2"
 TABLE = "fleet-config-test"
+REGISTRY_PARAM = "/sdlc-agents/test/registry"
 os.environ["AWS_DEFAULT_REGION"] = REGION
 os.environ["FLEET_CONFIG_TABLE"] = TABLE
+os.environ["REGISTRY_PARAM"] = REGISTRY_PARAM
+
+ADMIN = {"sub": "admin-1", "cognito:groups": "[admins]"}
+OPERATOR = {"sub": "op-1", "cognito:groups": "[operators]"}
 
 
 def _make_table():
@@ -38,6 +44,35 @@ def _load_store():
     import config_store
 
     return config_store
+
+
+def _load_admin():
+    for m in ("admin", "config_store", "auth", "http_responses"):
+        sys.modules.pop(m, None)
+    import admin
+
+    return admin
+
+
+def _event(method, resource, claims=ADMIN, path=None, body=None):
+    return {
+        "httpMethod": method,
+        "resource": resource,
+        "pathParameters": path,
+        "queryStringParameters": None,
+        "body": json.dumps(body) if body is not None else None,
+        "requestContext": {"authorizer": {"claims": claims}},
+    }
+
+
+def _read_registry():
+    """The rendered registry the admin routes published to SSM (parsed)."""
+    import yaml
+
+    val = boto3.client("ssm", region_name=REGION).get_parameter(Name=REGISTRY_PARAM)[
+        "Parameter"
+    ]["Value"]
+    return yaml.safe_load(val)
 
 
 @mock_aws
@@ -160,3 +195,147 @@ def test_repos_and_capabilities_coexist():
     cs.put_capability("triage", onboarded_by="admin-1")
     assert [r["repo"] for r in cs.list_repos()] == ["acme/app"]
     assert [c["agent_id"] for c in cs.list_capabilities()] == ["triage"]
+
+
+# --- admin API routes (Phase 2) ----------------------------------------------
+
+
+@mock_aws
+def test_operator_cannot_touch_capabilities():
+    _make_table()
+    admin = _load_admin()
+    assert (
+        admin.handler(_event("GET", "/admin/capabilities", claims=OPERATOR))[
+            "statusCode"
+        ]
+        == 403
+    )
+    assert (
+        admin.handler(
+            _event("POST", "/admin/capabilities", claims=OPERATOR, body={"agent_id": "x"})
+        )["statusCode"]
+        == 403
+    )
+
+
+@mock_aws
+def test_onboard_capability_persists_and_lists():
+    _make_table()
+    admin = _load_admin()
+    resp = admin.handler(
+        _event(
+            "POST",
+            "/admin/capabilities",
+            body={
+                "agent_id": "triage",
+                "description": "Triage bot",
+                "aliases": ["tri"],
+                "triggers": {"github": ["issue_comment"]},
+                "authorization_users": ["alice"],
+                "limits": {"max_concurrent": 3},
+                "env": {"FOO": "bar"},
+            },
+        )
+    )
+    assert resp["statusCode"] == 200, resp["body"]
+    body = json.loads(resp["body"])
+    assert body["agent_id"] == "triage"
+    assert body["status"] == "pending"  # not active until built (later phases)
+    assert body["onboarded_by"] == "admin-1"
+
+    listed = json.loads(
+        admin.handler(_event("GET", "/admin/capabilities"))["body"]
+    )["capabilities"]
+    assert [c["agent_id"] for c in listed] == ["triage"]
+    # Pending capability is not yet in the published registry.
+    assert _read_registry() == {"agents": {}}
+
+
+@mock_aws
+def test_onboard_rejects_bad_agent_id():
+    _make_table()
+    admin = _load_admin()
+    resp = admin.handler(
+        _event("POST", "/admin/capabilities", body={"agent_id": "../evil"})
+    )
+    assert resp["statusCode"] == 400
+    assert "agent_id" in json.loads(resp["body"])["error"]
+
+
+@mock_aws
+def test_onboard_rejects_bad_trigger_source_and_env():
+    _make_table()
+    admin = _load_admin()
+    bad_trigger = admin.handler(
+        _event(
+            "POST",
+            "/admin/capabilities",
+            body={"agent_id": "triage", "triggers": {"pager": ["x"]}},
+        )
+    )
+    assert bad_trigger["statusCode"] == 400
+    bad_env = admin.handler(
+        _event(
+            "POST",
+            "/admin/capabilities",
+            body={"agent_id": "triage", "env": {"lower_case": "x"}},
+        )
+    )
+    assert bad_env["statusCode"] == 400
+    comma_env = admin.handler(
+        _event(
+            "POST",
+            "/admin/capabilities",
+            body={"agent_id": "triage", "env": {"K": "a,b"}},
+        )
+    )
+    assert comma_env["statusCode"] == 400
+
+
+@mock_aws
+def test_edit_live_capability_republishes_registry():
+    """Editing an already-active capability (e.g. add an alias) must take effect
+    in the router registry immediately."""
+    _make_table()
+    admin = _load_admin()
+    cs = _load_store()
+    admin.handler(
+        _event("POST", "/admin/capabilities", body={"agent_id": "triage", "aliases": ["tri"]})
+    )
+    # Simulate the build/runtime lifecycle bringing it up.
+    cs.set_capability_deploy_state("triage", runtime_arn="arn:runtime/triage-xyz")
+    cs.set_capability_status("triage", cs.CAP_ACTIVE)
+
+    # Edit: add an alias. Republish should reflect it.
+    admin.handler(
+        _event(
+            "POST",
+            "/admin/capabilities",
+            body={"agent_id": "triage", "aliases": ["tri", "triage-bot"]},
+        )
+    )
+    reg = _read_registry()
+    assert reg["agents"]["triage"]["aliases"] == ["tri", "triage-bot"]
+    assert reg["agents"]["triage"]["runtime_arn"] == "arn:runtime/triage-xyz"
+
+
+@mock_aws
+def test_delete_capability_route():
+    _make_table()
+    admin = _load_admin()
+    admin.handler(_event("POST", "/admin/capabilities", body={"agent_id": "triage"}))
+    resp = admin.handler(
+        _event(
+            "DELETE",
+            "/admin/capabilities/{agent_id}",
+            path={"agent_id": "triage"},
+        )
+    )
+    assert resp["statusCode"] == 200
+    assert json.loads(resp["body"]) == {"agent_id": "triage", "deleted": True}
+    assert (
+        json.loads(admin.handler(_event("GET", "/admin/capabilities"))["body"])[
+            "capabilities"
+        ]
+        == []
+    )

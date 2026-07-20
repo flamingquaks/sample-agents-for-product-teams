@@ -71,6 +71,7 @@ installation_id on every repo row — the repo row references its owner. This le
 one App span many individual + org owners (each a separate installation).
 """
 
+import json
 import os
 import re
 import time
@@ -360,7 +361,7 @@ def put_capability(
     limits: dict | None = None,
     env: dict | None = None,
     enabled: bool = True,
-    status: str = CAP_PENDING,
+    status: str | None = None,
     onboarded_by: str = "",
 ) -> dict:
     """Create/replace a capability record's DECLARATIVE fields (the parts an admin
@@ -370,6 +371,11 @@ def put_capability(
     onboarding form can't clobber a live runtime's ARN. Preserves onboarded_at +
     existing deploy state on an update; bumps updated_at.
 
+    ``status`` is LIFECYCLE state owned by set_capability_status, not a declarative
+    field: on a NEW row it defaults to ``pending``; on an EDIT it is preserved
+    (an admin editing an active capability's aliases must not knock it back to
+    pending and out of the registry). Pass it explicitly only to force a state.
+
     Raises ValueError on an invalid agent_id — it flows into resource names and
     filesystem paths downstream, so it's validated at the store boundary."""
     if not valid_agent_id(agent_id):
@@ -377,10 +383,12 @@ def put_capability(
             f"invalid agent_id {agent_id!r} — must match {_AGENT_ID_RE.pattern} "
             f"(lowercase, starts with a letter, [a-z0-9-], 2-64 chars)"
         )
-    if status not in CAP_STATUSES:
-        raise ValueError(f"invalid capability status {status!r}")
     now = int(time.time())
     existing = get_capability(agent_id) or {}
+    if status is None:
+        status = existing.get("status", CAP_PENDING)
+    if status not in CAP_STATUSES:
+        raise ValueError(f"invalid capability status {status!r}")
     # Normalize + de-dup aliases, order-preserving. The router lowercases the
     # mention before matching (resolve_agent), so aliases must be lowercase; dupes
     # are harmless there but pointless to store.
@@ -503,6 +511,40 @@ def render_registry() -> dict:
             "limits": dict(cap.get("limits", {})),
         }
     return {"agents": agents}
+
+
+def publish_registry() -> dict:
+    """Render the registry from the active capabilities and write it to the SSM
+    parameter the Dispatch Router reads (REGISTRY_PARAM). Returns the rendered
+    dict. This is what scripts/sync_registry.py used to do on deploy — now it runs
+    on every capability change, so the router picks up onboard/enable/disable
+    without a redeploy.
+
+    Written as YAML because router.load_registry() does ``yaml.safe_load`` on the
+    parameter value. json.dumps output is valid YAML (YAML is a JSON superset), so
+    we emit compact JSON via the stdlib and avoid a PyYAML dependency in the write
+    path — the router still parses it with yaml.safe_load. DynamoDB Decimals from
+    limits are coerced to plain numbers so the value is JSON-serializable."""
+    registry = render_registry()
+    ssm = boto3.client("ssm")
+    ssm.put_parameter(
+        Name=os.environ["REGISTRY_PARAM"],
+        Value=json.dumps(registry, default=_decimal_default),
+        Type="String",
+        Overwrite=True,
+    )
+    return registry
+
+
+def _decimal_default(o):
+    """JSON encoder hook for the DynamoDB Decimal values that reach the registry
+    via a capability's ``limits`` (max_concurrent, timeout_minutes, token budget).
+    Integral → int, else float — matches http_responses._DecimalEncoder."""
+    from decimal import Decimal
+
+    if isinstance(o, Decimal):
+        return int(o) if o == o.to_integral_value() else float(o)
+    raise TypeError(f"not JSON-serializable: {type(o).__name__}")
 
 
 # --- derived -----------------------------------------------------------------

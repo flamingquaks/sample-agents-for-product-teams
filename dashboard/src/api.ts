@@ -7,6 +7,7 @@
 // the UI can trigger re-authentication (the token likely expired).
 
 import type {
+  CapabilityConfig,
   FleetSettings,
   FleetStats,
   GitHubAppStatus,
@@ -154,6 +155,31 @@ export class DashboardApi {
 
   putSettings(body: FleetSettings): Promise<FleetSettings> {
     return this.request<FleetSettings>("PUT", "/admin/settings", { body });
+  }
+
+  // --- capabilities (UI-onboarded agents) ------------------------------------
+
+  listCapabilities(): Promise<{ capabilities: CapabilityConfig[] }> {
+    return this.get<{ capabilities: CapabilityConfig[] }>("/admin/capabilities");
+  }
+
+  onboardCapability(body: {
+    agent_id: string;
+    description?: string;
+    aliases?: string[];
+    triggers?: Record<string, string[]>;
+    authorization_users?: string[];
+    limits?: Record<string, number>;
+    env?: Record<string, string>;
+    enabled?: boolean;
+  }): Promise<CapabilityConfig> {
+    return this.request<CapabilityConfig>("POST", "/admin/capabilities", { body });
+  }
+
+  deleteCapability(
+    agentId: string
+  ): Promise<{ agent_id: string; deleted: boolean }> {
+    return this.request("DELETE", `/admin/capabilities/${encodeURIComponent(agentId)}`);
   }
 
   // --- GitHub App setup (manifest flow) --------------------------------------

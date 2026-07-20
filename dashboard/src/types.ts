@@ -86,6 +86,31 @@ export interface FleetSettings {
   restrict_repos: boolean;
 }
 
+/** A UI-onboarded agent. The declarative fields are admin-edited; the deploy
+ *  fields (image_tag/runtime_arn/build_id/status) are written by the build →
+ *  runtime lifecycle. Only enabled + active capabilities route dispatches. */
+export interface CapabilityConfig {
+  agent_id: string;
+  description?: string;
+  aliases?: string[];
+  /** {source: [event, ...]} — source ∈ github|asana|slack. */
+  triggers?: Record<string, string[]>;
+  authorization_users?: string[];
+  limits?: Record<string, number>;
+  /** Per-agent runtime env (e.g. ASANA_PROJECT_GID); values injected at deploy. */
+  env?: Record<string, string>;
+  enabled?: boolean;
+  /** pending | building | active | failed | disabled. */
+  status?: string;
+  status_detail?: string;
+  image_tag?: string;
+  runtime_arn?: string;
+  build_id?: string;
+  onboarded_by?: string;
+  onboarded_at?: number;
+  updated_at?: number;
+}
+
 /** GitHub App registration status for the admin setup panel. */
 export interface GitHubAppStatus {
   configured: boolean;
