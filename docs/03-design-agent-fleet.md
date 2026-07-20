@@ -1,8 +1,8 @@
 # Technical Design Document
 ## Autonomous PDLC Agent Fleet
 
-**Document Version:** 2.0
-**Date:** April 2026
+**Document Version:** 2.1
+**Date:** July 2026
 **Status:** Describes the v1 fleet as it ships. Sections marked *Roadmap* are planned, not implemented.
 
 ---
@@ -25,25 +25,28 @@ The PDLC Agent Fleet is a multi-agent system on **Amazon Bedrock AgentCore Runti
 
 ### 1.2 Component Map
 
+The rendered diagram is [`docs/assets/architecture.mmd`](assets/architecture.mmd) (Mermaid). ASCII overview:
+
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                     EXTERNAL PLATFORMS                           │
-│           GitHub (Issues, PRs, Actions)  │   Asana              │
+│              GitHub (Issues, PRs)  │   Asana                    │
 └──────────────┬──────────────────────────┴──────┬────────────────┘
-               │                                 │
+               │  @mention events                │
                ▼                                 ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                     DISPATCH LAYER                               │
 │                                                                  │
-│  GitHub Actions workflow            Asana Webhook Lambda         │
-│  (agent-dispatch.yml)               (asana-webhook-${STAGE})     │
+│  GitHub App webhook Lambda          Asana Webhook Lambda         │
+│  (github-webhook-${STAGE})          (asana-webhook-${STAGE})     │
+│  HMAC X-Hub-Signature-256           HMAC signature              │
 │         │                                    │                   │
 │         └────────────────┬───────────────────┘                   │
-│                          ▼                                       │
+│                          ▼  async invoke (verified events only)  │
 │          Dispatch Router Lambda (dispatch-router-${STAGE})       │
 │          ┌─────────────────────────────┐                         │
-│          │ • Parse @mention             │                         │
-│          │ • Resolve aliases            │                         │
+│          │ • Edge guardrail (apply_guardrail)                    │
+│          │ • Parse @mention + aliases   │                         │
 │          │ • Check authorization        │                         │
 │          │ • Track in DynamoDB          │                         │
 │          │ • Invoke AgentCore Runtime   │                         │
@@ -57,30 +60,28 @@ The PDLC Agent Fleet is a multi-agent system on **Amazon Bedrock AgentCore Runti
 │                          ▼                                       │
 │  ┌──────────┐ ┌────────────┐ ┌──────────┐ ┌────────┐            │
 │  │ workitems │ │ researcher │ │ docwriter │ │  adr   │            │
-│  │          │ │            │ │          │ │        │            │
 │  │ Strands  │ │ Strands    │ │ Strands  │ │Strands │            │
-│  │ + Opus   │ │ + Opus     │ │ + Opus   │ │+ Opus  │            │
-│  │   4.7    │ │   4.7      │ │   4.7    │ │  4.7   │            │
 │  └──────────┘ └────────────┘ └──────────┘ └────────┘            │
 │                                                                  │
 │  Each agent: Strands SDK + BedrockAgentCoreApp in a container   │
-│  Model: us.anthropic.claude-opus-4-7 (all agents)               │
-│  Credentials: SSM SecureString (per-tool: asana_mcp, github_mcp)│
+│  Model: Claude Sonnet 5 via Bedrock Mantle (bearer token +      │
+│         guardrail headers; per-repo OpenAI-Project)             │
+│  Tool access: AgentCore Gateway only (SigV4) — no direct MCP    │
 └──────────────────────────┬──────────────────────────────────────┘
-                           │
+                           │  all MCP tool calls (SigV4)
 ┌──────────────────────────┼──────────────────────────────────────┐
-│                     TOOLS │                                       │
+│                  TOOLS via AgentCore Gateway                     │
+│         Cedar policy engine + REQUEST interceptor                │
 │                           ▼                                       │
-│   Asana MCP                           GitHub MCP                  │
-│   https://mcp.asana.com/v2/mcp        https://api.githubcopilot  │
-│   (OAuth via bootstrap_asana_oauth)   .com/mcp/                   │
-│                                       (PAT or GitHub App)         │
+│   Asana MCP (AsanaTarget)             GitHub SCM broker target   │
+│   https://mcp.asana.com/v2/mcp        (scm_broker.py — mints     │
+│   (OAuth)                              per-owner App tokens)     │
 │                                                                  │
-│   Tavily web search (Researcher only) Cedar policy evaluation     │
+│   Tavily web search (Researcher only, via the gateway)          │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-**What's *not* in this diagram but is in some earlier designs:** AgentCore Identity (not used — credentials live in SSM), AgentCore Memory (optional — honored via env var if set, not provisioned by the fleet's infra template), AgentCore Browser (not used — no agent needs a browser today). These are plausible upgrades on the roadmap. **AgentCore Gateway** is now available as an opt-in (`DeployGateway`): agents route MCP tool calls through it so the Cedar policy engine can enforce the repo allowlist at the tool-call boundary (see § 5.2 and `docs/aws-deploy.md`). Absent the gateway, agents connect directly to the vendor MCP servers.
+**What's *not* in this diagram but is in some earlier designs:** AgentCore Identity (not used — Asana credentials live in SSM; GitHub uses per-owner App tokens minted server-side; Mantle uses a bearer token minted from the runtime role), AgentCore Memory (optional — honored via env var if set, not provisioned by the fleet's infra template), AgentCore Browser (not used — no agent needs a browser today). These are plausible upgrades on the roadmap. The **AgentCore Gateway** is now the fleet's shipping tool-access path — the fleet is **gateway-only**: agents route all MCP tool calls through it so the Cedar policy engine enforces per-agent tool grants + the repo allowlist at the tool-call boundary (see § 5.2 and `docs/aws-deploy.md`). There is no direct-to-vendor MCP fallback.
 
 ---
 
@@ -92,7 +93,7 @@ The PDLC Agent Fleet is a multi-agent system on **Amazon Bedrock AgentCore Runti
 Event Source                  Normalization                  Routing
 ────────────                  ─────────────                  ───────
 
-GitHub Actions       ┐                                ┌─ Resolve agent ID
+GitHub App webhook   ┐                                ┌─ Resolve agent ID
   issue_comment      │                                │  (incl. aliases from
   pr_review_comment  ├──► Dispatch Router             │   the SSM registry)
   issue assigned     │    Lambda                      │
@@ -109,7 +110,7 @@ Asana Webhook        ├──► │  Normalize to:            │  (authorizat
                           │                              Runtime (async)
 ```
 
-The Asana webhook Lambda handles signature verification against `/sdlc-agents/asana-webhook-secret` (written on first handshake). The GitHub path arrives via the `agent-dispatch.yml` workflow, which extracts the mention and invokes the router Lambda directly — no separate GitHub webhook receiver.
+The Asana webhook Lambda handles signature verification against `/sdlc-agents/asana-webhook-secret` (written on first handshake). The GitHub path arrives via the **GitHub App webhook Lambda** (`infra/dispatch/github_webhook.py`), which verifies the App's `X-Hub-Signature-256` HMAC, extracts the mention, fetches issue/PR context with a per-repo App token, and async-invokes the router — one App webhook covers every onboarded repo. (The earlier `agent-dispatch.yml` GitHub Actions workflow and its OIDC deploy role have been retired.)
 
 ### 2.2 Assignment State Machine
 
@@ -196,19 +197,19 @@ The runtime's environment is assembled by the `capability-deployer` from the fle
 
 ### 4.1 GitHub Integration
 
-**Inbound triggers:**
-- `issue_comment` containing `@<agent>` mention → `agent-dispatch.yml` → Dispatch Router
-- `pull_request_review_comment` containing `@<agent>` mention → `agent-dispatch.yml` → Dispatch Router
+**Inbound triggers (via the GitHub App webhook Lambda):**
+- `issue_comment` containing `@<agent>` mention → `github-webhook-${STAGE}` → Dispatch Router
+- `pull_request_review_comment` containing `@<agent>` mention → `github-webhook-${STAGE}` → Dispatch Router
 - `issues` with assignment to a bot user (future) → same path
 
-**Outbound actions (via GitHub MCP):**
+**Outbound actions (via the AgentCore Gateway → SCM broker):**
 - Create and update issues
 - Post comments (Markdown)
 - Add labels
 - Read files, diffs, directory listings
 - Create PRs (Docwriter's doc PRs, agents don't merge)
 
-**Authentication:** Fine-grained GitHub PAT or GitHub App installation, stashed in SSM under `/sdlc-agents/github-mcp-*`. The Strands agent loads the token and passes it as a bearer header to `api.githubcopilot.com/mcp/`.
+**Authentication:** Agents hold **no** GitHub credential. GitHub tool calls are SigV4-invoked to the AgentCore Gateway; the SCM broker Lambda target (`infra/dispatch/scm_broker.py`) mints a **per-owner GitHub App installation token** per call, scoped to the called repo and the calling agent's tier ∩ the tool's least privilege. The App private key is in Secrets Manager (`sdlc-agents/github-app/private-key`); the app id/slug + webhook secret are in SSM; per-owner `installation_id`s are in the `fleet-config` table. See [`docs/specs/github-onboarding-spec.md`](specs/github-onboarding-spec.md).
 
 ### 4.2 Asana Integration
 
@@ -237,12 +238,13 @@ The runtime's environment is assembled by the `capability-deployer` from the fle
 
 | Boundary | Authentication |
 |----------|----------------|
-| GitHub Actions → AWS | GitHub OIDC (no stored credentials) |
-| Agents → Asana MCP | OAuth2 refresh-token flow; tokens in SSM SecureString |
-| Agents → GitHub MCP | PAT or GitHub App installation token; credentials in SSM SecureString |
-| Agents → Bedrock models | IAM execution role attached to the AgentCore Runtime |
-| Dispatch Router → AgentCore Runtime | IAM (Lambda execution role) |
+| GitHub App webhook → Lambda | `X-Hub-Signature-256` HMAC verification against the App webhook secret (SSM SecureString) |
 | Asana webhook → Lambda | `X-Hook-Signature` HMAC verification against `/sdlc-agents/asana-webhook-secret` |
+| Agents → Gateway → Asana MCP | Gateway SigV4 (runtime role); Asana OAuth2 held gateway-side |
+| Agents → Gateway → GitHub | Gateway SigV4 (runtime role); per-owner GitHub App installation token minted by the SCM broker per call (agents hold no GitHub credential) |
+| Agents → Bedrock Mantle | Short-term Bedrock bearer token minted from the runtime role (`aws-bedrock-token-generator`); guardrail applied via Mantle headers |
+| Dispatch Router → AgentCore Runtime | IAM (Lambda execution role, scoped `InvokeAgentRuntime`) |
+| Dashboard API → authorization | Cognito JWT at the API Gateway authorizer + Amazon Verified Permissions (Cedar `Read`/`Write`), fail-closed |
 
 ### 5.2 Cedar Policy Summary
 
@@ -256,12 +258,12 @@ Every agent ships with a per-agent policy file at `cedar/<agent>.cedar`, plus `c
 | Docwriter | Create PRs (doc files), post comments | All shared forbids; cannot modify code files |
 | Adr | Post issue comments, add labels, post PR review comments | All shared forbids; cannot modify ADR files |
 
-The per-agent `cedar/*.cedar` files document the contract. Hard enforcement is available via the **AgentCore Gateway policy engine** (opt-in, `DeployGateway`): agents route tool calls through the Gateway, whose Cedar engine evaluates policies in the invocation path (default-deny + forbid-wins). The fleet repo-allowlist policy is generated from the admin config and enforced there — see `docs/aws-deploy.md` § AgentCore Gateway. Rolled out `LOG_ONLY` first; the per-agent tool-scope rules above are folded into the engine (rewritten to gateway `<Target>___<tool>` actions) as part of that migration. Until the gateway is deployed and set to `ACTIVE`, the `cedar/*.cedar` files remain advisory.
+The per-agent `cedar/*.cedar` files document the contract; the **enforced** form lives in `infra/dashboard/fleet_policy.py`, evaluated by the **AgentCore Gateway policy engine** in the invocation path. The fleet is **gateway-only** — agents route every tool call through the Gateway, whose Cedar engine evaluates policies default-deny + forbid-wins (per-agent permits keyed on the runtime-role ARN, an unconditional destructive-tool forbid, and a repo-allowlist forbid generated from the admin config). See `docs/aws-deploy.md` § AgentCore Gateway. The engine is rolled out `LOG_ONLY` first, then flipped to `ACTIVE`; until `ACTIVE`, Cedar tool-grant *deny* decisions log rather than block, but the co-repo interceptor and the per-call scoped GitHub credential enforce regardless. The `cedar/*.cedar` files themselves remain advisory (`fleet_policy.py` is authoritative).
 
 ### 5.3 Data Security
 
-- **OAuth tokens and PATs** stored in SSM Parameter Store as SecureString (KMS-encrypted at rest), never in source or in environment variables baked into images.
-- **Per-agent runtime roles** (`<agent>-agentcore-runtime`) with narrow `ssm:GetParameter` access — Workitems can read Asana + GitHub MCP creds, Adr can read only GitHub MCP creds, etc.
+- **Asana OAuth tokens** stored in SSM Parameter Store as SecureString (KMS-encrypted at rest); the **GitHub App private key** is in Secrets Manager. Neither lives in source or in environment variables baked into images.
+- **Per-agent runtime roles** (`<agent>-agentcore-runtime`, created under IAM path `/sdlc-agents/capabilities/` and capped by the `CapabilityRuntimeBoundary` permissions boundary) grant only what the agent needs — Mantle inference + bearer-token mint, guardrail apply, gateway invoke, DynamoDB, ECR pull, logs — and no GitHub credential (the SCM broker holds the App key).
 - **CloudTrail** captures every `bedrock-agentcore:InvokeAgentRuntime` and `ssm:GetParameter` call.
 - **CloudWatch Logs** receive agent stdout via the OpenTelemetry distribution baked into each container.
 - **No agent has access to production databases or customer PII.** Agents operate on GitHub + Asana metadata only.
@@ -291,7 +293,7 @@ The per-agent `cedar/*.cedar` files document the contract. Hard enforcement is a
 
 Cost is driven by three things:
 
-1. **Bedrock model invocations** — all four agents run on Claude Opus 4.7 today.
+1. **Bedrock model invocations** — all four agents run on Claude Sonnet 5 via the Bedrock Mantle endpoint today. A per-repo Mantle **project** attributes model cost/usage to the repo the dispatch acted on.
 2. **AgentCore Runtime compute** — billed per-second during invocations.
 3. **Lambda + API Gateway** for Dispatch Router and Asana webhook — pennies at typical volume.
 
@@ -313,7 +315,6 @@ Actual observed cost depends on usage volume. The primary cost lever is **prompt
 Explicit list of things the earlier design described as load-bearing but which aren't in the shipping system. Each is plausibly a future upgrade; none are blocking adoption today.
 
 - **AgentCore Identity.** Would replace the per-agent SSM paths with a centralized credential vault and a `@requires_access_token` decorator pattern. Upside: easier rotation, auditability. Downside: more setup friction; contributors need to understand Identity's workload-identity model.
-- **AgentCore Gateway.** Would replace direct MCP connections with a single managed MCP endpoint. Upside: one place to authorize, rate-limit, and observe tool calls. Downside: one more hop to debug and a Gateway cold-start path to manage.
 - **AgentCore Memory (provisioned).** Agents already honor `AGENTCORE_MEMORY_ID`; what's missing is a Memory resource in the foundation stack and a story for seeding it. Upside: agents accumulate context across invocations. Downside: memory-quality governance is a non-trivial operational problem.
 - **Feedback agent.** A Haiku-based agent that watches human edits to other agents' output and writes corrections to the `/feedback/` memory namespace. Useful once Memory is provisioned; depends on it.
 - **UAT agent.** Playwright test generation and execution against staging. Depends on AgentCore Browser and a solid story for test-maintenance across UI changes.

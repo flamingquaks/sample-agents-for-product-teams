@@ -20,13 +20,13 @@ An autonomous agent fleet that handles the operational burden of software develo
 Supporting infrastructure shipped:
 - **Dispatch Router** Lambda routes `@mention` events from GitHub + Asana to the right runtime.
 - **Asana webhook receiver** Lambda handles Asana event subscription, signature verification, and normalization.
-- **`agent-dispatch.yml`** GitHub Actions workflow handles the GitHub mention path.
+- **GitHub App webhook receiver** Lambda handles the GitHub mention path (HMAC-verified). *(This replaced the earlier `agent-dispatch.yml` GitHub Actions workflow + OIDC deploy role, both retired.)*
 - **Per-agent Cedar policies** under `cedar/<agent>.cedar` declare what each agent may and may not do.
 - **UI-driven agent onboarding** — the dashboard Admin view onboards an agent by writing a capability row; a shared `sdlc-agent-builder-<stage>` CodeBuild project builds its container and the `capability-deployer` Lambda stands up its runtime and republishes the registry. A weekly `capability-rebuilder` schedule rebuilds every active agent for security patches. Base platform deployed with `scripts/deploy_fleet.py`.
 - **Skills** under `skills/` drive guided install into a new repo/account.
 - **Fleet monitoring + admin dashboard** (`dashboard/`) — React + Vite SPA showing run history, traces, fleet status, and the Admin view for onboarding agents/repos. Backed by query + admin API Lambdas (`infra/dashboard/`), hosted on S3 + CloudFront, published by `scripts/deploy_fleet.py`.
 
-All four agents run Claude Opus 4.7 via Bedrock.
+All four agents run Claude Sonnet 5 via Bedrock Mantle.
 
 ---
 

@@ -12,7 +12,7 @@ Two capabilities, one workflow:
 1. **Issue coding** — on `@claude` in an issue/comment, Claude Code clones the repo, reads the conversation, and opens a PR with an implementation.
 2. **PR code review** — on a new PR or `@claude review` comment, Claude Code reviews the diff, leaves inline comments, and posts a summary.
 
-Both use the same `anthropics/claude-code-action@v1` GitHub Action, authenticated to **Amazon Bedrock** via **GitHub Actions OIDC** — no long-lived Anthropic API key, no Claude.ai auth, no `CLAUDE_CODE_OAUTH_TOKEN`. The action invokes `us.anthropic.claude-opus-4-7-v1` through Bedrock `InvokeModel`.
+Both use the same `anthropics/claude-code-action@v1` GitHub Action, authenticated to **Amazon Bedrock** via **GitHub Actions OIDC** — no long-lived Anthropic API key, no Claude.ai auth, no `CLAUDE_CODE_OAUTH_TOKEN`. The action invokes `us.anthropic.claude-sonnet-5-v1` through Bedrock `InvokeModel`.
 
 ## Why Bedrock (vs API key)
 
@@ -25,7 +25,7 @@ Use an Anthropic API key instead only if the user has a constraint that forces i
 ## Prerequisites
 
 - A GitHub repo the user admins.
-- AWS account with **Bedrock model access enabled** for `us.anthropic.claude-opus-4-7-v1` in the region Claude Code will run in (default `us-east-1`). The region is independent of where the SDLC agent fleet runs — Claude Code only needs `bedrock:InvokeModel` from CI runners.
+- AWS account with **Bedrock model access enabled** for `us.anthropic.claude-sonnet-5-v1` in the region Claude Code will run in (default `us-east-1`). The region is independent of where the SDLC agent fleet runs — Claude Code only needs `bedrock:InvokeModel` from CI runners.
 - `gh` CLI authenticated as a repo admin (for setting secrets/variables); or the user can click through the UI.
 - If using the SDLC Agent Fleet: `sdlc-agents-provision-aws` Step 0 already created a deploy role (default name `sdlc-agents-deploy`). You can either reuse it (simplest) or create a dedicated `ClaudeCodeBedrockRole` (cleaner blast radius). This skill does the dedicated-role path — reuse is a footnote at the end.
 
@@ -34,7 +34,7 @@ Use an Anthropic API key instead only if the user has a constraint that forces i
 Ask the user and record:
 
 - `AWS_ACCOUNT_ID` — 12 digits
-- `AWS_REGION` — the region Claude Code will call Bedrock in (default `us-east-1`; must have Opus 4.7 model access)
+- `AWS_REGION` — the region Claude Code will call Bedrock in (default `us-east-1`; must have Sonnet 5 model access)
 - `GITHUB_ORG` and `GITHUB_REPO` — scopes the OIDC trust policy
 - Which events should trigger Claude (defaults below are sensible):
   - `@claude` in issue or issue comment → code against issue and open PR
@@ -45,11 +45,11 @@ Ask the user and record:
 
 ```bash
 aws bedrock get-foundation-model \
-  --model-identifier us.anthropic.claude-opus-4-7-v1 \
+  --model-identifier us.anthropic.claude-sonnet-5-v1 \
   --region "$AWS_REGION"
 ```
 
-If this returns `ResourceNotFoundException`, stop and tell the user to request access in the Bedrock console (Model access → Opus 4.7) before continuing. Provisioning IAM/OIDC without model access will succeed but the first `@claude` run will 403.
+If this returns `ResourceNotFoundException`, stop and tell the user to request access in the Bedrock console (Model access → Sonnet 5) before continuing. Provisioning IAM/OIDC without model access will succeed but the first `@claude` run will 403.
 
 ## Step 2 — Create the IAM role for Claude Code
 
@@ -117,9 +117,9 @@ cat > /tmp/bedrock-invoke.json <<EOF
       "bedrock:InvokeModelWithResponseStream"
     ],
     "Resource": [
-      "arn:aws:bedrock:${AWS_REGION}::foundation-model/anthropic.claude-opus-4-7-v1:0",
-      "arn:aws:bedrock:*::foundation-model/anthropic.claude-opus-4-7-v1:0",
-      "arn:aws:bedrock:${AWS_REGION}:${AWS_ACCOUNT_ID}:inference-profile/us.anthropic.claude-opus-4-7-v1"
+      "arn:aws:bedrock:${AWS_REGION}::foundation-model/anthropic.claude-sonnet-5-v1:0",
+      "arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-5-v1:0",
+      "arn:aws:bedrock:${AWS_REGION}:${AWS_ACCOUNT_ID}:inference-profile/us.anthropic.claude-sonnet-5-v1"
     ]
   }]
 }
@@ -127,13 +127,13 @@ EOF
 
 aws iam put-role-policy \
   --role-name ClaudeCodeBedrockRole \
-  --policy-name BedrockInvokeOpus47 \
+  --policy-name BedrockInvokeSonnet5 \
   --policy-document file:///tmp/bedrock-invoke.json
 
 rm /tmp/bedrock-invoke.json
 ```
 
-Opus 4.7 is served through a **cross-region inference profile** (`us.*` prefix) — both the profile ARN and the underlying foundation-model ARN (in any region the profile routes to) must be allowed. The wildcard region on the foundation-model ARN covers that without enumerating each region the profile might land on.
+Sonnet 5 is served through a **cross-region inference profile** (`us.*` prefix) — both the profile ARN and the underlying foundation-model ARN (in any region the profile routes to) must be allowed. The wildcard region on the foundation-model ARN covers that without enumerating each region the profile might land on.
 
 Capture the role ARN:
 
@@ -193,7 +193,7 @@ jobs:
         with:
           use_bedrock: "true"
           claude_args: |
-            --model us.anthropic.claude-opus-4-7-v1
+            --model us.anthropic.claude-sonnet-5-v1
 ```
 
 **Two knobs to tune before the user commits:**
@@ -240,7 +240,7 @@ Three checks, in order. Don't skip — each catches a different class of failure
 aws iam simulate-principal-policy \
   --policy-source-arn "$ROLE_ARN" \
   --action-names bedrock:InvokeModel \
-  --resource-arns "arn:aws:bedrock:${AWS_REGION}:${AWS_ACCOUNT_ID}:inference-profile/us.anthropic.claude-opus-4-7-v1" \
+  --resource-arns "arn:aws:bedrock:${AWS_REGION}:${AWS_ACCOUNT_ID}:inference-profile/us.anthropic.claude-sonnet-5-v1" \
   --query 'EvaluationResults[0].EvalDecision' --output text
 ```
 
@@ -267,7 +267,7 @@ gh run view <run-id> --log
 |---|---|---|
 | `Could not assume role with OIDC: Not authorized to perform sts:AssumeRoleWithWebIdentity` | Trust policy doesn't allow this repo | Check `sub` condition in Step 2b — must match `repo:<org>/<repo>:ref:refs/heads/main` or `repo:<org>/<repo>:pull_request` |
 | `AccessDeniedException when calling InvokeModel` | Role lacks Bedrock permission | Re-check the inline policy from Step 2c; confirm resource ARNs match the region |
-| `You don't have access to the model with the specified model ID` | Bedrock model access not enabled | Request access in Bedrock console → Model access → Opus 4.7 |
+| `You don't have access to the model with the specified model ID` | Bedrock model access not enabled | Request access in Bedrock console → Model access → Sonnet 5 |
 | Action runs but `@claude` gets no response | Condition in `if:` didn't match | Check event name + body in the run logs; adjust the condition |
 
 ### 5c. End-to-end user test

@@ -1,7 +1,7 @@
 # Dispatch: Unified @Agent Work Assignment System
 ## Cross-Platform Agent Routing for GitHub, Asana, and Slack
 
-> **Status: target design.** The shipping Dispatch layer (`infra/dispatch/router.py` + `asana_webhook.py`, plus `.github/workflows/agent-dispatch.yml`) routes mentions from **GitHub** and **Asana** to the right AgentCore Runtime and tracks assignments in DynamoDB. **Slack** routing described in this spec is not wired up — there's no Slack event receiver Lambda or signing-secret path today. The registry advertises Slack triggers for some agents but the path is dark end-to-end. For current behavior, read the router and webhook Lambda source.
+> **Status: target design.** The shipping Dispatch layer (`infra/dispatch/router.py` + the HMAC-verified webhook receivers `asana_webhook.py` and `github_webhook.py`) routes mentions from **GitHub** and **Asana** to the right AgentCore Runtime and tracks assignments in DynamoDB. The GitHub path is a **GitHub App webhook** (the earlier `agent-dispatch.yml` GitHub Actions workflow + OIDC deploy role have been retired). **Slack** routing described in this spec is not wired up — there's no Slack event receiver Lambda or signing-secret path today. The registry advertises Slack triggers for some agents but the path is dark end-to-end. For current behavior, read the router and webhook Lambda source.
 
 ---
 

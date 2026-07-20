@@ -22,7 +22,7 @@ phases:
 
 - `.sdlc-agents/selection.yaml` exists and lists the agents, AWS account ID, region, and stage
 - The user's current AWS credentials can reach the target account (`aws sts get-caller-identity` shows the right account) with enough privilege to run `sam deploy` (the base deploy uses the operator's own credentials — there is no CI deploy role)
-- Bedrock model access is enabled for the Opus 4.7 cross-region inference profile in the target region (check: `aws bedrock get-inference-profile --inference-profile-identifier us.anthropic.claude-opus-4-7 --region $REGION`). If the call 404s, stop and tell the user to request access in the Bedrock console before continuing.
+- Bedrock model access is enabled for the fleet's Mantle model (`anthropic.claude-sonnet-5`) in the target region — the fleet's agents call the OpenAI-compatible Bedrock Mantle endpoint, not classic `bedrock-runtime`. Confirm the model is available/enabled in the Bedrock console → Model access for `$REGION`. If it isn't, stop and tell the user to request access before continuing.
 
 ## Step 1 — Deploy the base platform
 

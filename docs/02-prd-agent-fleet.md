@@ -169,7 +169,7 @@ Concrete baselines and targets should be set per adopter; these are the categori
 |------------|-------|------|
 | Amazon Bedrock AgentCore Runtime | AWS | Low |
 | Strands Agents SDK (Python) | AWS Open Source | Low — actively maintained |
-| Claude Opus 4.7 via Bedrock | Anthropic via AWS | Low — available on-demand in Bedrock |
+| Claude Sonnet 5 via Bedrock Mantle | Anthropic via AWS | Low — available on-demand in Bedrock |
 | GitHub API + official remote MCP (`api.githubcopilot.com/mcp`) | GitHub | Low |
 | Asana API + official MCP (`mcp.asana.com/v2/mcp`) | Asana | Low |
 | Cedar policy engine | AWS | Low |

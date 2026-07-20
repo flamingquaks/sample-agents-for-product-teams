@@ -22,7 +22,7 @@ they'll be listed here once their code ships.
 
 | Agent | Role | Trigger |
 |-------|------|---------|
-| [**Workitems**](docs/agents/workitems.md) | PO/PM — work decomposition, status reports, risk detection, sync | `@workitems` in Asana/GitHub/Slack |
+| [**Workitems**](docs/agents/workitems.md) | PO/PM — work decomposition, status reports, risk detection, sync | `@workitems` in Asana/GitHub |
 | [**Researcher**](docs/agents/researcher.md) | Business analyst — research synthesis, competitive intel | `@researcher` |
 | [**Docwriter**](docs/agents/docwriter.md) | Technical writer — API docs, user guides, release notes | `@docwriter` |
 | [**Adr**](docs/agents/adr.md) | ADR linker — tags issues and reviews PRs against the repo's ADR library | `@adr` on a GitHub issue or PR |
@@ -33,9 +33,9 @@ they'll be listed here once their code ships.
 
 ## How It Works
 
-1. A user assigns work via `@agent` mention in Asana, GitHub, or Slack
-2. The **Dispatch Router** resolves the mention, checks authorization, and routes to the agent
-3. The agent runs on **AgentCore Runtime**, using **Gateway** for GitHub/Asana/Slack access
+1. A user assigns work via `@agent` mention in Asana or GitHub
+2. An HMAC-verified **webhook** (GitHub App or Asana) async-invokes the **Dispatch Router**, which resolves the mention, applies a prompt-injection guardrail, checks authorization, and routes to the agent
+3. The agent runs on **AgentCore Runtime** (model calls via **Bedrock Mantle**), reaching GitHub/Asana only through the **AgentCore Gateway** (Cedar-enforced, gateway-only)
 4. Results are posted back to the originating platform
 
 For Workitems' work decomposition flow:
@@ -65,13 +65,13 @@ cedar/           Cedar policy guardrails
 skills/          Claude Code skills that drive the Quickstart
 scripts/         Operator helpers (base-platform deploy, OAuth/webhook bootstrap)
 .github/
-  workflows/     GitHub event triggers (@claude, @mention dispatch), lint, security scans
+  workflows/     Lint + security scans only (triggers + deploy are server-side)
 docs/            Specs, roadmap, planning docs
 ```
 
 ## Prerequisites
 
-- AWS account with Bedrock model access enabled for `us.anthropic.claude-opus-4-7-v1` in your target region
+- AWS account with Bedrock model access enabled for the fleet's Mantle model (`anthropic.claude-sonnet-5`) in your target region
 - AWS CLI configured with appropriate credentials
 - [SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html)
 - Docker (for building agent containers)
@@ -216,18 +216,22 @@ Run these only for the integrations you actually use.
 ## GitHub Actions Workflows
 
 Agents are built and deployed by the dashboard onboarding flow (CodeBuild →
-AgentCore), not by GitHub Actions. The workflows in `.github/workflows/` cover
-GitHub event triggers and repo hygiene:
+AgentCore), not by GitHub Actions — and `@mention` **dispatch** now arrives via
+the fleet's GitHub App **webhook**, not a workflow. The old `agent-dispatch.yml`
+and `claude-code.yml` workflows and the OIDC deploy role have been retired. The
+workflows that remain in `.github/workflows/` cover lint and repo hygiene only:
 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
-| `claude-code.yml` | `@claude` in comments/PRs | Claude Code assistant |
-| `agent-dispatch.yml` | `@workitems`, `@docwriter`, etc. in comments | Route mentions to agents |
 | `python-lint.yml` | Push/PR to `main` | Ruff lint + format check |
 | `ash-security-scan.yml` | Push/PR to `main` | Security scan changed files |
 | `ash-security-comment.yml` | After ASH scan | Post scan results to PR |
 | `ash-full-repository-scan.yml` | Monthly + manual | Full repo security scan |
 | `dependabot.yml` | Dependabot PRs | Auto-merge patch/minor updates |
+
+(The optional Claude Code on Bedrock feature installs its own `claude-code.yml`
+into a *target* repo — see the `sdlc-agents-setup-claude-code` skill. That is
+separate from the fleet and not shipped in this repo's workflows.)
 
 ## Security
 
@@ -246,41 +250,42 @@ repository or workspace. Key findings you should understand before shipping:
   every inbound `@mention` is scored by an
   [Amazon Bedrock Guardrail](https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails.html)
   (`PROMPT_ATTACK` filter) at the Dispatch Router edge, and every agent's
-  `BedrockModel` runs the same guardrail on its `InvokeModel` calls —
-  catching injection in content the agent fetches later via MCP. Guardrails
-  is probabilistic, not deterministic; don't treat it as a hard boundary.
+  model call (on the Bedrock Mantle endpoint) carries the same guardrail via
+  Mantle headers — catching injection in content the agent fetches later via
+  its tools. Guardrails is probabilistic, not deterministic; don't treat it as
+  a hard boundary.
 
   ![Workitems blocking a prompt-attack attempt on an Asana task](docs/assets/workflow-agent-asana-mitigates-prompt-attacks.png)
 
-- **Cedar policies are advisory (T-5, Accepted)** — `cedar/*.cedar` files
-  describe per-agent tool allow/deny rules but are not enforced at runtime
-  yet. A prompt-injected agent can call any tool its MCP server exposes.
+- **Cedar tool policies (T-5, Partially mitigated)** — `cedar/*.cedar` files
+  describe per-agent tool allow/deny rules; the enforced form
+  (`infra/dashboard/fleet_policy.py`) runs in the AgentCore Gateway policy
+  engine in the invocation path (the fleet is gateway-only). The engine is
+  rolled out `LOG_ONLY` first, so until an operator flips it to `ACTIVE`,
+  tool-grant deny decisions log rather than block (the co-repo interceptor and
+  per-call scoped GitHub credential enforce regardless).
 - **Legitimate-path exfiltration (T-15, Accepted)** — a subverted agent can
   leak context through its own write-capable tools (GitHub comment, Asana
-  task). Cedar runtime enforcement is the intended control; it is on the
-  roadmap.
+  task). The Gateway Cedar engine bounds which tools an agent can reach; content
+  filtering of tool *outputs* is not attempted.
 
-Mitigated surfaces include Dispatch Router IAM scope (T-6), GitHub OIDC
-trust guidance (T-7), ECR image immutability (T-19), fail-closed
-authorization defaults (T-4), and Asana webhook credential hygiene
-(T-8, T-9). See the threat model for the full matrix.
+Mitigated surfaces include Dispatch Router IAM scope (T-6), the GitHub App
+webhook HMAC trigger (T-30, which replaced the retired OIDC path T-7), the
+bounded per-owner GitHub App credential (T-11), AVP-authorized dashboard API
+(T-29), the isolated capability-deployer privileged IAM (T-31), ECR image
+immutability (T-19), fail-closed authorization defaults (T-4), and Asana webhook
+credential hygiene (T-8, T-9). See the threat model for the full matrix.
 
 ### Before deploying against real repositories
 
-Two **Open** findings in the threat model do not block the reference
-architecture but should be handled before you wire the fleet to a production
-repo or workspace:
+The main **Open** finding that does not block the reference architecture but
+should be handled before you wire the fleet to a production repo or workspace:
 
-- **T-11 — GitHub PAT scope.** A classic `repo`-scoped PAT grants write
-  access to every repository its owner can reach. Prefer a GitHub App
-  installation token scoped to the single repo, or at minimum a fine-grained
-  PAT limited to the target repository and the smallest permission set the
-  agent actually needs.
-- **T-13 — API Gateway throttling.** The Asana webhook endpoint ships
-  without usage-plan throttling or WAF. Attach an API Gateway usage plan
-  (burst + steady-state limits) and, if the endpoint is discoverable, an AWS
-  WAF web ACL with an IP-based rate rule before exposing it to untrusted
-  inbound traffic.
+- **T-13 — API Gateway throttling.** The public webhook endpoints (Asana and
+  the GitHub App) ship without usage-plan throttling or WAF. Attach an API
+  Gateway usage plan (burst + steady-state limits) and, if the endpoints are
+  discoverable, an AWS WAF web ACL with an IP-based rate rule before exposing
+  them to untrusted inbound traffic.
 
 ## Docs
 

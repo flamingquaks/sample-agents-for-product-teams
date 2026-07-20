@@ -2,6 +2,56 @@
 
 What this project provisions in AWS, and what inputs you need to make a deploy deterministic from scratch.
 
+## 0. Architecture
+
+The rendered architecture diagram is [`docs/assets/architecture.mmd`](assets/architecture.mmd)
+(Mermaid — open in any Mermaid renderer). It shows the four planes the deploy
+surface below provisions:
+
+**Trigger plane.** Users `@mention` an agent in GitHub or Asana. Two public,
+HMAC-verified **webhook** Lambdas receive those events: the **GitHub App webhook**
+(`infra/dispatch/github_webhook.py`, verifying `X-Hub-Signature-256`) and the
+**Asana webhook** (`infra/dispatch/asana_webhook.py`). Each validates the
+signature, resolves the mentioned agent, and async-invokes the Dispatch Router.
+There is **no GitHub Actions / OIDC dispatch path** — one App webhook serves every
+onboarded repo, so no per-repo workflow or repo-side AWS credential is needed.
+
+**Dispatch + agent plane.** The **Dispatch Router** Lambda runs an edge
+prompt-injection guardrail (`bedrock-runtime` `apply_guardrail`), authorizes the
+sender against the per-agent allowlist, reads its registry from an SSM parameter
+(rendered from the fleet-config capability rows), records the assignment in
+DynamoDB, and calls `InvokeAgentRuntime` on the target agent's **AgentCore
+Runtime** container. Agents run the Strands SDK and call models on the
+**Bedrock Mantle** endpoint (Claude Sonnet 5; short-term bearer token from the
+runtime role; the prompt-injection guardrail is applied via Mantle headers and
+is fail-closed; a per-repo Mantle **project** — passed through dispatch as
+`source_context.mantle_project` — is set as the `OpenAI-Project` header for cost
+attribution). All MCP **tool** calls are **gateway-only**: agents SigV4-invoke
+the **AgentCore Gateway**, whose Cedar policy engine + REQUEST interceptor enforce
+per-agent tool grants and per-origin co-repo grouping before a call reaches the
+GitHub SCM broker (which mints a per-owner GitHub App token) or the Asana MCP
+target.
+
+**Control plane (dashboard).** The optional operator dashboard is a React/Vite
+SPA on S3 + CloudFront, behind an API Gateway with a Cognito authorizer. Every
+API request is authorized by **Amazon Verified Permissions** (Cedar `Read` for
+operators, `Write` for admins — `infra/dashboard/auth.py`, fail-closed). A
+read-only **query** Lambda serves run history from DynamoDB; an **admin** Lambda
+onboards agents and repos into the `fleet-config` DynamoDB table (and holds only
+`codebuild:StartBuild` — no privileged IAM).
+
+**Onboarding pipeline.** Onboarding an agent writes a capability row and starts
+the shared **`sdlc-agent-builder-<stage>` CodeBuild** project (parameterized by
+`AGENT_NAME`), which builds `agents/<name>` and pushes to ECR. A build-completion
+**EventBridge** event invokes the **capability-deployer** Lambda — the only
+component holding `iam:CreateRole`/`PassRole` + `create/update-agent-runtime` —
+which creates the per-agent runtime IAM role (IAM path `/sdlc-agents/capabilities/*`,
+capped by the `CapabilityRuntimeBoundary` permissions boundary), deploys the
+AgentCore runtime, waits READY, marks the capability active, and republishes the
+registry. A weekly EventBridge schedule rebuilds every active agent for security
+patches. See [`docs/threat-model.md`](threat-model.md) for the security analysis
+of each plane.
+
 ## 1. What gets deployed
 
 Everything lives in a single AWS account + region. There are three layers of resources:
@@ -57,35 +107,49 @@ The flow: the admin API starts one shared build (it holds only `codebuild:StartB
 
 Four agents ship in `agents/` today: `workitems`, `researcher`, `docwriter`, `adr`. Each becomes per-agent runtime surface once onboarded.
 
-### 1.3 GitHub Actions OIDC + role (for `@mention` dispatch and `@claude`)
+### 1.3 GitHub triggers — no CI, no OIDC deploy role
 
-There is **no agent-deploy CI role** — the OIDC provider, CI deploy role, and per-agent runtime roles that the old deploy workflows depended on have been retired. The two remaining GitHub Actions workflows that call AWS — `agent-dispatch.yml` (routes `@agent` mentions by invoking the Dispatch Router / AgentCore) and `claude-code.yml` (`@claude`) — still authenticate to AWS via OIDC using the `AWS_DEPLOY_ROLE_ARN` secret. If you use them, that role needs:
+The `@mention` trigger path is a **GitHub App webhook**, not GitHub Actions. The
+old `agent-dispatch.yml` (and `claude-code.yml`) workflows, the GitHub OIDC
+provider, and the CI deploy role that those workflows depended on have all been
+**retired** — there is no CI deploy or CI dispatch path in the fleet. This repo's
+`.github/workflows/` now holds lint and security-scan workflows only; none of
+them assume an AWS role.
 
-- Trust policy allowing `token.actions.githubusercontent.com`, with `sub` restricted via `StringEquals` to the exact subjects your workflows use. For this repo that's two subjects: `repo:<your-org>/<your-repo>:ref:refs/heads/main` (covers the comment-driven triggers like `issue_comment` / `pull_request_review_comment` in `agent-dispatch.yml` and `claude-code.yml` — all of which run on the default branch) and `repo:<your-org>/<your-repo>:pull_request` (covers the `pull_request: [opened, synchronize]` trigger in `claude-code.yml`, which auto-reviews new PRs). Do **not** use `StringLike: "repo:<org>/<repo>:*"` — that allows any branch, tag, or environment in the repo to assume the role, including feature branches a contributor can push without review. Re-check this list if you add workflows that use `workflow_dispatch`, `schedule`, or `workflow_call` from a different repo — those may emit different `sub` claims.
-- A scoped permission policy for what those workflows actually do: `bedrock-agentcore:InvokeAgentRuntime` (dispatch), `bedrock:InvokeModel`/`ApplyGuardrail` (Claude Code on Bedrock), and any read the dispatch step needs. It does **not** need ECR push, `iam:PassRole`, `create/update-agent-runtime`, `ssm:PutParameter`, or CloudFront/S3 publish — none of the agent build/deploy or dashboard publish happens in CI anymore.
-- OIDC provider for `token.actions.githubusercontent.com` with `sts.amazonaws.com` audience and the GitHub thumbprint
-
-The role ARN goes into the target repo's GitHub Actions secrets as `AWS_DEPLOY_ROLE_ARN`. The base platform itself (`scripts/deploy_fleet.py` / `scripts/bootstrap.py`) runs with a privileged human's own credentials — it does not use this role.
+- **Trigger auth is server-side.** The fleet's GitHub App is registered once (via
+  the dashboard manifest flow), and its webhook deliveries are HMAC-verified by
+  the `github-webhook-${Stage}` Lambda. Onboarded repos need no per-repo workflow
+  and no repo-side AWS credential — one App webhook serves every repo the App is
+  installed on.
+- **Build/deploy is server-side.** Agent images are built by the shared CodeBuild
+  project and deployed by the `capability-deployer` Lambda (§1.2); the base
+  platform is deployed by `scripts/deploy_fleet.py` / `scripts/bootstrap.py`
+  running with a privileged human's own credentials. Nothing in CI needs
+  `bedrock-agentcore:InvokeAgentRuntime`, ECR push, `iam:PassRole`, or S3/CloudFront
+  publish.
 
 ### 1.4 Optional: Claude Code on Bedrock (one-time, per repo)
 
-If you use the `sdlc-agents-setup-claude-code` skill, it creates:
-
-- IAM role `ClaudeCodeBedrockRole` with `bedrock:InvokeModel` on Opus 4.7's inference profile
-- Secret `CLAUDE_CODE_ROLE_ARN` + variable `CLAUDE_CODE_AWS_REGION` on the target repo
-
-Independent of the fleet — you can deploy it or not.
+**Separate optional feature, not part of the fleet's trigger/deploy path.** If you
+use the `sdlc-agents-setup-claude-code` skill, it wires the Claude Code assistant
+(a GitHub Action) into a *target* repo so `@claude` can respond on issues/PRs. That
+feature is the one place that still uses GitHub Actions + OIDC — Claude Code runs
+in CI and calls Bedrock `InvokeModel` directly, independent of the fleet's Mantle
+model path. The skill creates an IAM role with `bedrock:InvokeModel` on its chosen
+model's inference profile, a GitHub OIDC provider/trust for the target repo, and
+the `CLAUDE_CODE_ROLE_ARN` secret + `CLAUDE_CODE_AWS_REGION` variable on that repo.
+Deploy it or not — the fleet works without it.
 
 ## 2. Inputs required for a deterministic deploy
 
 ### 2.1 AWS account + region
 
-- **`AWS_ACCOUNT_ID`** — 12-digit account ID, stored as a GitHub Actions secret.
-- **`AWS_REGION`** — deployment region, stored as a GitHub Actions variable. Must have Bedrock model access enabled for `us.anthropic.claude-opus-4-7-v1`.
+- **`AWS_ACCOUNT_ID`** — 12-digit account ID. Set in the deploying shell's environment (used by `scripts/deploy_fleet.py` / `scripts/bootstrap.py`).
+- **`AWS_REGION`** — deployment region (same shell env). Must have Bedrock Mantle access + the Claude Sonnet 5 model available in-region (see §2.2).
 
-### 2.2 Bedrock model access
+### 2.2 Bedrock (Mantle) model access
 
-Enabled in the Bedrock console → Model access. Required in the same region as `AWS_REGION`. Without this, agent invocations return `AccessDeniedException`.
+Agents call models on the OpenAI-compatible **Bedrock Mantle** endpoint (default `anthropic.claude-sonnet-5`); enable Bedrock model access for that model in the Bedrock console → Model access, in the same region as `AWS_REGION`. The Router's edge guardrail and the ADR agent's Titan embeddings use classic `bedrock-runtime` in the same region. Without model access, invocations return `AccessDeniedException`.
 
 ### 2.3 SAM parameters (for the foundation stack)
 
@@ -149,20 +213,17 @@ The merged env is applied wholesale on every deploy (the deployer always passes 
 
 ### 2.6 GitHub Actions repository secrets
 
-Only the surviving GitHub event workflows (`agent-dispatch.yml`, `claude-code.yml`) use these; there is no agent-deploy CI anymore:
+The fleet needs **none** — triggers are the GitHub App webhook and build/deploy is server-side (§1.3). The only GitHub Actions secret/variable in play is for the **optional, separate** Claude Code on Bedrock feature (§1.4), and only in a repo where you enable it:
 
-| Secret | Consumed by |
+| Secret / variable | Consumed by |
 |---|---|
-| `AWS_DEPLOY_ROLE_ARN` | `agent-dispatch.yml`, `claude-code.yml` (OIDC role for dispatch invoke / Claude Code on Bedrock — see §1.3) |
-| `CLAUDE_CODE_ROLE_ARN` | `claude-code.yml` (optional — only if using a dedicated Claude Code on Bedrock role) |
-
-`agent-dispatch.yml` and `claude-code.yml` also read the repository variables `AWS_REGION` (falls back to `us-west-2`) and `CLAUDE_CODE_AWS_REGION` (falls back to `us-east-1`).
+| `CLAUDE_CODE_ROLE_ARN` (secret) + `CLAUDE_CODE_AWS_REGION` (variable) | `claude-code.yml` in the target repo (only if you run the `sdlc-agents-setup-claude-code` skill) |
 
 ## 3. Ordering for a first-time deploy
 
 Top-to-bottom, no skipping.
 
-1. **Enable Bedrock model access** (console) for `us.anthropic.claude-opus-4-7-v1` in `$AWS_REGION`.
+1. **Enable Bedrock model access** (console) for the fleet's Mantle model (`anthropic.claude-sonnet-5`) in `$AWS_REGION`.
 2. **Deploy the base platform** — `python scripts/deploy_fleet.py --stage <stage> --region <region>` (or the interactive `scripts/bootstrap.py`), with the dashboard enabled (`DeployDashboard=true`; add `DeployGateway=true` for the tool-call boundary). This runs `sam deploy` for the foundation stack (Dispatch Router, webhook Lambda, API Gateway, DynamoDB, S3, SSM registry parameter, guardrail, the shared build pipeline + capability deployer/rebuilder, and — when enabled — Cognito + dashboard API/CDN + Gateway), uploads the agent build source, and publishes the dashboard SPA.
 3. **Add dashboard operators/admins** — create Cognito users and add them to the `operators` (view) and `admins` (onboard) groups. Sign in at the `DashboardUrl` output.
 4. **Connect integrations** — run `sdlc-agents-connect-asana` and/or `sdlc-agents-connect-github` to populate SSM parameters.
@@ -192,8 +253,8 @@ Rough shutdown order:
 3. Delete each agent's IAM runtime role (under path `/sdlc-agents/capabilities/`).
 4. Delete each `sdlc-agents/<agent>` ECR repository (including all images).
 5. Delete the foundation CloudFormation stack (`sam delete`). This removes the Dispatch Router, webhook Lambda, API Gateway, DynamoDB tables, S3 buckets (must be empty first — including the build-source and dashboard buckets), SSM registry parameter, the build pipeline + capability deployer/rebuilder, guardrail, and CloudWatch alarms.
-6. Delete the SSM SecureString parameters (`asana-*`, `github-*`, `researcher-tavily-api-key`).
-7. Delete the GitHub Actions OIDC role/provider if you set one up for `agent-dispatch.yml` / `claude-code.yml` and no longer need it.
+6. Delete the SSM parameters (`asana-*`, `github-app-*`, `researcher-tavily-api-key`) and the Secrets Manager `sdlc-agents/github-app/private-key` secret.
+7. If you enabled the optional Claude Code on Bedrock feature (§1.4), delete its `ClaudeCodeBedrockRole` and the GitHub OIDC provider/trust you created for it. (The fleet itself creates no OIDC provider or CI role to clean up.)
 8. Disable Bedrock model access (optional).
 
 S3 bucket deletion blocks on non-empty. Explicit empty before destroy is required.

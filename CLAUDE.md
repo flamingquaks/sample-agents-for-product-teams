@@ -1,57 +1,71 @@
 # PDLC Agent Fleet
 
-Autonomous AI agents for the software development lifecycle, deployed on
-Amazon Bedrock AgentCore.
+Autonomous AI agents for the software development lifecycle, deployed on Amazon
+Bedrock AgentCore. This file is the canonical project reference — start here.
 
-## Project Structure
+## What it is
+
+A multi-agent fleet. Users trigger an agent by `@mention` from GitHub or Asana;
+a **Dispatch Router** Lambda resolves the mention, authorizes it, applies a
+prompt-injection guardrail, and invokes the agent's **AgentCore Runtime**
+container. Agents act back on GitHub/Asana through an **AgentCore Gateway**
+(Cedar-enforced), never directly.
+
+Agents (each self-contained under `agents/<name>/`):
+
+| Agent | Role | Aliases |
+|-------|------|---------|
+| `workitems` | PO/PM — decomposition, status, risk, sync | `@pm` `@status` `@plan` |
+| `researcher` | BA — research, competitive intel, backlog | `@ba` `@research` `@analyze` |
+| `docwriter` | Tech writer — API docs, guides, release notes | `@docs` `@doc` `@writer` |
+| `adr` | ADR linker — tags issues, reviews PRs vs the ADR library | `@decisions` `@architecture` |
+
+## Project structure
 
 ```
-agents/           — Agent code (Strands SDK, containerized, deployed to AgentCore Runtime)
-  workitems/      — PO/PM agent: work decomposition, status, risk, sync
-  researcher/     — BA agent: research synthesis, competitive intel, backlog
-  docwriter/      — Tech-writer agent: API docs, guides, release notes
-  shared/         — Shared tools and helpers used by all agents
-infra/            — AWS infrastructure (SAM/CloudFormation)
-  dispatch/       — Dispatch Router + Asana webhook receiver (Lambda)
-  foundation/     — Shared resources (DynamoDB, S3, IAM, CloudWatch)
-cedar/            — Cedar policies (guardrails for agent tool access)
-docs/             — Planning docs, specs, roadmap
-  specs/          — Individual agent and system specs
-dashboard/        — Fleet monitoring + admin SPA (React + Vite); Admin view onboards agents/repos
-.github/workflows — GitHub event triggers (@claude, @mention dispatch), lint, security scans
+agents/            Agent code (Strands SDK, containerized → AgentCore Runtime)
+  <name>/          agent.py · prompts.py · tools/ · project_config.py · Dockerfile · requirements.txt · tests/
+  shared/          Shared helpers (bedrock.py model builder, gateway client, assignment, tools)
+infra/
+  dispatch/        Dispatch Router + Asana & GitHub webhook receivers, SCM broker/interceptor, guardrail (Lambda)
+  dashboard/       Fleet monitoring + admin SPA backend (query + admin Lambdas), capability build/deploy, AVP authz
+  foundation/      SAM/CloudFormation — all shared AWS resources
+cedar/             Cedar policies for agent TOOL access (advisory source; enforced copy in dashboard/fleet_policy.py)
+dashboard/         Admin + monitoring SPA (React + Vite); Admin view onboards agents + repos
+docs/              Design docs, specs, threat model, roadmap
+.github/workflows/ Lint + security scans only (no deploy/dispatch — those are server-side now)
 ```
 
-## Tech Stack
+## Tech stack
 
-- **Language**: Python 3.12
-- **Agent Framework**: Strands Agents SDK
-- **Model**: Claude Opus 4.7 via Amazon Bedrock
-- **Runtime**: Amazon Bedrock AgentCore Runtime (containerized)
-- **Tool Access**: **Gateway-only.** Every agent routes ALL MCP tool calls through the **AgentCore Gateway** (`GATEWAY_MCP_URL` required; the agent refuses to start without it) — one SigV4-signed client via the runtime role (`agents/shared/tools/gateway.py`). The gateway fronts Asana (direct MCP target) and GitHub (via the **SCM broker Lambda**, `infra/dispatch/scm_broker.py`), enforces a Cedar policy engine, and runs the **SCM co-repo REQUEST interceptor** (`infra/dispatch/scm_interceptor.py`). No direct-to-vendor path — that would bypass policy + observability.
-- **Auth**: Asana via OAuth/PAT in SSM (SecureString). **GitHub via per-owner GitHub App installation tokens minted server-side** by the broker/interceptor/reply Lambdas (the shared PAT was retired; agents hold NO GitHub credential). The App private key is in Secrets Manager, app id/slug in SSM String. Tokens are scoped per call to the co-reachable repo set (co-repo grouping) + the per-agent∩per-tool permission tier. Agent runtime roles get only `bedrock-agentcore:InvokeGateway`. AgentCore Identity is a planned upgrade.
-- **Multi-repo**: multi-owner (mixed personal + org); each repo declares which OTHER repos a dispatch from it may act on (`co_repo_mode`: isolated | group | all); per-agent product access (docwriter opens PRs + writes code, workitems issues-only, adr comment/read-only, researcher no GitHub). Enforced at the interceptor + credential layers — see `docs/specs/github-onboarding-spec.md` §3.7.
-- **Memory**: Agents honor `AGENTCORE_MEMORY_ID` via Strands' `AgentCoreMemoryToolProvider`. No Memory resource is provisioned by the fleet's infra template today; this is a roadmap item.
-- **Policy**: Cedar policy files under `cedar/<agent>.cedar` (advisory unless the Gateway is deployed). With `DeployGateway`, the AgentCore Gateway policy engine enforces Cedar in the invocation path — including the admin repo-allowlist policy (`infra/dashboard/fleet_policy.py`).
-- **Infra**: AWS SAM (CloudFormation) — see `docs/aws-deploy.md` for the full surface.
-- **Deploy**: base platform via `scripts/deploy_fleet.py` (foundation stack + build source + dashboard SPA); agents are onboarded from the dashboard Admin view, which builds each container (shared `sdlc-agent-builder-<stage>` CodeBuild) → ECR → AgentCore Runtime (`capability-deployer` Lambda).
+- **Language / framework**: Python 3.12 · Strands Agents SDK · Amazon Bedrock AgentCore Runtime (containerized).
+- **Models — Bedrock Mantle**: agents call the OpenAI-compatible **bedrock-mantle** endpoint (`agents/shared/bedrock.py` → Strands `OpenAIModel`), NOT `bedrock-runtime`. Default `anthropic.claude-sonnet-5` (env `BEDROCK_MODEL_ID`; never send `temperature` — Sonnet 5 rejects it). Auth is a short-term bearer token minted from the runtime role (`aws-bedrock-token-generator`), no stored secret. **Per-repo cost attribution** via a Mantle **project** created on repo onboard and passed through dispatch → the `OpenAI-Project` header. ADR Titan embeddings and the Router's `apply_guardrail` stay on classic `bedrock-runtime`.
+- **Guardrail (fail-closed, T-1/2/3)**: the prompt-injection guardrail is attached to every model call via Mantle headers (`X-Amzn-Bedrock-Guardrail*`); `build_model` raises if `BEDROCK_GUARDRAIL_ID` is unset. The Router also runs an edge `apply_guardrail` check before dispatch.
+- **Tool access — Gateway-only**: every agent routes ALL MCP tool calls through the **AgentCore Gateway** (`GATEWAY_MCP_URL` required; agent refuses to start without it), one SigV4 client via the runtime role. Gateway fronts Asana (direct MCP) and GitHub (via the SCM broker Lambda), enforces a Cedar policy engine, runs the SCM co-repo interceptor. No direct-to-vendor path.
+- **Auth (external)**: Asana via OAuth/PAT in SSM. **GitHub via per-owner GitHub App installation tokens** minted server-side (broker/interceptor/webhook Lambdas); agents hold no GitHub credential. App private key in Secrets Manager, id/slug/webhook-secret in SSM.
+- **API authz — Amazon Verified Permissions (Cedar)**: the dashboard API's authorization (`infra/dashboard/auth.py`) is decided by **AVP** evaluating Cedar policies — `Read` (operators+admins) and `Write` (admins). Distinct from the agent-tool Cedar at the Gateway. Add a permission = add a Cedar policy, no code change.
+- **Multi-repo**: multi-owner; each repo declares which OTHER repos a dispatch from it may act on (`co_repo_mode`: isolated | group | all); per-agent product access enforced at the interceptor + credential layers.
+- **Infra**: AWS SAM. **Deploy**: base platform via `scripts/deploy_fleet.py` (foundation stack + agent build source + dashboard SPA); `scripts/bootstrap.py` is the thin one-time privileged setup. There is no GitHub-OIDC / CI deploy path — it was retired.
+
+## How things flow
+
+- **Triggers → dispatch**: GitHub App webhook (`infra/dispatch/github_webhook.py`) and Asana webhook (`asana_webhook.py`) verify HMAC signatures and async-invoke the Dispatch Router. No per-repo GitHub Actions workflow.
+- **Onboarding an agent (capability)**: admin clicks Onboard in the dashboard → a `capability#<id>` row is written → the shared `sdlc-agent-builder-<stage>` CodeBuild project builds `agents/<name>` → a build-completion event invokes the `capability-deployer` Lambda, which creates the per-agent runtime IAM role (under IAM path `/sdlc-agents/capabilities/*`, capped by a permissions boundary) + the AgentCore runtime, waits READY, marks the capability `active`.
+- **Registry**: the Dispatch Router registry is **rendered from the active capability rows** (`config_store.render_registry`) and written to SSM (`/sdlc-agents/${Stage}/registry`) on every change — replacing the old `.dispatch/agents.yaml` + `sync_registry.py`. Routability keys on "enabled + has a live runtime", so a rebuild never drops a working agent.
+- **Weekly security rebuild**: a scheduled Lambda rebuilds every active agent's container so images pick up patches; a failed rebuild leaves the running agent up.
+- **Onboarding a repo**: admin onboards `owner/repo` → GitHub App install is verified → a per-repo Mantle project is created → the row drives the dispatch allowlist + Cedar repo policy.
 
 ## Conventions
 
-- Agents NEVER close issues, merge PRs, or delete tasks. Cedar policies enforce this.
-- Work decomposition uses the approval pattern: agent proposes → human approves → agent executes.
-- Custom tools are structured task prompts, not business logic. They return instructions that guide the agent's reasoning. The LLM does the actual orchestration.
-- System prompts live in `prompts.py` alongside agent code, not in separate config.
-- The Dispatch Router registry is rendered from the capability rows in the `fleet-config-${Stage}` DynamoDB table (onboarded in the dashboard Admin view) and written to SSM (`/sdlc-agents/${Stage}/registry`) on every change.
+- Agents NEVER close issues, merge PRs, or delete tasks (Cedar-enforced). Work decomposition uses propose → human-approve → execute.
+- Custom tools are structured task prompts, not business logic — they return instructions the LLM orchestrates. System prompts live in `prompts.py` beside the agent code.
+- The privileged deploy actions (IAM role + runtime + build) live only on event-triggered Lambdas (`capability-deployer`), never on the internet-facing admin API — which holds only `codebuild:StartBuild`.
 
-## Working with Agents
+## Future (low-effort pivots kept open)
 
-Each agent under `agents/` is self-contained:
-- `agent.py` — Strands agent entry point with `@app.entrypoint`
-- `prompts.py` — System prompt (versioned with code)
-- `tools/` — Custom `@tool` functions
-- `tests/eval_dataset.json` — Golden set for quality evaluation
-- `Dockerfile` + `requirements.txt` — Container deployment
+- **AWS Agent Registry** as the org-wide agent catalog: the `render_registry`/`publish_registry` seam is isolated so the DynamoDB-rendered registry can additionally sync to Agent Registry (Preview; no CFN yet) without disturbing dispatch.
 
-## Current Focus
+## Working notes
 
-Building the Workitems agent (MLP). See `docs/roadmap.md` for the full plan.
+- Build & verify: dashboard/dispatch/shared Python suites run under `pytest` (moto for AWS); `dashboard/` SPA builds with `npm run build`; validate infra with `sam validate` in `infra/foundation/`.
+- `docs/` has the design docs, per-agent specs, and the living **threat model** (`docs/threat-model.md`). `docs/aws-deploy.md` is the full deploy surface.

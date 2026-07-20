@@ -1,6 +1,6 @@
 ---
 name: sdlc-agents-register-triggers
-description: Use when the user's agents are provisioned and integrations are connected, and they need to enable the event triggers that make agents actually respond to @mentions. Registers Asana webhooks, enables the GitHub Actions dispatch workflow, configures Slack app event subscriptions, and updates the dispatch router Lambda environment for the selected agents. Invoked by sdlc-agents after the connect skills finish.
+description: Use when the user's agents are provisioned and integrations are connected, and they need to enable the event triggers that make agents actually respond to @mentions. Registers Asana webhooks, confirms the GitHub App webhook subscription, configures Slack app event subscriptions, and updates the dispatch router Lambda environment for the selected agents. Invoked by sdlc-agents after the connect skills finish.
 ---
 
 # Wire up event triggers so agents respond to mentions
@@ -73,22 +73,27 @@ The script prints the Asana webhook GID on success. If the handshake times out, 
 
 ### GitHub
 
-#### 1. Enable the agent-dispatch workflow
+The GitHub `@mention` trigger is the fleet's **GitHub App webhook**, not a
+GitHub Actions workflow. There is no per-repo `agent-dispatch.yml` to enable and
+no OIDC deploy role to scope — those were retired. Wiring GitHub triggers is
+therefore about the App, not the repo:
 
-`.github/workflows/agent-dispatch.yml` already exists in the repo. Ensure its trigger list covers the user's selected agents — it's a hardcoded `if:` block:
+#### 1. Confirm the App webhook is delivering to the fleet endpoint
 
-```yaml
-if: |
-  contains(github.event.comment.body, '@workitems') ||
-  contains(github.event.comment.body, '@docwriter') ||
-  ...
-```
+The GitHub App (registered in `sdlc-agents-connect-github`) has its webhook URL
+pointed at the fleet's `github-webhook-${STAGE}` endpoint (the `WebhookEndpoint`-style
+API Gateway route for GitHub) and its webhook secret stored in SSM
+(`/sdlc-agents/github-webhook-secret`). The App is subscribed to `Issue comment`
+and `Pull request review comment` events. One App webhook serves **every** repo
+the App is installed on — there is no per-repo enablement step.
 
-Add a line for each agent in `.sdlc-agents/selection.yaml`. Commit.
+#### 2. Confirm the repos are onboarded and the App is installed
 
-#### 2. Confirm the deploy role OIDC trust is scoped to the target repo
-
-The trust policy for the deploy role is created manually (or via `sdlc-agents-provision-aws`) when you first set up the account — see `docs/aws-deploy.md` §1.3. It should use `StringEquals` on `sub` with two explicit subjects: `repo:<ORG>/<REPO>:ref:refs/heads/main` (covers deploy workflows on `push` to main AND the dispatch workflow's `issue_comment` / `pull_request_review_comment` events, which run in the default-branch context) and `repo:<ORG>/<REPO>:pull_request` (covers `claude-code.yml`'s `pull_request: [opened, synchronize]` trigger — the only true "pull request event" in OIDC terms). If the user is bringing a brand-new repo, the role's trust policy was scoped to a different `<ORG>/<REPO>` — update the role directly (`aws iam update-assume-role-policy`) to add their repo's two subjects, or create a fresh role for them.
+For each repo the user wants agents to act in, confirm it is onboarded in the
+dashboard Admin view (which verifies the App is installed on the owner and can
+reach the repo). Mentions from a non-onboarded repo are rejected at dispatch.
+Agent mention tokens are resolved by the webhook Lambda against the live registry;
+there is no hardcoded `if:` trigger list to edit.
 
 ### Slack (gap — not yet supported end-to-end)
 

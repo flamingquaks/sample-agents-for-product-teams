@@ -4,7 +4,7 @@ This document replaces the earlier 438-line epic/story plan. That plan laid out 
 
 ## What shipped
 
-Four agents are live on AgentCore Runtime today. Each has code under `agents/<name>/`, a Cedar policy in `cedar/<name>.cedar`, and a deploy workflow at `.github/workflows/deploy-<name>.yml`.
+Four agents are live on AgentCore Runtime today. Each has code under `agents/<name>/` and a Cedar policy in `cedar/<name>.cedar`. Agents are built and deployed by the UI-driven onboarding pipeline (shared `sdlc-agent-builder-<stage>` CodeBuild → `capability-deployer` Lambda), not by per-agent GitHub Actions workflows.
 
 | Agent | Role | Trigger surface |
 |---|---|---|
@@ -13,16 +13,15 @@ Four agents are live on AgentCore Runtime today. Each has code under `agents/<na
 | **Docwriter** | Technical writer — API docs, release notes, doc PRs | `@docwriter` in GitHub/Asana |
 | **Adr** | ADR linker — tags issues, reviews PRs against governing ADRs | `@adr` on GitHub issues or PRs |
 
-The **Dispatch Router** Lambda routes mentions from GitHub + Asana to the right runtime. **Asana webhook receiver** + **GitHub Actions workflow** (`agent-dispatch.yml`) are the two event sources. State tracks in DynamoDB (`dispatch-assignments-${STAGE}`). Credentials live in SSM (SecureString, per-path narrow IAM).
+The **Dispatch Router** Lambda routes mentions from GitHub + Asana to the right runtime. Two HMAC-verified **webhook** Lambdas are the event sources: the **GitHub App webhook** (`github_webhook.py`) and the **Asana webhook** (`asana_webhook.py`) — the old `agent-dispatch.yml` GitHub Actions workflow + OIDC deploy role are retired. State tracks in DynamoDB (`dispatch-assignments-${STAGE}`). Asana credentials live in SSM; the GitHub App key lives in Secrets Manager.
 
-All agents run **Claude Opus 4.7** via Bedrock.
+All agents run **Claude Sonnet 5** via Bedrock Mantle.
 
 ## What's intentionally *not* shipped
 
 These were in the original plan. Each is cleanly deferrable and none blocks adoption.
 
-- **AgentCore Identity** — we use SSM directly. Identity is a natural upgrade when the operational story for it solidifies.
-- **AgentCore Gateway** — agents connect directly to vendor MCP servers (`mcp.asana.com`, `api.githubcopilot.com/mcp`). Gateway would be an upgrade for centralized auth/rate-limiting/observability.
+- **AgentCore Identity** — we use SSM (Asana) + per-owner GitHub App tokens + a runtime-role Mantle bearer token. Identity is a natural upgrade when the operational story for it solidifies.
 - **AgentCore Memory (provisioned)** — agents honor `AGENTCORE_MEMORY_ID` if set, but no Memory resource is provisioned by the foundation stack. Teams that want memory today provision their own.
 - **AgentCore Browser** — not used; no agent has a browser dependency today.
 - **UAT agent** — depends on Browser and a maintenance story for tests across UI changes.

@@ -1,0 +1,101 @@
+%% PDLC Agent Fleet — current architecture (2026-07)
+%% Triggers → Dispatch Router → AgentCore Runtime → Gateway (Cedar) → SCM/Asana,
+%% plus the dashboard + UI-driven onboarding pipeline, models via Bedrock Mantle.
+%% Render: any Mermaid renderer (mermaid.live, VS Code Mermaid, GitHub).
+flowchart TB
+
+  %% ---------------- External platforms ----------------
+  subgraph EXT["External platforms (trusted contributors)"]
+    GH["GitHub<br/>issues · PRs · comments"]
+    AS["Asana<br/>tasks · stories"]
+  end
+
+  %% ---------------- Triggers (webhooks) ----------------
+  subgraph TRIG["Triggers — API Gateway (public HTTPS)"]
+    GHW["GitHub App webhook Lambda<br/>github_webhook.py<br/>HMAC X-Hub-Signature-256"]
+    ASW["Asana webhook Lambda<br/>asana_webhook.py<br/>HMAC signature verify"]
+  end
+
+  GH -->|"@mention event"| GHW
+  AS -->|"story / assignment event"| ASW
+
+  %% ---------------- Dispatch ----------------
+  subgraph DISP["Dispatch layer (AWS account)"]
+    ROUTER["Dispatch Router Lambda<br/>router.py<br/>• resolve @mention + aliases<br/>• edge guardrail (apply_guardrail)<br/>• authorization (allowlist)<br/>• concurrency + assignment record"]
+    REG["SSM param<br/>/sdlc-agents/&lt;stage&gt;/registry<br/>(rendered from capability rows)"]
+    DDB["DynamoDB<br/>dispatch-assignments"]
+  end
+
+  GHW -->|"async invoke"| ROUTER
+  ASW -->|"async invoke"| ROUTER
+  REG -.->|"read registry"| ROUTER
+  ROUTER -->|"write assignment (TTL)"| DDB
+
+  %% ---------------- Agent runtime ----------------
+  subgraph RT["AgentCore Runtime (containerized Strands agents)"]
+    WI["workitems"]
+    RE["researcher"]
+    DW["docwriter"]
+    ADR["adr"]
+  end
+
+  ROUTER -->|"InvokeAgentRuntime<br/>instruction + source_context<br/>(incl. mantle_project)"| RT
+
+  %% ---------------- Models: Bedrock Mantle ----------------
+  subgraph MDL["Models — Bedrock Mantle (OpenAI-compatible)"]
+    MANTLE["bedrock-mantle endpoint<br/>anthropic.claude-sonnet-5<br/>bearer token (runtime role)<br/>guardrail headers (fail-closed)<br/>OpenAI-Project = per-repo project"]
+  end
+  BRT["bedrock-runtime (classic)<br/>ApplyGuardrail · Titan embeddings"]
+
+  RT -->|"model calls<br/>(bearer + guardrail hdrs)"| MANTLE
+  ROUTER -.->|"edge apply_guardrail"| BRT
+  ADR -.->|"ADR Titan embeddings"| BRT
+
+  %% ---------------- Gateway + tool access ----------------
+  subgraph GW["AgentCore Gateway (gateway-only, SigV4)"]
+    CEDAR["Cedar policy engine<br/>default-deny · forbid-wins<br/>per-agent tool grants + repo allowlist"]
+    INT["REQUEST interceptor<br/>scm_interceptor.py<br/>co-repo grouping (x-dispatch-origin)"]
+    BROKER["SCM broker Lambda target<br/>scm_broker.py<br/>mints per-owner GitHub App token"]
+  end
+
+  RT -->|"all MCP tool calls (SigV4)"| CEDAR
+  CEDAR --> INT
+  INT --> BROKER
+  BROKER -->|"per-owner App installation token"| GH
+  CEDAR -->|"AsanaTarget (direct MCP)"| AS
+
+  %% ---------------- Dashboard ----------------
+  subgraph DASH["Fleet dashboard + admin (optional)"]
+    SPA["SPA (React + Vite)<br/>S3 + CloudFront (OAC)<br/>Cognito Hosted UI login"]
+    API["API Gateway<br/>Cognito authorizer"]
+    QRY["query Lambda (queries.py)<br/>read-only run history"]
+    ADM["admin Lambda (admin.py)<br/>onboard agents + repos<br/>codebuild:StartBuild only"]
+    AVP["Amazon Verified Permissions<br/>Cedar: Read / Write actions<br/>fail-closed (auth.py)"]
+    FCFG["DynamoDB fleet-config<br/>capability + repo rows"]
+  end
+
+  SPA --> API
+  API -->|"authorize each request"| AVP
+  API --> QRY
+  API --> ADM
+  QRY -->|"read"| DDB
+  ADM -->|"capability / repo rows"| FCFG
+  FCFG -.->|"render_registry / publish"| REG
+
+  %% ---------------- Onboarding pipeline ----------------
+  subgraph ONB["Onboarding pipeline (event-driven)"]
+    CB["CodeBuild<br/>sdlc-agent-builder-&lt;stage&gt;<br/>(AGENT_NAME param)"]
+    ECR["ECR sdlc-agents/&lt;agent&gt;<br/>IMMUTABLE tags"]
+    EVT["EventBridge<br/>build-completion / weekly rebuild"]
+    DEP["capability-deployer Lambda<br/>PRIVILEGED: CreateRole/PassRole +<br/>create-agent-runtime<br/>role path /sdlc-agents/capabilities/*<br/>+ CapabilityRuntimeBoundary"]
+    MPRJ["Bedrock Mantle project<br/>(created on repo onboard, mantle.py)"]
+  end
+
+  ADM -->|"StartBuild"| CB
+  ADM -->|"ensure per-repo project"| MPRJ
+  CB --> ECR
+  CB -->|"build succeeded"| EVT
+  EVT --> DEP
+  DEP -->|"create role + runtime, wait READY,<br/>mark active, republish registry"| RT
+  DEP -.->|"update capability row"| FCFG
+  ECR -.->|"image pulled by runtime"| RT

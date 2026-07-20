@@ -66,7 +66,7 @@ access) if they aren't already set up.
 For each tool the customer uses, invoke the matching connect skill:
 
 - Asana → **sdlc-agents-connect-asana** (OAuth app setup, MCP vs API app, PAT for webhook Lambda)
-- GitHub → **sdlc-agents-connect-github** (GitHub App or fine-grained PAT for MCP, deploy-role OIDC for CI)
+- GitHub → **sdlc-agents-connect-github** (register + install the fleet's GitHub App — the only credential model; the App webhook is the mention trigger and per-owner installation tokens back tool calls)
 
 Other tools (Jira, GitLab, Slack, Salesforce, Datadog) don't have connect skills yet — the shipping agents all work against Asana + GitHub. If the user picked one of those other tools during discovery, tell them honestly that the connect path isn't written yet and point them at the vendor's remote MCP docs; don't fabricate setup steps.
 
@@ -76,7 +76,7 @@ Each connect skill knows the specific pitfalls of its tool (Asana's MCP-app-vs-A
 
 Invoke **sdlc-agents-register-triggers**. This is the step that turns an onboarded fleet into one that actually reacts to `@agent` mentions:
 - Asana webhook → API Gateway endpoint, with handshake secret stored in SSM
-- GitHub: `agent-dispatch.yml` workflow enabled, trigger list updated for selected agents
+- GitHub: the fleet's GitHub App webhook confirmed delivering to the `github-webhook-${STAGE}` endpoint (no per-repo workflow — one App webhook serves every onboarded repo)
 - Slack app event subscriptions, etc.
 
 ### Step 6 — Verify
@@ -87,9 +87,9 @@ Invoke **sdlc-agents-verify**. Runs a smoke test per agent (health-check invocat
 
 After the fleet is verified, ask the user:
 
-> Do you want to enable `@claude` in this repo so Claude Code can code against issues and review PRs? It uses the same Amazon Bedrock model as the fleet, authenticated via GitHub Actions OIDC — no Anthropic API key needed.
+> Do you want to enable `@claude` in this repo so Claude Code can code against issues and review PRs? It runs as a GitHub Action calling Amazon Bedrock directly, authenticated via GitHub Actions OIDC — no Anthropic API key needed.
 
-If yes, invoke **sdlc-agents-setup-claude-code**. It's scoped to GitHub + Bedrock (not tied to the agent fleet's AgentCore runtimes), so users who want `@claude` but not the fleet can also run it standalone.
+If yes, invoke **sdlc-agents-setup-claude-code**. It's scoped to GitHub + Bedrock (not tied to the agent fleet's AgentCore runtimes or its Mantle model path), so users who want `@claude` but not the fleet can also run it standalone. Note this is the one optional feature that still uses GitHub Actions + OIDC; the fleet's own trigger/deploy paths do not.
 
 ## When to stop and get help
 

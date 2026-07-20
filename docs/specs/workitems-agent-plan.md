@@ -506,7 +506,7 @@ Issue comment         →          Task comment (selective, tagged)
 | Component | Driver | Estimate |
 |-----------|--------|----------|
 | AgentCore Runtime | Per-second compute during agent runs | Low — runs are short (< 5 min) |
-| Bedrock (Claude Opus 4.7) | Input/output tokens per run | ~$0.50–2.00/run depending on scope |
+| Bedrock Mantle (Claude Sonnet 5) | Input/output tokens per run | ~$0.50–2.00/run depending on scope |
 | AgentCore Memory | Storage + retrieval calls | Minimal at project scale |
 | AgentCore Gateway | Per-tool-call | Pennies per invocation |
 | GitHub API | Rate limited, free for authenticated apps | No cost |

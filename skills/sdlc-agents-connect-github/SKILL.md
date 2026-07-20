@@ -1,6 +1,6 @@
 ---
 name: sdlc-agents-connect-github
-description: Use when the user needs to connect SDLC agents to GitHub. Walks through registering the fleet's GitHub App (the only credential model — the shared PAT was retired), installing it per owner, onboarding repos, configuring the deploy-role OIDC trust, and verifying agent + CI paths. Knows the specific GitHub pitfalls (fine-grained App permissions, org SSO enforcement).
+description: Use when the user needs to connect SDLC agents to GitHub. Walks through registering the fleet's GitHub App (the only credential model — the shared PAT was retired), installing it per owner, onboarding repos, and verifying the agent + webhook-trigger paths. Knows the specific GitHub pitfalls (fine-grained App permissions, org SSO enforcement).
 ---
 
 # Connect the SDLC Agent Fleet to GitHub
@@ -10,7 +10,7 @@ description: Use when the user needs to connect SDLC agents to GitHub. Walks thr
 Like Asana, GitHub access splits:
 
 - **Agent runtime → GitHub** — **gateway-only**: agents SigV4-invoke the AgentCore Gateway, which routes GitHub through its SCM broker target. Agents hold no GitHub credential; the broker mints a per-owner **GitHub App** installation token per call, scoped to the co-approved repo set + the agent's permission tier. **This is the only credential model**: the shared PAT and its `GITHUB_AUTH_MODE` selector have been retired, and there is no direct-to-GitHub path (the gateway is the required policy + observability chokepoint). Prerequisite: deploy the foundation stack with `DeployGateway=true` (and `DeployDashboard=true`).
-- **CI (deploy workflow) → AWS** (no GitHub side needed beyond OIDC). The deploy role is assumed via GitHub Actions OIDC. No secret stored in GitHub beyond `AWS_DEPLOY_ROLE_ARN` and `AWS_ACCOUNT_ID`.
+- **GitHub → fleet (mention triggers)** — the same GitHub App's **webhook** delivers `@mention` events to the fleet's `github-webhook-${STAGE}` endpoint, HMAC-verified by `infra/dispatch/github_webhook.py`. No GitHub Actions workflow and no OIDC deploy role are involved — both were retired. Nothing is stored in the repo's GitHub Actions settings for the fleet.
 
 ## GitHub App (the only path)
 
@@ -26,8 +26,11 @@ App needs `DeployDashboard=true` at least once).
    POSTs a GitHub App *manifest* to GitHub; you confirm the App's permissions
    there and are redirected back.
    - The manifest requests: Contents R&W, Issues R&W, Pull requests R&W,
-     Metadata Read (see `github_client.APP_PERMISSIONS`). Webhook disabled — the
-     `agent-dispatch.yml` workflow, not this App, listens for `@agent` mentions.
+     Metadata Read (see `github_client.APP_PERMISSIONS`). **Webhook enabled** —
+     the App's webhook (URL = the fleet's `github-webhook-${STAGE}` endpoint,
+     secret in SSM) is what listens for `@agent` mentions, subscribed to
+     `Issue comment` + `Pull request review comment`. One App webhook serves
+     every onboarded repo (this replaced the retired `agent-dispatch.yml`).
 2. On return, the admin API's manifest exchange persists the credentials
    automatically: the **private key → Secrets Manager**
    (`sdlc-agents/github-app/private-key`), and the **app id + slug → SSM String**
@@ -98,20 +101,15 @@ A 200 with the list of owners the App is installed on confirms the key + app-id
 are valid and the App can mint per-owner tokens. A 401 means the stored key/app-id
 don't match — re-run the manifest flow in the dashboard.
 
-## Configure CI OIDC
+## No CI credentials to configure
 
-Separate from the MCP credential: the deploy workflows assume an AWS role via OIDC. The OIDC provider and deploy role are **not** created by the foundation stack — `sdlc-agents-provision-aws` Step 0 creates them manually (one-time per AWS account). By the time you're in this skill, that role exists and its ARN was captured as `$DEPLOY_ROLE_ARN`. The target GitHub repo needs:
-
-- Secret `AWS_DEPLOY_ROLE_ARN` — the role ARN from `sdlc-agents-provision-aws` Step 0b
-- Secret `AWS_ACCOUNT_ID` — the 12-digit account ID
-
-Both are already written by `sdlc-agents-provision-aws` Step 5 if you ran it first. If the user skipped that step or set them manually, confirm they exist here.
-
-Walk the user through:
-- Repo → Settings → Secrets and variables → Actions → New repository secret
-- Add both
-
-No AWS credentials stored in GitHub. The OIDC trust only permits `token.actions.githubusercontent.com` for the configured repo.
+The fleet needs **no** GitHub Actions secrets or OIDC role: `@mention` triggers
+arrive via the App webhook (above), and build/deploy is server-side (CodeBuild +
+capability-deployer). The old deploy-role OIDC trust and `AWS_DEPLOY_ROLE_ARN`
+secret have been retired. (The only exception is the optional Claude Code on
+Bedrock feature — a separate skill, `sdlc-agents-setup-claude-code` — which
+installs its own workflow + OIDC role into the target repo. That is not part of
+connecting the fleet to GitHub.)
 
 ## Record GitHub state
 
@@ -129,6 +127,6 @@ github:
 
 ## What this skill does NOT do
 
-- Configure the `agent-dispatch.yml` workflow triggers. That's `sdlc-agents-register-triggers`.
+- Confirm the App webhook subscription / onboard the repos for triggering. That's `sdlc-agents-register-triggers`.
 - Install Claude Code Action for `@claude` in issues. That's a separate Anthropic-provided action, not part of this fleet.
 - Handle GitLab. If the user is on GitLab, use `sdlc-agents-connect-gitlab` (not yet written — flag it as a gap if asked).

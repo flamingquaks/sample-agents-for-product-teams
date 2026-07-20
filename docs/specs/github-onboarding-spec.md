@@ -474,5 +474,8 @@ The modal from the just-shipped change is the entry point. Additions:
 - Changing the Cedar per-agent tool grants or the destructive forbid — those
   stay exactly as they are; this spec only changes *how the credential is
   obtained*, not *what each agent may do*.
-- GitHub webhook-based dispatch (the App's webhook is disabled;
-  `agent-dispatch.yml` remains the mention path).
+- The GitHub App's **webhook** is the mention-dispatch path
+  (`infra/dispatch/github_webhook.py`, HMAC-verified) — it replaced the retired
+  `agent-dispatch.yml` GitHub Actions workflow. This spec covers the App's
+  *credential* model (installation tokens for tool calls); the webhook receiver's
+  design is out of scope here.

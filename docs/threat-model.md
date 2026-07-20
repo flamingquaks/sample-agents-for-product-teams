@@ -1,7 +1,7 @@
 # Threat Model — PDLC Agent Fleet
 
-**Version:** 1.7
-**Date:** 2026-05-05
+**Version:** 1.8
+**Date:** 2026-07-20
 **Status:** Living document. Describes the fleet as it currently ships.
 **Methodology:** Aligned with the [AWS Threat Designer](https://aws.amazon.com/blogs/machine-learning/accelerate-threat-modeling-with-generative-ai/) approach — identify assets, map data flows, enumerate threats (MITRE ATT&CK / OWASP), and document how each threat is mitigated today or why it is accepted.
 
@@ -9,91 +9,100 @@
 
 ## 1. System Overview
 
-The PDLC Agent Fleet is a multi-agent system on Amazon Bedrock AgentCore Runtime. Users trigger agents via `@mention` in GitHub or Asana. A Dispatch Router Lambda resolves the mention, checks authorization, and invokes the appropriate agent container. Agents interact with external platforms (GitHub, Asana) through MCP servers using stored credentials.
+The PDLC Agent Fleet is a multi-agent system on Amazon Bedrock AgentCore Runtime. Users trigger agents via `@mention` in GitHub or Asana. HMAC-verified **webhook** Lambdas (GitHub App + Asana) async-invoke a Dispatch Router Lambda, which resolves the mention, checks authorization, applies a prompt-injection guardrail, and invokes the appropriate agent container. Agents interact with external platforms (GitHub, Asana) exclusively through the AgentCore Gateway (gateway-only); model inference runs on the Bedrock Mantle endpoint. Fleet configuration (agents/capabilities and onboarded repos) is UI-driven from an operator dashboard whose API is authorized by Amazon Verified Permissions.
 
 ### 1.1 Component Inventory
 
 | ID | Component | Type | Description |
 |----|-----------|------|-------------|
-| C-1 | GitHub Actions (`agent-dispatch.yml`) | CI/CD Workflow | Extracts `@mention` from comments, assumes an OIDC-federated role, invokes Dispatch Router Lambda |
+| C-1 | GitHub App Webhook Lambda (`github_webhook.py`) | AWS Lambda + API Gateway | Public HTTPS endpoint; verifies the App's HMAC `X-Hub-Signature-256`; extracts `@mention` from `issue_comment`/`pull_request_review_comment`; async-invokes the Dispatch Router. **Replaces the retired `agent-dispatch.yml` GitHub Actions workflow** — one App webhook serves every onboarded repo, so no per-repo workflow or repo-side AWS credential is needed |
 | C-2 | Asana Webhook Lambda | AWS Lambda + API Gateway | Public HTTPS endpoint; verifies HMAC signature; forwards events to Dispatch Router |
-| C-3 | Dispatch Router Lambda | AWS Lambda | Resolves agent, checks auth/concurrency, records assignment, invokes AgentCore Runtime |
-| C-4 | AgentCore Runtimes (×4) | Bedrock AgentCore | Containerized agents (workitems, researcher, docwriter, adr) running Strands SDK + Claude Opus 4.7 |
+| C-3 | Dispatch Router Lambda | AWS Lambda | Resolves agent, edge guardrail check, checks auth/concurrency, records assignment, invokes AgentCore Runtime |
+| C-4 | AgentCore Runtimes (×4) | Bedrock AgentCore | Containerized agents (workitems, researcher, docwriter, adr) running Strands SDK; model = Claude Sonnet 5 via Bedrock Mantle (C-15) |
 | C-5 | DynamoDB (`dispatch-assignments`) | Database | Assignment state tracking with TTL-based expiry |
-| C-6 | SSM Parameter Store | Secrets/Config | Agent registry (String), OAuth tokens, PATs, webhook secret (SecureString) |
+| C-6 | SSM Parameter Store | Secrets/Config | Agent registry (String), OAuth tokens, GitHub App id/slug + webhook secret (SecureString/String); App private key is in Secrets Manager |
 | C-7 | S3 Artifacts Bucket | Object Storage | Agent artifacts, screenshots, test results |
-| C-8 | Cedar Policies | Policy Files | Per-agent allow/deny rules for tool invocations (advisory only — not enforced at runtime) |
-| C-9 | GitHub MCP Server / SCM broker | External API | `api.githubcopilot.com/mcp/` (direct) or the gateway SCM broker target — agents read/write GitHub via per-owner GitHub App installation tokens |
-| C-10 | Asana MCP Server | External API | `mcp.asana.com/v2/mcp` — agents read/write Asana via OAuth |
-| C-11 | GitHub OIDC Provider | IAM Federation | Allows GitHub Actions to assume a scoped deploy role without stored credentials |
+| C-8 | Cedar Policies (agent tool access) | Policy Files + Gateway engine | Per-agent allow/deny rules for tool invocations; the enforced form runs in the AgentCore Gateway policy engine (`fleet_policy.py`), `cedar/*.cedar` is the advisory source |
+| C-9 | GitHub SCM broker / Gateway target | AWS Lambda (gateway target) | The `scm-broker-${STAGE}` Lambda mints per-owner GitHub App installation tokens and calls the GitHub REST API; the gateway holds no GitHub credential |
+| C-10 | Asana MCP Server | External API | `mcp.asana.com/v2/mcp` — agents read/write Asana via OAuth, fronted by the gateway `AsanaTarget` |
+| C-11 | *(retired)* GitHub OIDC Provider | IAM Federation | **Removed.** The old GitHub Actions deploy/dispatch path (OIDC provider + CI deploy role) has been retired — there is no CI deploy path. Kept as a stable ID; superseded by C-1 (webhook triggers) and the UI-driven onboarding pipeline (C-16, C-17) |
 | C-12 | ECR Repositories | Container Registry | One per agent; `IMMUTABLE` tag policy; images built by the shared `sdlc-agent-builder-${STAGE}` CodeBuild project (on onboard + the weekly security rebuild), scanned on push |
+| C-13 | Amazon Verified Permissions policy store (`DashboardPolicyStore`) | AVP / Cedar | Authorizes the **dashboard API** (distinct from C-8). `auth.is_operator`/`is_admin` call AVP `IsAuthorized` with `Read` (operators+admins) / `Write` (admins) actions; 3 static Cedar policies in the foundation template; fail-closed |
+| C-14 | AgentCore Gateway + Cedar engine + REQUEST interceptor | Bedrock AgentCore | The gateway-only tool-call chokepoint. Cedar engine (default-deny, forbid-wins) enforces per-agent tool grants + repo allowlist; the `scm-interceptor` enforces per-origin co-repo grouping from the trusted `x-dispatch-origin` header |
+| C-15 | Bedrock Mantle endpoint + per-repo projects | Managed model API | OpenAI-compatible `bedrock-mantle` endpoint serving `anthropic.claude-sonnet-5`. Auth is a short-term bearer token minted from the runtime role (no stored secret). A per-repo Mantle **project** (created on repo onboard, `mantle.py`) is passed through dispatch and set as the `OpenAI-Project` header for cost attribution |
+| C-16 | Shared CodeBuild build project (`sdlc-agent-builder-${STAGE}`) | CodeBuild | The single agent-agnostic build project, parameterized by `AGENT_NAME`; builds `agents/<name>` and pushes to ECR (C-12). Started by the admin API (which holds only `codebuild:StartBuild`) on onboard and by the weekly rebuild schedule |
+| C-17 | Capability-deployer Lambda (`capability-deployer-${STAGE}`) + `CapabilityRuntimeBoundary` | AWS Lambda + IAM managed policy | Invoked only by the CodeBuild-completion EventBridge event. **The only component holding `iam:CreateRole`/`PassRole` + `create/update-agent-runtime`** — creates each per-agent runtime role under IAM path `/sdlc-agents/capabilities/*`, capped by the `CapabilityRuntimeBoundary` permissions boundary, then deploys the AgentCore runtime, waits READY, and republishes the registry |
 
 ---
 
 ## 2. Data Flow Diagram
 
+The current architecture diagram is maintained as Mermaid at
+[`docs/assets/architecture.mmd`](assets/architecture.mmd) (rendered/explained in
+[`docs/aws-deploy.md` §0](aws-deploy.md#0-architecture)). The trigger path is now
+HMAC-verified **webhooks** (no GitHub Actions / OIDC), tool calls are **gateway-only**,
+and model calls go to the **Bedrock Mantle** endpoint. Text summary:
+
 ```
-                    ┌──────────────────────────────────────────────────────┐
-                    │              TRUST BOUNDARY: External Platforms       │
-                    │                                                      │
-                    │   GitHub (Issues, PRs, Comments)    Asana (Tasks)    │
-                    └──────────┬──────────────────────────────┬────────────┘
-                               │                              │
-                    ┌──────────┼──────────────────────────────┼────────────┐
-                    │          │  TRUST BOUNDARY: AWS Account  │            │
-                    │          ▼                              ▼            │
-                    │  ┌───────────────┐           ┌──────────────────┐   │
-                    │  │ GitHub Actions │           │ API Gateway      │   │
-                    │  │ OIDC → IAM    │           │ (public HTTPS)   │   │
-                    │  └───────┬───────┘           └────────┬─────────┘   │
-                    │          │ Lambda invoke               │             │
-                    │          │                    ┌────────▼─────────┐   │
-                    │          │                    │ Asana Webhook    │   │
-                    │          │                    │ Lambda           │   │
-                    │          │                    │ (HMAC verify)    │   │
-                    │          │                    └────────┬─────────┘   │
-                    │          │                             │ async invoke│
-                    │          ▼                             ▼             │
-                    │  ┌─────────────────────────────────────────────┐    │
-                    │  │         Dispatch Router Lambda               │    │
-                    │  │  • Parse mention  • Check auth (allowlist)  │    │
-                    │  │  • Check concurrency  • Record in DynamoDB  │    │
-                    │  └──────────────────────┬──────────────────────┘    │
-                    │                         │ InvokeAgentRuntime        │
-                    │          ┌──────────────┼──────────────┐            │
-                    │          ▼              ▼              ▼            │
-                    │  ┌────────────┐ ┌────────────┐ ┌────────────┐      │
-                    │  │ workitems  │ │ researcher │ │ docwriter  │ ...  │
-                    │  │ (AgentCore)│ │ (AgentCore)│ │ (AgentCore)│      │
-                    │  └─────┬──────┘ └─────┬──────┘ └─────┬──────┘      │
-                    │        │              │              │              │
-                    │        │  SSM (creds) │              │              │
-                    │        ▼              ▼              ▼              │
-                    └────────┼──────────────┼──────────────┼──────────────┘
-                             │              │              │
-                    ┌────────┼──────────────┼──────────────┼──────────────┐
-                    │        ▼  TRUST BOUNDARY: External MCP Servers      │
-                    │  GitHub MCP          Asana MCP        Tavily Search │
-                    └─────────────────────────────────────────────────────┘
+   External platforms (GitHub, Asana)
+            │  @mention events
+            ▼
+   ┌───────────────────────────────────────────────┐  TRUST BOUNDARY: webhook edge
+   │ API Gateway (public HTTPS)                      │
+   │  GitHub App webhook Lambda  (HMAC X-Hub-Sig-256)│
+   │  Asana webhook Lambda       (HMAC signature)    │
+   └───────────────┬─────────────────────────────────┘
+                   │ async Lambda invoke (verified events only)
+                   ▼
+   ┌───────────────────────────────────────────────┐  TRUST BOUNDARY: AWS Account
+   │ Dispatch Router Lambda                          │
+   │  • edge apply_guardrail (bedrock-runtime)       │
+   │  • resolve agent + authorization allowlist      │
+   │  • registry from SSM (rendered from fleet-config)│
+   │  • concurrency check + assignment (DynamoDB)     │
+   └───────────────┬─────────────────────────────────┘
+                   │ InvokeAgentRuntime (instruction + source_context.mantle_project)
+                   ▼
+   ┌───────────────────────────────────────────────┐  AgentCore Runtime (per-agent isolation)
+   │ workitems · researcher · docwriter · adr        │
+   │   model calls → Bedrock Mantle (bearer token,   │
+   │     guardrail headers, OpenAI-Project=per-repo)  │
+   │   all tool calls → AgentCore Gateway (SigV4)     │
+   └───────────────┬─────────────────────────────────┘
+                   │ gateway-only (Cedar engine + REQUEST interceptor)
+                   ▼
+   ┌───────────────────────────────────────────────┐  TRUST BOUNDARY: External APIs
+   │ SCM broker (per-owner GitHub App token) → GitHub │
+   │ AsanaTarget → Asana MCP                          │
+   └─────────────────────────────────────────────────┘
+
+   Control plane (separate): Dashboard SPA → API Gateway (Cognito) → query/admin
+   Lambdas, each API request authorized by Amazon Verified Permissions (Cedar).
+   Onboarding: admin (codebuild:StartBuild) → CodeBuild → ECR → build-completion
+   EventBridge → capability-deployer (privileged IAM) → AgentCore runtime + registry.
 ```
 
 ### 2.1 Data Flows
 
 | ID | From → To | Data | Protocol | Auth |
 |----|-----------|------|----------|------|
-| DF-1 | GitHub → GitHub Actions | Comment body, user login, issue metadata | HTTPS (GitHub webhook) | GitHub App event |
-| DF-2 | GitHub Actions → Dispatch Router | Full comment + issue context as JSON payload | AWS Lambda invoke (OIDC → IAM) | STS AssumeRoleWithWebIdentity |
+| DF-1 | GitHub → GitHub App Webhook Lambda | Comment body, user login, issue metadata (delivery payload) | HTTPS (GitHub App webhook) | HMAC-SHA256 `X-Hub-Signature-256` verified against the App webhook secret |
+| DF-2 | GitHub App Webhook Lambda → Dispatch Router | Full comment + server-fetched issue context as JSON payload | AWS Lambda async invoke | IAM execution role |
 | DF-3 | Asana → API Gateway | Webhook event payload (story/task changes) | HTTPS POST | HMAC-SHA256 signature |
 | DF-4 | Asana Webhook Lambda → Asana API | Task/story fetch requests | HTTPS | Bearer PAT from SSM |
 | DF-5 | Asana Webhook Lambda → Dispatch Router | Normalized event payload | Lambda async invoke | IAM execution role |
-| DF-6 | Dispatch Router → SSM | Registry fetch | AWS API | IAM execution role |
+| DF-6 | Dispatch Router → SSM | Registry fetch (rendered from fleet-config capability rows) | AWS API | IAM execution role |
 | DF-7 | Dispatch Router → DynamoDB | Assignment create/query | AWS API | IAM execution role |
-| DF-8 | Dispatch Router → AgentCore Runtime | Instruction + context as JSON | `InvokeAgentRuntime` | IAM execution role (scoped to runtime/runtime-endpoint ARNs in this account+region) |
-| DF-9 | Agent → SSM | Credential fetch (OAuth tokens, PATs) | AWS API | AgentCore runtime role |
+| DF-8 | Dispatch Router → AgentCore Runtime | Instruction + context (incl. per-repo `mantle_project`) as JSON | `InvokeAgentRuntime` | IAM execution role (scoped to runtime/runtime-endpoint ARNs in this account+region) |
+| DF-9 | Agent → SSM / Secrets Manager | Credential fetch (Asana OAuth tokens); GitHub App key is read only by the broker/reply Lambdas | AWS API | AgentCore runtime role |
 | DF-10 | Agent → Gateway → SCM broker → GitHub | Issue/PR reads, comment/code writes | HTTPS (SigV4 to gateway) | Per-owner GitHub App installation token, minted server-side, scoped per co-repo group + per-agent tier |
-| DF-11 | Agent → Asana MCP | Task reads, comment writes | HTTPS | OAuth2 access token |
-| DF-12 | Agent → Bedrock | LLM inference (Claude Opus 4.7) | AWS API | AgentCore runtime role |
+| DF-11 | Agent → Gateway → Asana MCP | Task reads, comment writes | HTTPS (SigV4 to gateway) | OAuth2 access token |
+| DF-12 | Agent → Bedrock Mantle | LLM inference (Claude Sonnet 5), guardrail applied via Mantle headers | HTTPS (OpenAI-compatible) | Short-term Bedrock bearer token minted from the runtime role (`aws-bedrock-token-generator`); `OpenAI-Project` = per-repo Mantle project |
+| DF-12b | Dispatch Router / ADR agent → bedrock-runtime | Edge `apply_guardrail` (Router); Titan embeddings (ADR) | AWS API | IAM/runtime role (classic `bedrock-runtime`) |
 | DF-13 | CodeBuild (`sdlc-agent-builder-${STAGE}`) → ECR | Container image push (per-build tag, immutable) | HTTPS | CodeBuild service role |
+| DF-14 | Dashboard SPA → API Gateway → query/admin Lambda | Run history reads (operators); capability/repo config writes (admins) | HTTPS | Cognito JWT at the API Gateway authorizer; every request authorized by AVP (`IsAuthorized`, Read/Write) |
+| DF-15 | Admin Lambda → CodeBuild / Mantle | Start agent build (`codebuild:StartBuild`); create per-repo Mantle project on repo onboard | AWS API | Admin Lambda role (no privileged IAM — holds only StartBuild + Mantle project APIs) |
+| DF-16 | build-completion EventBridge → capability-deployer → IAM/AgentCore | Create per-agent runtime role (boundary-capped) + create/update runtime + republish registry | AWS API | Capability-deployer role (`CreateRole`/`PassRole` scoped to `/sdlc-agents/capabilities/*` with the mandatory permissions boundary) |
 
 ---
 
@@ -115,9 +124,9 @@ An attacker can craft a GitHub issue body, Asana task description, or the commen
 
 1. **Edge filter at the Dispatch Router.** The body of every inbound `@mention` is scored by Amazon Bedrock Guardrails (`PROMPT_ATTACK` filter, `InputStrength: MEDIUM`) before the agent is invoked. A trip records the assignment as `blocked_guardrail`, posts a block-notice reply to the originating thread (no silent failures), emits a `GuardrailTripped` CloudWatch metric, and returns 400. This is the primary defense against T-2 and the first line against T-3. Attackers who probe the filter receive the same block-notice legitimate users do — there is no differentiated error path. `MEDIUM` is the shipping strength after `HIGH` was found to block benign user messages at high false-positive rate against the Dispatch Context wrapper; operators running against more hostile inputs can raise it in `infra/foundation/template.yaml`.
 
-2. **Runtime guardrail on every agent's model invocation.** The same guardrail is attached to each agent's Bedrock `InvokeModel` call. Content the agent fetches from external platforms after dispatch (task notes, issue bodies, PR descriptions pulled via MCP) is scored server-side on the way into the model. This is the only layer that sees T-1 — an edge-only check cannot, because the attack arrives via a trusted-looking tool response, not via the mention comment. `OutputStrength` on this guardrail is `NONE` by design: agent outputs are bounded by structural controls (approval pattern, no destructive tools, per-agent IAM) rather than content filtering, and Cedar runtime enforcement (roadmap) is the intended structural layer.
+2. **Runtime guardrail on every agent's model invocation.** The same guardrail is attached to each agent's model call — the fleet runs on the OpenAI-compatible **Bedrock Mantle** endpoint, and the guardrail is applied via the documented Mantle headers (`X-Amzn-Bedrock-GuardrailIdentifier` / `-GuardrailVersion` / `-Trace`), so the OpenAI-compatible surface does not weaken it. `build_model` (`agents/shared/bedrock.py`) **fails closed**: it raises if `BEDROCK_GUARDRAIL_ID` is unset (except in explicitly flagged local dev/tests), so an agent cannot come up with an unguarded model path. Content the agent fetches from external platforms after dispatch (task notes, issue bodies, PR descriptions pulled via the gateway) is scored server-side on the way into the model. This is the only layer that sees T-1 — an edge-only check cannot, because the attack arrives via a trusted-looking tool response, not via the mention comment. `OutputStrength` on this guardrail is `NONE` by design: agent outputs are bounded by structural controls (approval pattern, no destructive tools, per-agent IAM, and the Gateway Cedar engine) rather than content filtering.
 
-3. **Model-level resistance.** Claude Opus 4.7 has built-in resistance to adversarial prompts. Treated as a baseline, not a boundary — probabilistic like any LLM defense.
+3. **Model-level resistance.** Claude Sonnet 5 (the fleet's default model via Mantle) has built-in resistance to adversarial prompts. Treated as a baseline, not a boundary — probabilistic like any LLM defense.
 
 4. **Structural controls on what a subverted agent can do.** Agents have no destructive tools (no close-issue, merge-PR, or delete-task primitives). Approval-pattern workflows require a human to accept proposed work before it lands. Per-agent IAM runtime roles grant only the specific SSM parameters and MCP endpoints each agent needs. A prompt-injected agent can still misuse a legitimate tool (e.g. post a misleading comment), but cannot escalate into actions the architecture doesn't expose.
 
@@ -132,22 +141,20 @@ An attacker can craft a GitHub issue body, Asana task description, or the commen
 | ID | Threat | Severity | Component | STRIDE | Status |
 |----|--------|----------|-----------|--------|--------|
 | T-4 | **Agent registry authorization defaults** | — | C-3 | Elevation of Privilege | Mitigated |
-| T-5 | **Cedar policies not enforced at runtime** | **High** | C-8 | Tampering | Accepted |
+| T-5 | **Cedar policies not enforced at runtime** | **High** | C-8 | Tampering | Partially mitigated |
 | T-6 | **Dispatch Router IAM scope** | — | C-3 | — | Mitigated |
-| T-7 | **GitHub OIDC trust scope** | — | C-11 | — | Mitigated (guidance) |
+| T-7 | **GitHub OIDC trust scope** | — | C-11 | — | **Superseded** (OIDC/CI deploy path retired) |
+| T-29 | **Dashboard API authorization (AVP)** | — | C-13 | Elevation of Privilege | Mitigated |
 
 **T-4 (Mitigated):** A capability's `authorization.users` defaults to `[]` and the Dispatch Router fails closed — an empty allowlist returns 403 with a log line instructing the operator to populate the capability's user list in the dashboard Admin view (which re-renders the SSM registry). The wildcard `"*"` is still accepted for operators who explicitly opt into an open-by-default posture, but it is no longer the shipping default. Cross-agent invocation is permitted by listing a peer agent's bot identity (GitHub login or Asana user GID) in the callee's `users` list — see T-23 for the design intent and runaway-chain defense.
 
-**T-5 (Accepted for v1):** Cedar policy files under `cedar/*.cedar` express per-agent allow/deny rules for tool calls, but no evaluator runs them at invocation time. A prompt-injected agent can call any tool its MCP server exposes. Documented as a roadmap item. The intended evaluator would intercept every `@tool` call in the Strands runtime and deny forbidden operations, which would bound T-1/T-2/T-3 blast radius materially.
+**T-5 (Partially mitigated):** Cedar policy files under `cedar/*.cedar` express per-agent allow/deny rules for tool calls; the **enforced** form lives in `infra/dashboard/fleet_policy.py` and is evaluated by the **AgentCore Gateway policy engine** in the invocation path (the fleet is gateway-only, so every tool call passes through it). The engine is default-deny + forbid-wins: destructive tools are unconditionally forbidden, per-agent permits grant only each agent's `AGENT_TOOL_GRANTS`, and a repo-allowlist forbid blocks tools targeting non-onboarded repos. Residual: the engine is rolled out `LOG_ONLY` first — until an operator flips `GatewayPolicyEnforcement=ACTIVE`, Cedar *tool-grant* deny decisions log rather than block (the co-repo interceptor and the per-call scoped credential still enforce regardless — see T-11). The `cedar/*.cedar` files themselves remain advisory; `fleet_policy.py` is authoritative.
 
 **T-6 (Mitigated):** The Dispatch Router Lambda's IAM policy grants only `bedrock-agentcore:InvokeAgentRuntime`, scoped to `arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*` and the corresponding `runtime/*/runtime-endpoint/*` shape. The router cannot invoke runtimes in other accounts or regions, and cannot call `bedrock:InvokeAgent` on the legacy Bedrock Agents service.
 
-**T-7 (Mitigated in guidance):** The deploy role's OIDC trust policy is created by operators (not by the foundation stack). Every piece of shipping guidance — `docs/aws-deploy.md` §1.3, `skills/pdlc-agents-setup-claude-code`, `skills/pdlc-agents-register-triggers` — recommends `StringEquals` with two explicit `sub` claims:
+**T-7 (Superseded):** This threat covered the GitHub Actions OIDC deploy role's trust scope. That path is **retired** — there is no GitHub OIDC provider, no CI deploy role, and no `agent-dispatch.yml`/`claude-code.yml` workflow in the shipping fleet. Triggers now arrive via HMAC-verified webhooks (T-30) and all build/deploy is server-side (CodeBuild + capability-deployer, T-31). The ID is kept stable for history; the OIDC trust-scope guidance no longer applies to this architecture.
 
-- `repo:<org>/<repo>:ref:refs/heads/main` — covers `push`-to-main deploys and comment-driven triggers (`issue_comment`, `pull_request_review_comment`, `pull_request_review`), which all run in the default-branch context.
-- `repo:<org>/<repo>:pull_request` — covers `claude-code.yml`'s `pull_request: [opened, synchronize]` trigger, the only true "pull_request event" in OIDC terms.
-
-Wildcards (`StringLike: repo:<org>/<repo>:*`) are explicitly called out as anti-patterns. Operators are responsible for applying the guidance when they create the role.
+**T-29 (Mitigated):** The dashboard exposes fleet-wide, cross-user activity data and the fleet's *configuration surface* (onboard/offboard agents and repos), so its API needs authorization beyond a valid login. Authorization is decided by **Amazon Verified Permissions** evaluating Cedar policies (`infra/dashboard/auth.py` → `IsAuthorized`), decoupled from app code: two coarse actions today — `Read` (GET routes, gated by `is_operator`) and `Write` (POST/PUT/DELETE, gated by `is_admin`) — expressed as three static Cedar policies in the foundation template (operators→Read, admins→Read, admins→Write). The API Gateway Cognito authorizer validates the JWT and forwards its claims; `auth.py` builds the principal + `cognito:groups` parent entities and calls AVP. **Fail-closed at every step:** no authenticated subject → deny; any AVP error or outage → deny; any non-`ALLOW` decision → deny. When `AVP_POLICY_STORE_ID` is unset (AVP not deployed / unit tests) the same policy is evaluated locally with identical semantics, also fail-closed. This is **distinct from the agent-tool Cedar engine at the Gateway (C-14)** — that authorizes what an *agent* may do to GitHub/Asana; this authorizes what a *human operator* may do to the fleet config. Adding a permission is adding a Cedar policy, not a code change. **Residual (availability, not confidentiality):** because it is fail-closed, an AVP outage denies all dashboard API calls until service is restored — the API becomes unavailable but never leaks or accepts an unauthorized write. Acceptable: the dashboard is an operator console, not on the agent hot path (dispatch/agent execution do not depend on AVP).
 
 ### 3.3 Credential & Secret Management
 
@@ -171,12 +178,15 @@ Wildcards (`StringLike: repo:<org>/<repo>:*`) are explicitly called out as anti-
 | ID | Threat | Severity | Component | STRIDE | Status |
 |----|--------|----------|-----------|--------|--------|
 | T-12 | **Public API Gateway endpoint for Asana webhooks** | **Medium** | C-2 | Spoofing, DoS | Partially mitigated |
-| T-13 | **No API Gateway throttling or WAF configured** | **Medium** | C-2 | Denial of Service | Open |
+| T-13 | **No API Gateway throttling or WAF configured** | **Medium** | C-2, C-1 | Denial of Service | Open |
 | T-14 | **Dispatch Router 900-second timeout** | **Low** | C-3 | Denial of Service | Accepted |
+| T-30 | **Public GitHub App webhook endpoint** | **Medium** | C-1 | Spoofing, DoS | Partially mitigated |
 
 **T-12 (Partially mitigated):** The `/asana/webhook` endpoint is public but every request's HMAC-SHA256 signature is verified against the stored webhook secret before any downstream work is done. Forged events are rejected at ingress. What remains open: volumetric DDoS and replay — see T-13.
 
-**T-13 (Open):** The SAM template sets no throttling, burst, or WAF configuration on the webhook API. A flood of malformed requests still triggers Lambda cold starts and signature-verification work. Fix path: add API Gateway usage-plan throttling and optionally attach AWS WAF for IP-based rate limiting.
+**T-13 (Open):** The SAM template sets no throttling, burst, or WAF configuration on the webhook API — this applies to **both** public webhook endpoints (Asana C-2 and the GitHub App C-1). A flood of malformed requests still triggers Lambda cold starts and signature-verification work. Fix path: add API Gateway usage-plan throttling and optionally attach AWS WAF for IP-based rate limiting.
+
+**T-30 (Partially mitigated):** The GitHub App webhook path replaces the retired `agent-dispatch.yml` (the old trigger relied on GitHub Actions + an OIDC deploy role in every repo — see the C-11/T-7 retirement). The `/github/webhook` endpoint is public, but `github_webhook.py` authenticates **every** delivery: it computes an HMAC-SHA256 over the exact raw body and compares it (constant-time, `hmac.compare_digest`) against `X-Hub-Signature-256` using the App's webhook secret. A missing/unset secret **fails closed** (503, refuse events); a bad signature returns 401 before any downstream work. The secret is an SSM SecureString fetched per invocation and held only in local scope, never a module global (mirrors T-8). This webhook signature check is the direct replacement for the OIDC trust boundary that used to gate the GitHub → AWS hop: instead of federating a CI role, the fleet verifies that each event genuinely came from its own GitHub App. Server-side issue/PR context enrichment uses a per-repo, least-privilege GitHub App installation token (not a broad Actions token). What remains open (shared with T-13): volumetric DDoS and replay have no throttling/WAF yet.
 
 **T-14 (Accepted):** The Dispatch Router Lambda timeout is 900 seconds to accommodate the synchronous `InvokeAgentRuntime` call for long agent runs. A hung agent ties up the Lambda execution environment; combined with concurrency limits, this could delay legitimate dispatches. Acceptable for the scale this architecture targets.
 
@@ -206,13 +216,16 @@ Exfiltration through legitimate tool paths (e.g., encoding data in a GitHub comm
 |----|--------|----------|-----------|--------|--------|
 | T-18 | **Compromised base image or dependency in agent container** | **Medium** | C-12 | Tampering | Partially mitigated |
 | T-19 | **ECR image tag mutability** | — | C-12 | — | Mitigated |
-| T-20 | **GitHub Actions workflow injection** | **Medium** | C-1 | Tampering | Partially mitigated |
+| T-20 | **GitHub Actions workflow injection** | — | C-1 | Tampering | **Superseded** (dispatch workflow retired) |
+| T-31 | **Capability-deployer privileged-IAM surface** | **Medium** | C-17 | Elevation of Privilege | Mitigated |
 
 **T-18 (Partially mitigated):** Every image the shared build pipeline pushes is scanned on push (the `sdlc-agents/*` repos are created with `scanOnPush=true`), and the weekly `capability-rebuilder` rebuild re-scans every active agent's image. Python dependencies are pinned to versions in `requirements.txt` but not hashed. Dependabot opens PRs for updates. Fix path: add `pip install --require-hashes` with a lockfile, and gate the runtime deploy on scan severity.
 
 **T-19 (Mitigated):** ECR repositories for fleet agents (`sdlc-agents/*`) are created with `--image-tag-mutability IMMUTABLE` by the shared build pipeline (`sdlc-agent-builder-${STAGE}` CodeBuild) the first time an agent is built. Images are tagged with a fresh per-build tag only; no `:latest` tag is produced. An attacker with ECR push rights cannot silently overwrite a running image — every push requires a new tag, and the AgentCore runtime is updated explicitly by the `capability-deployer` Lambda against the specific built tag. Operators with pre-existing MUTABLE repos from earlier deploys are not automatically upgraded; delete and recreate for the hardened default.
 
-**T-20 (Partially mitigated):** `.github/workflows/agent-dispatch.yml` passes `${{ github.event.comment.body }}` via the `env:` context, not direct shell interpolation — the standard mitigation for command injection in GitHub Actions. This pattern is safe today; any future refactoring that moves the comment body into `run:` interpolation would reintroduce the vulnerability. The review checklist for workflow changes should flag this.
+**T-20 (Superseded):** This threat covered command injection via the untrusted comment body in the `agent-dispatch.yml` GitHub Actions workflow. **That workflow is retired** — the GitHub trigger path is now the `github_webhook.py` Lambda (C-1), which never shell-interpolates the comment body: the body is parsed in Python (a mention regex + a JSON dispatch payload) and the injection-scoring guardrail runs at the Router edge (T-2). There is no GitHub Actions dispatch surface left to inject into. The remaining GitHub-side risk is content-level prompt injection, covered by T-1/T-2.
+
+**T-31 (Mitigated):** The onboarding pipeline deliberately isolates the one genuinely privileged capability — creating IAM roles and AgentCore runtimes — onto the **capability-deployer** Lambda (C-17), which is **invocable only by the CodeBuild build-completion EventBridge rule**, never by the internet-facing dashboard API. The admin API (reachable via the authenticated dashboard) holds only `codebuild:StartBuild`; it cannot create roles, pass roles, or create runtimes. The deployer's own grants are tightly bounded: `iam:CreateRole` is scoped to IAM path `arn:aws:iam::<acct>:role/sdlc-agents/capabilities/*` **and** conditioned on `iam:PermissionsBoundary` equal to the `CapabilityRuntimeBoundary` managed policy — so any role it creates is capped by the boundary (Mantle inference + bearer-token mint, guardrail apply + classic InvokeModel for Titan, DynamoDB, ECR pull, gateway invoke, logs) and can never exceed it. `iam:PassRole` is scoped to the same path and conditioned on `iam:PassedToService = bedrock-agentcore.amazonaws.com`. The deployer is granted no `iam:AttachRolePolicy`, so it cannot attach an arbitrary managed policy — runtime roles get their permissions only via inline `PutRolePolicy` within the boundary ceiling. **This is a NEW privileged surface** relative to the prior architecture (where deploy ran in CI); the controls above are why concentrating it here is safer than the retired CI deploy role: the surface is event-only (not reachable from the API), path-scoped, and boundary-capped. **Residual:** a defect in the deployer's own logic (e.g. building an over-broad inline policy) is bounded by the permissions boundary but not eliminated; the deployer's code is in-repo and reviewed like any Lambda. A compromise of the CodeBuild build (T-18) that produced a malicious image would still be deployed by the deployer — the boundary limits what that image's runtime role can reach, but image provenance is T-18's concern, not T-31's.
 
 ### 3.7 Denial of Service & Resource Exhaustion
 
@@ -233,7 +246,7 @@ The real threat is a **chain that doesn't stop** — a prompt-injected or mis-pr
 **Current controls:**
 - `authorization.users` allowlists per agent (T-4) — runaway only propagates between agents the operator has explicitly paired.
 - `max_concurrent` per agent in the registry, enforced by the Dispatch Router. Caps in-flight work but does not bound total volume over time.
-- Comment-pattern gating in `agent-dispatch.yml` — the workflow fires only on known `@agent` tokens, which bounds the surface but not the volume.
+- Mention gating in the webhook receivers (`github_webhook.py` / `asana_webhook.py`) — an event is only forwarded to the Router if it @mentions a known agent token, which bounds the surface but not the volume.
 
 **Recommended mitigation (circuit breaker in the Dispatch Router):** thread a `parent_assignment_id` through dispatch and track three signals in DynamoDB; trip on any of them and emit a CloudWatch alarm:
 
@@ -263,11 +276,13 @@ Automated scanners (checkov, semgrep, bandit) flag several patterns in this repo
 
 | Boundary | Components Inside | Components Outside | Controls |
 |----------|-------------------|--------------------|----------|
-| **AWS Account** | C-2 through C-8, C-11, C-12 | C-1 (GitHub Actions), C-9 (GitHub MCP), C-10 (Asana MCP) | IAM, OIDC federation |
-| **Dispatch Layer** | C-2, C-3 | C-4 (Agents) | IAM roles, Lambda invoke permissions, scoped `InvokeAgentRuntime` |
-| **Agent Runtime** | Individual agent container | Other agents, Dispatch layer | AgentCore runtime isolation, per-agent IAM roles |
-| **External APIs** | — | C-9, C-10 | OAuth/PAT authentication, HTTPS TLS |
-| **Build & CI** | C-12 (ECR), `sdlc-agent-builder` CodeBuild; C-1 (GitHub Actions dispatch) | Developer workstations | CodeBuild service role (in-account image build), OIDC (scoped `sub` claims) for the dispatch/`@claude` workflows, scan-on-push, immutable ECR tags |
+| **AWS Account** | C-1, C-2 through C-8, C-12 through C-17 | C-9/GitHub (external SCM), C-10 (Asana MCP), C-15 Mantle endpoint (AWS-managed) | IAM; webhook HMAC verification at ingress |
+| **Webhook edge** | C-1, C-2 (public API Gateway) | GitHub, Asana | HMAC-SHA256 signature verification (fail-closed), async invoke only on verified events |
+| **Dispatch Layer** | C-1, C-2, C-3 | C-4 (Agents) | IAM roles, Lambda invoke permissions, scoped `InvokeAgentRuntime`, edge guardrail |
+| **Agent Runtime** | Individual agent container | Other agents, Dispatch layer | AgentCore runtime isolation, per-agent boundary-capped IAM roles |
+| **Tool-call boundary** | C-14 (Gateway + Cedar engine + interceptor) | C-9, C-10 | Gateway-only (SigV4), Cedar default-deny/forbid-wins, co-repo interceptor, per-owner scoped App tokens |
+| **Dashboard control plane** | C-13 (AVP), dashboard query/admin Lambdas | Operators (browser) | Cognito login + AVP `IsAuthorized` (fail-closed); admin API holds only `codebuild:StartBuild` |
+| **Build & deploy** | C-12 (ECR), C-16 (CodeBuild), C-17 (capability-deployer) | Developer workstations | CodeBuild service role (in-account image build), scan-on-push, immutable ECR tags; privileged IAM isolated on the event-only deployer (path-scoped + permissions boundary) |
 
 ---
 
@@ -279,12 +294,14 @@ Risk is expressed as the residual exposure given current controls. Mitigated thr
 |----------|-------|---------|
 | **Critical (Partially mitigated)** | 1 | T-1 |
 | **High (Accepted)** | 1 | T-15 |
-| **High (Partially mitigated)** | 2 | T-2, T-3 |
+| **High (Partially mitigated)** | 3 | T-2, T-3, T-5 |
 | **High (Open)** | 1 | T-23 |
-| **Medium (Open or Partial)** | 8 | T-11, T-13, T-17, T-21 (open); T-12, T-18, T-20, T-22 (partial) |
+| **Medium (Open or Partial)** | 8 | T-11, T-13, T-17, T-21 (open); T-12, T-18, T-22, T-30 (partial) |
+| **Medium (Mitigated)** | 1 | T-31 |
 | **Low (Accepted with rationale)** | 5 | T-24, T-25, T-26, T-27, T-28 |
 | **Low** | 3 | T-10, T-14, T-16 |
-| **Mitigated (Not scored)** | 6 | T-4, T-6, T-7, T-8, T-9, T-19 |
+| **Mitigated (Not scored)** | 7 | T-4, T-6, T-8, T-9, T-19, T-29 |
+| **Superseded (retired path)** | 2 | T-7 (GitHub OIDC), T-20 (Actions workflow injection) |
 
 ---
 
@@ -303,7 +320,7 @@ Roadmap items ordered by leverage:
 
 ## 7. Assumptions & Scope
 
-- Covers the fleet as shipped: four agents (workitems, researcher, docwriter, adr), Dispatch Router, Asana webhook. Slack integration, AgentCore Memory, AgentCore Gateway, AgentCore Identity, and Feedback/UAT agents are out of scope — they are not yet implemented.
+- Covers the fleet as shipped: four agents (workitems, researcher, docwriter, adr), Dispatch Router, GitHub App + Asana webhooks, the AgentCore Gateway (gateway-only tool access), the AVP-authorized dashboard, and the UI-driven onboarding pipeline (CodeBuild + capability-deployer). Slack integration, AgentCore Memory, AgentCore Identity, and Feedback/UAT agents are out of scope — they are not yet implemented.
 - Single AWS account + single region deployment. Multi-account or cross-region introduces additional trust boundaries not analyzed here.
 - LLM model behavior (hallucinations, jailbreaks, adversarial-input sensitivity) is treated as a baseline risk of using foundation models. Mitigations focus on constraining what the agent can *do*, not on preventing the model from generating bad outputs.
 - GitHub MCP and Asana MCP servers are treated as trusted third-party services. Their internal security posture is out of scope.
@@ -315,6 +332,7 @@ Roadmap items ordered by leverage:
 
 | Date | Version | Changes |
 |------|---------|---------|
+| 2026-07-20 | 1.8 | Ship-accurate refresh for the current architecture. **Component inventory:** C-1 is now the GitHub App webhook Lambda (was `agent-dispatch.yml`); C-11 (GitHub OIDC provider) **retired**; C-4 model → Claude Sonnet 5 via Mantle; C-9 → SCM broker gateway target; new C-13 (AVP dashboard-API policy store), C-14 (AgentCore Gateway + Cedar engine + interceptor), C-15 (Bedrock Mantle + per-repo projects), C-16 (shared CodeBuild), C-17 (capability-deployer + `CapabilityRuntimeBoundary`). **Data flows** rewritten for the webhook trigger path, gateway-only tool calls, and Mantle model calls (bearer token + guardrail headers + `OpenAI-Project`); added DF-14/15/16 for the dashboard + onboarding pipeline. **Threats:** T-5 → Partially mitigated (Gateway Cedar engine enforces); T-7 and T-20 → **Superseded** (OIDC/CI dispatch retired); new T-29 (AVP fail-closed API authz), T-30 (GitHub App webhook HMAC — replaces the OIDC trust boundary), T-31 (capability-deployer privileged-IAM isolation: event-only, path-scoped, boundary-capped). Runtime guardrail narrative updated for Mantle-header attachment + fail-closed `build_model`. |
 | 2026-05-05 | 1.7 | Checkov / semgrep scan pass (Kai Xu review). Hardened CFN: DynamoDB PITR, S3 versioning + access logs, API Gateway X-Ray + access logs, Lambda reserved concurrency + SQS DLQ; Dockerfiles switched to non-root `agent` user; all workflows given top-level `permissions: contents: read`. New §3.8 documents T-24..T-28 — accepted scanner findings (CKV_AWS_119, CKV_DOCKER_2, CKV_AWS_173, CKV_AWS_120, CKV_AWS_117) with rationale and upgrade paths. |
 | 2026-05-05 | 1.6 | Security review fixes: T-4 Asana sender is now the user `.gid` (was the self-editable display name — a HIGH-severity auth bypass); Router rejects unresolved sender sentinels ("", "unknown") as defense-in-depth. §3.1 narrative now states the shipping guardrail posture (`InputStrength: MEDIUM`, `OutputStrength: NONE`) — prior text implied HIGH/HIGH. |
 | 2026-05-05 | 1.5 | T-1/T-2/T-3 flipped from Accepted to Partially mitigated — Bedrock Guardrails (`PROMPT_ATTACK`) enforced at the Dispatch Router edge and on every agent's `InvokeModel` call. Section 6 roadmap re-ordered: Cedar enforcement now #1. |
