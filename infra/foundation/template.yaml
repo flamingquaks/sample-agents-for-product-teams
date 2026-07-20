@@ -18,14 +18,27 @@ Parameters:
     Type: String
     Description: Asana custom field GID for the "Agent" dropdown
 
+  DeployMantleProject:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Opt-in flag to provision the fleet's shared Bedrock Mantle project as a
+      CloudFormation resource (AWS::BedrockMantle::Project) and inject its id as
+      MANTLE_PROJECT_ID on every agent runtime. Default "false" because the
+      resource type must be activated in the account+region first; when off,
+      MantleProjectId (below) supplies a pre-existing project id instead.
+
   MantleProjectId:
     Type: String
     Default: ""
     Description: >
-      The fleet's shared Bedrock Mantle project id for model cost/usage
-      attribution, injected as MANTLE_PROJECT_ID on every agent runtime. One
-      project fleet-wide (a dispatch may span repos, so per-repo attribution is
-      meaningless). Blank leaves agents on the account's default project.
+      A pre-existing Bedrock Mantle project id for model cost/usage attribution,
+      used when DeployMantleProject is "false". Injected as MANTLE_PROJECT_ID on
+      every agent runtime. One project fleet-wide (a dispatch may span repos, so
+      per-repo attribution is meaningless). Blank leaves agents on the account's
+      default project. Ignored when DeployMantleProject is "true" (the created
+      project's id wins).
 
   DeployDashboard:
     Type: String
@@ -76,9 +89,17 @@ Parameters:
 Conditions:
   DashboardEnabled: !Equals [!Ref DeployDashboard, "true"]
   GatewayEnabled: !Equals [!Ref DeployGateway, "true"]
-  # Inject MANTLE_PROJECT_ID onto agent runtimes only when a shared project id is
-  # configured; blank leaves agents on the account's default Mantle project.
-  HasMantleProject: !Not [!Equals [!Ref MantleProjectId, ""]]
+  # Provision the shared Mantle project as a CFN resource (opt-in — the resource
+  # type must be activated in the account+region first).
+  MantleProjectEnabled: !Equals [!Ref DeployMantleProject, "true"]
+  # A manually-supplied project id is present (used when not provisioning here).
+  HasMantleProjectId: !Not [!Equals [!Ref MantleProjectId, ""]]
+  # Inject MANTLE_PROJECT_ID onto agent runtimes when EITHER we created the
+  # project here OR an operator supplied a pre-existing id; otherwise leave
+  # agents on the account's default Mantle project.
+  HasMantleProject: !Or
+    - !Condition MantleProjectEnabled
+    - !Condition HasMantleProjectId
   # GatewayPolicyEnforcement is expressed in per-policy terms (LOG_ONLY|ACTIVE);
   # the gateway→engine attachment Mode instead uses LOG_ONLY|ENFORCE. This maps
   # the ACTIVE choice to the attachment's ENFORCE value (see FleetGateway).
@@ -579,6 +600,21 @@ Resources:
           - Type: PROMPT_ATTACK
             InputStrength: MEDIUM
             OutputStrength: NONE
+
+  # The fleet's single shared Bedrock Mantle project for model cost/usage
+  # attribution (opt-in via DeployMantleProject — the resource type must be
+  # activated in the account+region first). One project fleet-wide: a dispatch
+  # may act across several repos (co-repo modes), so per-repo attribution is
+  # meaningless. Its Id is injected as MANTLE_PROJECT_ID on every agent runtime
+  # (see CapabilityDeployerFunction) and sent as the OpenAI-Project header.
+  FleetMantleProject:
+    Type: AWS::BedrockMantle::Project
+    Condition: MantleProjectEnabled
+    Properties:
+      Name: !Sub sdlc-agents-fleet-${Stage}
+      Tags:
+        - Key: sdlc-fleet
+          Value: !Ref Stage
 
   # ---------------------------------------------------------------------------
   # CloudWatch — Observability
@@ -1364,8 +1400,13 @@ Resources:
           BEDROCK_GUARDRAIL_VERSION: DRAFT
           GATEWAY_MCP_URL: !If [GatewayEnabled, !GetAtt FleetGateway.GatewayUrl, !Ref "AWS::NoValue"]
           # The fleet's shared Mantle cost-attribution project, propagated onto
-          # every agent runtime as MANTLE_PROJECT_ID (blank → account default).
-          MANTLE_PROJECT_ID: !If [HasMantleProject, !Ref MantleProjectId, !Ref "AWS::NoValue"]
+          # every agent runtime as MANTLE_PROJECT_ID (absent → account default).
+          # The CFN-created project's id wins when provisioned here; otherwise a
+          # pre-existing MantleProjectId param is used.
+          MANTLE_PROJECT_ID: !If
+            - MantleProjectEnabled
+            - !GetAtt FleetMantleProject.Id
+            - !If [HasMantleProjectId, !Ref MantleProjectId, !Ref "AWS::NoValue"]
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref FleetConfigTable
@@ -2125,6 +2166,13 @@ Outputs:
     Description: Guardrail version referenced by Router and agents. Bump explicitly to pin a published version.
     Export:
       Name: !Sub ${AWS::StackName}-GuardrailVersion
+
+  MantleProjectId:
+    Condition: MantleProjectEnabled
+    Value: !GetAtt FleetMantleProject.Id
+    Description: The fleet's shared Bedrock Mantle project id (injected as MANTLE_PROJECT_ID on agent runtimes)
+    Export:
+      Name: !Sub ${AWS::StackName}-MantleProjectId
 
   # --- Dashboard (only present when DeployDashboard=true) --------------------
 
