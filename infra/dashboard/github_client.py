@@ -216,10 +216,16 @@ def _app_jwt() -> str:
 # --- manifest flow -----------------------------------------------------------
 
 
-def generate_manifest(app_name: str, api_base_url: str, frontend_url: str) -> dict:
+def generate_manifest(
+    app_name: str, api_base_url: str, frontend_url: str, webhook_url: str
+) -> dict:
     """The GitHub App manifest the admin UI POSTs to github.com. Least-privilege
-    permissions; webhook disabled (the fleet dispatches via @mention, not the
-    App webhook — spec §8)."""
+    permissions; the webhook is ENABLED and points at the fleet's dispatch-side
+    webhook receiver (``webhook_url``), which turns @mention comment events into
+    dispatches — the server-side replacement for the retired per-repo
+    agent-dispatch.yml workflow. GitHub returns a generated webhook secret from
+    the manifest conversion, which exchange_manifest_code persists for the
+    receiver to verify delivery signatures."""
     # redirect_url must be a fragment-free URL — GitHub rejects a "#..." hash
     # ("redirect_url must be a valid URL"). The SPA is hash-routed, but CloudFront
     # serves any path as index.html (403/404 → /), so we use a real PATH
@@ -229,7 +235,7 @@ def generate_manifest(app_name: str, api_base_url: str, frontend_url: str) -> di
     return {
         "name": app_name,
         "url": frontend_url,
-        "hook_attributes": {"url": f"{api_base_url}/webhooks/github", "active": False},
+        "hook_attributes": {"url": webhook_url, "active": True},
         "redirect_url": f"{base}/github-app-callback",
         "public": False,
         "default_permissions": APP_PERMISSIONS,
@@ -270,6 +276,20 @@ def exchange_manifest_code(code: str) -> dict:
         SecretId=os.environ["GITHUB_APP_PRIVATE_KEY_SECRET_ARN"], SecretString=pem
     )
     ssm = _ssm_client()
+    # The App's webhook secret — used by the github_webhook receiver Lambda to
+    # verify each delivery's HMAC signature. Written BEFORE the app-id commit
+    # marker (same crash-consistency rule as the key/slug): if this write fails,
+    # app-id is never written and the whole registration retries cleanly. Stored
+    # SecureString; the receiver reads it per-invocation. Only present when the
+    # manifest enabled the webhook (it does — see generate_manifest).
+    webhook_secret = data.get("webhook_secret", "")
+    if os.environ.get("GITHUB_WEBHOOK_SECRET_PARAM") and webhook_secret:
+        ssm.put_parameter(
+            Name=os.environ["GITHUB_WEBHOOK_SECRET_PARAM"],
+            Value=webhook_secret,
+            Type="SecureString",
+            Overwrite=True,
+        )
     if os.environ.get("GITHUB_APP_SLUG_PARAM") and slug:
         ssm.put_parameter(
             Name=os.environ["GITHUB_APP_SLUG_PARAM"],

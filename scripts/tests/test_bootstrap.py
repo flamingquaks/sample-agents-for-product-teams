@@ -1,10 +1,11 @@
 """Unit tests for the pure logic in scripts/bootstrap.py.
 
-The AWS/sam/gh orchestration is exercised by a real bootstrap (needs those CLIs
-+ credentials); these tests cover the decision logic that must be correct
-regardless: tool detection + install guidance, profile parsing, the OIDC
-deploy-role trust policy, per-agent IAM policy generation, config round-trip,
-and the Runner's dry-run contract.
+The AWS/sam orchestration is exercised by a real bootstrap (needs those CLIs +
+credentials); these tests cover the decision logic that must be correct
+regardless: tool detection + install guidance, profile parsing, config
+round-trip, and the Runner's dry-run contract. (The OIDC deploy-role + per-agent
+IAM role creation were removed when the fleet moved to UI-driven onboarding —
+the dashboard's capability-deployer owns runtime roles now.)
 """
 
 import json
@@ -24,37 +25,36 @@ def test_detect_tools_reports_each(monkeypatch):
         bootstrap.shutil, "which", lambda t: None if t == "sam" else "/usr/bin/" + t
     )
     present = bootstrap.detect_tools()
-    assert present == {"aws": True, "sam": False, "gh": True}
+    assert present == {"aws": True, "sam": False}
 
 
-def test_required_tools_are_aws_sam_gh_not_docker():
-    # Bootstrap doesn't build images — docker is CI's concern, not this script's.
-    assert bootstrap.REQUIRED_TOOLS == ("aws", "sam", "gh")
+def test_required_tools_are_aws_sam_not_gh_or_docker():
+    # Thin base deploy: needs aws + sam. gh was dropped (no CI secrets to set),
+    # docker was never needed (the dashboard's CodeBuild builds agent images).
+    assert bootstrap.REQUIRED_TOOLS == ("aws", "sam")
+    assert "gh" not in bootstrap.REQUIRED_TOOLS
     assert "docker" not in bootstrap.REQUIRED_TOOLS
 
 
 def test_install_hint_is_os_specific(monkeypatch):
     monkeypatch.setattr(bootstrap.platform, "system", lambda: "Darwin")
     assert "brew install aws-sam-cli" in bootstrap.install_hint("sam")
-    assert "brew install gh" in bootstrap.install_hint("gh")
     for tool in bootstrap.REQUIRED_TOOLS:
         assert "docs:" in bootstrap.install_hint(tool)
 
 
-def test_preflight_fails_when_gh_unauthenticated(monkeypatch):
+def test_preflight_passes_when_all_present(monkeypatch):
     monkeypatch.setattr(
         bootstrap, "detect_tools", lambda: dict.fromkeys(bootstrap.REQUIRED_TOOLS, True)
     )
-    monkeypatch.setattr(bootstrap, "gh_authenticated", lambda: False)
-    assert bootstrap.preflight_tools() is False
-
-
-def test_preflight_passes_when_all_present_and_gh_authed(monkeypatch):
-    monkeypatch.setattr(
-        bootstrap, "detect_tools", lambda: dict.fromkeys(bootstrap.REQUIRED_TOOLS, True)
-    )
-    monkeypatch.setattr(bootstrap, "gh_authenticated", lambda: True)
     assert bootstrap.preflight_tools() is True
+
+
+def test_preflight_fails_when_a_tool_missing(monkeypatch):
+    present = dict.fromkeys(bootstrap.REQUIRED_TOOLS, True)
+    present["sam"] = False
+    monkeypatch.setattr(bootstrap, "detect_tools", lambda: present)
+    assert bootstrap.preflight_tools() is False
 
 
 # --- profile parsing ---------------------------------------------------------
@@ -69,64 +69,6 @@ def test_list_profiles_parses_config_and_credentials(monkeypatch, tmp_path):
     profiles = bootstrap.list_profiles()
     assert {"default", "prod", "sandbox"} <= set(profiles)
     assert profiles.count("default") == 1
-
-
-# --- OIDC deploy-role trust --------------------------------------------------
-
-
-def test_deploy_role_trust_is_repo_scoped_string_equals():
-    trust = bootstrap.deploy_role_trust("123456789012", "acme", "web")
-    cond = trust["Statement"][0]["Condition"]
-    # Must be StringEquals (not a StringLike wildcard) restricted to main + PRs.
-    assert "StringLike" not in cond
-    subs = cond["StringEquals"]["token.actions.githubusercontent.com:sub"]
-    assert subs == [
-        "repo:acme/web:ref:refs/heads/main",
-        "repo:acme/web:pull_request",
-    ]
-    assert (
-        cond["StringEquals"]["token.actions.githubusercontent.com:aud"]
-        == "sts.amazonaws.com"
-    )
-    principal = trust["Statement"][0]["Principal"]["Federated"]
-    assert principal.endswith(":oidc-provider/token.actions.githubusercontent.com")
-    assert "123456789012" in principal
-
-
-# --- per-agent IAM -----------------------------------------------------------
-
-
-def test_agent_role_policies_baseline_and_ssm():
-    pols = bootstrap.agent_role_policies(
-        "workitems", "us-west-2", "123456789012", "dev"
-    )
-    assert {"cloudwatch-logs", "dynamodb-assignments", "ecr-pull", "ssm-read"} <= set(
-        pols
-    )
-    assert "table/dispatch-assignments-dev" in json.dumps(pols["dynamodb-assignments"])
-    ssm = json.dumps(pols["ssm-read"])
-    # ssm-read covers only Asana credentials; no GitHub PAT (retired).
-    assert "asana-mcp-*" in ssm and "asana-pat" in ssm and "github-mcp" not in ssm
-    # Gateway-only: agents do NOT hold GitHub App credentials (the broker mints
-    # server-side). No github-app policy on any agent role.
-    assert "github-app" not in pols
-    # They CAN invoke the gateway (SigV4) — that's how they reach GitHub tools.
-    assert "agentcore-gateway-invoke" in pols
-    assert "bedrock-agentcore:InvokeGateway" in json.dumps(pols["agentcore-gateway-invoke"])
-
-
-def test_adr_role_has_no_github_creds_or_asana():
-    pols = bootstrap.agent_role_policies("adr", "us-west-2", "123456789012", "dev")
-    # adr touches GitHub only, but gateway-only means no App creds and (having no
-    # Asana) no ssm-read at all — it reaches GitHub purely via the gateway.
-    assert "ssm-read" not in pols
-    assert "github-app" not in pols
-    assert "agentcore-gateway-invoke" in pols
-
-
-def test_agent_role_policies_stage_scopes_table():
-    pols = bootstrap.agent_role_policies("adr", "us-west-2", "123456789012", "prod")
-    assert "table/dispatch-assignments-prod" in json.dumps(pols["dynamodb-assignments"])
 
 
 # --- config persistence ------------------------------------------------------
@@ -168,38 +110,6 @@ def test_runner_aws_base_includes_profile_and_region():
             dry_run=True, profile=None, region="us-west-2"
         )._aws_base()
     )
-
-
-# --- scoped deploy-role policy (#3) ------------------------------------------
-
-
-def test_deploy_role_policy_is_scoped_not_admin():
-    import json as _json
-
-    pol = bootstrap.deploy_role_policy("us-west-2", "123456789012")
-    blob = _json.dumps(pol)
-    # No AdministratorAccess / blanket allow-all.
-    assert "AdministratorAccess" not in blob
-    assert not any(s.get("Action") == "*" for s in pol["Statement"])
-    sids = {s.get("Sid") for s in pol["Statement"]}
-    assert {"EcrPushPull", "AgentCoreRuntime", "PassAgentCoreRoles"} <= sids
-    # The @mention dispatch path (agent-dispatch.yml) invokes the router Lambda —
-    # the scoped role must grant it (regression: it was missing, so every
-    # dispatch would have 403'd under the scoped role).
-    invoke = next(s for s in pol["Statement"] if s["Sid"] == "InvokeDispatchRouter")
-    assert invoke["Action"] == "lambda:InvokeFunction"
-    assert ":function:dispatch-router-*" in invoke["Resource"]
-    # PassRole is limited to the per-agent runtime roles + the gateway service
-    # role (both passed to bedrock-agentcore), never a wildcard.
-    passrole = next(s for s in pol["Statement"] if s["Sid"] == "PassAgentCoreRoles")
-    assert any(r.endswith(":role/*-agentcore-runtime") for r in passrole["Resource"])
-    assert any(r.endswith(":role/sdlc-fleet-gateway-*") for r in passrole["Resource"])
-    assert (
-        passrole["Condition"]["StringEquals"]["iam:PassedToService"]
-        == "bedrock-agentcore.amazonaws.com"
-    )
-    # No cloudformation *write* — the foundation sam deploy runs locally, not in CI.
-    assert "cloudformation:CreateStack" not in blob and "cloudformation:*" not in blob
 
 
 # --- failure tracking (#1) ---------------------------------------------------

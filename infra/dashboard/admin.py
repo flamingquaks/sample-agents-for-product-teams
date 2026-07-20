@@ -566,16 +566,21 @@ def _route(event: dict) -> dict:
             "GITHUB_APP_NAME", "SDLC Agent Fleet"
         )
         # Derive the API base from the request itself (avoids a CFN cycle between
-        # the admin function and its own API). The App webhook is disabled, so
-        # this only fills the manifest's (inactive) hook URL.
+        # the admin function and its own API).
         rc = event.get("requestContext") or {}
         domain = rc.get("domainName", "")
         stage = rc.get("stage", "")
         api_base = f"https://{domain}/{stage}" if domain else ""
         frontend = os.environ.get("DASHBOARD_URL", "")
-        if not api_base or not frontend:
-            return error(500, "could not resolve API/dashboard URL for the manifest")
-        manifest = github_client.generate_manifest(app_name, api_base, frontend)
+        # The App's webhook must deliver to the dispatch-side webhook API, NOT the
+        # admin/dashboard API. That endpoint is a different API Gateway, so it's
+        # supplied via env (WEBHOOK_API_BASE) rather than derived from this request.
+        webhook_base = os.environ.get("WEBHOOK_API_BASE", "")
+        if not api_base or not frontend or not webhook_base:
+            return error(500, "could not resolve API/dashboard/webhook URL for the manifest")
+        manifest = github_client.generate_manifest(
+            app_name, api_base, frontend, f"{webhook_base}/github/webhook"
+        )
         # The SPA POSTs this to the org form when an org is given, else the user
         # form. Hand back both the manifest and the target so the SPA doesn't
         # hardcode GitHub URLs.

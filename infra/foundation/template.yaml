@@ -451,6 +451,58 @@ Resources:
             Method: POST
             RestApiId: !Ref WebhookApi
 
+  # GitHub App webhook receiver — the server-side replacement for the deleted
+  # agent-dispatch.yml GitHub Actions workflow. The App delivers issue/PR comment
+  # events here; the receiver verifies the HMAC signature and dispatches @mentions.
+  GitHubWebhookFunction:
+    Type: AWS::Serverless::Function
+    # cryptography (github_app signs App JWTs to mint installation tokens for
+    # context enrichment) is a native wheel — build for the Lambda target.
+    Metadata:
+      BuildMethod: python3.12
+    Properties:
+      FunctionName: !Sub github-webhook-${Stage}
+      CodeUri: ../dispatch/
+      Handler: github_webhook.handler
+      Timeout: 30
+      ReservedConcurrentExecutions: 10
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt LambdaDeadLetterQueue.Arn
+      Environment:
+        Variables:
+          DISPATCH_FUNCTION: !Ref DispatchRouterFunction
+          GITHUB_WEBHOOK_SECRET_PARAM: !Sub /sdlc-agents/${Stage}/github-webhook-secret
+          FLEET_CONFIG_TABLE: !Ref FleetConfigTable
+          GITHUB_APP_ID_PARAM: !Ref GitHubAppIdParam
+          GITHUB_APP_PRIVATE_KEY_SECRET_ARN: !Ref GitHubAppPrivateKey
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref DispatchRouterFunction
+        # Read the per-owner install records to mint context-enrichment tokens.
+        - DynamoDBReadPolicy:
+            TableName: !Ref FleetConfigTable
+        - Statement:
+            # Verify inbound HMAC signatures (webhook secret) + mint per-repo App
+            # installation tokens for issue-context enrichment (app id + private
+            # key). ssm:PutParameter is intentionally NOT granted — the secret is
+            # written once by the admin manifest flow (github_client), not here.
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/github-webhook-secret
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/github-app-id
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref GitHubAppPrivateKey
+      Events:
+        Webhook:
+          Type: Api
+          Properties:
+            Path: /github/webhook
+            Method: POST
+            RestApiId: !Ref WebhookApi
+
   WebhookApiAccessLogs:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -461,7 +513,7 @@ Resources:
     Type: AWS::Serverless::Api
     Properties:
       StageName: !Ref Stage
-      Description: Asana webhook endpoint for agent dispatch
+      Description: Asana + GitHub App webhook endpoints for agent dispatch
       TracingEnabled: true
       MethodSettings:
         - ResourcePath: "/*"
@@ -859,6 +911,12 @@ Resources:
           GITHUB_APP_ID_PARAM: !Ref GitHubAppIdParam
           GITHUB_APP_SLUG_PARAM: !Ref GitHubAppSlugParam
           GITHUB_APP_PRIVATE_KEY_SECRET_ARN: !Ref GitHubAppPrivateKey
+          # The manifest flow persists the App's webhook secret here for the
+          # github-webhook receiver to verify delivery signatures.
+          GITHUB_WEBHOOK_SECRET_PARAM: !Sub /sdlc-agents/${Stage}/github-webhook-secret
+          # The dispatch-side webhook API base — used to build the App manifest's
+          # hook URL (the App delivers events to <this>/github/webhook).
+          WEBHOOK_API_BASE: !Sub https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}
           DASHBOARD_URL: !Sub https://${DashboardDistribution.DomainName}/
           # The admin Lambda renders the Dispatch Router registry from the
           # capability rows and writes it here on every capability change — the
@@ -905,6 +963,7 @@ Resources:
               Resource:
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/github-app-id
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/github-app-slug
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/github-webhook-secret
         # Sync the fleet Cedar policy to the engine (gateway deploys only).
         - !If
           - GatewayEnabled
@@ -1929,6 +1988,10 @@ Outputs:
   WebhookEndpoint:
     Value: !Sub https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/asana/webhook
     Description: Asana webhook URL — register this in Asana webhook subscriptions
+
+  GitHubWebhookEndpoint:
+    Value: !Sub https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/github/webhook
+    Description: GitHub App webhook URL — the manifest flow sets this as the App's hook automatically
 
   WebhookApiId:
     Value: !Ref WebhookApi

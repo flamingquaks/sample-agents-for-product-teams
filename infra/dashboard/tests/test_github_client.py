@@ -26,6 +26,7 @@ def _reset(monkeypatch):
     github_client._token_cache.clear()
     monkeypatch.setenv("GITHUB_APP_ID_PARAM", "/x/app-id")
     monkeypatch.setenv("GITHUB_APP_SLUG_PARAM", "/x/app-slug")
+    monkeypatch.setenv("GITHUB_WEBHOOK_SECRET_PARAM", "/x/webhook-secret")
     monkeypatch.setenv("GITHUB_APP_PRIVATE_KEY_SECRET_ARN", "arn:secret")
     # Real RSA key so _app_jwt actually signs; app_id/slug via a fake SSM.
     from cryptography.hazmat.primitives import serialization
@@ -94,10 +95,16 @@ def test_app_jwt_is_three_segments_with_iss():
 
 def test_generate_manifest_shape():
     m = github_client.generate_manifest(
-        "App", "https://api.example/staging", "https://d.cf/"
+        "App",
+        "https://api.example/staging",
+        "https://d.cf/",
+        "https://wh.example/staging/github/webhook",
     )
     assert m["name"] == "App"
-    assert m["hook_attributes"]["active"] is False  # webhook disabled
+    # Webhook ENABLED and pointed at the dispatch-side receiver — this is how
+    # @mention comments reach the fleet now (replacing agent-dispatch.yml).
+    assert m["hook_attributes"]["active"] is True
+    assert m["hook_attributes"]["url"] == "https://wh.example/staging/github/webhook"
     assert m["default_permissions"] == github_client.APP_PERMISSIONS
     assert "contents" in m["default_permissions"]
     # redirect_url must be fragment-free (GitHub rejects "#..."); a real path.
@@ -173,7 +180,10 @@ def test_exchange_manifest_code_persists(monkeypatch):
     monkeypatch.setattr(
         github_client,
         "_request",
-        lambda *a, **k: (201, {"id": 777, "slug": "sdlc-fleet", "pem": "PEMDATA"}),
+        lambda *a, **k: (
+            201,
+            {"id": 777, "slug": "sdlc-fleet", "pem": "PEMDATA", "webhook_secret": "WH_SECRET"},
+        ),
     )
     put_secret = {}
     put_params = {}
@@ -193,6 +203,8 @@ def test_exchange_manifest_code_persists(monkeypatch):
     assert put_secret["SecretString"] == "PEMDATA"
     assert put_params["/x/app-id"] == "777"
     assert put_params["/x/app-slug"] == "sdlc-fleet"
+    # The App's webhook secret is persisted for the github-webhook receiver.
+    assert put_params["/x/webhook-secret"] == "WH_SECRET"
 
 
 def test_exchange_manifest_code_never_leaks_code(monkeypatch):
