@@ -53,16 +53,55 @@ def ensure_project(repo: str) -> str | None:
     stage = os.environ.get("STAGE", "dev")
     name = project_name_for(repo, stage)
     tags = {"sdlc-fleet": stage, "repo": repo.strip().casefold()}
+    client = _mantle()
     try:
-        client = _mantle()
         # Idempotency: CreateProject with the same name should return/point at the
-        # existing project. If the API instead errors on a duplicate, we fall back
-        # to listing by name.
+        # existing project.
         resp = client.create_project(name=name, tags=tags)
-        return resp.get("id") or resp.get("projectId") or resp.get("arn")
+        return _project_id(resp)
     except Exception:  # noqa: BLE001
+        # If the API instead errors on a duplicate name (e.g. a re-onboard of a
+        # repo whose project already exists — project_name_for is deterministic),
+        # fall back to finding the existing project by name rather than dropping
+        # the repo's cost attribution to the default project.
+        existing = _find_project_by_name(client, name)
+        if existing:
+            logger.info("Mantle project %s already exists — reusing it", name)
+            return existing
         logger.exception(
             "Mantle project ensure failed for %s (repo will use the default "
             "project until re-onboard)", repo
         )
         return None
+
+
+def _project_id(record: dict) -> str | None:
+    """Pull the project id out of a Mantle project record, tolerating the field
+    name the API uses (id / projectId / arn)."""
+    if not isinstance(record, dict):
+        return None
+    return record.get("id") or record.get("projectId") or record.get("arn")
+
+
+def _find_project_by_name(client, name: str) -> str | None:
+    """Look up an existing Mantle project id by exact name. Best-effort: any
+    listing error just yields None (caller falls back to the default project)."""
+    try:
+        # Prefer the paginator when the client exposes one; fall back to a single
+        # list_projects call otherwise.
+        pages = []
+        if hasattr(client, "get_paginator"):
+            try:
+                for page in client.get_paginator("list_projects").paginate():
+                    pages.append(page)
+            except Exception:  # noqa: BLE001 — operation may not be paginatable
+                pages = [client.list_projects()]
+        else:
+            pages = [client.list_projects()]
+        for page in pages:
+            for proj in page.get("projects", []) or []:
+                if proj.get("name") == name:
+                    return _project_id(proj)
+    except Exception:  # noqa: BLE001
+        logger.exception("Mantle list_projects lookup failed for %s", name)
+    return None

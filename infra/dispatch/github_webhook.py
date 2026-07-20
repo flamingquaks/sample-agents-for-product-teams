@@ -22,12 +22,14 @@ Handled events: ``issue_comment`` (created) and ``pull_request_review_comment``
 (created). A comment must @mention a known agent; otherwise it's a no-op 200.
 """
 
+import base64
 import hashlib
 import hmac
 import json
 import logging
 import os
 import re
+import time
 
 import boto3
 
@@ -41,31 +43,45 @@ DISPATCH_FUNCTION = os.environ.get("DISPATCH_FUNCTION", "dispatch-router")
 GITHUB_WEBHOOK_SECRET_PARAM = os.environ.get(
     "GITHUB_WEBHOOK_SECRET_PARAM", "/sdlc-agents/github-webhook-secret"
 )
+# The Dispatch Router registry (rendered from the active capability rows and
+# written to SSM by the dashboard on every capability change). This receiver
+# resolves @mentions against it so a UI-onboarded agent becomes reachable from
+# GitHub with NO code change here — the same registry the router resolves
+# against. Cached with a short TTL so an onboard/disable propagates within the
+# window across warm invocations.
+REGISTRY_PARAM = os.environ.get("REGISTRY_PARAM", "/dispatch/agents")
 
 _ssm = boto3.client("ssm")
 _lambda = boto3.client("lambda")
 
-# @agent mention → canonical agent id. The router does the authoritative
-# resolution against the live registry; this only decides WHICH agent a comment
-# is addressed to (and short-circuits comments that mention no agent). Aliases
-# mirror asana_webhook.ALIAS_MAP so both sources resolve the same names.
-MENTION_PATTERN = re.compile(
-    r"@(workitems|uat|researcher|docwriter|feedback|merge|triage|adr|pm|status|plan|qa|test|ba|research|analyze|docs|doc|writer)\b",
-    re.IGNORECASE,
-)
-ALIAS_MAP = {
-    "pm": "workitems",
-    "status": "workitems",
-    "plan": "workitems",
-    "qa": "uat",
-    "test": "uat",
-    "ba": "researcher",
-    "research": "researcher",
-    "analyze": "researcher",
-    "docs": "docwriter",
-    "doc": "docwriter",
-    "writer": "docwriter",
-}
+# Any ``@word`` mention. The registry — not a hardcoded roster — decides which
+# words are real agents/aliases; this pattern just enumerates the candidates.
+# (Mirrors router.MENTION_PATTERN; the router does the authoritative resolution.)
+MENTION_PATTERN = re.compile(r"@(\w+)", re.IGNORECASE)
+
+_registry_cache = None
+_registry_expires_at = 0.0
+_REGISTRY_TTL_SECONDS = 30
+
+
+def _load_registry() -> dict:
+    """Load the agent registry from SSM, cached for a short TTL. On a read error
+    returns the last-known-good cache (or an empty registry), so a transient SSM
+    hiccup degrades to 'mention not resolved' rather than an exception."""
+    global _registry_cache, _registry_expires_at
+    now = time.time()
+    if _registry_cache is not None and now < _registry_expires_at:
+        return _registry_cache
+    try:
+        resp = _ssm.get_parameter(Name=REGISTRY_PARAM, WithDecryption=False)
+        # publish_registry writes compact JSON (a YAML subset); parse as JSON to
+        # avoid a PyYAML dependency in this receiver.
+        _registry_cache = json.loads(resp["Parameter"]["Value"]) or {}
+        _registry_expires_at = now + _REGISTRY_TTL_SECONDS
+    except Exception:  # noqa: BLE001
+        logger.exception("could not load agent registry from %s", REGISTRY_PARAM)
+        return _registry_cache if _registry_cache is not None else {}
+    return _registry_cache
 
 
 def _get_secret() -> str | None:
@@ -88,11 +104,22 @@ def _verify_signature(secret: str, raw_body: str, signature_header: str) -> bool
 
 
 def _resolve_agent(body: str) -> str | None:
-    match = MENTION_PATTERN.search(body or "")
-    if not match:
+    """Resolve the first @mention in ``body`` to a canonical agent id, checking
+    the live registry's agent ids AND their aliases. Returns None if no mention
+    maps to a known agent — a UI-onboarded agent (or a new alias) resolves here
+    the moment it lands in the registry, no code change required."""
+    registry = _load_registry()
+    agents = registry.get("agents", {})
+    if not agents:
         return None
-    name = match.group(1).lower()
-    return ALIAS_MAP.get(name, name)
+    for match in MENTION_PATTERN.finditer(body or ""):
+        name = match.group(1).lower()
+        if name in agents:
+            return name
+        for agent_id, config in agents.items():
+            if name in config.get("aliases", []):
+                return agent_id
+    return None
 
 
 def _dispatch(agent_id: str, instruction: str, sender: str, context: dict, trigger_type: str):
@@ -190,6 +217,15 @@ def handler(event, context=None):
     """API Gateway entry point for GitHub App webhook deliveries."""
     headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
     raw_body = event.get("body") or ""
+    # API Gateway base64-encodes the body when the route matches a binary media
+    # type. GitHub signs the EXACT decoded bytes, so decode BEFORE computing the
+    # HMAC or every affected delivery fails verification.
+    if event.get("isBase64Encoded"):
+        try:
+            raw_body = base64.b64decode(raw_body).decode("utf-8")
+        except Exception:  # noqa: BLE001
+            logger.warning("could not base64-decode webhook body")
+            return {"statusCode": 400, "body": "invalid body encoding"}
 
     # --- authenticate the delivery ---
     secret = _get_secret()

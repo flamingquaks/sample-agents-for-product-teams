@@ -41,6 +41,8 @@ def router(monkeypatch):
             del sys.modules["reply"]
         import router as router_mod  # noqa: E402
     router_mod._registry_cache = REGISTRY
+    # Prime the cache as fresh so load_registry() serves it without an SSM read.
+    router_mod._registry_expires_at = float("inf")
     # Avoid real DynamoDB calls:
     router_mod.assignments_table = MagicMock()
     router_mod.assignments_table.query.return_value = {"Count": 0}

@@ -66,25 +66,44 @@ GUARDRAIL_ERROR_MESSAGE_TEMPLATE = (
 
 # --- Agent Registry ----------------------------------------------------------
 # Loaded from SSM Parameter Store (rendered from the capability rows by the
-# dashboard admin API on every capability change).
-# Cached for the lifetime of the Lambda execution environment.
+# dashboard admin API / capability deployer on every capability change).
+#
+# Cached with a SHORT TTL, not for the whole execution-environment lifetime: the
+# registry is now runtime-mutable (an admin onboard/enable/disable republishes it
+# immediately), so a lifetime cache on a warm Lambda would keep resolving to a
+# just-disabled agent — or miss a just-onboarded one — until a cold start. The
+# TTL bounds that staleness to _REGISTRY_TTL_SECONDS fleet-wide (mirrors
+# fleet_config's short-TTL cache, which replaced this same lifetime-cache
+# pattern).
 
 _registry_cache = None
+_registry_expires_at = 0.0
+_REGISTRY_TTL_SECONDS = 30
 
 
 def load_registry():
-    """Load agent registry from SSM Parameter Store."""
-    global _registry_cache
-    if _registry_cache is not None:
+    """Load the agent registry from SSM Parameter Store, refreshing when the TTL
+    has expired. On a refresh error, keeps serving the last-known-good cache if we
+    have one (availability > freshness for an already-loaded registry)."""
+    global _registry_cache, _registry_expires_at
+    now = time.time()
+    if _registry_cache is not None and now < _registry_expires_at:
         return _registry_cache
 
-    param = ssm.get_parameter(
-        Name=os.environ.get("REGISTRY_PARAM", "/dispatch/agents"),
-        WithDecryption=False,
-    )
-    import yaml
+    try:
+        param = ssm.get_parameter(
+            Name=os.environ.get("REGISTRY_PARAM", "/dispatch/agents"),
+            WithDecryption=False,
+        )
+        import yaml
 
-    _registry_cache = yaml.safe_load(param["Parameter"]["Value"])
+        _registry_cache = yaml.safe_load(param["Parameter"]["Value"])
+        _registry_expires_at = now + _REGISTRY_TTL_SECONDS
+    except Exception:
+        if _registry_cache is not None:
+            logger.exception("registry refresh failed; serving stale cache")
+            return _registry_cache
+        raise
     return _registry_cache
 
 

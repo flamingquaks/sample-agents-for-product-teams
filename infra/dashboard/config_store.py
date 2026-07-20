@@ -541,13 +541,23 @@ def publish_registry() -> dict:
     parameter value. json.dumps output is valid YAML (YAML is a JSON superset), so
     we emit compact JSON via the stdlib and avoid a PyYAML dependency in the write
     path — the router still parses it with yaml.safe_load. DynamoDB Decimals from
-    limits are coerced to plain numbers so the value is JSON-serializable."""
+    limits are coerced to plain numbers so the value is JSON-serializable.
+
+    Capabilities are unbounded (UI-onboarded), so the rendered registry can grow
+    past the SSM Standard-tier 4KB value cap. We select the Advanced tier once the
+    value crosses that limit so a large fleet's registry still publishes instead
+    of raising ValidationException. (Standard is free; Advanced is used only when
+    needed.)"""
     registry = render_registry()
+    value = json.dumps(registry, default=_decimal_default)
+    # SSM Standard tier caps a parameter value at 4096 bytes; Advanced allows 8KB.
+    tier = "Standard" if len(value.encode("utf-8")) <= 4096 else "Advanced"
     ssm = boto3.client("ssm")
     ssm.put_parameter(
         Name=os.environ["REGISTRY_PARAM"],
-        Value=json.dumps(registry, default=_decimal_default),
+        Value=value,
         Type="String",
+        Tier=tier,
         Overwrite=True,
     )
     return registry

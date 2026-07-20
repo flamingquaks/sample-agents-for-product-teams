@@ -473,6 +473,7 @@ Resources:
         Variables:
           DISPATCH_FUNCTION: !Ref DispatchRouterFunction
           GITHUB_WEBHOOK_SECRET_PARAM: !Sub /sdlc-agents/${Stage}/github-webhook-secret
+          REGISTRY_PARAM: !Sub /sdlc-agents/${Stage}/registry
           FLEET_CONFIG_TABLE: !Ref FleetConfigTable
           GITHUB_APP_ID_PARAM: !Ref GitHubAppIdParam
           GITHUB_APP_PRIVATE_KEY_SECRET_ARN: !Ref GitHubAppPrivateKey
@@ -485,13 +486,15 @@ Resources:
         - Statement:
             # Verify inbound HMAC signatures (webhook secret) + mint per-repo App
             # installation tokens for issue-context enrichment (app id + private
-            # key). ssm:PutParameter is intentionally NOT granted — the secret is
-            # written once by the admin manifest flow (github_client), not here.
+            # key) + read the agent registry to resolve @mentions to onboarded
+            # agents. ssm:PutParameter is intentionally NOT granted — the secret
+            # is written once by the admin manifest flow (github_client), not here.
             - Effect: Allow
               Action: ssm:GetParameter
               Resource:
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/github-webhook-secret
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/github-app-id
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/registry
             - Effect: Allow
               Action: secretsmanager:GetSecretValue
               Resource: !Ref GitHubAppPrivateKey

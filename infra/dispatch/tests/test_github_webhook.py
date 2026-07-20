@@ -15,12 +15,26 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 os.environ.setdefault("GITHUB_WEBHOOK_SECRET_PARAM", "/sdlc-agents/test/github-webhook-secret")
+os.environ.setdefault("REGISTRY_PARAM", "/sdlc-agents/test/registry")
 os.environ.setdefault("DISPATCH_FUNCTION", "dispatch-router-test")
 
 SECRET = "s3cr3t-webhook-key"
 
+# The receiver now resolves @mentions against the live registry (rendered from
+# the capability rows), NOT a hardcoded roster — so an onboarded agent resolves
+# with no code change. Mirror the router registry shape (agents + aliases).
+REGISTRY = {
+    "agents": {
+        "workitems": {"aliases": ["pm", "status", "plan"]},
+        "uat": {"aliases": ["qa", "test"]},
+        "researcher": {"aliases": ["ba", "research", "analyze"]},
+        "docwriter": {"aliases": ["docs", "doc", "writer"]},
+        "adr": {"aliases": ["decisions", "architecture"]},
+    }
+}
 
-def _fresh(monkeypatch, secret=SECRET):
+
+def _fresh(monkeypatch, secret=SECRET, registry=REGISTRY):
     """Import github_webhook with its SSM + Lambda clients stubbed."""
     sys.modules.pop("github_webhook", None)
     import github_webhook as gw
@@ -37,6 +51,8 @@ def _fresh(monkeypatch, secret=SECRET):
         exceptions = _Exceptions()
 
         def get_parameter(self, Name, WithDecryption=False):
+            if Name == gw.REGISTRY_PARAM:
+                return {"Parameter": {"Value": json.dumps(registry)}}
             if secret is None:
                 raise _ParamNotFound()
             return {"Parameter": {"Value": secret}}
@@ -115,6 +131,42 @@ def test_alias_resolves_to_canonical_agent(monkeypatch):
     gw, dispatched = _fresh(monkeypatch)
     gw.handler(_event(_comment_body("@docs update the readme")))
     assert dispatched[0]["agent_id"] == "docwriter"  # docs -> docwriter
+
+
+def test_ui_onboarded_agent_resolves_without_code_change(monkeypatch):
+    # An agent id that is NOT in any hardcoded roster, present only in the
+    # registry, must still resolve — the whole point of UI-driven onboarding.
+    reg = {"agents": {"securityscan": {"aliases": ["sec"]}}}
+    gw, dispatched = _fresh(monkeypatch, registry=reg)
+    gw.handler(_event(_comment_body("@securityscan please review")))
+    assert dispatched and dispatched[0]["agent_id"] == "securityscan"
+    # And its registry-declared alias resolves to the canonical id too.
+    gw2, dispatched2 = _fresh(monkeypatch, registry=reg)
+    gw2.handler(_event(_comment_body("@sec please review")))
+    assert dispatched2 and dispatched2[0]["agent_id"] == "securityscan"
+
+
+def test_mention_not_in_registry_is_noop(monkeypatch):
+    # A retired/unknown agent name (absent from the registry) does not dispatch.
+    gw, dispatched = _fresh(monkeypatch, registry={"agents": {"workitems": {}}})
+    resp = gw.handler(_event(_comment_body("@ghostagent do something")))
+    assert resp["statusCode"] == 200
+    assert not dispatched
+
+
+def test_base64_encoded_body_verifies_and_dispatches(monkeypatch):
+    import base64
+
+    gw, dispatched = _fresh(monkeypatch)
+    body = _comment_body("@workitems break this down", repo="acme/web", number=7)
+    encoded = base64.b64encode(body.encode()).decode()
+    # GitHub signs the DECODED bytes; the event carries the base64 form + flag.
+    event = _event(body)  # signature computed over the raw (decoded) body
+    event["body"] = encoded
+    event["isBase64Encoded"] = True
+    resp = gw.handler(event)
+    assert resp["statusCode"] == 200
+    assert dispatched and dispatched[0]["agent_id"] == "workitems"
 
 
 def test_no_mention_is_noop_200(monkeypatch):

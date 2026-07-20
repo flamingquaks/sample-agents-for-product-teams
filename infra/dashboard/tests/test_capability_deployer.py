@@ -68,11 +68,14 @@ class _FakeAgentCore:
 
     def create_agent_runtime(self, **kw):
         self.created.append(kw)
-        return {"agentRuntimeId": "new-rt-id"}
+        return {"agentRuntimeId": "new-rt-id", "agentRuntimeArn": self._arn("new-rt-id")}
 
     def update_agent_runtime(self, **kw):
         self.updated.append(kw)
-        return {"agentRuntimeId": kw["agentRuntimeId"]}
+        return {
+            "agentRuntimeId": kw["agentRuntimeId"],
+            "agentRuntimeArn": self._arn(kw["agentRuntimeId"]),
+        }
 
     def get_agent_runtime(self, agentRuntimeId):
         seq = self._statuses.get(agentRuntimeId, ["READY"])
@@ -156,6 +159,49 @@ def test_successful_build_creates_runtime_and_activates(monkeypatch):
     # Marked active + registry republished.
     assert ("triage", cd.config_store.CAP_ACTIVE, "ready") in calls["status"]
     assert calls["published"] == 1
+    # The ARN written to the registry is the one the SERVICE returned, not a
+    # locally re-synthesized string.
+    assert calls["deploy"]
+    _agent, dkw = calls["deploy"][0]
+    assert dkw["runtime_arn"] == agentcore._arn("new-rt-id")
+
+
+def test_registry_publish_failure_keeps_capability_active(monkeypatch):
+    """A transient SSM publish error must NOT flip an already-active, READY
+    runtime back to failed — publish happens after the active commit."""
+    cd = _fresh()
+    agentcore = _FakeAgentCore(statuses={"new-rt-id": ["READY"]})
+    iam = _FakeIam()
+    calls = _install_fakes(cd, monkeypatch, agentcore, iam)
+    monkeypatch.setattr(cd.config_store, "get_capability", lambda a: {"agent_id": a, "env": {}})
+
+    def _boom():
+        raise RuntimeError("ssm throttled")
+    monkeypatch.setattr(cd.config_store, "publish_registry", _boom)
+
+    out = cd.handler(_build_event("triage", "build-1", "SUCCEEDED"))
+    assert out == {"ok": True, "agent_id": "triage"}
+    # Still active; never marked failed despite the publish error.
+    assert any(s[1] == cd.config_store.CAP_ACTIVE for s in calls["status"])
+    assert not any(s[1] == cd.config_store.CAP_FAILED for s in calls["status"])
+
+
+def test_missing_required_base_env_fails_fast_without_runtime(monkeypatch):
+    """A missing guardrail/gateway env is a deploy misconfiguration — fail the
+    capability before creating any role or runtime, with a clear reason."""
+    cd = _fresh()
+    agentcore = _FakeAgentCore()
+    iam = _FakeIam()
+    calls = _install_fakes(cd, monkeypatch, agentcore, iam)
+    monkeypatch.setattr(cd.config_store, "get_capability", lambda a: {"agent_id": a, "env": {}})
+    monkeypatch.delenv("GATEWAY_MCP_URL", raising=False)
+
+    cd.deploy_capability("triage", "build-1")
+    # No role or runtime mutation; marked failed with a misconfiguration reason.
+    assert not agentcore.created and not agentcore.updated and not iam.created
+    failed = [s for s in calls["status"] if s[1] == cd.config_store.CAP_FAILED]
+    assert failed and "GATEWAY_MCP_URL" in failed[0][2]
+    assert calls["published"] == 0
 
 
 def _fleet_arn(rt_id):

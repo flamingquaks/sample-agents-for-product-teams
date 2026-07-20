@@ -78,17 +78,31 @@ def _iam_client():
     return _iam
 
 
-def _base_env() -> dict[str, str]:
-    """Fleet-wide runtime env every agent needs — resolved from THIS function's
-    environment, which the stack populates from the same outputs the agents
-    require (guardrail id/version + gateway URL). Missing values are a deploy
-    misconfiguration; we still pass what we have and let the runtime surface it."""
+# Fleet-wide runtime env every agent REQUIRES to boot: the prompt-injection
+# guardrail (threat T-1/2/3) and the Cedar-enforced tool gateway (the agent
+# refuses to start without GATEWAY_MCP_URL). A capability created without any of
+# these would either boot with the guardrail silently detached or never reach
+# READY — so a missing value is a deploy misconfiguration we surface up front
+# rather than passing through. Note GATEWAY_MCP_URL is only wired when the stack
+# is deployed with the gateway enabled (DeployGateway=true).
+_REQUIRED_BASE_ENV = ("BEDROCK_GUARDRAIL_ID", "BEDROCK_GUARDRAIL_VERSION", "GATEWAY_MCP_URL")
+
+
+def _base_env() -> tuple[dict[str, str], list[str]]:
+    """The fleet-wide runtime env, resolved from THIS function's environment (the
+    stack populates it from the same outputs the agents require). Returns
+    ``(env, missing)`` where ``missing`` names any required key absent/blank so
+    the caller can fail fast with an actionable reason instead of a silent
+    misconfiguration that only surfaces as a runtime timeout."""
     env = {}
-    for key in ("BEDROCK_GUARDRAIL_ID", "BEDROCK_GUARDRAIL_VERSION", "GATEWAY_MCP_URL"):
+    missing = []
+    for key in _REQUIRED_BASE_ENV:
         val = os.environ.get(key)
         if val:
             env[key] = val
-    return env
+        else:
+            missing.append(key)
+    return env, missing
 
 
 def _runtime_role_arn(agent_id: str) -> str:
@@ -192,7 +206,14 @@ def _ensure_runtime_role(agent_id: str) -> str:
                 {
                     "Effect": "Allow",
                     "Action": "bedrock-agentcore:InvokeGateway",
-                    "Resource": f"arn:aws:bedrock-agentcore:{region}:{account}:gateway/sdlcFleet{stage}*",
+                    # Account+region wildcard, NOT a name-prefixed pattern: the
+                    # service lowercases the gateway name into the resource id
+                    # (sdlcFleet<stage> -> sdlcfleet<stage>-<suffix>) and IAM
+                    # matching is case-sensitive, so `gateway/sdlcFleet<stage>*`
+                    # would NEVER match the real id and every tool call would be
+                    # denied. Matches template.yaml FleetGatewayRole, which uses
+                    # `gateway/*` for the same reason.
+                    "Resource": f"arn:aws:bedrock-agentcore:{region}:{account}:gateway/*",
                 }
             ],
         },
@@ -273,11 +294,13 @@ def _env_csv(env: dict[str, str]) -> str:
     return ",".join(f"{k}={v}" for k, v in env.items())
 
 
-def _deploy_runtime(agent_id: str, image_uri: str, role_arn: str, env: dict) -> str:
+def _deploy_runtime(agent_id: str, image_uri: str, role_arn: str, env: dict) -> tuple[str, str]:
     """Create or update the agent's AgentCore runtime to ``image_uri``. Returns
-    the runtime id. An existing FLEET runtime is UPDATED (its env is replaced
-    wholesale, which is why we always pass the full merged env); a new one is
-    CREATED and tagged as fleet-managed.
+    ``(runtime_id, runtime_arn)`` — the ARN as reported by the service, which is
+    the authoritative value written into the registry (never re-synthesized). An
+    existing FLEET runtime is UPDATED (its env is replaced wholesale, which is why
+    we always pass the full merged env); a new one is CREATED and tagged as
+    fleet-managed.
 
     Raises DeployGuardError if a runtime with this name exists but is NOT
     fleet-tagged — refusing to hijack a foreign runtime that merely shares the
@@ -296,14 +319,16 @@ def _deploy_runtime(agent_id: str, image_uri: str, role_arn: str, env: dict) -> 
                 "refusing to overwrite it; choose a different agent_id"
             )
         logger.info("updating runtime %s (%s)", agent_id, existing_id)
-        acc.update_agent_runtime(
+        resp = acc.update_agent_runtime(
             agentRuntimeId=existing_id,
             agentRuntimeArtifact=artifact,
             roleArn=role_arn,
             networkConfiguration=network,
             environmentVariables=env_vars,
         )
-        return existing_id
+        # Prefer the ARN the service returns; fall back to the one we already
+        # resolved via _find_runtime if update's response omits it.
+        return existing_id, resp.get("agentRuntimeArn") or existing_arn
     logger.info("creating runtime %s", agent_id)
     resp = acc.create_agent_runtime(
         agentRuntimeName=agent_id,
@@ -313,7 +338,7 @@ def _deploy_runtime(agent_id: str, image_uri: str, role_arn: str, env: dict) -> 
         environmentVariables=env_vars,
         tags={_FLEET_TAG_KEY: _fleet_tag_value()},
     )
-    return resp["agentRuntimeId"]
+    return resp["agentRuntimeId"], resp.get("agentRuntimeArn", "")
 
 
 def _wait_ready(runtime_id: str) -> tuple[bool, str]:
@@ -331,12 +356,6 @@ def _wait_ready(runtime_id: str) -> tuple[bool, str]:
     return False, f"timeout(last={status})"
 
 
-def _runtime_arn(runtime_id: str) -> str:
-    account = os.environ["AWS_ACCOUNT_ID"]
-    region = os.environ.get("AWS_REGION", "us-east-1")
-    return f"arn:aws:bedrock-agentcore:{region}:{account}:runtime/{runtime_id}"
-
-
 def deploy_capability(agent_id: str, image_tag: str) -> None:
     """Bring a freshly built image live for ``agent_id``: ensure the role, deploy
     the runtime, wait READY, mark active + republish. Marks the capability
@@ -351,12 +370,26 @@ def deploy_capability(agent_id: str, image_tag: str) -> None:
     image_uri = f"{account}.dkr.ecr.{region}.amazonaws.com/sdlc-agents/{agent_id}:{image_tag}"
 
     try:
+        base_env, missing = _base_env()
+        if missing:
+            # Fail fast with a clear reason rather than creating a runtime that
+            # boots without the guardrail or never reaches READY without the
+            # gateway URL. Left BEFORE any role/runtime mutation.
+            detail = (
+                "deploy misconfiguration: required runtime env missing "
+                f"({', '.join(missing)}). Check the CapabilityDeployer function's "
+                "environment / stack outputs (GATEWAY_MCP_URL requires the gateway "
+                "to be enabled)."
+            )
+            config_store.set_capability_status(agent_id, config_store.CAP_FAILED, detail=detail[:900])
+            logger.error("%s for capability %s", detail, agent_id)
+            return
         role_arn = _ensure_runtime_role(agent_id)
         # A freshly created IAM role isn't always immediately assumable by the
         # service; a brief settle avoids a spurious create-runtime failure.
         time.sleep(8)
-        env = config_store.capability_env_pairs(cap, _base_env())
-        runtime_id = _deploy_runtime(agent_id, image_uri, role_arn, env)
+        env = config_store.capability_env_pairs(cap, base_env)
+        runtime_id, runtime_arn = _deploy_runtime(agent_id, image_uri, role_arn, env)
         ok, status = _wait_ready(runtime_id)
         if not ok:
             config_store.set_capability_status(
@@ -367,12 +400,10 @@ def deploy_capability(agent_id: str, image_tag: str) -> None:
         config_store.set_capability_deploy_state(
             agent_id,
             image_tag=image_tag,
-            runtime_arn=_runtime_arn(runtime_id),
+            runtime_arn=runtime_arn,
             build_id="",  # cleared; the row already recorded the build that ran
         )
         config_store.set_capability_status(agent_id, config_store.CAP_ACTIVE, detail="ready")
-        config_store.publish_registry()
-        logger.info("capability %s active (image %s)", agent_id, image_tag)
     except Exception as exc:  # noqa: BLE001
         # Never tear down a working runtime on failure — just record why.
         logger.exception("deploy failed for capability %s", agent_id)
@@ -382,6 +413,20 @@ def deploy_capability(agent_id: str, image_tag: str) -> None:
             )
         except Exception:  # noqa: BLE001
             logger.exception("could not mark %s failed", agent_id)
+        return
+
+    # Publish AFTER the capability is committed active — OUTSIDE the try above, so
+    # a transient SSM publish error can't flip a runtime that is genuinely up and
+    # active to ``failed``. The registry re-publishes on the next capability
+    # change, and the router refreshes its cached copy within its TTL meanwhile.
+    try:
+        config_store.publish_registry()
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "capability %s is active but registry publish failed; it will "
+            "re-publish on the next capability change", agent_id
+        )
+    logger.info("capability %s active (image %s)", agent_id, image_tag)
 
 
 def _agent_from_build_event(event: dict) -> tuple[str, str, str] | None:

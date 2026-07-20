@@ -286,8 +286,11 @@ def _start_capability_build(agent_id: str) -> str:
     reports "building"; it does not block on the multi-minute build.
 
     The image tag is time-based (the caller can't read git SHA here) so each build
-    is a distinct immutable tag. AGENT_NAME + IMAGE_TAG are passed as build env
-    overrides; the deployer reads them back off the completion event.
+    is a distinct tag. A short random suffix is appended so two builds for the same
+    agent in the same wall-clock second (double-submit, retry, onboard-then-edit)
+    can't collide on the IMMUTABLE ECR tag — a collision would fail the second
+    push and surface a spurious build failure. AGENT_NAME + IMAGE_TAG are passed as
+    build env overrides; the deployer reads them back off the completion event.
 
     No-op returning '' when CAPABILITY_BUILD_PROJECT is unset (gateway/dashboard
     deployed without the build pipeline) — the capability stays pending and an
@@ -299,7 +302,12 @@ def _start_capability_build(agent_id: str) -> str:
         return ""
     import boto3
 
-    image_tag = f"build-{int(time.time())}"
+    # ``build-<epoch>-<rand>``: still matches the deployer's IMAGE_TAG allowlist
+    # (^[A-Za-z0-9_.-]+$) and stays unique within a second. secrets.token_hex is
+    # collision-resistant without needing wall-clock sub-second precision.
+    import secrets
+
+    image_tag = f"build-{int(time.time())}-{secrets.token_hex(3)}"
     boto3.client("codebuild").start_build(
         projectName=project,
         environmentVariablesOverride=[
