@@ -35,14 +35,25 @@ weekly security rebuild, Phase 6).
 import json
 import logging
 import os
+import re
 import time
 
 import boto3
 
 import config_store
 
+# An ECR image tag we'll accept off a build event: alphanumerics, dot, underscore,
+# hyphen only — no ":" or "@" or "/" that could repoint the image reference.
+_IMAGE_TAG_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+
+
+class DeployGuardError(Exception):
+    """A safety guard refused the deploy (e.g. a name collision with a foreign,
+    non-fleet runtime). Caught by deploy_capability, which marks the capability
+    ``failed`` with the reason and leaves all existing resources untouched."""
 
 # Bounded READY poll. AgentCore runtime create/update takes minutes; the Lambda
 # timeout (template: 900s) caps the outer bound, this caps our own loop.
@@ -200,16 +211,38 @@ def _ensure_runtime_role(agent_id: str) -> str:
     return _runtime_role_arn(agent_id)
 
 
-def _find_runtime_id(agent_id: str) -> str:
-    """The AgentCore runtime id for this agent, or '' if none exists yet.
-    Paginates — the account can hold many runtimes."""
+# Tag every fleet-managed runtime with this marker so we can tell OUR runtimes
+# apart from any other AgentCore runtime in the account that happens to share a
+# name. The deployer refuses to UPDATE a same-named runtime that lacks this tag,
+# so onboarding a capability whose agent_id collides with a foreign runtime can
+# never hijack (repoint image/role/env of) that runtime.
+_FLEET_TAG_KEY = "sdlc-fleet"
+
+
+def _fleet_tag_value() -> str:
+    return f"capability-{os.environ['STAGE']}"
+
+
+def _find_runtime(agent_id: str) -> tuple[str, str]:
+    """Find this agent's runtime by name. Returns (runtime_id, runtime_arn), or
+    ('','') if none exists yet. Paginates — the account can hold many runtimes."""
     acc = _acc()
     paginator = acc.get_paginator("list_agent_runtimes")
     for page in paginator.paginate():
         for rt in page.get("agentRuntimes", []):
             if rt.get("agentRuntimeName") == agent_id:
-                return rt["agentRuntimeId"]
-    return ""
+                return rt["agentRuntimeId"], rt.get("agentRuntimeArn", "")
+    return "", ""
+
+
+def _is_fleet_runtime(runtime_arn: str) -> bool:
+    """Whether a runtime carries our fleet tag — the guard against updating a
+    foreign runtime that merely shares the agent's name."""
+    if not runtime_arn:
+        return False
+    acc = _acc()
+    tags = acc.list_tags_for_resource(resourceArn=runtime_arn).get("tags", {})
+    return tags.get(_FLEET_TAG_KEY) == _fleet_tag_value()
 
 
 def _env_csv(env: dict[str, str]) -> str:
@@ -218,14 +251,26 @@ def _env_csv(env: dict[str, str]) -> str:
 
 def _deploy_runtime(agent_id: str, image_uri: str, role_arn: str, env: dict) -> str:
     """Create or update the agent's AgentCore runtime to ``image_uri``. Returns
-    the runtime id. An existing runtime is UPDATED (its env is replaced wholesale,
-    which is why we always pass the full merged env), a new one is CREATED."""
+    the runtime id. An existing FLEET runtime is UPDATED (its env is replaced
+    wholesale, which is why we always pass the full merged env); a new one is
+    CREATED and tagged as fleet-managed.
+
+    Raises DeployGuardError if a runtime with this name exists but is NOT
+    fleet-tagged — refusing to hijack a foreign runtime that merely shares the
+    agent's name (the IAM grant is account-wide, so this app-level check is the
+    real scoping)."""
     acc = _acc()
     artifact = {"containerConfiguration": {"containerUri": image_uri}}
     network = {"networkMode": "PUBLIC"}
     env_vars = env  # AgentCore takes a map for the SDK call
-    existing_id = _find_runtime_id(agent_id)
+    existing_id, existing_arn = _find_runtime(agent_id)
     if existing_id:
+        if not _is_fleet_runtime(existing_arn):
+            raise DeployGuardError(
+                f"a runtime named {agent_id!r} already exists but is not managed by "
+                f"this fleet ({_FLEET_TAG_KEY}={_fleet_tag_value()} tag absent) — "
+                "refusing to overwrite it; choose a different agent_id"
+            )
         logger.info("updating runtime %s (%s)", agent_id, existing_id)
         acc.update_agent_runtime(
             agentRuntimeId=existing_id,
@@ -242,6 +287,7 @@ def _deploy_runtime(agent_id: str, image_uri: str, role_arn: str, env: dict) -> 
         roleArn=role_arn,
         networkConfiguration=network,
         environmentVariables=env_vars,
+        tags={_FLEET_TAG_KEY: _fleet_tag_value()},
     )
     return resp["agentRuntimeId"]
 
@@ -330,6 +376,15 @@ def _agent_from_build_event(event: dict) -> tuple[str, str, str] | None:
     agent_id = overrides.get("AGENT_NAME", "")
     image_tag = overrides.get("IMAGE_TAG", "")
     if not agent_id or not config_store.valid_agent_id(agent_id):
+        return None
+    # IMAGE_TAG is interpolated into the pulled image URI. Even though the only
+    # caller that can StartBuild (the admin Lambda) generates a safe build-<ts>
+    # tag today, validate it here so a crafted tag (e.g. an "@sha256:" digest or a
+    # ":"/"/" that repoints the reference to another image) can never reach the
+    # runtime if any other principal ever gains StartBuild.
+    if not _IMAGE_TAG_RE.match(image_tag):
+        logger.warning("build event for %s has invalid IMAGE_TAG %r — ignoring",
+                       agent_id, image_tag)
         return None
     return agent_id, image_tag, status
 

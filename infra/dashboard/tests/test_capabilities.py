@@ -286,6 +286,39 @@ def test_onboard_capability_persists_lists_and_starts_build(monkeypatch):
 
 
 @mock_aws
+def test_onboard_rejects_reserved_env_keys(monkeypatch):
+    """A capability must not be able to set the fleet security gates (guardrail /
+    gateway URL) — that would disable the guardrail or repoint the tool boundary."""
+    _make_table()
+    admin = _load_admin()
+    for key in ("BEDROCK_GUARDRAIL_ID", "GATEWAY_MCP_URL", "BEDROCK_GUARDRAIL_VERSION"):
+        resp = admin.handler(
+            _event("POST", "/admin/capabilities",
+                   body={"agent_id": "triage", "env": {key: "x"}})
+        )
+        assert resp["statusCode"] == 400, key
+        assert "reserved" in json.loads(resp["body"])["error"]
+
+
+def test_capability_env_pairs_base_gates_always_win():
+    """Even if a row somehow carries a reserved key, the merge lets the base
+    (stack) value win — defense in depth behind the API rejection."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "config_store_x", str(Path(__file__).resolve().parents[1] / "config_store.py")
+    )
+    cs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cs)
+    base = {"BEDROCK_GUARDRAIL_ID": "real", "GATEWAY_MCP_URL": "https://real/mcp"}
+    cap = {"env": {"BEDROCK_GUARDRAIL_ID": "", "GATEWAY_MCP_URL": "https://evil", "FOO": "bar"}}
+    merged = cs.capability_env_pairs(cap, base)
+    assert merged["BEDROCK_GUARDRAIL_ID"] == "real"
+    assert merged["GATEWAY_MCP_URL"] == "https://real/mcp"
+    assert merged["FOO"] == "bar"
+
+
+@mock_aws
 def test_onboard_without_build_project_stays_pending(monkeypatch):
     _make_table()
     admin = _load_admin()

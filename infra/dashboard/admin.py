@@ -247,6 +247,16 @@ def _validate_capability_body(body: dict) -> tuple[dict, dict | None]:
     for k, v in env.items():
         if not isinstance(k, str) or not _ENV_KEY_RE.match(k):
             return {}, error(400, f"body.env key {k!r} must match [A-Z][A-Z0-9_]*")
+        # The fleet-wide security gates (guardrail + gateway URL) are set by the
+        # deployer from the stack, never by a capability — accepting them here
+        # would let an onboard disable the guardrail or repoint the tool-call
+        # gateway. Reject outright (config_store also wins the base value on merge).
+        if k in config_store.RESERVED_ENV_KEYS:
+            return {}, error(
+                400,
+                f"body.env.{k} is a reserved fleet setting and cannot be set per "
+                "capability",
+            )
         if not isinstance(v, str):
             return {}, error(400, f"body.env.{k} must be a string")
         # The runtime env is passed to create/update-agent-runtime as a

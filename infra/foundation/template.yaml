@@ -1213,9 +1213,19 @@ Resources:
               Effect: Allow
               Action:
                 - iam:PutRolePolicy
-                - iam:AttachRolePolicy
                 - iam:GetRole
               Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/sdlc-agents/capabilities/*
+            # AttachRolePolicy is split out and pinned to the ONE managed policy the
+            # deployer attaches, so it can't attach an arbitrary (e.g. admin) policy.
+            # The permissions boundary already caps effective permissions, but this
+            # removes the unnecessary latitude.
+            - Sid: AttachBedrockManagedPolicy
+              Effect: Allow
+              Action: iam:AttachRolePolicy
+              Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/sdlc-agents/capabilities/*
+              Condition:
+                ArnEquals:
+                  iam:PolicyARN: arn:aws:iam::aws:policy/AmazonBedrockFullAccess
             # PassRole so create/update-agent-runtime can hand the runtime role to
             # the AgentCore service — scoped to the same path + service.
             - Sid: PassRuntimeRole
@@ -1227,6 +1237,10 @@ Resources:
                   iam:PassedToService: bedrock-agentcore.amazonaws.com
             # Runtime lifecycle. list/get are account-wide (no resource scoping on
             # those APIs); create/update are the mutating ones the deployer runs.
+            # list/get/tag-read are account-wide (those APIs don't take a resource
+            # ARN); Create tags the runtime as fleet-managed and the deployer
+            # refuses to Update any same-named runtime lacking that tag, so the
+            # broad Resource can't be used to hijack a foreign runtime.
             - Sid: AgentCoreRuntime
               Effect: Allow
               Action:
@@ -1234,6 +1248,8 @@ Resources:
                 - bedrock-agentcore-control:UpdateAgentRuntime
                 - bedrock-agentcore-control:GetAgentRuntime
                 - bedrock-agentcore-control:ListAgentRuntimes
+                - bedrock-agentcore-control:ListTagsForResource
+                - bedrock-agentcore-control:TagResource
               Resource: "*"
       Events:
         BuildCompleted:

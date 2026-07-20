@@ -547,18 +547,41 @@ def _decimal_default(o):
     raise TypeError(f"not JSON-serializable: {type(o).__name__}")
 
 
+# Runtime env keys a capability may NOT set — the fleet-wide security gates.
+# BEDROCK_GUARDRAIL_* attaches the prompt-injection guardrail to every model call
+# (threat-model T-1/2/3); GATEWAY_MCP_URL points the agent at the Cedar-enforced
+# tool-call gateway (the agent refuses to start without it). Letting a capability's
+# own env override these would silently disable the guardrail or repoint the tool
+# boundary — so the base values ALWAYS win for these keys, and the admin API
+# rejects them outright (see admin._validate_capability_body). Kept here so both
+# the API validation and the merge agree on one list.
+RESERVED_ENV_KEYS = frozenset(
+    {"BEDROCK_GUARDRAIL_ID", "BEDROCK_GUARDRAIL_VERSION", "GATEWAY_MCP_URL"}
+)
+
+
 def capability_env_pairs(cap: dict, base_env: dict[str, str]) -> dict[str, str]:
     """The full runtime environment for a capability: the fleet-wide base env
     (guardrail id/version + gateway URL — the hard gates every agent needs) merged
-    with the capability's own ``env`` (e.g. Asana GIDs). Capability env wins on a
-    key clash so an operator can override, but the base gates should never be
-    clashed in practice.
+    with the capability's own ``env`` (e.g. Asana GIDs).
+
+    The base env ALWAYS wins for RESERVED_ENV_KEYS: even though the admin API
+    rejects a capability that sets them, this merge re-enforces it as defense in
+    depth (e.g. a row written before this rule, or by a future non-API path) so a
+    capability can never disable the guardrail or repoint the gateway.
 
     Returned as a plain dict; the caller renders the CSV create/update-agent-runtime
     wants. Kept here so the onboard path and the weekly rebuild share one
     definition of an agent's environment."""
     merged = dict(base_env)
-    merged.update({k: str(v) for k, v in (cap.get("env") or {}).items()})
+    for k, v in (cap.get("env") or {}).items():
+        if k in RESERVED_ENV_KEYS:
+            continue  # base gate wins — never overridable
+        merged[k] = str(v)
+    # Re-assert the base gates last in case the loop above was bypassed.
+    for k in RESERVED_ENV_KEYS:
+        if k in base_env:
+            merged[k] = base_env[k]
     return merged
 
 
