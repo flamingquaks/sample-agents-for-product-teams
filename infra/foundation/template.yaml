@@ -1011,6 +1011,22 @@ Resources:
                 Action: ssm:GetParameter
                 Resource:
                   - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/asana-pat
+        - PolicyName: invoke-scm-broker
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # A Lambda gateway target is invoked with the GATEWAY's execution
+              # role (identity-based), so the role needs lambda:InvokeFunction on
+              # the broker — the resource-based ScmBrokerInvokePermission (service
+              # principal) alone is NOT sufficient and target CREATE fails with
+              # "Gateway execution role lacks permission to invoke Lambda".
+              # Referenced by name (not !GetAtt ScmBrokerFunction.Arn) to avoid a
+              # dependency cycle: the gateway takes this role, and the GitHub
+              # target references both the gateway and the broker.
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:scm-broker-${Stage}
         - PolicyName: policy-engine-eval
           PolicyDocument:
             Version: "2012-10-17"
