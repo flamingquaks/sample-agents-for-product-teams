@@ -26,7 +26,7 @@ The PDLC Agent Fleet is a multi-agent system on Amazon Bedrock AgentCore Runtime
 | C-9 | GitHub MCP Server / SCM broker | External API | `api.githubcopilot.com/mcp/` (direct) or the gateway SCM broker target — agents read/write GitHub via per-owner GitHub App installation tokens |
 | C-10 | Asana MCP Server | External API | `mcp.asana.com/v2/mcp` — agents read/write Asana via OAuth |
 | C-11 | GitHub OIDC Provider | IAM Federation | Allows GitHub Actions to assume a scoped deploy role without stored credentials |
-| C-12 | ECR Repositories | Container Registry | One per agent; `IMMUTABLE` tag policy; images built in CI, scanned by Amazon Inspector |
+| C-12 | ECR Repositories | Container Registry | One per agent; `IMMUTABLE` tag policy; images built by the shared `sdlc-agent-builder-${STAGE}` CodeBuild project (on onboard + the weekly security rebuild), scanned on push |
 
 ---
 
@@ -93,7 +93,7 @@ The PDLC Agent Fleet is a multi-agent system on Amazon Bedrock AgentCore Runtime
 | DF-10 | Agent → Gateway → SCM broker → GitHub | Issue/PR reads, comment/code writes | HTTPS (SigV4 to gateway) | Per-owner GitHub App installation token, minted server-side, scoped per co-repo group + per-agent tier |
 | DF-11 | Agent → Asana MCP | Task reads, comment writes | HTTPS | OAuth2 access token |
 | DF-12 | Agent → Bedrock | LLM inference (Claude Opus 4.7) | AWS API | AgentCore runtime role |
-| DF-13 | CI/CD → ECR | Container image push (SHA-tagged, immutable) | HTTPS | OIDC → IAM |
+| DF-13 | CodeBuild (`sdlc-agent-builder-${STAGE}`) → ECR | Container image push (per-build tag, immutable) | HTTPS | CodeBuild service role |
 
 ---
 
@@ -136,7 +136,7 @@ An attacker can craft a GitHub issue body, Asana task description, or the commen
 | T-6 | **Dispatch Router IAM scope** | — | C-3 | — | Mitigated |
 | T-7 | **GitHub OIDC trust scope** | — | C-11 | — | Mitigated (guidance) |
 
-**T-4 (Mitigated):** `.dispatch/agents.yaml` ships with `authorization.users: []` for every agent and the Dispatch Router fails closed — an empty allowlist returns 403 with a log line instructing the operator to populate the registry and re-run `scripts/sync_registry.py`. The wildcard `"*"` is still accepted for operators who explicitly opt into an open-by-default posture, but it is no longer the shipping default. Cross-agent invocation is permitted by listing a peer agent's bot identity (GitHub login or Asana user GID) in the callee's `users` list — see T-23 for the design intent and runaway-chain defense.
+**T-4 (Mitigated):** A capability's `authorization.users` defaults to `[]` and the Dispatch Router fails closed — an empty allowlist returns 403 with a log line instructing the operator to populate the capability's user list in the dashboard Admin view (which re-renders the SSM registry). The wildcard `"*"` is still accepted for operators who explicitly opt into an open-by-default posture, but it is no longer the shipping default. Cross-agent invocation is permitted by listing a peer agent's bot identity (GitHub login or Asana user GID) in the callee's `users` list — see T-23 for the design intent and runaway-chain defense.
 
 **T-5 (Accepted for v1):** Cedar policy files under `cedar/*.cedar` express per-agent allow/deny rules for tool calls, but no evaluator runs them at invocation time. A prompt-injected agent can call any tool its MCP server exposes. Documented as a roadmap item. The intended evaluator would intercept every `@tool` call in the Strands runtime and deny forbidden operations, which would bound T-1/T-2/T-3 blast radius materially.
 
@@ -208,9 +208,9 @@ Exfiltration through legitimate tool paths (e.g., encoding data in a GitHub comm
 | T-19 | **ECR image tag mutability** | — | C-12 | — | Mitigated |
 | T-20 | **GitHub Actions workflow injection** | **Medium** | C-1 | Tampering | Partially mitigated |
 
-**T-18 (Partially mitigated):** Every CI build runs Amazon Inspector SBOM scanning on the agent container. Python dependencies are pinned to versions in `requirements.txt` but not hashed. Dependabot opens PRs for updates. Fix path: add `pip install --require-hashes` with a lockfile, and gate deploys on Inspector severity.
+**T-18 (Partially mitigated):** Every image the shared build pipeline pushes is scanned on push (the `sdlc-agents/*` repos are created with `scanOnPush=true`), and the weekly `capability-rebuilder` rebuild re-scans every active agent's image. Python dependencies are pinned to versions in `requirements.txt` but not hashed. Dependabot opens PRs for updates. Fix path: add `pip install --require-hashes` with a lockfile, and gate the runtime deploy on scan severity.
 
-**T-19 (Mitigated):** ECR repositories for fleet agents (`sdlc-agents/*`) are created with `--image-tag-mutability IMMUTABLE` by both `.github/workflows/deploy-agent.yml` and the `pdlc-agents-provision-aws` skill. Images are tagged with `:${github.sha}` only; no `:latest` tag is produced. An attacker with ECR push rights cannot silently overwrite a running image — every push requires a new tag, and the AgentCore runtime is updated explicitly in CI. Operators with pre-existing MUTABLE repos from earlier deploys are not automatically upgraded; delete and recreate for the hardened default.
+**T-19 (Mitigated):** ECR repositories for fleet agents (`sdlc-agents/*`) are created with `--image-tag-mutability IMMUTABLE` by the shared build pipeline (`sdlc-agent-builder-${STAGE}` CodeBuild) the first time an agent is built. Images are tagged with a fresh per-build tag only; no `:latest` tag is produced. An attacker with ECR push rights cannot silently overwrite a running image — every push requires a new tag, and the AgentCore runtime is updated explicitly by the `capability-deployer` Lambda against the specific built tag. Operators with pre-existing MUTABLE repos from earlier deploys are not automatically upgraded; delete and recreate for the hardened default.
 
 **T-20 (Partially mitigated):** `.github/workflows/agent-dispatch.yml` passes `${{ github.event.comment.body }}` via the `env:` context, not direct shell interpolation — the standard mitigation for command injection in GitHub Actions. This pattern is safe today; any future refactoring that moves the comment body into `run:` interpolation would reintroduce the vulnerability. The review checklist for workflow changes should flag this.
 
@@ -222,7 +222,7 @@ Exfiltration through legitimate tool paths (e.g., encoding data in a GitHub comm
 | T-22 | **Concurrency slot exhaustion** | **Medium** | C-3 | Denial of Service | Partially mitigated |
 | T-23 | **Runaway agent-to-agent chains** | **High** | C-3, C-4 | Denial of Service | Open |
 
-**T-21 (Open):** `.dispatch/agents.yaml` declares `daily_token_budget` per agent but no runtime enforcement exists. A flood of requests or a prompt-injected loop could run the Bedrock bill up. Fix path: track daily token consumption per agent in DynamoDB and reject dispatches over budget. AWS Service Quotas on Bedrock model invocations is an out-of-band ceiling operators can set.
+**T-21 (Open):** each agent's capability row declares a `daily_token_budget` (in `limits`) but no runtime enforcement exists. A flood of requests or a prompt-injected loop could run the Bedrock bill up. Fix path: track daily token consumption per agent in DynamoDB and reject dispatches over budget. AWS Service Quotas on Bedrock model invocations is an out-of-band ceiling operators can set.
 
 **T-22 (Partially mitigated):** The Dispatch Router consults DynamoDB for active-assignment counts per agent and rejects dispatches over `max_concurrent`. What's absent: per-user rate limiting. A single user can legitimately fill the concurrency window and block others. Fix path: add a per-sender dispatch-count bucket in DynamoDB with a short rolling window.
 
@@ -267,7 +267,7 @@ Automated scanners (checkov, semgrep, bandit) flag several patterns in this repo
 | **Dispatch Layer** | C-2, C-3 | C-4 (Agents) | IAM roles, Lambda invoke permissions, scoped `InvokeAgentRuntime` |
 | **Agent Runtime** | Individual agent container | Other agents, Dispatch layer | AgentCore runtime isolation, per-agent IAM roles |
 | **External APIs** | — | C-9, C-10 | OAuth/PAT authentication, HTTPS TLS |
-| **CI/CD Pipeline** | C-1, C-12 | Developer workstations | OIDC (scoped `sub` claims), branch protection, Inspector scans, immutable ECR tags |
+| **Build & CI** | C-12 (ECR), `sdlc-agent-builder` CodeBuild; C-1 (GitHub Actions dispatch) | Developer workstations | CodeBuild service role (in-account image build), OIDC (scoped `sub` claims) for the dispatch/`@claude` workflows, scan-on-push, immutable ECR tags |
 
 ---
 

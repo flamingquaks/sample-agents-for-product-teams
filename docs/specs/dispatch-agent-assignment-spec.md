@@ -815,12 +815,21 @@ def invoke_agent(
 
 ---
 
-## 10. Configuration File (Repo-Level)
+## 10. Agent Configuration
 
-Store agent configuration in the repo so team members can modify it without code changes:
+> **Note (as shipped):** this configuration is no longer a repo-level
+> `.dispatch/agents.yaml` file. Each agent is a **capability row** in the
+> `fleet-config-${STAGE}` DynamoDB table, onboarded/edited from the dashboard
+> Admin view. The Dispatch Router registry (in SSM) is *rendered* from the
+> active capability rows on every change. The field shape below still reflects
+> the per-agent config (description, aliases, triggers, authorization, limits);
+> `runtime_arn` is filled in by the capability deployer once the runtime is
+> live, not hand-authored.
+
+The per-agent configuration shape:
 
 ```yaml
-# .dispatch/agents.yaml
+# capability row / rendered registry entry (was: .dispatch/agents.yaml)
 
 agents:
   uat:

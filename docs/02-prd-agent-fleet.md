@@ -95,7 +95,7 @@ A fleet of autonomous AI agents that operate as specialized team members across 
 | D-01 | Route `@agent` mentions from GitHub issue/PR comments to the correct AgentCore Runtime | P1 | Shipped |
 | D-02 | Route `@agent` mentions from Asana task comments | P1 | Shipped |
 | D-03 | Trigger agents via Asana task assignment to bot user accounts | P1 | Shipped |
-| D-04 | Support agent aliases (`@pm` → `@workitems`) configurable in `.dispatch/agents.yaml` | P1 | Shipped |
+| D-04 | Support agent aliases (`@pm` → `@workitems`) configurable per capability in the dashboard Admin view | P1 | Shipped |
 | D-05 | Post agent results back to the originating platform in a platform-appropriate format | P1 | Shipped |
 | D-06 | Track all assignments in DynamoDB with status, timing, and result references | P1 | Shipped |
 | D-07 | Per-agent concurrency caps and daily token budgets enforced via registry | P1 | Shipped |

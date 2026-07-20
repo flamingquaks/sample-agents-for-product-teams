@@ -9,7 +9,7 @@ description: Use when the user's agents are provisioned and integrations are con
 
 - `.sdlc-agents/selection.yaml` has the agent list, toolchain, and GIDs captured by the connect skills
 - The shared foundation stack is deployed (`dispatch-router-${STAGE}` Lambda + `asana-webhook-${STAGE}` Lambda + API Gateway exist)
-- The first successful CI deploy of each selected agent has completed — `deploy-agent.yml` creates the AgentCore Runtime and then runs `scripts/sync_registry.py` automatically, so at this point `.dispatch/agents.yaml` has the runtime ARNs and the SSM registry is current. If you're re-running this skill after changing the agent selection, re-run `python scripts/sync_registry.py --stage $STAGE --region $REGION` manually before proceeding.
+- Each selected agent has been onboarded from the dashboard Admin view and its capability row is **active** — onboarding builds the container and stands up the AgentCore Runtime (`capability-deployer` Lambda), then re-renders the Dispatch Router registry from the active capability rows, so at this point the SSM registry (`/sdlc-agents/${STAGE}/registry`) is current. If a capability is still `building` or `failed`, finish onboarding it (check the `sdlc-agent-builder-${STAGE}` CodeBuild + `capability-deployer-${STAGE}` logs) before proceeding — there's no manual registry-sync step.
 
 ## Per-integration wiring
 
@@ -92,7 +92,7 @@ The trust policy for the deploy role is created manually (or via `sdlc-agents-pr
 
 ### Slack (gap — not yet supported end-to-end)
 
-Slack triggers aren't wired up in the foundation stack or the Dispatch Router yet. If the user has Slack in their toolchain and selected agents that advertise Slack triggers in `.dispatch/agents.yaml`, tell them:
+Slack triggers aren't wired up in the foundation stack or the Dispatch Router yet. If the user has Slack in their toolchain and selected agents that advertise Slack triggers in their capability row, tell them:
 
 > Slack triggers aren't implemented in this fleet yet. The registry advertises the trigger shape but the foundation stack has no Slack event receiver, and the router has no signature verifier. You can still use your selected agents via Asana/GitHub; the Slack path can be added later.
 

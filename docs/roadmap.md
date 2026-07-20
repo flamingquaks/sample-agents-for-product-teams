@@ -22,9 +22,9 @@ Supporting infrastructure shipped:
 - **Asana webhook receiver** Lambda handles Asana event subscription, signature verification, and normalization.
 - **`agent-dispatch.yml`** GitHub Actions workflow handles the GitHub mention path.
 - **Per-agent Cedar policies** under `cedar/<agent>.cedar` declare what each agent may and may not do.
-- **Per-agent CI/CD** (`deploy-<agent>.yml`) on push to `main`, plus a reusable `deploy-agent.yml` that handles build, Inspector scan, AgentCore Runtime create/update, registry sync, and smoke test.
+- **UI-driven agent onboarding** — the dashboard Admin view onboards an agent by writing a capability row; a shared `sdlc-agent-builder-<stage>` CodeBuild project builds its container and the `capability-deployer` Lambda stands up its runtime and republishes the registry. A weekly `capability-rebuilder` schedule rebuilds every active agent for security patches. Base platform deployed with `scripts/deploy_fleet.py`.
 - **Skills** under `skills/` drive guided install into a new repo/account.
-- **Fleet monitoring dashboard** (`dashboard/`) — React + Vite SPA showing run history, traces, and fleet status. Backed by a query API Lambda (`infra/dashboard/`), hosted on S3 + CloudFront, deployed via `deploy-dashboard.yml`.
+- **Fleet monitoring + admin dashboard** (`dashboard/`) — React + Vite SPA showing run history, traces, fleet status, and the Admin view for onboarding agents/repos. Backed by query + admin API Lambdas (`infra/dashboard/`), hosted on S3 + CloudFront, published by `scripts/deploy_fleet.py`.
 
 All four agents run Claude Opus 4.7 via Bedrock.
 
@@ -33,7 +33,7 @@ All four agents run Claude Opus 4.7 via Bedrock.
 ## Near-term (next 1–2 quarters, order is priority)
 
 1. **Provision AgentCore Memory in the foundation template.** Agents already honor `AGENTCORE_MEMORY_ID`; what's missing is a Memory resource in `infra/foundation/template.yaml` and a documented seeding path per agent.
-2. **Slack dispatch.** `.dispatch/agents.yaml` advertises Slack triggers but there's no Slack event receiver Lambda or signing-secret path. Needs a new receiver, a Slack app manifest, and routing through the existing Dispatch Router.
+2. **Slack dispatch.** A capability's triggers can advertise Slack, but there's no Slack event receiver Lambda or signing-secret path. Needs a new receiver, a Slack app manifest, and routing through the existing Dispatch Router.
 3. **Cedar enforcement in the invocation path.** Today Cedar policies are advisory — they document the contract. Hard enforcement via a policy evaluator invoked before each tool call is the next step.
 4. **AgentCore Evaluations.** Each agent ships with `tests/eval_dataset.json`. The evaluation pipeline that scores runs against those datasets isn't wired up.
 5. **Per-assignment cost tracking.** Token usage is available in Bedrock response metadata; surface it to the DynamoDB assignments table so we can report cost per run per agent.

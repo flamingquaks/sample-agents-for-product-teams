@@ -47,14 +47,19 @@ All repo-specific checks inside the select skill (ADR directory detection in par
 
 After selection: write the chosen list to `$TARGET_REPO/.sdlc-agents/selection.yaml`. Later steps read from there so the user can re-run any single step without restating their selection.
 
-### Step 3 — Provision AWS infrastructure
+### Step 3 — Deploy the base platform and onboard the agents
 
-Invoke the **sdlc-agents-provision-aws** skill. For each selected agent it creates:
-- IAM runtime role (named `<agent>-agentcore-runtime`) with the specific policies that agent needs
-- ECR repo (`sdlc-agents/<agent>`)
-- AgentCore Runtime (created on first container push; the deploy workflow handles this)
+Invoke the **sdlc-agents-provision-aws** skill. It deploys the base platform
+(`scripts/deploy_fleet.py` — foundation stack, shared build pipeline, build
+source, dashboard SPA) and then onboards each selected agent from the dashboard
+Admin view. Onboarding an agent builds its container (the shared
+`sdlc-agent-builder-<stage>` CodeBuild project, parameterized by `AGENT_NAME`)
+and stands up its per-agent runtime IAM role + AgentCore Runtime (the
+`capability-deployer` Lambda) — there are no per-agent scripts, workflows, ECR
+repos, or runtime roles for you to create by hand.
 
-Idempotent — safe to re-run. Walks the user through prerequisites (Bedrock model access, deploy-role OIDC trust) if they aren't already set up.
+Idempotent — safe to re-run. Walks the user through prerequisites (Bedrock model
+access) if they aren't already set up.
 
 ### Step 4 — Wire up integrations (per tool)
 
@@ -69,7 +74,7 @@ Each connect skill knows the specific pitfalls of its tool (Asana's MCP-app-vs-A
 
 ### Step 5 — Register webhooks and bot accounts
 
-Invoke **sdlc-agents-register-triggers**. This is the step that turns a provisioned fleet into one that actually reacts to `@agent` mentions:
+Invoke **sdlc-agents-register-triggers**. This is the step that turns an onboarded fleet into one that actually reacts to `@agent` mentions:
 - Asana webhook → API Gateway endpoint, with handshake secret stored in SSM
 - GitHub: `agent-dispatch.yml` workflow enabled, trigger list updated for selected agents
 - Slack app event subscriptions, etc.
@@ -98,5 +103,5 @@ If any step fails in a way the skill didn't anticipate:
 
 - `docs/agents/<agent>.md` — one file per agent with role, triggers, guardrails, and infra notes. Read the relevant ones before walking a customer through that agent's setup.
 - `docs/agent-fleet-implementation-plan.md` — the full multi-phase rollout plan.
-- `.dispatch/agents.yaml` — canonical agent registry format. Your end state should match this structure.
-- `AGENTS.md` (at repo root) — step-by-step runbook for configuring the fleet manually. Skills automate this; when the skill flow diverges from the runbook, the skill is wrong — update it.
+- `infra/dashboard/config_store.py` — the capability row schema and how the Dispatch Router registry is rendered from the active capability rows. Onboarding writes one of these rows; the dashboard drives build → runtime → registry from it.
+- `AGENTS.md` (at repo root) — step-by-step runbook for the new deploy-base-then-onboard flow. Skills automate this; when the skill flow diverges from the runbook, the skill is wrong — update it.

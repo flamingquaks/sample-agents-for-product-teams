@@ -17,7 +17,12 @@ This repo contains autonomous AI agents for the software development lifecycle, 
 | `researcher` | Business analyst — research, competitive intel | `@ba`, `@research`, `@analyze` |
 | `adr` | ADR linker — tags issues and reviews PRs against the ADR library | `@decisions`, `@architecture` |
 
-Each deployed agent requires: an ECR repository, an AgentCore Runtime, and an entry in `.dispatch/agents.yaml`.
+The fleet moved to **UI-driven onboarding**. You no longer edit a registry file, write per-agent deploy workflows, or run manual ECR/runtime commands. Instead:
+
+1. **Deploy the base platform once** (`scripts/deploy_fleet.py`) — the foundation stack, the shared build pipeline, and the dashboard SPA.
+2. **Onboard each agent from the dashboard Admin view** — the dashboard builds its container and stands up its AgentCore runtime for you.
+
+An onboarded agent is a **capability** row in the `fleet-config-${STAGE}` DynamoDB table. Onboarding builds the agent's container (one shared CodeBuild project, parameterized by `AGENT_NAME`), creates the per-agent runtime IAM role + AgentCore runtime (the `capability-deployer` Lambda), waits for it to become READY, and marks the capability active — at which point the Dispatch Router registry is re-rendered from the capability rows and the agent becomes routable.
 
 ---
 
@@ -31,7 +36,7 @@ Each deployed agent requires: an ECR repository, an AgentCore Runtime, and an en
 > - `researcher` (business analyst)
 > - `adr` (ADR linker)
 >
-> You can deploy any combination. Each one adds an ECR repo, an AgentCore Runtime, a deploy workflow, and an entry in the agent registry.
+> You can deploy any combination. Each one becomes a capability you onboard from the dashboard; onboarding builds its container and stands up an AgentCore Runtime.
 
 Record the user's answer. For the rest of this guide, replace `<AGENTS>` with the chosen list (e.g. `workitems docwriter`).
 
@@ -44,7 +49,6 @@ Before touching any AWS resources, collect the following. Ask the user for any y
 **AWS:**
 - `AWS_ACCOUNT_ID` — 12-digit AWS account ID
 - `AWS_REGION` — deployment region (default: `us-west-2`; must have Bedrock model access)
-- `GITHUB_ORG` and `GITHUB_REPO` — used to scope the OIDC trust policy
 - `STAGE` — environment name: `dev`, `staging`, or `prod` (default: `dev`)
 
 **Asana** (only if the user wants Asana triggers — ask):
@@ -58,7 +62,7 @@ Before touching any AWS resources, collect the following. Ask the user for any y
 
 ---
 
-## Step 3 — Bootstrap AWS infrastructure
+## Step 3 — Deploy the base platform
 
 ### 3a. Verify Bedrock model access
 
@@ -70,38 +74,19 @@ aws bedrock get-foundation-model \
 
 If this returns a `ResourceNotFoundException`, the user must request access in the AWS Bedrock console under **Model access** before continuing.
 
-### 3b. Deploy shared infrastructure (SAM)
+### 3b. Deploy the base platform
+
+The base platform is everything the UI onboarding runs on: the foundation stack (DynamoDB, Dispatch Router, webhook API, guardrail, SSM registry, the shared build pipeline + capability deployer/rebuilder, and — when enabled — Cognito + the dashboard API/CDN and the AgentCore Gateway), the uploaded agent build source, and the dashboard SPA.
 
 ```bash
-cd infra/foundation
-sam build
-
-sam deploy \
-  --stack-name sdlc-agents-${STAGE} \
-  --parameter-overrides \
-    Stage=${STAGE} \
-    WorkitemsBotGID=${WORKITEMS_BOT_GID:-""} \
-    AgentFieldGID=${AGENT_FIELD_GID:-""} \
-  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
-  --region $AWS_REGION \
-  --guided   # remove --guided on subsequent deploys
+python scripts/deploy_fleet.py --stage $STAGE --region $AWS_REGION
 ```
 
-This creates:
-- DynamoDB table `dispatch-assignments-${STAGE}`
-- S3 bucket `sdlc-agent-artifacts-${AWS_ACCOUNT_ID}-${STAGE}`
-- Lambda `dispatch-router-${STAGE}`
-- Lambda `asana-webhook-${STAGE}` + API Gateway endpoint (for Asana)
-- IAM role `GitHubActionsDeployRole` with OIDC trust (used by all deploy workflows)
+This runs `sam build`/`sam deploy` on `infra/foundation`, zips `agents/` and uploads it as `source.zip` to the build pipeline's source bucket, then builds and publishes the dashboard SPA. It is idempotent; re-runs preserve the stack's existing parameter values (so a redeploy is a code/template update, not a silent reconfiguration). Use `--dry-run` to preview every command first.
 
-After deploy, capture these outputs:
-```bash
-sam list stack-outputs --stack-name sdlc-agents-${STAGE} --region $AWS_REGION
-```
+The dashboard and AgentCore Gateway are **off by default**. To onboard agents from the Admin UI you need the dashboard, so a first deploy usually turns it on. Set the parameters on the SAM deploy the first time (or with a `sam deploy` of your own), for example `DeployDashboard=true` and, for the tool-call boundary, `DeployGateway=true`. See `docs/aws-deploy.md` §2.3 for the full parameter list.
 
-Key outputs to save:
-- `DeployRoleArn` → set as `AWS_DEPLOY_ROLE_ARN` GitHub secret
-- `AsanaWebhookUrl` → register with Asana in Step 6
+Alternatively, `python scripts/bootstrap.py` is a thin, interactive one-time base setup that wraps the same foundation deploy + build-source upload (and seeds initial onboarded repos when the dashboard is off). It does not create OIDC providers, CI deploy roles, or per-agent runtime roles — that machinery has been retired.
 
 ### 3c. Store secrets in SSM
 
@@ -116,120 +101,70 @@ aws ssm put-parameter \
 # Webhook secret is auto-populated by the Lambda on first Asana handshake
 ```
 
-### 3d. Create ECR repositories
+You do **not** create ECR repositories by hand — the shared build pipeline creates `sdlc-agents/<agent>` on the first build if it's missing.
 
-One per agent being deployed:
+---
+
+## Step 4 — Add the agent code (only if you're adding a NEW agent)
+
+The four agents above already ship in `agents/`. Skip to Step 5 if you're deploying one of them.
+
+To add a brand-new agent, create `agents/<name>/` with the standard code shape:
+
+```
+agents/<name>/
+  agent.py           # Strands agent entry point with @app.entrypoint
+  prompts.py         # System prompt (versioned with code)
+  tools/             # Custom @tool functions
+  Dockerfile         # Container build (build context is agents/, so shared/ is available)
+  requirements.txt
+  tests/eval_dataset.json   # optional golden set for quality evaluation
+```
+
+Then re-upload the build source so the pipeline can build it (a redeploy that skips the foundation and dashboard is enough):
 
 ```bash
-for agent in <AGENTS>; do
-  aws ecr create-repository \
-    --repository-name sdlc-agents/${agent} \
-    --region $AWS_REGION
-done
+python scripts/deploy_fleet.py --stage $STAGE --region $AWS_REGION --skip-foundation --skip-dashboard
 ```
+
+(A full `python scripts/deploy_fleet.py` run also re-uploads the source.) The `agent_id` you onboard in Step 6 must match the directory name under `agents/` in the source tree — an onboard for a nonexistent `agent_id` surfaces as a build failure.
 
 ---
 
-## Step 4 — Register the agent registry in SSM
+## Step 5 — Add operators/admins to the dashboard
 
-The Dispatch Router reads agent configuration from SSM at runtime. After editing `.dispatch/agents.yaml` (Step 5), sync it:
+Onboarding happens in the dashboard's Admin view, which is gated by the Cognito `admins` group (operators who only view runs are in `operators`). There is no self sign-up — an admin creates users and adds them to the group. The dashboard URL and Cognito details are stack outputs (`DashboardUrl`, `DashboardUserPoolId`, …); `scripts/deploy_fleet.py` prints the published dashboard URL.
 
-```bash
-aws ssm put-parameter \
-  --name /sdlc-agents/${STAGE}/registry \
-  --value "$(cat .dispatch/agents.yaml)" \
-  --type String \
-  --overwrite \
-  --region $AWS_REGION
-```
+Add yourself (or the operator) to the `admins` group, then open the dashboard and sign in.
 
 ---
 
-## Step 5 — Configure .dispatch/agents.yaml
+## Step 6 — Onboard each agent from the dashboard Admin view
 
-Edit `.dispatch/agents.yaml`. For each agent being deployed:
+In the dashboard **Admin view**, open the **Capabilities** panel and click **Onboard capability**. For each agent in `<AGENTS>`:
 
-1. Uncomment or add its entry
-2. Set `runtime_arn` to `"${AGENT_RUNTIME_ARN}"` — this is a placeholder; the actual ARN is filled in after the first deploy (Step 7)
-3. Set `authorization.users` to `["*"]` for open access, or list specific GitHub/Asana usernames
+1. Enter the **`agent_id`** (must match the `agents/<name>/` directory in the uploaded build source).
+2. Optionally set a **description**, **aliases** (comma-separated; the router lowercases mentions before matching), and **env** (`KEY=value, KEY2=value2`) for any agent-specific environment variables.
+3. Click **Onboard**.
 
-**Remove or comment out agents that are NOT being deployed.** The Dispatch Router will return a 404 for any mention of an unregistered agent.
+Onboarding writes the capability row and immediately:
+1. Starts the shared build (`sdlc-agent-builder-${STAGE}` CodeBuild, with `AGENT_NAME=<agent_id>`) — builds `agents/<agent_id>` and pushes to ECR.
+2. On build completion, an EventBridge event invokes the `capability-deployer` Lambda, which creates the per-agent runtime IAM role (under IAM path `/sdlc-agents/capabilities/`, capped by a permissions boundary) and the AgentCore runtime, waits for READY, then marks the capability **active**.
+3. Marking it active re-renders the Dispatch Router registry from the capability rows and writes it to SSM (`/sdlc-agents/${STAGE}/registry`) — the agent is now routable.
 
-For agents using Asana assignment triggers, set the bot GID environment variables in `infra/foundation/template.yaml`:
-```yaml
-Environment:
-  Variables:
-    WORKITEMS_BOT_GID: !Ref WorkitemsBotGID
-    DOCWRITER_BOT_GID: !Ref DocwriterBotGID   # add parameter if needed
-```
+The capability row shows its status (`building` → `active`, or `failed` with a reason). A failed build or a runtime that never reaches READY leaves any existing runtime untouched.
 
----
-
-## Step 6 — Configure GitHub repository secrets
-
-Go to the repo **Settings → Secrets and variables → Actions** and add:
-
-| Secret | Value | Required |
-|--------|-------|----------|
-| `AWS_DEPLOY_ROLE_ARN` | ARN of the deploy role you created in Step 1.3 of `docs/aws-deploy.md` | Always |
-| `AWS_ACCOUNT_ID` | 12-digit account ID | Always |
-
-The deploy workflows use OIDC — no long-lived AWS credentials are stored in GitHub.
-
-**The SAM foundation stack does not create the OIDC provider or deploy role** — you (or the `sdlc-agents-provision-aws` skill's Step 0) create both by hand the first time the fleet is set up in an AWS account. See `docs/aws-deploy.md` §1.3 for the trust policy and rationale.
+Editing a capability's fields (or re-onboarding) starts a fresh build — that's how you pick up new agent code after re-uploading the build source in Step 4.
 
 ---
 
-## Step 7 — Add deploy workflows for chosen agents
-
-For each agent in `<AGENTS>`, verify a deploy workflow exists at `.github/workflows/deploy-<agent>.yml`. If one is missing, create it by copying the pattern:
-
-```yaml
-name: Deploy <Agent> Agent
-
-on:
-  push:
-    branches: [main]
-    paths:
-      - "agents/<agent>/**"
-      - "agents/shared/**"
-
-jobs:
-  deploy:
-    uses: ./.github/workflows/deploy-agent.yml
-    with:
-      agent_name: <agent>
-    secrets: inherit
-```
-
-The shared `deploy-agent.yml` workflow:
-1. Builds the container from `agents/<agent>/Dockerfile`
-2. Pushes to ECR (`sdlc-agents/<agent>`)
-3. Runs Amazon Inspector security scan
-4. Calls `aws bedrock-agentcore-control update-agent-runtime` to deploy
-5. Waits for the runtime to become active
-6. Runs a smoke test (`{"prompt": "health check"}`)
-
-The deploy workflow (`.github/workflows/deploy-agent.yml`) creates the AgentCore Runtime on the first push and updates it on subsequent pushes — no manual `create-agent-runtime` step is needed. It uses the commit SHA as the image tag (ECR repositories are `IMMUTABLE` in this fleet). The runtime ARN is written back to `.dispatch/agents.yaml` by `scripts/sync_registry.py`, which runs as part of the deploy workflow.
-
-To inspect an agent's runtime ARN later (e.g. for debugging):
-
-```bash
-aws bedrock-agentcore-control get-agent-runtime \
-  --agent-runtime-name <agent> \
-  --region $AWS_REGION \
-  --query 'agentRuntimeArn' --output text
-```
-
----
-
-## Step 8 — Configure Asana integration (if applicable)
+## Step 7 — Configure Asana integration (if applicable)
 
 **Ask the user:** "Do you want Asana triggers? This lets users assign tasks to agents or mention them in Asana comments."
 
 If yes:
 
-### 8a. Create bot accounts in Asana
+### 7a. Create bot accounts in Asana
 
 For each agent being deployed with Asana triggers, create a dedicated Asana user account (e.g. `workitems-bot@yourorg.com`). These are the accounts users will "assign" tasks to in order to trigger agents.
 
@@ -239,7 +174,7 @@ curl -s "https://app.asana.com/api/1.0/users/workitems-bot@yourorg.com" \
   -H "Authorization: Bearer $ASANA_PAT" | jq -r '.data.gid'
 ```
 
-### 8b. Create the "Agent" custom field (for custom_field triggers)
+### 7b. Create the "Agent" custom field (for custom_field triggers)
 
 In Asana, create an Enum custom field called **Agent** with values matching each deployed agent name (`workitems`, `docwriter`, `researcher`). Retrieve its GID from the workspace:
 
@@ -248,62 +183,19 @@ curl -s "https://app.asana.com/api/1.0/workspaces/$ASANA_WORKSPACE_GID/custom_fi
   -H "Authorization: Bearer $ASANA_PAT" | jq '.data[] | select(.name=="Agent") | .gid'
 ```
 
-### 8c. Register the webhook
+### 7c. Register the webhook
 
-The Asana webhook URL is the API Gateway endpoint from Step 3b (`AsanaWebhookUrl` output).
+The Asana webhook URL is the API Gateway endpoint from the foundation stack (`WebhookEndpoint` output). Registration is handled by `scripts/bootstrap_asana_webhook.py`, which mediates the Asana handshake and stores the webhook secret in SSM (attaching a temporary `ssm:PutParameter` policy to the webhook Lambda's role only for the registration window). See the `sdlc-agents-register-triggers` skill for the details.
 
-```bash
-curl -X POST "https://app.asana.com/api/1.0/webhooks" \
-  -H "Authorization: Bearer $ASANA_PAT" \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"data\": {
-      \"resource\": \"$ASANA_WORKSPACE_GID\",
-      \"target\": \"$ASANA_WEBHOOK_URL\",
-      \"filters\": [
-        {\"resource_type\": \"story\", \"action\": \"added\"},
-        {\"resource_type\": \"task\", \"action\": \"changed\", \"fields\": [\"assignee\", \"custom_fields\"]}
-      ]
-    }
-  }"
-```
-
-Asana will send a handshake request immediately. The Lambda handles it automatically and stores the webhook secret in SSM. Verify in CloudWatch Logs for the `asana-webhook-${STAGE}` function.
+Verify in CloudWatch Logs for the `asana-webhook-${STAGE}` function.
 
 ---
 
-## Step 9 — Configure GitHub @claude integration (optional)
+## Step 8 — Configure GitHub @claude integration (optional)
 
 **Ask the user:** "Do you want `@claude` to work in GitHub comments and PRs? This uses the `claude-code.yml` workflow."
 
-If yes, no extra setup is needed — the workflow uses the same `AWS_DEPLOY_ROLE_ARN` secret and Bedrock OIDC access that was already configured. The IAM role needs `bedrock:InvokeModel` for `us.anthropic.claude-opus-4-7-v1`.
-
-To verify the permission is in place:
-```bash
-aws iam simulate-principal-policy \
-  --policy-source-arn $DEPLOY_ROLE_ARN \
-  --action-names bedrock:InvokeModel \
-  --resource-arns "arn:aws:bedrock:${AWS_REGION}::foundation-model/us.anthropic.claude-opus-4-7-v1"
-```
-
----
-
-## Step 10 — Trigger first deploy
-
-Commit all changes and push to `main`. The deploy workflows will trigger for each agent whose files changed.
-
-```bash
-git add .dispatch/agents.yaml .github/workflows/ infra/
-git commit -m "Configure agent fleet for deployment"
-git push origin main
-```
-
-Monitor the Actions tab. Each agent deploy runs: build → scan → deploy → smoke test.
-
-After all deploys succeed:
-1. Update `.dispatch/agents.yaml` with the real `runtime_arn` values (from Step 7)
-2. Re-sync the registry: `aws ssm put-parameter --name /sdlc-agents/${STAGE}/registry --value "$(cat .dispatch/agents.yaml)" --type String --overwrite`
-3. Test end-to-end by commenting `@workitems health check` on a GitHub issue
+If yes, `claude-code.yml` authenticates to Bedrock. The `sdlc-agents-setup-claude-code` skill provisions the `ClaudeCodeBedrockRole` (with `bedrock:InvokeModel` for `us.anthropic.claude-opus-4-7-v1`) and sets `CLAUDE_CODE_ROLE_ARN` + `CLAUDE_CODE_AWS_REGION` on the target repo. This is independent of the fleet — you can enable it or not.
 
 ---
 
@@ -311,33 +203,32 @@ After all deploys succeed:
 
 Before reporting the setup as complete, confirm each of the following:
 
-- [ ] `sam deploy` completed without errors
-- [ ] ECR repos exist for all chosen agents
-- [ ] AgentCore Runtimes are in `ACTIVE` state
-- [ ] `.dispatch/agents.yaml` has real `runtime_arn` values (no `${...}` placeholders)
-- [ ] SSM parameter `/sdlc-agents/${STAGE}/registry` is populated
-- [ ] GitHub secrets `AWS_DEPLOY_ROLE_ARN` and `AWS_ACCOUNT_ID` are set
-- [ ] At least one deploy workflow has run and passed
-- [ ] Smoke test passed (the deploy workflow runs it automatically)
+- [ ] `python scripts/deploy_fleet.py` completed without errors
+- [ ] The dashboard is reachable and you can sign in as an admin
+- [ ] The build source (`agents/`) was uploaded to the pipeline's source bucket
+- [ ] Each chosen agent has an **active** capability row in the dashboard (not `building`/`failed`)
+- [ ] AgentCore Runtimes for the active capabilities are in `READY` state
+- [ ] SSM parameter `/sdlc-agents/${STAGE}/registry` is populated (re-rendered from the capability rows)
 - [ ] If Asana: webhook registered and handshake logged in CloudWatch
 - [ ] If Asana: bot GIDs stored in SSM / Lambda environment variables
+- [ ] End-to-end: commenting `@workitems health check` on a GitHub issue gets a response
 - [ ] `@claude` works on a test comment (if configured)
 
 ---
 
 ## Troubleshooting
 
-**Deploy workflow fails at "Deploy to AgentCore Runtime"**
-The Runtime must be created manually before the first CI deploy — `update-agent-runtime` cannot create a new one. Run the `create-agent-runtime` command from Step 7.
+**A capability is stuck in `building` or lands in `failed`**
+Check the `sdlc-agent-builder-${STAGE}` CodeBuild run and the `capability-deployer-${STAGE}` Lambda's CloudWatch logs. Common causes: no `agents/<agent_id>/Dockerfile` in the uploaded source (re-run `deploy_fleet.py` to refresh `source.zip`), an invalid `agent_id`, or the runtime never reaching READY. A failed build/deploy leaves any existing runtime untouched.
 
 **Dispatch Router returns 404 for a known agent**
-The SSM registry is stale or missing the agent entry. Re-run the `ssm put-parameter` command from Step 4.
+The agent isn't an active capability. Confirm its capability row is `active` in the dashboard; the registry is re-rendered from active rows on every change and written to `/sdlc-agents/${STAGE}/registry`.
+
+**Onboard fails with "a runtime named X already exists but is not managed by this fleet"**
+An AgentCore runtime with that name exists without the fleet tag. The deployer refuses to overwrite a foreign runtime — choose a different `agent_id`.
 
 **Asana webhook not triggering**
 Check CloudWatch Logs for `asana-webhook-${STAGE}`. Common causes: webhook not registered, signature mismatch (SSM secret out of sync), or the Lambda's API Gateway URL changed after a stack update.
 
-**Smoke test fails with "no recognized @agent mention"**
-The registry doesn't include the agent yet, or the runtime ARN is still a placeholder. Check `.dispatch/agents.yaml` and re-sync SSM.
-
 **`@claude` workflow fails with access denied on Bedrock**
-The IAM role needs `bedrock:InvokeModel` permission. Check the SAM template's `GitHubActionsDeployRole` policy and redeploy if needed.
+The `ClaudeCodeBedrockRole` needs `bedrock:InvokeModel` for `us.anthropic.claude-opus-4-7-v1`. Re-run `sdlc-agents-setup-claude-code`.

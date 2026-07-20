@@ -48,7 +48,7 @@ The PDLC Agent Fleet is a multi-agent system on **Amazon Bedrock AgentCore Runti
 │          │ • Track in DynamoDB          │                         │
 │          │ • Invoke AgentCore Runtime   │                         │
 │          └─────────────────────────────┘                         │
-│          Config: SSM (synced from .dispatch/agents.yaml)         │
+│          Config: SSM (rendered from fleet-config capability rows) │
 │          State: DynamoDB (dispatch-assignments-${STAGE})         │
 └──────────────────────────┬──────────────────────────────────────┘
                            │
@@ -94,7 +94,7 @@ Event Source                  Normalization                  Routing
 
 GitHub Actions       ┐                                ┌─ Resolve agent ID
   issue_comment      │                                │  (incl. aliases from
-  pr_review_comment  ├──► Dispatch Router             │   agents.yaml)
+  pr_review_comment  ├──► Dispatch Router             │   the SSM registry)
   issue assigned     │    Lambda                      │
                      │    │                           ├─ Check authorization
 Asana Webhook        ├──► │  Normalize to:            │  (authorization.users)
@@ -167,26 +167,28 @@ Shared helpers live in `agents/shared/` (currently `assignment.py`, which provid
 
 ### 3.2 Deployment Pipeline
 
+Agents are onboarded from the dashboard Admin view (the Capabilities panel), not from a per-agent CI workflow. The base platform (foundation stack, shared build pipeline, dashboard) is deployed once with `scripts/deploy_fleet.py`, which also uploads the `agents/` tree as the build source.
+
 ```
-git push (change under agents/<name>/** or agents/shared/**)
-      │
+Admin onboards agent_id in the dashboard (Capabilities panel)
+      │  (admin API writes a capability row + codebuild:StartBuild)
       ▼
-GitHub Actions: deploy-<name>.yml
-      │ (passes required env vars from repo Actions Variables)
+Shared CodeBuild: sdlc-agent-builder-${STAGE}  (AGENT_NAME override)
+      ├── Ensure ECR repo exists (IMMUTABLE)
+      ├── Build Docker image from agents/${AGENT_NAME}/Dockerfile (context agents/)
+      └── Push image (fresh per-build tag, no :latest)
+      │  (build-completion EventBridge event)
       ▼
-Reusable workflow: deploy-agent.yml
-      ├── Validate env_vars (fail-fast if required value empty)
-      ├── Configure AWS credentials via OIDC
-      ├── Ensure ECR repo exists
-      ├── Build Docker image, tag with commit SHA + latest, push
-      ├── Amazon Inspector SBOM scan
-      ├── create-or-update AgentCore Runtime (create on first run)
+capability-deployer Lambda
+      ├── Ensure per-agent runtime IAM role (path /sdlc-agents/capabilities/,
+      │     capped by a permissions boundary)
+      ├── create-or-update AgentCore Runtime with the merged env
       ├── Wait for runtime READY
-      ├── Sync dispatch registry to SSM (resolves runtime ARN placeholders)
-      └── Smoke test (invoke runtime with {"prompt": "health check"})
+      ├── Mark capability active
+      └── Re-render + publish the dispatch registry to SSM
 ```
 
-The shared workflow also supports the `env_vars` input, which is passed through to `create-agent-runtime` / `update-agent-runtime` as the container's environment — this is how per-deployment config (GitHub repo, Asana GIDs) reaches the running agent without baking it into the image.
+The runtime's environment is assembled by the `capability-deployer` from the fleet base env (guardrail id/version, `GATEWAY_MCP_URL`) plus the capability row's own `env` map — this is how per-deployment config (GitHub repo, Asana GIDs) reaches the running agent without baking it into the image. A weekly EventBridge schedule (`capability-rebuilder` Lambda) re-runs the same build for every active capability to pick up security patches; a failed build or deploy never tears down a working runtime.
 
 ---
 
@@ -293,7 +295,7 @@ Cost is driven by three things:
 2. **AgentCore Runtime compute** — billed per-second during invocations.
 3. **Lambda + API Gateway** for Dispatch Router and Asana webhook — pennies at typical volume.
 
-Per-agent **daily token budgets** are defined in `.dispatch/agents.yaml`:
+Per-agent **daily token budgets** are carried on each agent's capability row (the `limits` field, edited in the dashboard Admin view):
 
 | Agent | Daily token budget | Max concurrent | Timeout |
 |---|---|---|---|

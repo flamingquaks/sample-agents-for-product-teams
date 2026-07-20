@@ -63,10 +63,9 @@ infra/
   foundation/    Shared AWS resources (DynamoDB, S3, IAM)
 cedar/           Cedar policy guardrails
 skills/          Claude Code skills that drive the Quickstart
-scripts/         Operator helpers (OAuth bootstrap, registry sync)
-.dispatch/       Agent registry (agents.yaml)
+scripts/         Operator helpers (base-platform deploy, OAuth/webhook bootstrap)
 .github/
-  workflows/     CI/CD pipelines
+  workflows/     GitHub event triggers (@claude, @mention dispatch), lint, security scans
 docs/            Specs, roadmap, planning docs
 ```
 
@@ -114,9 +113,9 @@ The skill will:
 
 1. Ask which PM tool, SCM, and chat platform you use
 2. Propose the matching subset of agents (and let you edit)
-3. Provision AWS (IAM roles, ECR repos, AgentCore Runtimes) in the account/region you chose
+3. Deploy the base platform (foundation stack, shared build pipeline, dashboard) in the account/region you chose
 4. Walk through OAuth/App connections for each integration
-5. Publish the per-repo config (region, GitHub repo, Asana GIDs) as GitHub Actions Variables so the deploy workflows pick them up automatically
+5. Onboard each chosen agent in the dashboard Admin view — which builds its container and stands up its AgentCore runtime
 6. Register webhooks and bot accounts
 7. Run a smoke test per agent
 
@@ -125,132 +124,103 @@ every downstream step — nothing in the install path is hard-coded to `us-west-
 
 ## Setup (interactive bootstrap)
 
-The cumbersome part of standing up the fleet is the one-time, privileged setup
-that CI depends on but can't create for itself — the GitHub OIDC provider, the
-deploy role, the per-agent IAM runtime roles, and the GitHub Actions
-secrets/variables. The interactive bootstrap script does exactly that, using an
-AWS profile you pick, then **hands ongoing deployment to CI**:
+`scripts/bootstrap.py` is a thin, interactive one-time **base** setup, using an
+AWS profile you pick:
 
 ```bash
 python scripts/bootstrap.py            # walks you through it
 python scripts/bootstrap.py --dry-run  # show the plan first, touch nothing
 ```
 
-It preflights the required tools (`aws`, `sam`, `gh`) with install guidance if
-any are missing, lets you choose an AWS profile + region (and confirms the
-account), collects config (stage, target repo, Asana GIDs — remembered in
-`.sdlc-agents/bootstrap.config.json` for re-runs), then creates the OIDC
-provider + repo-scoped deploy role, the per-agent runtime IAM roles, deploys the
-foundation stack, sets the GitHub Actions secrets/variables, and preflights the
-SSM secrets (pointing you at the bootstrap scripts for any that are missing — it
+It preflights the required tools (`aws`, `sam`) with install guidance if any are
+missing, lets you choose an AWS profile + region (and confirms the account),
+collects config (stage, target repo, Asana GIDs — remembered in
+`.sdlc-agents/bootstrap.config.json` for re-runs), deploys the foundation stack,
+uploads the agent build source, seeds the initial onboarded repos (when the
+dashboard is off and there's no Admin UI to do it), and preflights the SSM
+secrets (pointing you at the bootstrap scripts for any that are missing — it
 doesn't handle secrets itself). Everything is idempotent.
 
-It deliberately does **not** build images or create AgentCore runtimes — that's
-CI's job (`deploy-agent.yml`), the single source of truth for agent deploys.
-Once bootstrap finishes, you push to `main` and the per-agent workflows deploy
-the agents.
+It deliberately does **not** create OIDC providers, CI deploy roles, per-agent
+runtime roles, or GitHub Actions secrets — that machinery has been retired. It
+also does **not** build images or create AgentCore runtimes — that's the
+dashboard's job now. Once the base is deployed, open the dashboard, add
+operators/admins to the Cognito groups, and **onboard agents + repos from the
+Admin view**.
 
 ## Setup (manual)
 
-If you'd rather provision by hand, the outline below mirrors what the script does.
-Set `AWS_REGION` (and `AWS_ACCOUNT_ID`) once in your shell and every snippet
-below picks it up.
+If you'd rather drive the base deploy directly, `scripts/deploy_fleet.py` is the
+one-command base-platform deployer. Set `AWS_REGION` (and `AWS_ACCOUNT_ID`) once
+in your shell.
 
 ```bash
 export AWS_REGION=us-west-2          # pick your region
 export AWS_ACCOUNT_ID=123456789012   # your 12-digit account ID
 ```
 
-### 1. Bootstrap AWS infrastructure
+### 1. Deploy the base platform
 
 ```bash
-# Deploy shared resources (DynamoDB, S3, IAM roles)
-cd infra/foundation
-sam build && sam deploy --guided --region "$AWS_REGION"
+python scripts/deploy_fleet.py --stage dev --region "$AWS_REGION"
 ```
 
-This creates the `dispatch-router` Lambda, DynamoDB tables, and IAM roles used by all agents.
+This runs `sam build`/`sam deploy` on `infra/foundation` (the `dispatch-router`
+Lambda, DynamoDB tables, guardrail, SSM registry, the shared build pipeline +
+capability deployer/rebuilder, and — when enabled — Cognito + the dashboard
+API/CDN and the AgentCore Gateway), zips `agents/` and uploads it as `source.zip`
+to the build pipeline's source bucket, and builds/publishes the dashboard SPA.
+It's idempotent and preserves the stack's existing parameter values on re-run.
+Use `--dry-run` to preview.
 
-### 2. Configure GitHub repository secrets
+The dashboard and Gateway are off by default; enable them on the first deploy
+(e.g. `DeployDashboard=true`, `DeployGateway=true` — see `docs/aws-deploy.md`
+§2.3) since you need the dashboard Admin UI to onboard agents.
 
-Go to **Settings → Secrets and variables → Actions** and add:
+### 2. Add dashboard operators/admins
 
-| Secret | Description |
-|--------|-------------|
-| `AWS_DEPLOY_ROLE_ARN` | ARN of the IAM role for GitHub Actions OIDC (created by `infra/foundation`) |
-| `AWS_ACCOUNT_ID` | Your AWS account ID |
+Onboarding lives in the dashboard's Admin view, gated by the Cognito `admins`
+group (there's no self sign-up). Add yourself to `admins`, open the dashboard
+(`DashboardUrl` stack output, also printed by the deploy script), and sign in.
 
-The deploy workflows use OIDC — no long-lived credentials needed. The IAM role must have a trust policy allowing `token.actions.githubusercontent.com` for this repository.
+### 3. Onboard agents
 
-### 3. Configure GitHub Actions OIDC trust
+In the dashboard **Admin view → Capabilities** panel, click **Onboard
+capability** and enter the `agent_id` (must match a directory under `agents/` in
+the uploaded build source), plus optional description/aliases/env. Onboarding
+starts the shared build (`sdlc-agent-builder-<stage>` CodeBuild, `AGENT_NAME`
+override), which pushes to ECR; a build-completion EventBridge event then invokes
+the `capability-deployer` Lambda to create the per-agent runtime IAM role +
+AgentCore runtime, wait for READY, and mark the capability active — which
+re-renders the Dispatch Router registry. ECR repos (`sdlc-agents/<agent>`) are
+created by the build with `IMMUTABLE` tag mutability; each build uses a fresh
+tag.
 
-The IAM role created in step 1 needs a trust policy like:
-
-```json
-{
-  "Effect": "Allow",
-  "Principal": { "Federated": "arn:aws:iam::YOUR_ACCOUNT:oidc-provider/token.actions.githubusercontent.com" },
-  "Action": "sts:AssumeRoleWithWebIdentity",
-  "Condition": {
-    "StringLike": { "token.actions.githubusercontent.com:sub": "repo:YOUR_ORG/YOUR_REPO:*" }
-  }
-}
-```
-
-### 4. Create ECR repositories
-
-One repository per agent:
-
-```bash
-for agent in workitems docwriter researcher adr; do
-  aws ecr create-repository --repository-name "sdlc-agents/$agent" --region "$AWS_REGION"
-done
-```
-
-### 5. Deploy agents
-
-Push to `main` — the per-agent CI/CD workflows build, scan, and deploy automatically when files under `agents/<name>/` change.
-
-To deploy manually (rare — normally CI handles this via `.github/workflows/deploy-agent.yml`):
-
-```bash
-cd agents
-IMAGE_TAG="$(git rev-parse HEAD)"
-IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/sdlc-agents/workitems"
-docker build -f workitems/Dockerfile -t "${IMAGE_URI}:${IMAGE_TAG}" .
-aws ecr get-login-password --region "$AWS_REGION" \
-  | docker login --username AWS --password-stdin "${IMAGE_URI}"
-docker push "${IMAGE_URI}:${IMAGE_TAG}"
-aws bedrock-agentcore-control update-agent-runtime \
-  --agent-runtime-name workitems \
-  --agent-runtime-artifact "containerConfiguration={containerUri=${IMAGE_URI}:${IMAGE_TAG}}" \
-  --region "$AWS_REGION"
-```
-
-ECR repositories are created with `IMMUTABLE` tag mutability — each push must use a fresh tag. The commit SHA is a natural choice. Don't reuse tags across deploys.
+To add a **new** agent, create `agents/<name>/` (`agent.py`, `prompts.py`,
+`tools/`, `Dockerfile`, `requirements.txt`), re-upload the build source
+(`python scripts/deploy_fleet.py --skip-foundation --skip-dashboard`), then
+onboard it.
 
 ### Optional helper scripts
 
 Under `scripts/`:
 
-- `bootstrap.py` — interactive one-time setup (see [Setup (interactive bootstrap)](#setup-interactive-bootstrap)); preflights tooling, creates the OIDC provider + deploy role + per-agent runtime roles, deploys the foundation stack, and sets the GitHub Actions secrets/variables, then hands agent deploys to CI
+- `deploy_fleet.py` — base-platform deployer (foundation stack + build-source upload + dashboard SPA); no per-agent steps
+- `bootstrap.py` — interactive one-time base setup (see [Setup (interactive bootstrap)](#setup-interactive-bootstrap)); wraps the foundation deploy + build-source upload, seeds initial repos
 - `bootstrap_asana_oauth.py` — one-shot OAuth 2.0 dance for the Asana MCP server; stores the refresh token in SSM
 - `bootstrap_jira_oauth.py` — same thing for Atlassian/Jira (3LO)
 - `bootstrap_asana_webhook.py` — operator-run webhook registration; attaches a temporary `ssm:PutParameter` policy to the webhook Lambda's role so the Asana handshake can persist the shared secret, then removes the policy
-- `sync_registry.py` — resolves runtime ARNs in `.dispatch/agents.yaml` and pushes the registry to SSM so the Dispatch Router can read it
 
 Run these only for the integrations you actually use.
 
-## CI/CD Workflows
+## GitHub Actions Workflows
+
+Agents are built and deployed by the dashboard onboarding flow (CodeBuild →
+AgentCore), not by GitHub Actions. The workflows in `.github/workflows/` cover
+GitHub event triggers and repo hygiene:
 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
-| `deploy-workitems.yml` | Push to `main` touching `agents/workitems/**` | Build, scan, deploy Workitems |
-| `deploy-docwriter.yml` | Push to `main` touching `agents/docwriter/**` | Build, scan, deploy Docwriter |
-| `deploy-researcher.yml` | Push to `main` touching `agents/researcher/**` | Build, scan, deploy Researcher |
-| `deploy-adr.yml` | Push to `main` touching `agents/adr/**` | Build, scan, deploy Adr |
-| `deploy-agent.yml` | Called by above | Shared build/deploy logic |
-| `deploy-dashboard.yml` | Push to `main` touching `dashboard/**` | Build SPA, upload to S3, invalidate CloudFront |
 | `claude-code.yml` | `@claude` in comments/PRs | Claude Code assistant |
 | `agent-dispatch.yml` | `@workitems`, `@docwriter`, etc. in comments | Route mentions to agents |
 | `python-lint.yml` | Push/PR to `main` | Ruff lint + format check |

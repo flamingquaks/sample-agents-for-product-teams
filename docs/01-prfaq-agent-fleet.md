@@ -56,7 +56,7 @@ Consumption-based pricing. Primary cost drivers are **Bedrock model invocations*
 
 **Q: Can I add new agents?**
 
-Yes. Adding a new agent requires writing a Strands agent (system prompt + tools), adding a Dockerfile, creating a `deploy-<name>.yml` wrapper of the shared deploy workflow, and adding an entry to `.dispatch/agents.yaml`. The new agent is then reachable via `@mention` through Dispatch.
+Yes. Adding a new agent requires writing a Strands agent (system prompt + tools) and a Dockerfile under `agents/<name>/`, redeploying the base so the build source includes it, and onboarding it from the dashboard Admin view. Onboarding builds the container and stands up its runtime; the new agent is then reachable via `@mention` through Dispatch.
 
 **Q: What kind of teams is this suited for?**
 

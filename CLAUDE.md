@@ -17,8 +17,8 @@ infra/            — AWS infrastructure (SAM/CloudFormation)
 cedar/            — Cedar policies (guardrails for agent tool access)
 docs/             — Planning docs, specs, roadmap
   specs/          — Individual agent and system specs
-.dispatch/        — Agent registry (agents.yaml)
-.github/workflows — CI/CD pipelines and GitHub event triggers
+dashboard/        — Fleet monitoring + admin SPA (React + Vite); Admin view onboards agents/repos
+.github/workflows — GitHub event triggers (@claude, @mention dispatch), lint, security scans
 ```
 
 ## Tech Stack
@@ -33,7 +33,7 @@ docs/             — Planning docs, specs, roadmap
 - **Memory**: Agents honor `AGENTCORE_MEMORY_ID` via Strands' `AgentCoreMemoryToolProvider`. No Memory resource is provisioned by the fleet's infra template today; this is a roadmap item.
 - **Policy**: Cedar policy files under `cedar/<agent>.cedar` (advisory unless the Gateway is deployed). With `DeployGateway`, the AgentCore Gateway policy engine enforces Cedar in the invocation path — including the admin repo-allowlist policy (`infra/dashboard/fleet_policy.py`).
 - **Infra**: AWS SAM (CloudFormation) — see `docs/aws-deploy.md` for the full surface.
-- **CI/CD**: GitHub Actions → ECR → AgentCore Runtime
+- **Deploy**: base platform via `scripts/deploy_fleet.py` (foundation stack + build source + dashboard SPA); agents are onboarded from the dashboard Admin view, which builds each container (shared `sdlc-agent-builder-<stage>` CodeBuild) → ECR → AgentCore Runtime (`capability-deployer` Lambda).
 
 ## Conventions
 
@@ -41,7 +41,7 @@ docs/             — Planning docs, specs, roadmap
 - Work decomposition uses the approval pattern: agent proposes → human approves → agent executes.
 - Custom tools are structured task prompts, not business logic. They return instructions that guide the agent's reasoning. The LLM does the actual orchestration.
 - System prompts live in `prompts.py` alongside agent code, not in separate config.
-- Agent registry lives in `.dispatch/agents.yaml` and is synced to SSM on deploy.
+- The Dispatch Router registry is rendered from the capability rows in the `fleet-config-${Stage}` DynamoDB table (onboarded in the dashboard Admin view) and written to SSM (`/sdlc-agents/${Stage}/registry`) on every change.
 
 ## Working with Agents
 
