@@ -14,6 +14,25 @@ Table shape (single table, ``FLEET_CONFIG_TABLE`` env var). Partition key ``pk``
                    owner_type: "User"|"Organization", installation_id(int),
                    install_verified_at(epoch)}
   - Settings:      pk="settings",           {kind:"settings", restrict_repos(bool)}
+  - Capability:    pk="capability#<agent_id>", {kind:"capability", agent_id,
+                   description, aliases[list], triggers{source:[event...]},
+                   authorization_users[list], limits{max_concurrent,
+                   timeout_minutes, daily_token_budget}, env{KEY:val}, enabled(bool),
+                   status: "pending"|"building"|"active"|"failed"|"disabled",
+                   image_tag?, runtime_arn?, build_id?, onboarded_by, onboarded_at,
+                   updated_at, status_detail?}
+
+Capability record (the UI-onboarded agent): a "capability" is an agent the fleet
+can dispatch to. It USED to be spread across code + .dispatch/agents.yaml +
+per-agent CI wrappers + hand-created IAM roles; onboarding one now writes a single
+row here and the dashboard drives the rest (build → runtime → registry → policy).
+The registry the Dispatch Router reads from SSM is RENDERED from these rows
+(render_registry), so the row is the source of truth that agents.yaml/sync_registry
+previously were. Fields mirror the agents.yaml entry the router consumes
+(description/aliases/triggers/authorization.users/limits) plus the deploy state the
+UI now owns (image_tag, runtime_arn, build_id, status). ``env`` is the per-agent
+runtime environment (e.g. Asana GIDs) the build/runtime step injects — the values
+the deploy scripts previously sourced from the bootstrap config / GitHub vars.
 
 ``enabled``            — the repo is dispatchable (a mention from it is routed).
 ``multi_repo_eligible``— the master switch: the repo may participate in cross-repo
@@ -53,6 +72,7 @@ one App span many individual + org owners (each a separate installation).
 """
 
 import os
+import re
 import time
 
 import boto3
@@ -60,6 +80,26 @@ import boto3
 _REPO_PK_PREFIX = "repo#"
 _OWNER_PK_PREFIX = "owner#"
 _SETTINGS_PK = "settings"
+_CAPABILITY_PK_PREFIX = "capability#"
+
+# Capability lifecycle. A row starts "pending" the instant it's onboarded, moves
+# to "building" while the shared build pipeline runs, "active" once its runtime is
+# READY (only active + enabled capabilities are rendered into the router registry),
+# "failed" if a build/runtime step errors (kept so the admin can see why + retry),
+# and "disabled" when an admin turns it off without deleting it.
+CAP_PENDING = "pending"
+CAP_BUILDING = "building"
+CAP_ACTIVE = "active"
+CAP_FAILED = "failed"
+CAP_DISABLED = "disabled"
+CAP_STATUSES = (CAP_PENDING, CAP_BUILDING, CAP_ACTIVE, CAP_FAILED, CAP_DISABLED)
+
+# agent_id is used unquoted as an ECR repo suffix (sdlc-agents/<id>), a CodeBuild
+# AGENT_NAME override, an agents/<id>/ path, and a Cedar/registry literal. Pin it
+# to the same shape those consumers accept so an onboard can't inject a path
+# traversal, a shell metachar, or a bogus resource name: lowercase, start with a
+# letter, end alphanumeric (no trailing hyphen), 2-64 chars.
+_AGENT_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,62}[a-z0-9]$")
 
 # How a dispatch that ORIGINATES in a repo may reach OTHER repos.
 CO_REPO_ISOLATED = "isolated"  # only itself (default — safest)
@@ -268,6 +308,201 @@ def put_settings(*, restrict_repos: bool) -> dict:
     }
     _get_table().put_item(Item=item)
     return item
+
+
+# --- capabilities (UI-onboarded agents) --------------------------------------
+
+
+def valid_agent_id(agent_id: str) -> bool:
+    """Whether ``agent_id`` is a safe, canonical capability id (see _AGENT_ID_RE)."""
+    return bool(_AGENT_ID_RE.match(agent_id or ""))
+
+
+def _capability_pk(agent_id: str) -> str:
+    return f"{_CAPABILITY_PK_PREFIX}{agent_id}"
+
+
+def list_capabilities() -> list[dict]:
+    """All onboarded capability records, newest first (by onboarded_at). Pages on
+    LastEvaluatedKey for the same reason list_repos does — a dropped row would be
+    silently missing from both the admin listing and the rendered registry."""
+    table = _get_table()
+    caps: list[dict] = []
+    start_key = None
+    while True:
+        kwargs = {
+            "FilterExpression": "kind = :k",
+            "ExpressionAttributeValues": {":k": "capability"},
+        }
+        if start_key:
+            kwargs["ExclusiveStartKey"] = start_key
+        resp = table.scan(**kwargs)
+        caps.extend(resp.get("Items", []))
+        start_key = resp.get("LastEvaluatedKey")
+        if not start_key:
+            break
+    caps.sort(key=lambda c: c.get("onboarded_at", 0), reverse=True)
+    return caps
+
+
+def get_capability(agent_id: str) -> dict | None:
+    resp = _get_table().get_item(Key={"pk": _capability_pk(agent_id)})
+    return resp.get("Item")
+
+
+def put_capability(
+    agent_id: str,
+    *,
+    description: str = "",
+    aliases: list[str] | None = None,
+    triggers: dict | None = None,
+    authorization_users: list[str] | None = None,
+    limits: dict | None = None,
+    env: dict | None = None,
+    enabled: bool = True,
+    status: str = CAP_PENDING,
+    onboarded_by: str = "",
+) -> dict:
+    """Create/replace a capability record's DECLARATIVE fields (the parts an admin
+    edits). Deploy-state fields — image_tag, runtime_arn, build_id, status_detail —
+    are NOT set here; they're written by the build/runtime steps via
+    set_capability_deploy_state / set_capability_status, so re-submitting the
+    onboarding form can't clobber a live runtime's ARN. Preserves onboarded_at +
+    existing deploy state on an update; bumps updated_at.
+
+    Raises ValueError on an invalid agent_id — it flows into resource names and
+    filesystem paths downstream, so it's validated at the store boundary."""
+    if not valid_agent_id(agent_id):
+        raise ValueError(
+            f"invalid agent_id {agent_id!r} — must match {_AGENT_ID_RE.pattern} "
+            f"(lowercase, starts with a letter, [a-z0-9-], 2-64 chars)"
+        )
+    if status not in CAP_STATUSES:
+        raise ValueError(f"invalid capability status {status!r}")
+    now = int(time.time())
+    existing = get_capability(agent_id) or {}
+    # Normalize + de-dup aliases, order-preserving. The router lowercases the
+    # mention before matching (resolve_agent), so aliases must be lowercase; dupes
+    # are harmless there but pointless to store.
+    norm_aliases: list[str] = []
+    for a in aliases or []:
+        low = a.strip().lower()
+        if low and low not in norm_aliases:
+            norm_aliases.append(low)
+    item = {
+        "pk": _capability_pk(agent_id),
+        "kind": "capability",
+        "agent_id": agent_id,
+        "description": description,
+        "aliases": norm_aliases,
+        "triggers": triggers or {},
+        "authorization_users": [u for u in (authorization_users or []) if u],
+        "limits": limits or {},
+        "env": env or {},
+        "enabled": bool(enabled),
+        "status": status,
+        "onboarded_by": onboarded_by or existing.get("onboarded_by", ""),
+        "onboarded_at": existing.get("onboarded_at", now),
+        "updated_at": now,
+    }
+    # Carry forward deploy state the UI form doesn't own.
+    for k in ("image_tag", "runtime_arn", "build_id", "status_detail"):
+        if k in existing:
+            item[k] = existing[k]
+    _get_table().put_item(Item=item)
+    return item
+
+
+def set_capability_status(agent_id: str, status: str, *, detail: str = "") -> None:
+    """Advance a capability's lifecycle status (build/runtime steps call this).
+    ``detail`` records the last transition reason (e.g. a build failure message)
+    for the admin UI. Condition-guarded so a status write to a deleted row fails
+    loudly rather than resurrecting it."""
+    if status not in CAP_STATUSES:
+        raise ValueError(f"invalid capability status {status!r}")
+    _get_table().update_item(
+        Key={"pk": _capability_pk(agent_id)},
+        UpdateExpression="SET #s = :s, status_detail = :d, updated_at = :u",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={
+            ":s": status,
+            ":d": detail,
+            ":u": int(time.time()),
+        },
+        ConditionExpression="attribute_exists(pk)",
+    )
+
+
+def set_capability_deploy_state(
+    agent_id: str,
+    *,
+    image_tag: str | None = None,
+    runtime_arn: str | None = None,
+    build_id: str | None = None,
+) -> None:
+    """Record deploy artifacts produced by the build/runtime steps, without
+    touching the declarative fields. Only the provided fields are written."""
+    sets, names, values = ["updated_at = :u"], {}, {":u": int(time.time())}
+    for attr, val in (
+        ("image_tag", image_tag),
+        ("runtime_arn", runtime_arn),
+        ("build_id", build_id),
+    ):
+        if val is not None:
+            placeholder = f":{attr}"
+            sets.append(f"#{attr} = {placeholder}")
+            names[f"#{attr}"] = attr
+            values[placeholder] = val
+    _get_table().update_item(
+        Key={"pk": _capability_pk(agent_id)},
+        UpdateExpression="SET " + ", ".join(sets),
+        ExpressionAttributeNames=names or None,
+        ExpressionAttributeValues=values,
+        ConditionExpression="attribute_exists(pk)",
+    )
+
+
+def delete_capability(agent_id: str) -> bool:
+    """Delete a capability row. Returns True if a row was removed. Does NOT tear
+    down the runtime/role/image — the admin API handles that lifecycle before
+    removing the row, so a bare delete here never orphans the record ahead of its
+    resources."""
+    resp = _get_table().delete_item(
+        Key={"pk": _capability_pk(agent_id)}, ReturnValues="ALL_OLD"
+    )
+    return bool(resp.get("Attributes"))
+
+
+def render_registry() -> dict:
+    """Render the Dispatch Router registry from the active capability rows.
+
+    Reproduces exactly the shape the router consumes from SSM (see
+    infra/dispatch/router.py load_registry / resolve_agent): a top-level
+    ``{"agents": {agent_id: {description, runtime_arn, aliases, triggers,
+    authorization: {users}, limits}}}`` map. This REPLACES .dispatch/agents.yaml +
+    scripts/sync_registry.py — the registry is now generated from the table the
+    admin UI writes, so onboarding an agent needs no code/YAML edit.
+
+    Only capabilities that are enabled, ``active``, and actually have a resolved
+    ``runtime_arn`` are included: a half-onboarded agent (still building, or whose
+    runtime creation failed) must not appear in the registry, or the router would
+    resolve a mention to it and then fail to invoke a nonexistent runtime."""
+    agents = {}
+    for cap in list_capabilities():
+        if not cap.get("enabled") or cap.get("status") != CAP_ACTIVE:
+            continue
+        arn = cap.get("runtime_arn")
+        if not arn:
+            continue
+        agents[cap["agent_id"]] = {
+            "description": cap.get("description", ""),
+            "runtime_arn": arn,
+            "aliases": list(cap.get("aliases", [])),
+            "triggers": dict(cap.get("triggers", {})),
+            "authorization": {"users": list(cap.get("authorization_users", []))},
+            "limits": dict(cap.get("limits", {})),
+        }
+    return {"agents": agents}
 
 
 # --- derived -----------------------------------------------------------------
