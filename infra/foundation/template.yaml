@@ -18,6 +18,15 @@ Parameters:
     Type: String
     Description: Asana custom field GID for the "Agent" dropdown
 
+  MantleProjectId:
+    Type: String
+    Default: ""
+    Description: >
+      The fleet's shared Bedrock Mantle project id for model cost/usage
+      attribution, injected as MANTLE_PROJECT_ID on every agent runtime. One
+      project fleet-wide (a dispatch may span repos, so per-repo attribution is
+      meaningless). Blank leaves agents on the account's default project.
+
   DeployDashboard:
     Type: String
     Default: "false"
@@ -67,6 +76,9 @@ Parameters:
 Conditions:
   DashboardEnabled: !Equals [!Ref DeployDashboard, "true"]
   GatewayEnabled: !Equals [!Ref DeployGateway, "true"]
+  # Inject MANTLE_PROJECT_ID onto agent runtimes only when a shared project id is
+  # configured; blank leaves agents on the account's default Mantle project.
+  HasMantleProject: !Not [!Equals [!Ref MantleProjectId, ""]]
   # GatewayPolicyEnforcement is expressed in per-policy terms (LOG_ONLY|ACTIVE);
   # the gateway→engine attachment Mode instead uses LOG_ONLY|ENFORCE. This maps
   # the ACTIVE choice to the attachment's ENFORCE value (see FleetGateway).
@@ -1017,10 +1029,6 @@ Resources:
           CAPABILITY_BUILD_PROJECT: !Ref CapabilityBuildProject
           # AVP authorizes every write (auth.is_admin → Cedar Write action).
           AVP_POLICY_STORE_ID: !GetAtt DashboardPolicyStore.PolicyStoreId
-          # Per-repo Bedrock Mantle project creation on repo onboard (cost
-          # attribution). STAGE + repo name the project; the flag gates rollout.
-          STAGE: !Ref Stage
-          SDLC_MANTLE_ENABLED: "true"
       Policies:
         # Read+write the config table (onboard/enable/disable repos, settings,
         # capabilities).
@@ -1031,14 +1039,6 @@ Resources:
             - Effect: Allow
               Action: verifiedpermissions:IsAuthorized
               Resource: !GetAtt DashboardPolicyStore.Arn
-        # Create + tag a per-repo Mantle project on repo onboard (best-effort).
-        - Statement:
-            - Effect: Allow
-              Action:
-                - bedrock-mantle:CreateProject
-                - bedrock-mantle:ListProjects
-                - bedrock-mantle:TagResource
-              Resource: "*"
         # Publish the rendered agent registry to the SSM param the Dispatch Router
         # reads (capability onboard/edit/disable regenerates it).
         - Statement:
@@ -1363,6 +1363,9 @@ Resources:
           BEDROCK_GUARDRAIL_ID: !Ref PromptInjectionGuardrail
           BEDROCK_GUARDRAIL_VERSION: DRAFT
           GATEWAY_MCP_URL: !If [GatewayEnabled, !GetAtt FleetGateway.GatewayUrl, !Ref "AWS::NoValue"]
+          # The fleet's shared Mantle cost-attribution project, propagated onto
+          # every agent runtime as MANTLE_PROJECT_ID (blank → account default).
+          MANTLE_PROJECT_ID: !If [HasMantleProject, !Ref MantleProjectId, !Ref "AWS::NoValue"]
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref FleetConfigTable

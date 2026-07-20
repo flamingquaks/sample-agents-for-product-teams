@@ -454,21 +454,10 @@ def handler(event, context):
             f"act on it. Ask an admin to onboard it in the dashboard.",
         )
 
-    # --- Per-repo Mantle project (cost attribution) ---
-    # Attach the repo's Bedrock Mantle project id to the dispatch context so the
-    # agent attributes its model cost/usage to that project (per-repo chargeback).
-    # GitHub-sourced only, and STRICTLY best-effort: a config-read hiccup must
-    # never break a dispatch, so any failure just falls back to the default
-    # project (unattributed) rather than propagating.
-    if source == "github":
-        repo = str(source_context.get("repo", "")).strip()
-        try:
-            project = fleet_config.mantle_project_for(repo) if repo else None
-        except Exception:  # noqa: BLE001
-            logger.exception("mantle project lookup failed for %s; using default", repo)
-            project = None
-        if project:
-            source_context = {**source_context, "mantle_project": project}
+    # Cost attribution is handled fleet-side: agents tag model usage to the
+    # fleet's single shared Mantle project (MANTLE_PROJECT_ID runtime env). A
+    # dispatch may span repos (co-repo modes), so there's no per-repo project to
+    # inject here.
 
     # --- Concurrency ---
     max_concurrent = agent_config.get("limits", {}).get("max_concurrent", 5)

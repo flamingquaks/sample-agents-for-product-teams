@@ -24,8 +24,8 @@ DynamoDB, and calls `InvokeAgentRuntime` on the target agent's **AgentCore
 Runtime** container. Agents run the Strands SDK and call models on the
 **Bedrock Mantle** endpoint (Claude Sonnet 5; short-term bearer token from the
 runtime role; the prompt-injection guardrail is applied via Mantle headers and
-is fail-closed; a per-repo Mantle **project** — passed through dispatch as
-`source_context.mantle_project` — is set as the `OpenAI-Project` header for cost
+is fail-closed; the fleet's single shared Mantle **project** — injected as the
+`MANTLE_PROJECT_ID` runtime env — is set as the `OpenAI-Project` header for cost
 attribution). All MCP **tool** calls are **gateway-only**: agents SigV4-invoke
 the **AgentCore Gateway**, whose Cedar policy engine + REQUEST interceptor enforce
 per-agent tool grants and per-origin co-repo grouping before a call reaches the

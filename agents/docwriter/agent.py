@@ -111,8 +111,9 @@ def invoke(payload, context=None):
     # max_tokens bumped from Claude's default (4K) to 16K so Docwriter can
     # emit multi-file patches without hitting MaxTokensReachedException
     # mid-tool-call on a multi-file README update.
-    mantle_project = source_context.get("mantle_project") if source_context else None
-    model = build_model(project=mantle_project, max_tokens=16000)
+    # Cost attribution uses the fleet's shared Mantle project (MANTLE_PROJECT_ID
+    # runtime env, read inside build_model) — dispatches may span repos.
+    model = build_model(max_tokens=16000)
     tools = [generate_api_docs, generate_release_notes, detect_doc_gaps, check_doc_freshness, post_results]
 
     # Memory — optional until Memory resource is created

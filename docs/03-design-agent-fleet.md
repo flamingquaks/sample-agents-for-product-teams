@@ -65,7 +65,7 @@ The rendered diagram is [`docs/assets/architecture.mmd`](assets/architecture.mmd
 │                                                                  │
 │  Each agent: Strands SDK + BedrockAgentCoreApp in a container   │
 │  Model: Claude Sonnet 5 via Bedrock Mantle (bearer token +      │
-│         guardrail headers; per-repo OpenAI-Project)             │
+│         guardrail headers; fleet OpenAI-Project)                │
 │  Tool access: AgentCore Gateway only (SigV4) — no direct MCP    │
 └──────────────────────────┬──────────────────────────────────────┘
                            │  all MCP tool calls (SigV4)
@@ -293,7 +293,7 @@ The per-agent `cedar/*.cedar` files document the contract; the **enforced** form
 
 Cost is driven by three things:
 
-1. **Bedrock model invocations** — all four agents run on Claude Sonnet 5 via the Bedrock Mantle endpoint today. A per-repo Mantle **project** attributes model cost/usage to the repo the dispatch acted on.
+1. **Bedrock model invocations** — all four agents run on Claude Sonnet 5 via the Bedrock Mantle endpoint today. A single shared fleet-wide Mantle **project** (`MANTLE_PROJECT_ID`) attributes model cost/usage; attribution is fleet-wide rather than per-repo because a dispatch may act across several repos (co-repo modes).
 2. **AgentCore Runtime compute** — billed per-second during invocations.
 3. **Lambda + API Gateway** for Dispatch Router and Asana webhook — pennies at typical volume.
 

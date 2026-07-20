@@ -41,7 +41,6 @@ def _put_repo(
     status="active",
     co_repo_mode="isolated",
     repo_group=None,
-    mantle_project=None,
 ):
     item = {
         "pk": f"repo#{repo.casefold()}",
@@ -54,8 +53,6 @@ def _put_repo(
     }
     if repo_group:
         item["repo_group"] = repo_group
-    if mantle_project:
-        item["mantle_project"] = mantle_project
     boto3.resource("dynamodb", region_name=REGION).Table(TABLE).put_item(Item=item)
 
 
@@ -228,24 +225,3 @@ def test_cache_refreshes_after_ttl(modules):
     later = fc.time.time() + fc._CACHE_TTL_SECONDS + 1
     with patch.object(fc.time, "time", return_value=later):
         assert router.check_repo_allowed("github", {"repo": "acme/web"}) is True
-
-
-# --- per-repo Mantle project (cost attribution) ------------------------------
-
-
-def test_mantle_project_for_returns_binding(modules):
-    _, fleet_config = modules
-    _put_repo("acme/web", mantle_project="proj-acme-web")
-    fleet_config.reset_cache()
-    assert fleet_config.mantle_project_for("acme/web") == "proj-acme-web"
-    # Case-insensitive; unknown/empty → None (fail-soft to default project).
-    assert fleet_config.mantle_project_for("ACME/WEB") == "proj-acme-web"
-    assert fleet_config.mantle_project_for("no/such") is None
-    assert fleet_config.mantle_project_for("") is None
-
-
-def test_repo_without_project_returns_none(modules):
-    _, fleet_config = modules
-    _put_repo("acme/web")  # no mantle_project set
-    fleet_config.reset_cache()
-    assert fleet_config.mantle_project_for("acme/web") is None

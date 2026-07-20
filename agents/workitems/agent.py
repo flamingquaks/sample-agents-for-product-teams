@@ -106,10 +106,10 @@ def invoke(payload, context=None):
             f"on {source_context.get('repo', 'unknown')}\n"
         )
 
-    # Per-repo Mantle project for cost attribution — set by the Dispatch Router
-    # from the repo's record; absent for non-repo dispatches (default project).
-    mantle_project = source_context.get("mantle_project") if source_context else None
-    model = build_model(project=mantle_project)
+    # Cost attribution uses the fleet's shared Mantle project (MANTLE_PROJECT_ID
+    # runtime env, read inside build_model) — a dispatch may span repos, so there
+    # is no per-repo project to pass through.
+    model = build_model()
     tools = [generate_status_report, detect_risks, reconcile_sync, post_results]
 
     # Memory — optional until Memory resource is created

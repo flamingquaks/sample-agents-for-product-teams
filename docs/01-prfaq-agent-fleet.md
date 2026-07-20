@@ -52,7 +52,7 @@ The same way you'd tag a teammate. Type `@docwriter draft release notes for this
 
 **Q: What does it cost to operate?**
 
-Consumption-based pricing. Primary cost drivers are **Bedrock model invocations** (all agents run on Claude Sonnet 5 via Bedrock Mantle today, with a per-repo Mantle project for cost attribution), **AgentCore Runtime compute** (billed per-second during agent runs), and **Lambda + API Gateway** for the Dispatch Router and webhook receivers. Token budgets per agent per day are carried on each agent's capability row (edited in the dashboard Admin view) to cap runaway spend.
+Consumption-based pricing. Primary cost drivers are **Bedrock model invocations** (all agents run on Claude Sonnet 5 via Bedrock Mantle today, attributed to a shared fleet-wide Mantle project), **AgentCore Runtime compute** (billed per-second during agent runs), and **Lambda + API Gateway** for the Dispatch Router and webhook receivers. Token budgets per agent per day are carried on each agent's capability row (edited in the dashboard Admin view) to cap runaway spend.
 
 **Q: Can I add new agents?**
 

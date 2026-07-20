@@ -87,13 +87,20 @@ def _iam_client():
 # is deployed with the gateway enabled (DeployGateway=true).
 _REQUIRED_BASE_ENV = ("BEDROCK_GUARDRAIL_ID", "BEDROCK_GUARDRAIL_VERSION", "GATEWAY_MCP_URL")
 
+# Fleet-wide runtime env that's injected when present but is NOT boot-critical —
+# a missing value degrades gracefully rather than failing the deploy.
+# MANTLE_PROJECT_ID tags model usage to the fleet's shared cost-attribution
+# project; absent, calls just fall back to the account's default project.
+_OPTIONAL_BASE_ENV = ("MANTLE_PROJECT_ID",)
+
 
 def _base_env() -> tuple[dict[str, str], list[str]]:
     """The fleet-wide runtime env, resolved from THIS function's environment (the
     stack populates it from the same outputs the agents require). Returns
-    ``(env, missing)`` where ``missing`` names any required key absent/blank so
+    ``(env, missing)`` where ``missing`` names any REQUIRED key absent/blank so
     the caller can fail fast with an actionable reason instead of a silent
-    misconfiguration that only surfaces as a runtime timeout."""
+    misconfiguration that only surfaces as a runtime timeout. Optional keys are
+    added when present and never reported as missing."""
     env = {}
     missing = []
     for key in _REQUIRED_BASE_ENV:
@@ -102,6 +109,10 @@ def _base_env() -> tuple[dict[str, str], list[str]]:
             env[key] = val
         else:
             missing.append(key)
+    for key in _OPTIONAL_BASE_ENV:
+        val = os.environ.get(key)
+        if val:
+            env[key] = val
     return env, missing
 
 

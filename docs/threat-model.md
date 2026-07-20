@@ -29,7 +29,7 @@ The PDLC Agent Fleet is a multi-agent system on Amazon Bedrock AgentCore Runtime
 | C-12 | ECR Repositories | Container Registry | One per agent; `IMMUTABLE` tag policy; images built by the shared `sdlc-agent-builder-${STAGE}` CodeBuild project (on onboard + the weekly security rebuild), scanned on push |
 | C-13 | Amazon Verified Permissions policy store (`DashboardPolicyStore`) | AVP / Cedar | Authorizes the **dashboard API** (distinct from C-8). `auth.is_operator`/`is_admin` call AVP `IsAuthorized` with `Read` (operators+admins) / `Write` (admins) actions; 3 static Cedar policies in the foundation template; fail-closed |
 | C-14 | AgentCore Gateway + Cedar engine + REQUEST interceptor | Bedrock AgentCore | The gateway-only tool-call chokepoint. Cedar engine (default-deny, forbid-wins) enforces per-agent tool grants + repo allowlist; the `scm-interceptor` enforces per-origin co-repo grouping from the trusted `x-dispatch-origin` header |
-| C-15 | Bedrock Mantle endpoint + per-repo projects | Managed model API | OpenAI-compatible `bedrock-mantle` endpoint serving `anthropic.claude-sonnet-5`. Auth is a short-term bearer token minted from the runtime role (no stored secret). A per-repo Mantle **project** (created on repo onboard, `mantle.py`) is passed through dispatch and set as the `OpenAI-Project` header for cost attribution |
+| C-15 | Bedrock Mantle endpoint + shared fleet project | Managed model API | OpenAI-compatible `bedrock-mantle` endpoint serving `anthropic.claude-sonnet-5`. Auth is a short-term bearer token minted from the runtime role (no stored secret). A single fleet-wide Mantle **project** (`MantleProjectId` stack param → `MANTLE_PROJECT_ID` runtime env) is set as the `OpenAI-Project` header for cost attribution — one project fleet-wide because a dispatch may span repos |
 | C-16 | Shared CodeBuild build project (`sdlc-agent-builder-${STAGE}`) | CodeBuild | The single agent-agnostic build project, parameterized by `AGENT_NAME`; builds `agents/<name>` and pushes to ECR (C-12). Started by the admin API (which holds only `codebuild:StartBuild`) on onboard and by the weekly rebuild schedule |
 | C-17 | Capability-deployer Lambda (`capability-deployer-${STAGE}`) + `CapabilityRuntimeBoundary` | AWS Lambda + IAM managed policy | Invoked only by the CodeBuild-completion EventBridge event. **The only component holding `iam:CreateRole`/`PassRole` + `create/update-agent-runtime`** — creates each per-agent runtime role under IAM path `/sdlc-agents/capabilities/*`, capped by the `CapabilityRuntimeBoundary` permissions boundary, then deploys the AgentCore runtime, waits READY, and republishes the registry |
 
@@ -61,12 +61,12 @@ and model calls go to the **Bedrock Mantle** endpoint. Text summary:
    │  • registry from SSM (rendered from fleet-config)│
    │  • concurrency check + assignment (DynamoDB)     │
    └───────────────┬─────────────────────────────────┘
-                   │ InvokeAgentRuntime (instruction + source_context.mantle_project)
+                   │ InvokeAgentRuntime (instruction + source_context)
                    ▼
    ┌───────────────────────────────────────────────┐  AgentCore Runtime (per-agent isolation)
    │ workitems · researcher · docwriter · adr        │
    │   model calls → Bedrock Mantle (bearer token,   │
-   │     guardrail headers, OpenAI-Project=per-repo)  │
+   │     guardrail headers, OpenAI-Project=fleet)     │
    │   all tool calls → AgentCore Gateway (SigV4)     │
    └───────────────┬─────────────────────────────────┘
                    │ gateway-only (Cedar engine + REQUEST interceptor)
@@ -93,15 +93,15 @@ and model calls go to the **Bedrock Mantle** endpoint. Text summary:
 | DF-5 | Asana Webhook Lambda → Dispatch Router | Normalized event payload | Lambda async invoke | IAM execution role |
 | DF-6 | Dispatch Router → SSM | Registry fetch (rendered from fleet-config capability rows) | AWS API | IAM execution role |
 | DF-7 | Dispatch Router → DynamoDB | Assignment create/query | AWS API | IAM execution role |
-| DF-8 | Dispatch Router → AgentCore Runtime | Instruction + context (incl. per-repo `mantle_project`) as JSON | `InvokeAgentRuntime` | IAM execution role (scoped to runtime/runtime-endpoint ARNs in this account+region) |
+| DF-8 | Dispatch Router → AgentCore Runtime | Instruction + context as JSON | `InvokeAgentRuntime` | IAM execution role (scoped to runtime/runtime-endpoint ARNs in this account+region) |
 | DF-9 | Agent → SSM / Secrets Manager | Credential fetch (Asana OAuth tokens); GitHub App key is read only by the broker/reply Lambdas | AWS API | AgentCore runtime role |
 | DF-10 | Agent → Gateway → SCM broker → GitHub | Issue/PR reads, comment/code writes | HTTPS (SigV4 to gateway) | Per-owner GitHub App installation token, minted server-side, scoped per co-repo group + per-agent tier |
 | DF-11 | Agent → Gateway → Asana MCP | Task reads, comment writes | HTTPS (SigV4 to gateway) | OAuth2 access token |
-| DF-12 | Agent → Bedrock Mantle | LLM inference (Claude Sonnet 5), guardrail applied via Mantle headers | HTTPS (OpenAI-compatible) | Short-term Bedrock bearer token minted from the runtime role (`aws-bedrock-token-generator`); `OpenAI-Project` = per-repo Mantle project |
+| DF-12 | Agent → Bedrock Mantle | LLM inference (Claude Sonnet 5), guardrail applied via Mantle headers | HTTPS (OpenAI-compatible) | Short-term Bedrock bearer token minted from the runtime role (`aws-bedrock-token-generator`); `OpenAI-Project` = the fleet's shared Mantle project (`MANTLE_PROJECT_ID`) |
 | DF-12b | Dispatch Router / ADR agent → bedrock-runtime | Edge `apply_guardrail` (Router); Titan embeddings (ADR) | AWS API | IAM/runtime role (classic `bedrock-runtime`) |
 | DF-13 | CodeBuild (`sdlc-agent-builder-${STAGE}`) → ECR | Container image push (per-build tag, immutable) | HTTPS | CodeBuild service role |
 | DF-14 | Dashboard SPA → API Gateway → query/admin Lambda | Run history reads (operators); capability/repo config writes (admins) | HTTPS | Cognito JWT at the API Gateway authorizer; every request authorized by AVP (`IsAuthorized`, Read/Write) |
-| DF-15 | Admin Lambda → CodeBuild / Mantle | Start agent build (`codebuild:StartBuild`); create per-repo Mantle project on repo onboard | AWS API | Admin Lambda role (no privileged IAM — holds only StartBuild + Mantle project APIs) |
+| DF-15 | Admin Lambda → CodeBuild | Start agent build (`codebuild:StartBuild`) on capability onboard/edit | AWS API | Admin Lambda role (no privileged IAM — holds only StartBuild + registry publish) |
 | DF-16 | build-completion EventBridge → capability-deployer → IAM/AgentCore | Create per-agent runtime role (boundary-capped) + create/update runtime + republish registry | AWS API | Capability-deployer role (`CreateRole`/`PassRole` scoped to `/sdlc-agents/capabilities/*` with the mandatory permissions boundary) |
 
 ---

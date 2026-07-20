@@ -442,14 +442,10 @@ def _route(event: dict) -> dict:
                 verified_at = existing.get("install_verified_at")
             else:
                 verified_at = int(time.time()) if installation_id else None
-            # On a NEW onboard, create the repo's Bedrock Mantle project for
-            # per-repo cost attribution. Best-effort (mantle.ensure_project never
-            # raises); None just means the repo runs under the default project. On
-            # an update, put_repo carries the existing binding forward.
-            mantle_project = None
-            if existing is None:
-                import mantle
-                mantle_project = mantle.ensure_project(repo)
+            # Model cost attribution is fleet-wide (one shared Mantle project set
+            # as MANTLE_PROJECT_ID on the agent runtimes), not per-repo — a
+            # dispatch may span repos, so there's nothing repo-scoped to create
+            # here.
             config_store.put_repo(
                 repo,
                 enabled=enabled,
@@ -460,7 +456,6 @@ def _route(event: dict) -> dict:
                 status="active",
                 installation_id=installation_id,
                 install_verified_at=verified_at,
-                mantle_project=mantle_project,
             )
             try:
                 _sync_repo_policy()

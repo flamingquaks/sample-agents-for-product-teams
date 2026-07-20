@@ -55,16 +55,29 @@ def test_default_model_is_sonnet_5(monkeypatch, fake_openai_model):
     assert fake_openai_model.call_args.kwargs["model_id"] == "anthropic.claude-sonnet-5"
 
 
-def test_project_sets_cost_attribution_header(monkeypatch, fake_openai_model):
+def test_project_arg_overrides_env(monkeypatch, fake_openai_model):
     monkeypatch.setenv("BEDROCK_GUARDRAIL_ID", "gr-x")
+    monkeypatch.setenv("MANTLE_PROJECT_ID", "fleet-project")
     import shared.bedrock as mod
 
-    mod.build_model(project="proj-acme-web")
-    assert _headers(fake_openai_model)["OpenAI-Project"] == "proj-acme-web"
+    # An explicit project arg still wins over the env default.
+    mod.build_model(project="proj-override")
+    assert _headers(fake_openai_model)["OpenAI-Project"] == "proj-override"
+
+
+def test_project_defaults_to_env(monkeypatch, fake_openai_model):
+    monkeypatch.setenv("BEDROCK_GUARDRAIL_ID", "gr-x")
+    monkeypatch.setenv("MANTLE_PROJECT_ID", "fleet-project")
+    import shared.bedrock as mod
+
+    # No arg → the fleet-wide MANTLE_PROJECT_ID env is used for attribution.
+    mod.build_model()
+    assert _headers(fake_openai_model)["OpenAI-Project"] == "fleet-project"
 
 
 def test_no_project_omits_header(monkeypatch, fake_openai_model):
     monkeypatch.setenv("BEDROCK_GUARDRAIL_ID", "gr-x")
+    monkeypatch.delenv("MANTLE_PROJECT_ID", raising=False)
     import shared.bedrock as mod
 
     mod.build_model()

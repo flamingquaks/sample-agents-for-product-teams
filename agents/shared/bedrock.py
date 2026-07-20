@@ -5,8 +5,10 @@ one model backend, one guardrail attachment, and one cost-attribution scheme.
 
 The fleet runs on the **bedrock-mantle** endpoint (OpenAI-compatible), NOT the
 legacy ``bedrock-runtime`` Converse/Invoke path, because Mantle gives us:
-  - per-**project** cost & usage attribution (we use a project PER REPO, passed
-    in the dispatch payload — the app will surface cost/usage later), and
+  - **project**-scoped cost & usage attribution — the fleet uses ONE shared
+    Mantle project (a dispatch is multi-repo: a run from one repo may act on
+    others, so per-repo attribution is meaningless). The project id is a
+    deploy-time constant injected as the ``MANTLE_PROJECT_ID`` runtime env, and
   - flexibility to run non-Anthropic / non-Bedrock models (GPT-OSS, etc.) through
     the same client if we bring other tools in.
 
@@ -27,9 +29,8 @@ Env vars injected by each agent's AgentCore runtime (see capability_deployer):
   BEDROCK_MODEL_ID           — model id (defaults to anthropic.claude-sonnet-5)
   BEDROCK_GUARDRAIL_ID       — guardrail identifier from the foundation stack
   BEDROCK_GUARDRAIL_VERSION  — guardrail version (typically "DRAFT")
+  MANTLE_PROJECT_ID          — the fleet's shared Mantle cost-attribution project
   MANTLE_ENDPOINT / AWS_REGION — resolve the bedrock-mantle base URL
-Per-dispatch (NOT env — varies per request), passed by the agent from the
-dispatch payload: the Mantle project id (per repo) → ``project`` arg here.
 """
 
 import logging
@@ -95,13 +96,15 @@ def _guardrail_headers() -> dict[str, str]:
 
 def build_model(*, project: str | None = None, **extra):
     """Construct the fleet's Strands model on the bedrock-mantle endpoint, with the
-    prompt-injection guardrail attached via headers and (optionally) a Mantle
+    prompt-injection guardrail attached via headers and the fleet's shared Mantle
     project for cost attribution.
 
     Args:
-        project: the Mantle project id for cost/usage attribution — per REPO,
-            supplied from the dispatch payload. When None, the call is attributed
-            to the account's default project (still works, just uncredited).
+        project: override the Mantle cost-attribution project id. Defaults to the
+            fleet-wide ``MANTLE_PROJECT_ID`` env var (a deploy-time constant — the
+            fleet uses one shared project, since a dispatch is multi-repo). When
+            neither is set, the call is attributed to the account's default
+            project (still works, just uncredited).
         **extra: forwarded to the Strands model (e.g. ``max_tokens``, ``params``).
 
     Raises:
@@ -112,9 +115,10 @@ def build_model(*, project: str | None = None, **extra):
 
     model_id = os.environ.get("BEDROCK_MODEL_ID", DEFAULT_MODEL_ID)
     headers = _guardrail_headers()
-    # Per-repo cost attribution: the Mantle "OpenAI-Project" header tags usage to
-    # the project. Passed per-dispatch, not baked into the runtime, so one runtime
-    # image serves every repo and cost still splits per repo.
+    # Cost attribution: the Mantle "OpenAI-Project" header tags usage to the
+    # fleet's shared project (injected as MANTLE_PROJECT_ID). One runtime image,
+    # one project — a dispatch spanning repos can't be split per repo anyway.
+    project = project or os.environ.get("MANTLE_PROJECT_ID")
     if project:
         headers["OpenAI-Project"] = project
 

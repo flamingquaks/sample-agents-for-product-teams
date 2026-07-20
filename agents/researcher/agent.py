@@ -91,8 +91,9 @@ def invoke(payload, context=None):
         project_context=build_project_context(),
     ) + dispatch_context_block
 
-    mantle_project = source_context.get("mantle_project") if source_context else None
-    model = build_model(project=mantle_project)
+    # Cost attribution uses the fleet's shared Mantle project (MANTLE_PROJECT_ID
+    # runtime env, read inside build_model) — dispatches may span repos.
+    model = build_model()
     tools = [
         synthesize_research,
         competitive_scan,
