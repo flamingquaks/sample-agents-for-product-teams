@@ -158,9 +158,9 @@ def namespaced_principal(sender: str, source: str) -> str:
     already emits ``slack:<team>:<uid>``. We prefix github/asana here — in the
     ONE place every source funnels through — so a principal is globally
     unambiguous (an Asana gid can't collide with a GitHub login) and matches the
-    ``github:<login>`` / ``asana:<gid>`` form the dashboard rule editor + the
-    authz migration write. A sender already carrying its ``<source>:`` prefix
-    (Slack, or a re-dispatch) is left as-is."""
+    ``github:<login>`` / ``asana:<gid>`` form the dashboard rule editor writes. A
+    sender already carrying its ``<source>:`` prefix (Slack, or a re-dispatch) is
+    left as-is."""
     if not sender:
         return sender
     if source in ("github", "asana") and not sender.startswith(f"{source}:"):
