@@ -68,7 +68,9 @@ For each tool the customer uses, invoke the matching connect skill:
 - Asana → **sdlc-agents-connect-asana** (OAuth app setup, MCP vs API app, PAT for webhook Lambda)
 - GitHub → **sdlc-agents-connect-github** (register + install the fleet's GitHub App — the only credential model; the App webhook is the mention trigger and per-owner installation tokens back tool calls)
 
-Slack is onboarded differently — not via a connect skill but via the dashboard **Connectors → Slack** panel plus `scripts/bootstrap_slack.py` (app signing secret + per-workspace bot token, Slack app manifest registration). Deploy with `DeploySlack=true`. Users then request channel access with `/sdlc-onboard-channel` and an admin approves it.
+Slack is onboarded differently — not via a connect skill but via the dashboard **Connectors → Slack** panel plus `scripts/bootstrap_slack.py` (app signing secret + per-workspace bot token, Slack app manifest registration). The receiver is always deployed (no flag); a workspace goes live when an admin onboards it. Users then request channel access with `/sdlc-onboard-channel` (an admin approves it) and self-serve notifications with `/sdlc-notify`.
+
+**Users onboard on first touch, from any source.** The first time someone @mentions the fleet (GitHub/Asana/Slack) they get a *pending* identity and a reply asking them to get onboarded; an admin approves them in **Connectors → Access** and assigns permission groups (the recommended way to grant access — a group's access applies across all the user's sources). Email is the identity's cross-source join key.
 
 Other tools (Jira, GitLab, Salesforce, Datadog) don't have connect skills yet — the shipping agents all work against Asana + GitHub (+ Slack triggers). If the user picked one of those other tools during discovery, tell them honestly that the connect path isn't written yet and point them at the vendor's remote MCP docs; don't fabricate setup steps.
 

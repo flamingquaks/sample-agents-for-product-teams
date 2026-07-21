@@ -21,9 +21,22 @@ def test_manifest_urls_and_scopes():
     assert settings["bot_events"] == ["app_mention"]
     scopes = m["oauth_config"]["scopes"]["bot"]
     assert "app_mentions:read" in scopes and "chat:write" in scopes and "commands" in scopes
+    # users:read.email backs email-based identity resolution (spec §16).
+    assert "users:read.email" in scopes
     cmds = {c["command"]: c["url"] for c in m["features"]["slash_commands"]}
     assert cmds["/sdlc-onboard-channel"] == "https://x.example.com/dev/slack/commands"
     assert cmds["/fleet"] == "https://x.example.com/dev/slack/commands"
+    # /sdlc-notify opens the notification-config modal (spec §18).
+    assert cmds["/sdlc-notify"] == "https://x.example.com/dev/slack/commands"
+
+
+def test_manifest_enables_interactivity_for_modal():
+    # The /sdlc-notify modal submit posts to /slack/interactions — the manifest
+    # must enable interactivity and point it there (spec §18).
+    m = bootstrap_slack.build_manifest("https://x.example.com/dev/")
+    interactivity = m["settings"]["interactivity"]
+    assert interactivity["is_enabled"] is True
+    assert interactivity["request_url"] == "https://x.example.com/dev/slack/interactions"
 
 
 def test_manifest_trailing_slash_normalized():

@@ -1,11 +1,11 @@
 # Connectors: Multi-Workspace Slack, Trigger Authorization, Identity & Notifications
 ## Admin-managed event sources with per-connector access rules
 
-> **Status: Part I BUILT (behind `DeploySlack`); Part II PROPOSED.**
+> **Status: Part I BUILT; Part II BUILT.** *(Part I originally shipped behind a `DeploySlack` flag; Part II retired that gate — the Slack receiver is now always deployed and goes live on workspace onboarding. See §19.)*
 >
 > **Part I (§1–§15, built):** (1) a first-class **Slack** dispatch source at parity with GitHub and Asana, (2) a **Cedar-backed, data-driven trigger-authorization** layer (a third AVP policy store, evaluated by the Dispatch Router) that decides *who* may trigger *which* agent *where*, (3) a **channel onboarding request** flow — users request channel access via the `/sdlc-onboard-channel` slash command and admins approve/deny in the panel (§4.5), and (4) a **Connectors** section **inside the Admin panel** of the dashboard SPA, with a dedicated sub-page per connector (Slack, Asana, GitHub) that owns that connector's connection, triggers, and **per-connector access rules**. It supersedes the Slack sections of `dispatch-agent-assignment-spec.md` §4c. Implemented under `infra/dispatch/` (`slack_webhook.py`, `trigger_authz.py`, `trigger_grants.py`, `reply.py`, `mentions.py`), `infra/dashboard/` (`config_store.py`, `admin.py`), `infra/foundation/template.yaml` (`TriggerPolicyStore` + `SlackWebhookFunction`), `dashboard/src/connectors/`, and `scripts/bootstrap_slack.py`. The Slack receiver is gated by `DeploySlack` (default off); the trigger-authz store is always-on foundation.
 >
-> **Part II (§16–§20, proposed, not built):** a cross-source **identity map** (email as golden join id, get-or-create on first touch from any source, admin-approved onboarding), **permission groups** (the recommended access mechanism, reusing the existing Cedar group axis), **self-serve interactive Slack notifications** (tiered: actionable / informative / error, via `/sdlc-notify` modals + threading + identity-resolved mentions), and **retirement of the `DeploySlack` deploy gate** in favor of admin workspace-onboarding.
+> **Part II (§16–§20, BUILT):** a cross-source **identity map** (email as golden join id, get-or-create on first touch from any source, admin-approved onboarding), **permission groups** (the recommended access mechanism, reusing the existing Cedar group axis), **self-serve interactive Slack notifications** (tiered: actionable / informative / error, via `/sdlc-notify` modals + threading + identity-resolved mentions), and **retirement of the `DeploySlack` deploy gate** in favor of admin workspace-onboarding.
 
 ---
 
@@ -442,7 +442,7 @@ Admin Lambda IAM gains `verifiedpermissions:CreatePolicy/DeletePolicy/ListPolici
 ## 11. Infrastructure (`infra/foundation/template.yaml`)
 
 - **`TriggerPolicyStore`** (`AWS::VerifiedPermissions::PolicyStore`, STRICT schema §5.1) — **always provisioned** (required foundation, alongside `DashboardPolicyStore`); NOT toggle-gated. Optional policy templates (`AWS::VerifiedPermissions::PolicyTemplate`) are a convenience for hand-authored rules; the admin path renders static policies (§5.5).
-- **`SlackWebhookFunction`** (mirrors `AsanaWebhookFunction`) + `WebhookApi` routes `POST /slack/events` and `POST /slack/commands`; env `REGISTRY_PARAM`, `DISPATCH_FUNCTION`, `FLEET_CONFIG_TABLE` (workspace lookup); SSM read on `/sdlc-agents/${Stage}/slack/*`; `lambda:InvokeFunction` on the router. Gated by `DeploySlack` (default `false`).
+- **`SlackWebhookFunction`** (mirrors `AsanaWebhookFunction`) + `WebhookApi` routes `POST /slack/events`, `POST /slack/commands`, and `POST /slack/interactions` (the last added with Part II notifications); env `REGISTRY_PARAM`, `DISPATCH_FUNCTION`, `FLEET_CONFIG_TABLE` (workspace lookup); SSM read on `/sdlc-agents/${Stage}/slack/*`; `lambda:InvokeFunction` on the router. **Always deployed** — the `DeploySlack` gate was retired in Part II (§19).
 - A dedup table (or a reused TTL'd item shape) for `slack_event#<id>`, with the receiver's conditional-write perms.
 - **Router**: `verifiedpermissions:IsAuthorized` on the trigger store + `TRIGGER_POLICY_STORE_ID` env.
 - CloudWatch error alarm for `slack-webhook-${Stage}` (mirror `asana-webhook-errors-${Stage}`).
@@ -506,9 +506,9 @@ Plus a `1.10` changelog row and DF entries for the Slack inbound + reply flows a
 
 ---
 
-# Part II — Identity, Permission Groups, and Notifications (v3, PROPOSED)
+# Part II — Identity, Permission Groups, and Notifications (BUILT)
 
-> **Status: PROPOSED (not built).** Part I above (Slack source + trigger authz + Connectors UI) is shipped. Part II specifies the next increment: a **cross-source identity map** keyed on email, **permission groups** as the recommended access mechanism, and **self-serve interactive Slack notifications**. It also removes the `DeploySlack` deploy gate in favor of admin workspace-onboarding. These sections are dependency-ordered: identity (§16) underpins groups (§17), which underpin notification mentions (§18). Nothing here is implemented; sections are independently shippable in the order given.
+> **Status: BUILT.** A **cross-source identity map** keyed on email (§16), **permission groups** as the recommended access mechanism (§17), and **self-serve interactive Slack notifications** (§18); the `DeploySlack` deploy gate is retired in favor of admin workspace-onboarding (§19). Implemented under `infra/dispatch/` (`identity.py`, `notify.py`, `slack_notify.py`; router + reply + fleet_config wiring), `infra/dashboard/` (`config_store.py` identity/group/notif rows, `admin.py` routes), `infra/foundation/template.yaml` (admin API routes, `/slack/interactions`, `DeploySlack` removed), `dashboard/src/connectors/` (Access page, Slack Notifications tab), and `scripts/bootstrap_slack.py` (manifest interactivity + `/sdlc-notify`). Sections are dependency-ordered: identity (§16) underpins groups (§17), which underpin notification mentions (§18).
 
 ## 16. Cross-source identity map
 
@@ -679,13 +679,13 @@ The Connectors → Slack sub-page gains a read/edit view of channel subscription
 
 ## 20. New surfaces & threat-model deltas (Part II)
 
-**New/changed surfaces:** `identity#` rows + `email`/`gsi_handle` GSIs + `identity.py` resolver (dispatch + dashboard); `user_req#` rows + admin approval queue; `perm_group#` rows + group membership on identity + group-scoped `trigger_rule`s; `/slack/interactions` route + modal builders; `notif_sub#` rows + fan-out from fleet + SCM events; Slack scope `users:read.email`, added Asana user-email scope, GitHub org-member read; retire `SlackEnabled` condition.
+**New/changed surfaces (as built):** `identity#` rows + `identity.py` resolver (dispatch) / `config_store` identity CRUD (dashboard) — keyed on a synthetic uuid with email as a join attribute + a denormalized `handle_keys` list; lookups are **filtered scans over the small identity set with a short-TTL cache** (matching the fleet-config single-`pk`, no-GSI convention — `fleet_config`/`trigger_grants`), not a GSI. `user_req#` rows + admin approval queue; `perm_group#` rows + group membership on identity + group-scoped `trigger_rule`s; `/slack/interactions` route + `slack_notify.py` modal builders; `notif_sub#` rows + `notify.py` fan-out from fleet events (SCM-event fan-out reuses the same `notify()` seam — the GitHub webhook hook is a follow-up); Slack scope `users:read.email` (already present) + manifest interactivity; **`DeploySlack` parameter + `SlackEnabled` condition removed** (receiver always deployed).
 
-**Threat-model additions (to draft in `docs/threat-model.md`):**
-- **Identity-link spoofing** — a wrongly-claimed cross-source handle is impersonation. Mitigated: links are authz-load-bearing only when `verified`, and verification = admin approval (§16.6).
-- **Merge poisoning** — a bad auto-merge fuses two people. Mitigated: auto-merge only on exact email match (strongest signal); weaker signals go to admin review (§16.5); `merged_from` audit trail.
-- **Notification-scope leak** — a channel subscribing to a repo it shouldn't see. Mitigated: subscription repos validated ⊆ the channel's granted repos (§18.2).
-- **New public inbound route** (`/slack/interactions`) — same `v0` signature + replay-window verification as the existing routes; fails closed.
-- **Group over-grant** — a group's `trigger_rule`s apply to every member across every source. Accepted/By-design; bounded by admin authoring groups (`recommended`) and per-user forbid rules as the scalpel.
+**Threat-model additions (landed in `docs/threat-model.md` v2.1 as C-20–C-22 + §3.10 T-41–T-45):**
+- **T-41 Identity-link spoofing** — a wrongly-claimed cross-source handle is impersonation. Mitigated: links are authz-load-bearing only when `verified`, and verification = admin approval (§16.6).
+- **T-42 Merge poisoning** — a bad auto-merge fuses two people. Partially mitigated: auto-merge only on exact email match (strongest signal); weaker signals go to admin review (§16.5); `merged_from` audit trail.
+- **T-43 Notification-scope leak** — a channel subscribing to a repo it shouldn't see. Mitigated: subscription repos validated ⊆ the fleet's onboarded repos, in both the admin API and the Slack self-serve path (§18.2).
+- **T-44 New public inbound route** (`/slack/interactions`) — same `v0` signature + replay-window verification as the existing routes; fails closed; target channel from server-set `private_metadata`.
+- **T-45 Group over-grant** — a group's `trigger_rule`s apply to every member across every source. Accepted/By-design; bounded by admin authoring groups (`recommended`) and per-user forbid rules (forbid-wins) as the scalpel.
 
-Plus a `2.1` changelog row (identity map + permission groups + interactive notifications + `DeploySlack` retirement) and DF entries for identity resolution, the interactions route, and notification fan-out.
+The `2.1` changelog row + these C/T entries are in the threat model. The identity-map repo-scope for notifications is currently the full onboarded-repo set (a tighter per-channel repo grant is a noted follow-up), and SCM-event notifications (PR opened/merged) will hook the existing GitHub webhook into `notify()` next.

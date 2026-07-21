@@ -10,8 +10,9 @@ operator runs this script to place them.
 
 Two steps:
   1. ``manifest`` — print the Slack app manifest (scopes + event subscription +
-     slash commands) to paste into api.slack.com/apps → Create from manifest.
-     After creating + installing the app, copy its Signing Secret and Bot Token.
+     slash commands + interactivity) to paste into api.slack.com/apps → Create
+     from manifest. After creating + installing the app, copy its Signing Secret
+     and Bot Token.
   2. ``store`` — write the app-level signing secret (once per app) and the
      per-workspace bot token to SSM.
 
@@ -41,13 +42,19 @@ import sys
 # The slash command that files a channel-onboarding request (matches the
 # receiver's ONBOARD_COMMAND default).
 ONBOARD_COMMAND = "sdlc-onboard-channel"
+# The slash command that opens the interactive notification-config modal
+# (matches the receiver's NOTIFY_COMMAND default).
+NOTIFY_COMMAND = "sdlc-notify"
 
 
 def build_manifest(webhook_base: str, app_name: str = "SDLC Agent Fleet") -> dict:
     """The Slack app manifest. ``webhook_base`` is the deployed webhook API base
-    (…/slack/events + …/slack/commands hang off it). Scopes are minimal: read
-    mentions, post replies, run slash commands, resolve a user's email for
-    email-based grant rules."""
+    (…/slack/events, …/slack/commands, …/slack/interactions hang off it). Scopes
+    are minimal: read mentions, post replies, run slash commands, and resolve a
+    user's email for email-based identity/grant resolution (spec §16).
+
+    Interactivity is enabled and points at …/slack/interactions so the
+    /sdlc-notify Block Kit modal's submit reaches the receiver (spec §18)."""
     base = webhook_base.rstrip("/")
     return {
         "display_information": {"name": app_name},
@@ -59,6 +66,13 @@ def build_manifest(webhook_base: str, app_name: str = "SDLC Agent Fleet") -> dic
                     "url": f"{base}/slack/commands",
                     "description": "Request this channel be onboarded for fleet agents",
                     "usage_hint": "[agent ...]",
+                    "should_escape": False,
+                },
+                {
+                    "command": f"/{NOTIFY_COMMAND}",
+                    "url": f"{base}/slack/commands",
+                    "description": "Configure fleet notifications for this channel",
+                    "usage_hint": "",
                     "should_escape": False,
                 },
                 {
@@ -85,6 +99,11 @@ def build_manifest(webhook_base: str, app_name: str = "SDLC Agent Fleet") -> dic
             "event_subscriptions": {
                 "request_url": f"{base}/slack/events",
                 "bot_events": ["app_mention"],
+            },
+            # The /sdlc-notify modal posts its submit here (Block Kit view_submission).
+            "interactivity": {
+                "is_enabled": True,
+                "request_url": f"{base}/slack/interactions",
             },
             "org_deploy_enabled": False,
             "socket_mode_enabled": False,

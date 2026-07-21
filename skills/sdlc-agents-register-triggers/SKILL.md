@@ -97,24 +97,26 @@ there is no hardcoded `if:` trigger list to edit.
 
 ### Slack
 
-Slack is a shipped trigger source, gated behind `DeploySlack=true` on the foundation stack. When enabled it provisions the `slack-webhook-${STAGE}` Lambda on the webhook API with two routes — `/slack/events` (Events API `app_mention`) and `/slack/commands` (`/fleet @agent …` + `/sdlc-onboard-channel`). The receiver verifies the Slack `v0` signature (±5-min replay window), dedups on `event_id`, guards bot-loops, and resolves `@mentions` against the live registry exactly like the other sources.
+Slack is a shipped trigger source. The `slack-webhook-${STAGE}` Lambda is **always deployed** (no `DeploySlack` flag — it's serverless, inert at rest, and fails closed at runtime), serving three routes on the webhook API: `/slack/events` (Events API `app_mention`), `/slack/commands` (`/fleet @agent …`, `/sdlc-onboard-channel`, `/sdlc-notify`), and `/slack/interactions` (the `/sdlc-notify` Block Kit modal submit). The receiver verifies the Slack `v0` signature (±5-min replay window), dedups on `event_id`, guards bot-loops, and resolves `@mentions` against the live registry exactly like the other sources. Slack goes live only when an admin onboards a workspace.
 
-#### 1. Deploy with Slack enabled
+#### 1. Register the Slack app + store secrets
 
-Redeploy the base platform with `DeploySlack=true` (via `scripts/deploy_fleet.py` / `scripts/bootstrap.py`). Note the `SlackEventsEndpoint` + `SlackCommandsEndpoint` stack outputs.
+The receiver is already deployed; note the `SlackEventsEndpoint`, `SlackCommandsEndpoint`, and `SlackInteractionsEndpoint` stack outputs. Run `scripts/bootstrap_slack.py` (operator credentials):
 
-#### 2. Register the Slack app + store secrets
+- `manifest --webhook-base <api-base>` prints the Slack app manifest (scopes, event subscription, slash commands, **interactivity → `/slack/interactions`**) to paste into api.slack.com → Create from manifest. Install the app, then copy its Signing Secret + Bot Token.
+- `store --stage … --team-id … --signing-secret … --bot-token …` writes the secrets to SSM SecureString:
+  - **App signing secret** at `/sdlc-agents/${STAGE}/slack/signing-secret` — **app-level** (one per Slack app; the `url_verification` handshake carries no team scope, so verification can't depend on a `team_id`).
+  - **Bot token** (`xoxb-…`) at `/sdlc-agents/${STAGE}/slack/<team_id>/bot-token` — **per-workspace/installation**; run once per workspace you onboard.
 
-Run `scripts/bootstrap_slack.py` (operator credentials). It registers the Slack app from a manifest pointed at the two endpoints and writes the secrets to SSM SecureString:
+Scopes: `app_mentions:read`, `chat:write`, `commands`, `users:read`, `users:read.email` (the last backs email-based identity resolution — see the Users & Groups section).
 
-- **App signing secret** at `/sdlc-agents/${STAGE}/slack/signing-secret` — **app-level** (one per Slack app; the `url_verification` handshake carries no team scope, so verification can't depend on a `team_id`).
-- **Bot token** (`xoxb-…`) at `/sdlc-agents/${STAGE}/slack/<team_id>/bot-token` — **per-workspace/installation**; run once per workspace you onboard.
-
-Minimal scopes: `app_mentions:read`, `chat:write`, `commands`.
-
-#### 3. Onboard each workspace + channel
+#### 2. Onboard each workspace + channel
 
 In the dashboard **Connectors → Slack** panel, onboard the workspace (an enabled, active `slack_workspace` row — deliveries from any other `team_id` are rejected). Channel access is default-deny under the recommended allowlist posture: users request a channel with `/sdlc-onboard-channel [agent …]` and an **admin approves** it in the same panel (never self-served). No dispatch is authorized until a trigger-authz grant exists — see the next section.
+
+#### 3. (Optional) Notifications
+
+Once a workspace is live, users self-serve channel notifications with `/sdlc-notify` — an interactive modal with three tiers (actionable / informative / error) and a repo scope bounded to onboarded repos. Admins can review/remove subscriptions in **Connectors → Slack → Notifications**. Subscriptions only *receive* (they grant no access), so they need no approval.
 
 ## Trigger authorization (required — no dispatch runs without it)
 

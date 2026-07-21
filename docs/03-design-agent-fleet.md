@@ -230,15 +230,16 @@ The runtime's environment is assembled by the `capability-deployer` from the fle
 
 ### 4.3 Slack Integration
 
-Shipped, gated behind `DeploySlack=true`. A `slack-webhook-${STAGE}` Lambda (`infra/dispatch/slack_webhook.py`) sits on the webhook API on two routes:
+Shipped and **always deployed** (the `DeploySlack` gate was retired — the receiver is serverless/inert and fails closed, so Slack goes live only when an admin onboards a workspace). A `slack-webhook-${STAGE}` Lambda (`infra/dispatch/slack_webhook.py`) sits on the webhook API on three routes:
 
 **Inbound triggers:**
 - `/slack/events` — Events API `app_mention` ("@fleetbot @workitems break this up") → Dispatch Router
-- `/slack/commands` — slash commands: `/fleet @agent …` (mention dispatch) and `/sdlc-onboard-channel [agent …]` (files a channel-onboarding **request** an admin approves in the dashboard; never self-served)
+- `/slack/commands` — slash commands: `/fleet @agent …` (mention dispatch), `/sdlc-onboard-channel [agent …]` (files a channel-onboarding **request** an admin approves in the dashboard; never self-served), and `/sdlc-notify` (opens the notification-config modal)
+- `/slack/interactions` — Block Kit modal submits (the `/sdlc-notify` config modal — see §4.4)
 
 **Multi-workspace + security:** each delivery's `team_id` must resolve to an onboarded, enabled, active `slack_workspace` row. Every request is authenticated by the Slack `v0` signature over `v0:{ts}:{raw_body}` with a ±5-min replay window; deliveries are deduped on `event_id` and bot-loops are guarded. The **signing secret is app-level** (one per Slack app; the `url_verification` handshake carries no team scope) and **bot tokens are per-workspace** — both SSM SecureString under `/sdlc-agents/${STAGE}/slack/*`, fetched per-invocation, written out-of-band by `scripts/bootstrap_slack.py`.
 
-**Outbound actions:** replies via `chat.postMessage` using the per-workspace bot token (`infra/dispatch/reply.py`).
+**Outbound actions:** replies via `chat.postMessage` using the per-workspace bot token (`infra/dispatch/reply.py`); notification fan-out threads via the same helper (§4.4).
 
 ### 4.3.1 Trigger Authorization (Amazon Verified Permissions)
 
@@ -249,6 +250,16 @@ The Dispatch Router authorizes **every** dispatch — from all three sources —
 - **Fail-closed:** an unset store, any AVP/grant-read error, or a non-`ALLOW` decision all deny. Default-deny: an agent with no permit grant is not triggerable.
 
 See [`docs/specs/slack-connectors-spec.md`](specs/slack-connectors-spec.md) and [`docs/threat-model.md`](threat-model.md) (T-40, T-32–T-39).
+
+### 4.4 Identity, Permission Groups & Notifications
+
+**Cross-source identity (`infra/dispatch/identity.py`).** Every dispatch resolves its sender to one **identity** record (`identity#<uuid>` in `fleet-config`), keyed on a synthetic id with **email as the golden join attribute** (a GitHub/Asana first touch may carry no email, so email can't be the key). The resolver get-or-creates + progressively enriches the record on every touch from any source; the resolved `email` + `groups` are stamped onto trigger authz (§4.3.1), so a grant authored against an email/group applies across GitHub/Asana/Slack at once. This is the traceability spine — every assignment + authz decision maps to one person, not four disjoint handles.
+
+**First-touch onboarding gate.** A dispatch from an unknown/pending sender creates a `pending` identity + a single `user_req#` onboarding request, and the Router replies (every time) telling the user to get onboarded — org-repo copy promises an email on completion, personal-repo copy points at the admin. An admin approves in the dashboard **Connectors → Access** panel, which flips the identity `active`, assigns permission groups, and marks its handles `verified` (admin approval is the trust event).
+
+**Permission groups (§17).** The recommended access mechanism: membership lives on the identity record (source-agnostic), access is expressed as group-scoped `trigger_rule` rows — reusing the group axis the Cedar policy set already evaluates, no policy change.
+
+**Notifications (`notify.py` + `slack_notify.py`, §18).** Channels self-serve tiered Slack notifications (`actionable`/`informative`/`error`) via the `/sdlc-notify` Block Kit modal (submitted on `/slack/interactions` → `notif_sub#`). The Router fans fleet lifecycle events out to subscribed channels, threaded per unit-of-work, with @mentions (resolved to the right Slack user per workspace via the identity map) only on the actionable/error tiers. Repo scope is bounded to onboarded repos.
 
 ---
 
