@@ -1,6 +1,6 @@
 # Threat Model — PDLC Agent Fleet
 
-**Version:** 1.8
+**Version:** 2.0
 **Date:** 2026-07-20
 **Status:** Living document. Describes the fleet as it currently ships.
 **Methodology:** Aligned with the [AWS Threat Designer](https://aws.amazon.com/blogs/machine-learning/accelerate-threat-modeling-with-generative-ai/) approach — identify assets, map data flows, enumerate threats (MITRE ATT&CK / OWASP), and document how each threat is mitigated today or why it is accepted.
@@ -9,7 +9,9 @@
 
 ## 1. System Overview
 
-The PDLC Agent Fleet is a multi-agent system on Amazon Bedrock AgentCore Runtime. Users trigger agents via `@mention` in GitHub or Asana. HMAC-verified **webhook** Lambdas (GitHub App + Asana) async-invoke a Dispatch Router Lambda, which resolves the mention, checks authorization, applies a prompt-injection guardrail, and invokes the appropriate agent container. Agents interact with external platforms (GitHub, Asana) exclusively through the AgentCore Gateway (gateway-only); model inference runs on the Bedrock Mantle endpoint. Fleet configuration (agents/capabilities and onboarded repos) is UI-driven from an operator dashboard whose API is authorized by Amazon Verified Permissions.
+The PDLC Agent Fleet is a multi-agent system on Amazon Bedrock AgentCore Runtime. Users trigger agents via `@mention` in GitHub, Asana, or Slack. Signature-verified **webhook** Lambdas (GitHub App HMAC, Asana HMAC, Slack `v0` signature — the last `DeploySlack`-gated) async-invoke a Dispatch Router Lambda, which resolves the mention, **authorizes the trigger via Amazon Verified Permissions** (the `TriggerPolicyStore`), applies a prompt-injection guardrail, and invokes the appropriate agent container. Agents interact with external platforms (GitHub, Asana) exclusively through the AgentCore Gateway (gateway-only); model inference runs on the Bedrock Mantle endpoint. Fleet configuration (agents/capabilities, onboarded repos, and connectors: Slack workspaces/channels + trigger rules) is UI-driven from an operator dashboard whose API is authorized by Amazon Verified Permissions.
+
+Trigger authorization is **data-driven Cedar via AVP**: a small, fixed policy set evaluates admin-authored grant sets read from DynamoDB as entity attributes, so granting a user is a data write, not a new policy. The flat per-capability `authorization.users` allowlist has been **removed** — every source (GitHub, Asana, Slack) authorizes through this one path, with the source namespaced into the principal.
 
 ### 1.1 Component Inventory
 
@@ -32,6 +34,8 @@ The PDLC Agent Fleet is a multi-agent system on Amazon Bedrock AgentCore Runtime
 | C-15 | Bedrock Mantle endpoint + shared fleet project | Managed model API | OpenAI-compatible `bedrock-mantle` endpoint serving `anthropic.claude-sonnet-5`. Auth is a short-term bearer token minted from the runtime role (no stored secret). A single fleet-wide Mantle **project** — provisioned in the foundation stack as `AWS::BedrockMantle::Project` (`DeployMantleProject`, on by default), or a pre-existing id via the `MantleProjectId` param — flows to the `MANTLE_PROJECT_ID` runtime env and is set as the `OpenAI-Project` header for cost attribution. One project fleet-wide because a dispatch may span repos |
 | C-16 | Shared CodeBuild build project (`sdlc-agent-builder-${STAGE}`) | CodeBuild | The single agent-agnostic build project, parameterized by `AGENT_NAME`; builds `agents/<name>` and pushes to ECR (C-12). Started by the admin API (which holds only `codebuild:StartBuild`) on onboard and by the weekly rebuild schedule |
 | C-17 | Capability-deployer Lambda (`capability-deployer-${STAGE}`) + `CapabilityRuntimeBoundary` | AWS Lambda + IAM managed policy | Invoked only by the CodeBuild-completion EventBridge event. **The only component holding `iam:CreateRole`/`PassRole` + `create/update-agent-runtime`** — creates each per-agent runtime role under IAM path `/sdlc-agents/capabilities/*`, capped by the `CapabilityRuntimeBoundary` permissions boundary, then deploys the AgentCore runtime, waits READY, and republishes the registry |
+| C-18 | Slack Webhook Lambda (`slack-webhook-${STAGE}`) + Slack app | AWS Lambda + API Gateway | Public HTTPS endpoint (`DeploySlack`-gated), two routes: `/slack/events` (Events API `url_verification` + `app_mention`) and `/slack/commands` (`/fleet @agent …` + `/sdlc-onboard-channel`). Verifies the Slack `v0` signature over `v0:{ts}:{raw_body}` with a ±5-min replay window, dedups on `event_id`, guards bot-loops, resolves `@mentions` against the live registry (shared `mentions.py`), and async-invokes the Dispatch Router. Multi-workspace: each delivery's `team_id` must resolve to an onboarded, enabled `slack_workspace` row. The **signing secret is app-level** (one per Slack app, no team scope needed for the handshake); **bot tokens are per-workspace/installation**. Both are SSM SecureString under `/sdlc-agents/${Stage}/slack/*`, fetched per-invocation |
+| C-19 | `TriggerPolicyStore` (AVP) + `trigger_authz.py`/`trigger_grants.py` | AVP / Cedar + DynamoDB data | The fleet's **sole trigger-authorization mechanism**, consulted by the Dispatch Router on every dispatch. A small, FIXED 3-policy Cedar set (permit-on-allowed, forbid-on-denied [forbid-wins], forbid-on-blocked-channel) authored once in the foundation template; admin-authored grants are **data** — `trigger_rule` + `slack_workspace`/`slack_channel` rows read per dispatch and passed to AVP as entity attributes + `context`. Granting a user is a DynamoDB write, so the AVP policy count stays constant (avoids the policy-per-user anti-pattern). Distinct from C-8 (agent tool access) and C-13 (dashboard API authz). Fail-closed: unset store / AVP error / grant-read error / non-`ALLOW` all deny |
 
 ---
 
@@ -40,25 +44,27 @@ The PDLC Agent Fleet is a multi-agent system on Amazon Bedrock AgentCore Runtime
 The current architecture diagram is maintained as Mermaid at
 [`docs/assets/architecture.mmd`](assets/architecture.mmd) (rendered/explained in
 [`docs/aws-deploy.md` §0](aws-deploy.md#0-architecture)). The trigger path is now
-HMAC-verified **webhooks** (no GitHub Actions / OIDC), tool calls are **gateway-only**,
+signature-verified **webhooks** (no GitHub Actions / OIDC), tool calls are **gateway-only**,
 and model calls go to the **Bedrock Mantle** endpoint. Text summary:
 
 ```
-   External platforms (GitHub, Asana)
-            │  @mention events
+   External platforms (GitHub, Asana, Slack)
+            │  @mention / event triggers
             ▼
    ┌───────────────────────────────────────────────┐  TRUST BOUNDARY: webhook edge
    │ API Gateway (public HTTPS)                      │
    │  GitHub App webhook Lambda  (HMAC X-Hub-Sig-256)│
    │  Asana webhook Lambda       (HMAC signature)    │
+   │  Slack webhook Lambda       (v0 sig + replay)   │
    └───────────────┬─────────────────────────────────┘
                    │ async Lambda invoke (verified events only)
                    ▼
    ┌───────────────────────────────────────────────┐  TRUST BOUNDARY: AWS Account
    │ Dispatch Router Lambda                          │
    │  • edge apply_guardrail (bedrock-runtime)       │
-   │  • resolve agent + authorization allowlist      │
-   │  • registry from SSM (rendered from fleet-config)│
+   │  • resolve agent (live registry from SSM)       │
+   │  • trigger authz → AVP TriggerPolicyStore        │
+   │      (Cedar, data-driven grants; fail-closed)    │
    │  • concurrency check + assignment (DynamoDB)     │
    └───────────────┬─────────────────────────────────┘
                    │ InvokeAgentRuntime (instruction + source_context)
@@ -80,6 +86,10 @@ and model calls go to the **Bedrock Mantle** endpoint. Text summary:
    Lambdas, each API request authorized by Amazon Verified Permissions (Cedar).
    Onboarding: admin (codebuild:StartBuild) → CodeBuild → ECR → build-completion
    EventBridge → capability-deployer (privileged IAM) → AgentCore runtime + registry.
+   Connectors (Slack workspaces/channels + trigger rules) authored in the Admin
+   Connectors panel → DynamoDB fleet-config rows → read as data by the router's
+   trigger authz. Slack users file channel-onboarding requests via
+   /sdlc-onboard-channel; admins approve/deny in the dashboard (never self-serve).
 ```
 
 ### 2.1 Data Flows
@@ -103,6 +113,10 @@ and model calls go to the **Bedrock Mantle** endpoint. Text summary:
 | DF-14 | Dashboard SPA → API Gateway → query/admin Lambda | Run history reads (operators); capability/repo config writes (admins) | HTTPS | Cognito JWT at the API Gateway authorizer; every request authorized by AVP (`IsAuthorized`, Read/Write) |
 | DF-15 | Admin Lambda → CodeBuild | Start agent build (`codebuild:StartBuild`) on capability onboard/edit | AWS API | Admin Lambda role (no privileged IAM — holds only StartBuild + registry publish) |
 | DF-16 | build-completion EventBridge → capability-deployer → IAM/AgentCore | Create per-agent runtime role (boundary-capped) + create/update runtime + republish registry | AWS API | Capability-deployer role (`CreateRole`/`PassRole` scoped to `/sdlc-agents/capabilities/*` with the mandatory permissions boundary) |
+| DF-17 | Slack → Slack Webhook Lambda → Dispatch Router | `app_mention` / slash-command payload (text, `team_id`, `channel_id`, `user_id`) → normalized dispatch payload | HTTPS POST → Lambda async invoke | Slack `v0` signature (app signing secret, ±5-min window, `event_id` dedup); IAM execution role on the async invoke |
+| DF-18 | Dispatch Router → AVP `TriggerPolicyStore` | `IsAuthorized(Trigger)` — principal (`slack:<team>:<uid>` / `github:<login>` / `asana:<gid>`), agent, source, workspace/channel context; agent grant sets read from DynamoDB as entity attributes | AWS API | IAM execution role; fail-closed on any error |
+| DF-19 | Slack Webhook Lambda / config API → DynamoDB fleet-config | Channel-onboarding request write (`chan_req#`); admin trigger-rule + workspace/channel grant writes | AWS API | IAM execution role (receiver validates ids before persisting); admin writes gated by AVP (DF-14) |
+| DF-20 | Router / agent → Slack (`chat.postMessage`) | Ack, reject notice, and agent output posted to the originating channel/thread | HTTPS | Per-workspace bot token from SSM (`/sdlc-agents/${Stage}/slack/<team>/bot-token`), fetched per call |
 
 ---
 
@@ -130,7 +144,7 @@ An attacker can craft a GitHub issue body, Asana task description, or the commen
 
 4. **Structural controls on what a subverted agent can do.** Agents have no destructive tools (no close-issue, merge-PR, or delete-task primitives). Approval-pattern workflows require a human to accept proposed work before it lands. Per-agent IAM runtime roles grant only the specific SSM parameters and MCP endpoints each agent needs. A prompt-injected agent can still misuse a legitimate tool (e.g. post a misleading comment), but cannot escalate into actions the architecture doesn't expose.
 
-5. **Authorization at the Router (T-4).** The per-agent `authorization.users` allowlist rejects any sender not explicitly permitted to invoke that agent. Cross-agent chains only propagate between agents the operator has paired, which bounds the blast radius of T-3 to the topology of the allowlists.
+5. **Authorization at the Router (T-4, T-40).** Every dispatch is authorized by the AVP `TriggerPolicyStore` (default-deny), which rejects any sender without a matching permit grant. Cross-agent chains only propagate between agents an admin has explicitly granted, which bounds the blast radius of T-3 to the topology of the trigger grants.
 
 **Residual risk.** Bedrock Guardrails is probabilistic, not deterministic — a sufficiently novel prompt-attack pattern can slip past either evaluation point. Controls 3–5 bound what *happens* when it does: a subverted agent is restricted to the tools its IAM role and MCP servers allow, cannot invoke peers outside its allowlist, and cannot perform destructive actions. None of this prevents exfiltration via legitimate write channels (T-15) — Cedar runtime enforcement (T-5) is the roadmap item that would close that gap by intercepting individual tool calls. Operators deploying against untrusted input (public repos, external collaborators) should layer a classifier-based pre-filter in the Dispatch Router on top of Guardrails and revisit the Accepted findings before go-live.
 
@@ -140,19 +154,22 @@ An attacker can craft a GitHub issue body, Asana task description, or the commen
 
 | ID | Threat | Severity | Component | STRIDE | Status |
 |----|--------|----------|-----------|--------|--------|
-| T-4 | **Agent registry authorization defaults** | — | C-3 | Elevation of Privilege | Mitigated |
+| T-4 | **Trigger authorization defaults / sender-identity spoofing** | — | C-3, C-19 | Elevation of Privilege | Mitigated |
 | T-5 | **Cedar policies not enforced at runtime** | **High** | C-8 | Tampering | Partially mitigated |
 | T-6 | **Dispatch Router IAM scope** | — | C-3 | — | Mitigated |
 | T-7 | **GitHub OIDC trust scope** | — | C-11 | — | **Superseded** (OIDC/CI deploy path retired) |
 | T-29 | **Dashboard API authorization (AVP)** | — | C-13 | Elevation of Privilege | Mitigated |
+| T-40 | **Trigger authorization (AVP, data-driven)** | — | C-19 | Elevation of Privilege | Mitigated |
 
-**T-4 (Mitigated):** A capability's `authorization.users` defaults to `[]` and the Dispatch Router fails closed — an empty allowlist returns 403 with a log line instructing the operator to populate the capability's user list in the dashboard Admin view (which re-renders the SSM registry). The wildcard `"*"` is still accepted for operators who explicitly opt into an open-by-default posture, but it is no longer the shipping default. Cross-agent invocation is permitted by listing a peer agent's bot identity (GitHub login or Asana user GID) in the callee's `users` list — see T-23 for the design intent and runaway-chain defense.
+**T-4 (Mitigated):** Trigger authorization is now decided ONLY by the AVP `TriggerPolicyStore` (T-40) — the flat per-capability `authorization.users` allowlist is **removed**. The store is **default-deny**: an agent with no matching permit grant is not triggerable, so onboarding an agent does not open it to callers until an admin authors a grant. The Router additionally fails closed on an **unresolved sender** (`""` / `"unknown"`) *before* calling AVP (`authorize_trigger` in `router.py`) — these sentinels mean the receiver couldn't resolve a stable identity, and passing one to AVP as a principal would turn a misconfigured policy into a universal bypass. Senders are namespaced by source into immutable ids the receiver controls, never a self-editable display name: `github:<login>`, `asana:<gid>`, `slack:<team>:<uid>` (see T-35). Cross-agent invocation is permitted by granting a peer agent's bot identity a `trigger_rule` on the callee — see T-23 for the design intent and runaway-chain defense.
 
 **T-5 (Partially mitigated):** Cedar policy files under `cedar/*.cedar` express per-agent allow/deny rules for tool calls; the **enforced** form lives in `infra/dashboard/fleet_policy.py` and is evaluated by the **AgentCore Gateway policy engine** in the invocation path (the fleet is gateway-only, so every tool call passes through it). The engine is default-deny + forbid-wins: destructive tools are unconditionally forbidden, per-agent permits grant only each agent's `AGENT_TOOL_GRANTS`, and a repo-allowlist forbid blocks tools targeting non-onboarded repos. Residual: the engine is rolled out `LOG_ONLY` first — until an operator flips `GatewayPolicyEnforcement=ACTIVE`, Cedar *tool-grant* deny decisions log rather than block (the co-repo interceptor and the per-call scoped credential still enforce regardless — see T-11). The `cedar/*.cedar` files themselves remain advisory; `fleet_policy.py` is authoritative.
 
 **T-6 (Mitigated):** The Dispatch Router Lambda's IAM policy grants only `bedrock-agentcore:InvokeAgentRuntime`, scoped to `arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*` and the corresponding `runtime/*/runtime-endpoint/*` shape. The router cannot invoke runtimes in other accounts or regions, and cannot call `bedrock:InvokeAgent` on the legacy Bedrock Agents service.
 
 **T-7 (Superseded):** This threat covered the GitHub Actions OIDC deploy role's trust scope. That path is **retired** — there is no GitHub OIDC provider, no CI deploy role, and no `agent-dispatch.yml`/`claude-code.yml` workflow in the shipping fleet. Triggers now arrive via HMAC-verified webhooks (T-30) and all build/deploy is server-side (CodeBuild + capability-deployer, T-31). The ID is kept stable for history; the OIDC trust-scope guidance no longer applies to this architecture.
+
+**T-40 (Mitigated):** Every dispatch, from every source, is authorized by the AVP `TriggerPolicyStore` (`infra/dispatch/trigger_authz.py`) before the agent runs — this is the fleet's sole trigger-authz mechanism (C-19), distinct from the dashboard-API AVP store (C-13/T-29) and the agent-tool Cedar engine at the Gateway (C-14/T-5). The design is **data-driven**: a small, FIXED 3-policy Cedar set is authored once in the foundation template (`sdlc_trigger_permit`, `sdlc_trigger_forbid_denied` [forbid-wins], `sdlc_trigger_forbid_channel`), and admin-authored grants are **data** — `trigger_rule` rows (WHO: allowed/denied principals + groups per agent×workspace, wildcards allowed) and `slack_workspace`/`slack_channel` rows (WHERE: the channel-posture boolean, resolved in testable Python in `trigger_grants.channel_allowed`, not in Cedar). The router reads these rows per dispatch (through a 30-s cache, paged to drain every DynamoDB page so a dropped rule can't silently flip a decision) and passes the resolved sets to AVP as entity attributes + `context`. Granting a user is therefore a DynamoDB write and the AVP policy count stays constant no matter how many users/rules exist — deliberately avoiding the AVP policy-per-user anti-pattern. **Fail-closed at every step:** an unset `TRIGGER_POLICY_STORE_ID` denies (the store is required infrastructure, not optional), any grant-read exception denies (`authz-unavailable`), any AVP error denies, and any non-`ALLOW` decision denies (`no-matching-grant` under default-deny). A denial emits a `TriggerDenied` metric and posts a reject notice to the originating thread. **Residual (availability, not confidentiality):** because it is fail-closed and on the dispatch hot path, an AVP outage blocks *all* dispatch until service is restored — but never admits an unauthorized trigger.
 
 **T-29 (Mitigated):** The dashboard exposes fleet-wide, cross-user activity data and the fleet's *configuration surface* (onboard/offboard agents and repos), so its API needs authorization beyond a valid login. Authorization is decided by **Amazon Verified Permissions** evaluating Cedar policies (`infra/dashboard/auth.py` → `IsAuthorized`), decoupled from app code: two coarse actions today — `Read` (GET routes, gated by `is_operator`) and `Write` (POST/PUT/DELETE, gated by `is_admin`) — expressed as three static Cedar policies in the foundation template (operators→Read, admins→Read, admins→Write). The API Gateway Cognito authorizer validates the JWT and forwards its claims; `auth.py` builds the principal + `cognito:groups` parent entities and calls AVP. **Fail-closed at every step:** no authenticated subject → deny; any AVP error or outage → deny; any non-`ALLOW` decision → deny. When `AVP_POLICY_STORE_ID` is unset (AVP not deployed / unit tests) the same policy is evaluated locally with identical semantics, also fail-closed. This is **distinct from the agent-tool Cedar engine at the Gateway (C-14)** — that authorizes what an *agent* may do to GitHub/Asana; this authorizes what a *human operator* may do to the fleet config. Adding a permission is adding a Cedar policy, not a code change. **Residual (availability, not confidentiality):** because it is fail-closed, an AVP outage denies all dashboard API calls until service is restored — the API becomes unavailable but never leaks or accepts an unauthorized write. Acceptable: the dashboard is an operator console, not on the agent hot path (dispatch/agent execution do not depend on AVP).
 
@@ -244,7 +261,7 @@ Exfiltration through legitimate tool paths (e.g., encoding data in a GitHub comm
 The real threat is a **chain that doesn't stop** — a prompt-injected or mis-prompted agent that issues mentions indefinitely, or a bidirectional handoff that fails to terminate. Consequences are compute spend (Bedrock token bill), DynamoDB write pressure on the assignments table, and delayed dispatch for legitimate work as concurrency slots fill.
 
 **Current controls:**
-- `authorization.users` allowlists per agent (T-4) — runaway only propagates between agents the operator has explicitly paired.
+- AVP trigger-authz grants per agent (T-4, T-40) — runaway only propagates between agents an admin has explicitly granted.
 - `max_concurrent` per agent in the registry, enforced by the Dispatch Router. Caps in-flight work but does not bound total volume over time.
 - Mention gating in the webhook receivers (`github_webhook.py` / `asana_webhook.py`, via the shared `mentions.py` resolver) — an event is only forwarded to the Router if it @mentions an agent present in the live registry, which bounds the surface but not the volume.
 
@@ -270,15 +287,46 @@ Automated scanners (checkov, semgrep, bandit) flag several patterns in this repo
 
 **Mitigated by this same review** (no longer exceptions): CKV_AWS_28 (DynamoDB PITR enabled), CKV_AWS_18/CKV_AWS_21 (S3 access logging + versioning), CKV_AWS_73/CKV_AWS_76 (API Gateway X-Ray + access logs), CKV_AWS_115/CKV_AWS_116 (Lambda reserved concurrency + DLQ), CKV_DOCKER_3 (non-root container user), CKV2_GHA_1 (top-level workflow `permissions: contents: read`).
 
+### 3.9 Slack Connector (Trigger Source)
+
+The Slack trigger source (C-18, `DeploySlack`-gated) is a public webhook that async-invokes the same Dispatch Router as GitHub/Asana, so it inherits the guardrail (§3.1), trigger authz (T-40), and structural controls. The threats below are the ones specific to the Slack ingress and its multi-workspace/channel model. See `docs/specs/slack-connectors-spec.md` for the design rationale.
+
+| ID | Threat | Severity | Component | STRIDE | Status |
+|----|--------|----------|-----------|--------|--------|
+| T-32 | **Slack signature bypass** | **High** | C-18 | Spoofing | Mitigated |
+| T-33 | **Replay of a captured Slack delivery** | **Medium** | C-18 | Spoofing, DoS | Mitigated |
+| T-34 | **Bot-loop / self-trigger** | **Medium** | C-18 | Denial of Service | Mitigated |
+| T-35 | **Slack sender spoofing** | **High** | C-18, C-19 | Spoofing, Elevation of Privilege | Mitigated |
+| T-36 | **Slack bot-token / signing-secret exposure** | **Medium** | C-6, C-18 | Information Disclosure | Mitigated |
+| T-37 | **Cross-workspace confusion** | **Medium** | C-18, C-19 | Elevation of Privilege | Mitigated |
+| T-38 | **Authz bypass via missing channel context** | **Medium** | C-18, C-19 | Elevation of Privilege | Mitigated |
+| T-39 | **Trigger-rule / AVP divergence** | **Low** | C-19 | Tampering | Partially mitigated |
+
+**T-32 (Mitigated):** `slack_webhook.py` authenticates **every** delivery — before any routing or parsing of the payload's meaning — by recomputing the Slack `v0` HMAC-SHA256 over the basestring `v0:{X-Slack-Request-Timestamp}:{raw_body}` and comparing it constant-time against `X-Slack-Signature` (`mentions.verify_slack_signature`). Verification runs over the exact raw body (base64-decoded first if API Gateway wrapped it) and does **not** depend on a `team_id`, because the `url_verification` handshake carries no team scope. A missing/unset signing secret **fails closed** (503, refuse the delivery); a bad signature returns 401 before any downstream work.
+
+**T-33 (Mitigated):** Two independent controls bound replay. (1) The `v0` timestamp is inside the signed basestring and rejected outside a **±5-minute window**, so a captured request can't be re-sent later. (2) `event_id` **de-duplication**: the id is checked against a `slack-event#` marker in the assignments table and a repeat short-circuits. The marker is written only *after* the event processes cleanly (a mid-process failure returns 500 without marking, so Slack's legitimate retry is honored — the dedup never swallows a real mention). Dedup reads fail *open* (tolerate a duplicate) so an availability blip can't drop a real delivery; the router's assignment-id + concurrency guard absorbs a rare duplicate dispatch.
+
+**T-34 (Mitigated):** The agent posts its own replies to Slack (DF-20), which would otherwise re-arrive as new events and loop. `_process_app_mention` ignores any event carrying `bot_id` or `subtype == "bot_message"` before resolving a mention, so the fleet's own messages never re-trigger it. Cross-agent chains (an agent mentioning a peer) remain possible by design and are bounded by the trigger-authz grant topology (T-4/T-23), not by a blanket bot-reject.
+
+**T-35 (Mitigated):** Authorization keys on the workspace-scoped, immutable principal `slack:<team_id>:<user_id>` built by the receiver from the signed payload — never the user's display name (which a Slack user can edit). This mirrors the Asana `.gid` fix (see T-4 / v1.6). A user cannot impersonate another by changing their profile name; the `user_id` is set by Slack and covered by the signature.
+
+**T-36 (Mitigated):** Both Slack secrets are SSM SecureString under `/sdlc-agents/${Stage}/slack/*`, fetched **per-invocation** and held only in local scope, never a module global (mirrors T-8) — a memory-disclosure or verbose-log incident exposes at most the one request in flight. The receiver Lambda's IAM grants `ssm:GetParameter` on that path only; **writing** the secrets is an operator step (`scripts/bootstrap_slack.py`), never the Lambda (parity with T-9). Note the split the code enforces: the **signing secret is app-level** (one per Slack app, resolvable without a team id for the handshake) while **bot tokens are per-workspace/installation** (`…/slack/<team>/bot-token`) — so a single leaked bot token is bounded to one workspace.
+
+**T-37 (Mitigated):** A delivery is only honored if its `team_id` resolves to an onboarded, **enabled, active** `slack_workspace` row (`trigger_grants.is_workspace_enabled`, fail-closed on unknown/disabled). The workspace is pinned into the dispatch `context.workspace` and passed to AVP as Cedar `context.workspace`, and trigger rules are scoped per workspace — so a grant in one workspace cannot authorize a trigger from another. Bot-token selection is also keyed on `team_id`, so a reply always goes back to the originating workspace.
+
+**T-38 (Mitigated):** Trigger authz includes a channel axis (`forbid` when `!context.channelAllowed`), which is only sound if the channel is always present. The receiver always populates `channel_id` on both the event and slash-command paths, and `channel_allowed` fails closed under the recommended **allowlist** posture — an unknown workspace or a channel with no explicit `allow` row is denied. A dispatch that somehow arrived with no channel under allowlist posture is therefore rejected, not admitted.
+
+**T-39 (Partially mitigated):** Because grants are data and the Cedar policy set is fixed, the dashboard rule editor and the router read the *same* `trigger_rule`/`slack_channel` rows — there is no separate Cedar policy that can drift from what the UI shows (the classic policy-per-user divergence is designed out). The residual is at the row-write layer: the admin API must keep the DynamoDB rows and any projected view consistent on create vs. delete (spec §5.5 persist↔project invariant). This is enforced in `infra/dashboard` code and unit-tested (`test_trigger_policy_sync.py`), not by an independent runtime check — hence Partially, not fully, mitigated.
+
 ---
 
 ## 4. Trust Boundaries
 
 | Boundary | Components Inside | Components Outside | Controls |
 |----------|-------------------|--------------------|----------|
-| **AWS Account** | C-1, C-2 through C-8, C-12 through C-17 | C-9/GitHub (external SCM), C-10 (Asana MCP), C-15 Mantle endpoint (AWS-managed) | IAM; webhook HMAC verification at ingress |
-| **Webhook edge** | C-1, C-2 (public API Gateway) | GitHub, Asana | HMAC-SHA256 signature verification (fail-closed), async invoke only on verified events |
-| **Dispatch Layer** | C-1, C-2, C-3 | C-4 (Agents) | IAM roles, Lambda invoke permissions, scoped `InvokeAgentRuntime`, edge guardrail |
+| **AWS Account** | C-1, C-2 through C-8, C-12 through C-19 | C-9/GitHub (external SCM), C-10 (Asana MCP), C-15 Mantle endpoint (AWS-managed), Slack (external chat) | IAM; webhook signature verification at ingress |
+| **Webhook edge** | C-1, C-2, C-18 (public API Gateway) | GitHub, Asana, Slack | Per-source signature verification (GitHub/Asana HMAC-SHA256; Slack `v0` + ±5-min replay window), all fail-closed; async invoke only on verified events |
+| **Dispatch Layer** | C-1, C-2, C-3, C-18 | C-4 (Agents) | IAM roles, Lambda invoke permissions, scoped `InvokeAgentRuntime`, edge guardrail, AVP trigger authz (C-19, fail-closed) |
 | **Agent Runtime** | Individual agent container | Other agents, Dispatch layer | AgentCore runtime isolation, per-agent boundary-capped IAM roles |
 | **Tool-call boundary** | C-14 (Gateway + Cedar engine + interceptor) | C-9, C-10 | Gateway-only (SigV4), Cedar default-deny/forbid-wins, co-repo interceptor, per-owner scoped App tokens |
 | **Dashboard control plane** | C-13 (AVP), dashboard query/admin Lambdas | Operators (browser) | Cognito login + AVP `IsAuthorized` (fail-closed); admin API holds only `codebuild:StartBuild` |
@@ -296,11 +344,13 @@ Risk is expressed as the residual exposure given current controls. Mitigated thr
 | **High (Accepted)** | 1 | T-15 |
 | **High (Partially mitigated)** | 3 | T-2, T-3, T-5 |
 | **High (Open)** | 1 | T-23 |
+| **High (Mitigated)** | 2 | T-32, T-35 |
 | **Medium (Open or Partial)** | 8 | T-11, T-13, T-17, T-21 (open); T-12, T-18, T-22, T-30 (partial) |
-| **Medium (Mitigated)** | 1 | T-31 |
+| **Medium (Mitigated)** | 6 | T-31, T-33, T-34, T-36, T-37, T-38 |
 | **Low (Accepted with rationale)** | 5 | T-24, T-25, T-26, T-27, T-28 |
 | **Low** | 3 | T-10, T-14, T-16 |
-| **Mitigated (Not scored)** | 7 | T-4, T-6, T-8, T-9, T-19, T-29 |
+| **Low (Partially mitigated)** | 1 | T-39 |
+| **Mitigated (Not scored)** | 7 | T-4, T-6, T-8, T-9, T-19, T-29, T-40 |
 | **Superseded (retired path)** | 2 | T-7 (GitHub OIDC), T-20 (Actions workflow injection) |
 
 ---
@@ -320,7 +370,7 @@ Roadmap items ordered by leverage:
 
 ## 7. Assumptions & Scope
 
-- Covers the fleet as shipped: four agents (workitems, researcher, docwriter, adr), Dispatch Router, GitHub App + Asana webhooks, the AgentCore Gateway (gateway-only tool access), the AVP-authorized dashboard, and the UI-driven onboarding pipeline (CodeBuild + capability-deployer). Slack integration, AgentCore Memory, AgentCore Identity, and Feedback/UAT agents are out of scope — they are not yet implemented.
+- Covers the fleet as shipped: four agents (workitems, researcher, docwriter, adr), Dispatch Router, GitHub App + Asana + Slack (`DeploySlack`-gated) webhooks, AVP-backed trigger authorization (`TriggerPolicyStore`), the AgentCore Gateway (gateway-only tool access), the AVP-authorized dashboard with the Connectors admin panel, and the UI-driven onboarding pipeline (CodeBuild + capability-deployer). AgentCore Memory, AgentCore Identity, and Feedback/UAT agents are out of scope — they are not yet implemented. Slack usergroup-based group membership is a documented fast-follow (spec §15); shipped group grants use dashboard-maintained mappings.
 - Single AWS account + single region deployment. Multi-account or cross-region introduces additional trust boundaries not analyzed here.
 - LLM model behavior (hallucinations, jailbreaks, adversarial-input sensitivity) is treated as a baseline risk of using foundation models. Mitigations focus on constraining what the agent can *do*, not on preventing the model from generating bad outputs.
 - GitHub MCP and Asana MCP servers are treated as trusted third-party services. Their internal security posture is out of scope.
@@ -332,7 +382,7 @@ Roadmap items ordered by leverage:
 
 | Date | Version | Changes |
 |------|---------|---------|
-| 2026-07-20 | 2.0 | **Slack connector + Cedar trigger authorization + channel-request flow** (docs/specs/slack-connectors-spec.md). New **C-18** Slack webhook receiver (`slack_webhook.py`, `DeploySlack`-gated): per-workspace `v0` signature verification + ±5-min replay window (T-32/T-33), `event_id` dedup, bot-loop guard (T-34), per-workspace signing-secret + bot-token in SSM fetched per-invocation (T-36). New **C-19** `TriggerPolicyStore` (AVP) — the sole trigger-authz mechanism, always-on foundation, **data-driven**: a fixed 3-policy Cedar set evaluates grant sets passed as entity attributes from `trigger_rule`/`slack_channel` DynamoDB rows (granting = a data write, not a policy — avoids the AVP policy-per-user anti-pattern). Fail-closed on unset store / AVP error / grant-read error. The flat per-capability `authorization.users` allowlist is **removed** (nothing is deployed, so there is no legacy data to carry over — admins author grants directly). Sender principals are workspace-scoped immutable ids (`slack:<team>:<uid>`, T-4/T-35). **Channel onboarding requests**: users file via `/sdlc-onboard-channel`; access is granted only by explicit admin approval (no self-serve). Cross-workspace confusion mitigated by pinning `context.workspace` + per-workspace secret selection (T-37); missing-channel context fails closed under allowlist posture (T-38). |
+| 2026-07-20 | 2.0 | **Slack connector + Cedar trigger authorization + channel-request flow** (docs/specs/slack-connectors-spec.md) — the body is now written to match the shipped code (§1.1 C-18/C-19, §2.1 DF-17–DF-20, §3.2 T-40, new §3.9 T-32–T-39, trust boundaries + risk summary). New **C-18** Slack webhook receiver (`slack_webhook.py`, `DeploySlack`-gated): Slack `v0` signature verification over the raw basestring + ±5-min replay window (T-32/T-33), `event_id` dedup, bot-loop guard (T-34). Secrets in SSM fetched per-invocation (T-36) — the **signing secret is app-level** (one per Slack app; the `url_verification` handshake carries no team scope) while **bot tokens are per-workspace/installation**. New **C-19** `TriggerPolicyStore` (AVP) + **T-40** — the sole trigger-authz mechanism, always-on foundation, **data-driven**: a fixed 3-policy Cedar set evaluates grant sets passed as entity attributes from `trigger_rule`/`slack_channel` DynamoDB rows (granting = a data write, not a policy — avoids the AVP policy-per-user anti-pattern). Fail-closed on unset store / AVP error / grant-read error / non-`ALLOW`. The flat per-capability `authorization.users` allowlist is **removed** (nothing was deployed, so no legacy data to carry over — admins author grants directly); **T-4 reframed** around AVP trigger authz + unresolved-sender fail-closed. Sender principals are source-namespaced immutable ids (`slack:<team>:<uid>`, T-4/T-35). **Channel onboarding requests**: users file via `/sdlc-onboard-channel`; access is granted only by explicit admin approval (no self-serve). Cross-workspace confusion mitigated by pinning `context.workspace` + per-`team_id` bot-token selection (T-37); missing-channel context fails closed under allowlist posture (T-38). |
 | 2026-07-20 | 1.9 | **C-15** reworked: model cost attribution is now a **single fleet-wide** Mantle project (a dispatch may span repos, so per-repo attribution was meaningless) — provisioned in the foundation stack as `AWS::BedrockMantle::Project` (`DeployMantleProject`, default on) or a pre-existing `MantleProjectId`, injected as `MANTLE_PROJECT_ID`; the per-repo `mantle.py` create-on-onboard path and the `source_context.mantle_project` dispatch field are removed (DF-8/DF-12/DF-15 updated). **Mention gating**: both webhook receivers now resolve `@mentions` against the live registry via a shared `infra/dispatch/mentions.py` (HMAC verify + registry-cached resolution), replacing per-receiver hardcoded rosters; the Asana receiver also decodes base64 API-Gateway bodies before the HMAC check (parity with GitHub). Asana assignment/custom-field triggers remain built-in-only (keyed on Asana-side bot accounts / dropdown enums). |
 | 2026-07-20 | 1.8 | Ship-accurate refresh for the current architecture. **Component inventory:** C-1 is now the GitHub App webhook Lambda (was `agent-dispatch.yml`); C-11 (GitHub OIDC provider) **retired**; C-4 model → Claude Sonnet 5 via Mantle; C-9 → SCM broker gateway target; new C-13 (AVP dashboard-API policy store), C-14 (AgentCore Gateway + Cedar engine + interceptor), C-15 (Bedrock Mantle + per-repo projects), C-16 (shared CodeBuild), C-17 (capability-deployer + `CapabilityRuntimeBoundary`). **Data flows** rewritten for the webhook trigger path, gateway-only tool calls, and Mantle model calls (bearer token + guardrail headers + `OpenAI-Project`); added DF-14/15/16 for the dashboard + onboarding pipeline. **Threats:** T-5 → Partially mitigated (Gateway Cedar engine enforces); T-7 and T-20 → **Superseded** (OIDC/CI dispatch retired); new T-29 (AVP fail-closed API authz), T-30 (GitHub App webhook HMAC — replaces the OIDC trust boundary), T-31 (capability-deployer privileged-IAM isolation: event-only, path-scoped, boundary-capped). Runtime guardrail narrative updated for Mantle-header attachment + fail-closed `build_model`. |
 | 2026-05-05 | 1.7 | Checkov / semgrep scan pass (Kai Xu review). Hardened CFN: DynamoDB PITR, S3 versioning + access logs, API Gateway X-Ray + access logs, Lambda reserved concurrency + SQS DLQ; Dockerfiles switched to non-root `agent` user; all workflows given top-level `permissions: contents: read`. New §3.8 documents T-24..T-28 — accepted scanner findings (CKV_AWS_119, CKV_DOCKER_2, CKV_AWS_173, CKV_AWS_120, CKV_AWS_117) with rationale and upgrade paths. |

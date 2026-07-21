@@ -18,7 +18,7 @@ The SPA has four views, navigable via in-memory state (no router dependency):
 | **Fleet** | Paginated list of all runs newest-first, with status pills, agent/source labels, and trace chips. Supports filtering by agent, status, source, and requester. |
 | **Run Detail** | Full record for one run: timestamps, duration, token usage, cost, participants, source link, and all trace refs. Reached by clicking a run row. |
 | **Trace** | All runs sharing a trace dimension (e.g. every agent's work on a branch or Jira key). Reached by clicking any trace chip. |
-| **Admin** | Fleet configuration (admins only): onboard/remove the repositories the fleet may act on, toggle each repo's multi-repo eligibility, and flip the fleet-wide "restrict to allowlist" setting. Reached via the **Admin** nav button, shown only to members of the `admins` group. |
+| **Admin** | Fleet configuration (admins only): onboard/remove agent **capabilities** and the repositories the fleet may act on, toggle each repo's multi-repo eligibility, flip the fleet-wide "restrict to allowlist" setting, and manage **Connectors** — the GitHub App manifest setup, Slack workspaces/channels, **trigger rules** (the AVP trigger-authz grant data), and the channel-onboarding **request** approve/deny queue. Reached via the **Admin** nav button, shown only to members of the `admins` group. |
 
 **Trace chips** are data-driven — whatever keys appear in a run's `trace_refs`
 are rendered as clickable chips. Adding a new integration dimension (repo,
@@ -44,16 +44,32 @@ closed — operators can view but not configure).
 
 | Method | Route | Purpose |
 |--------|-------|---------|
-| GET | `/admin/repos` | List onboarded repos (repo, enabled, multi_repo_eligible, status, onboarded_by/at). |
-| POST | `/admin/repos` | Onboard/update a repo. Body: `repo` (`owner/repo`), optional `enabled`, `multi_repo_eligible`. |
+| GET/POST | `/admin/repos` | List / onboard-update a repo. POST body: `repo` (`owner/repo`), optional `enabled`, `multi_repo_eligible`. |
 | DELETE | `/admin/repos/{repo}` | Remove a repo from the fleet. |
-| GET | `/admin/settings` | Get fleet settings (`restrict_repos`). |
-| PUT | `/admin/settings` | Update settings. Body: `restrict_repos` (bool). |
+| GET | `/admin/settings` · PUT `/admin/settings` | Get / update fleet settings (`restrict_repos`). |
+| GET/POST | `/admin/capabilities` | List / onboard an agent capability (starts the shared build → runtime deploy). |
+| DELETE | `/admin/capabilities/{agent_id}` | Offboard a capability and republish the registry. |
+| GET | `/admin/github-app/status` | GitHub App configured?/slug/install URL. |
+| GET | `/admin/github-app/setup/manifest` | Build the App-registration manifest (webhook → dispatch API). |
+| POST | `/admin/github-app/setup/callback` | Exchange the manifest code to create the App. |
+| GET/POST | `/admin/slack/workspaces` | List / onboard a Slack workspace (`team_id`, `default_channel_policy`). |
+| DELETE | `/admin/slack/workspaces/{team_id}` | Remove a Slack workspace. |
+| GET/POST | `/admin/slack/channels` | List / set a per-channel allow\|deny policy. |
+| DELETE | `/admin/slack/channels/{team_id}/{channel_id}` | Remove a channel policy row. |
+| GET/POST | `/admin/trigger-rules` | List / author a trigger-authz grant (`connector`, `subject_type`, `subject_id`, `agent_id`, `workspace`, `effect`). This is the AVP `TriggerPolicyStore` grant *data*. |
+| DELETE | `/admin/trigger-rules/{rule_id}` | Revoke a trigger grant. |
+| POST | `/admin/trigger-rules/simulate` | Dry-run an authorization decision against the current grants + channel posture. |
+| GET | `/admin/channel-requests` | List channel-onboarding requests (optional `status`). |
+| POST | `/admin/channel-requests/{request_id}/approve`\|`/deny` | Decide a channel-onboarding request (approve writes the allow row + grant). |
 
-Onboarding writes the config row `pending`, syncs the Gateway Cedar policy, then
-marks it `active` — so the dispatch allowlist never widens ahead of the tool-call
-policy. A policy-sync failure leaves the row `pending` and returns `502`. See
-`docs/aws-deploy.md` § AgentCore Gateway.
+**Repo onboarding** writes the config row `pending`, syncs the Gateway Cedar
+policy, then marks it `active` — so the dispatch allowlist never widens ahead of
+the tool-call policy. A policy-sync failure leaves the row `pending` and returns
+`502`. See `docs/aws-deploy.md` § AgentCore Gateway.
+
+**Trigger rules** are the *data* the Dispatch Router's AVP trigger authz reads
+(`TriggerPolicyStore`); the Cedar policy set is fixed, so granting a subject is a
+DynamoDB write, not a new policy. See [`docs/specs/slack-connectors-spec.md`](../docs/specs/slack-connectors-spec.md).
 
 ## Architecture notes
 

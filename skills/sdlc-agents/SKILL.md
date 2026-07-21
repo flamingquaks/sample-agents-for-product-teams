@@ -5,7 +5,7 @@ description: Use when the user wants to install, configure, or onboard the SDLC 
 
 # Install SDLC Agent Fleet in a new project
 
-The SDLC Agent Fleet is a set of autonomous agents that cover the software development lifecycle — project management, documentation, business analysis, and ADR linking. Each agent runs on Amazon Bedrock AgentCore. Shipping agents integrate with **Asana** (PM) and **GitHub** (SCM); additional tools (Jira, GitLab, Slack, Salesforce, Datadog) are planned but not yet supported end-to-end.
+The SDLC Agent Fleet is a set of autonomous agents that cover the software development lifecycle — project management, documentation, business analysis, and ADR linking. Each agent runs on Amazon Bedrock AgentCore. Shipping agents integrate with **Asana** (PM) and **GitHub** (SCM), and **Slack** ships as a trigger source (`@mention` + slash commands, onboarded in the dashboard Connectors → Slack panel). Additional tools (Jira, GitLab, Salesforce, Datadog) are planned but not yet supported end-to-end.
 
 **Not every customer uses every agent.** Your job is to have a conversation that:
 
@@ -68,7 +68,9 @@ For each tool the customer uses, invoke the matching connect skill:
 - Asana → **sdlc-agents-connect-asana** (OAuth app setup, MCP vs API app, PAT for webhook Lambda)
 - GitHub → **sdlc-agents-connect-github** (register + install the fleet's GitHub App — the only credential model; the App webhook is the mention trigger and per-owner installation tokens back tool calls)
 
-Other tools (Jira, GitLab, Slack, Salesforce, Datadog) don't have connect skills yet — the shipping agents all work against Asana + GitHub. If the user picked one of those other tools during discovery, tell them honestly that the connect path isn't written yet and point them at the vendor's remote MCP docs; don't fabricate setup steps.
+Slack is onboarded differently — not via a connect skill but via the dashboard **Connectors → Slack** panel plus `scripts/bootstrap_slack.py` (app signing secret + per-workspace bot token, Slack app manifest registration). Deploy with `DeploySlack=true`. Users then request channel access with `/sdlc-onboard-channel` and an admin approves it.
+
+Other tools (Jira, GitLab, Salesforce, Datadog) don't have connect skills yet — the shipping agents all work against Asana + GitHub (+ Slack triggers). If the user picked one of those other tools during discovery, tell them honestly that the connect path isn't written yet and point them at the vendor's remote MCP docs; don't fabricate setup steps.
 
 Each connect skill knows the specific pitfalls of its tool (Asana's MCP-app-vs-API-app distinction is the classic one) and walks past them.
 

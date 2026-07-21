@@ -95,20 +95,40 @@ reach the repo). Mentions from a non-onboarded repo are rejected at dispatch.
 Agent mention tokens are resolved by the webhook Lambda against the live registry;
 there is no hardcoded `if:` trigger list to edit.
 
-### Slack (gap — not yet supported end-to-end)
+### Slack
 
-Slack triggers aren't wired up in the foundation stack or the Dispatch Router yet. If the user has Slack in their toolchain and selected agents that advertise Slack triggers in their capability row, tell them:
+Slack is a shipped trigger source, gated behind `DeploySlack=true` on the foundation stack. When enabled it provisions the `slack-webhook-${STAGE}` Lambda on the webhook API with two routes — `/slack/events` (Events API `app_mention`) and `/slack/commands` (`/fleet @agent …` + `/sdlc-onboard-channel`). The receiver verifies the Slack `v0` signature (±5-min replay window), dedups on `event_id`, guards bot-loops, and resolves `@mentions` against the live registry exactly like the other sources.
 
-> Slack triggers aren't implemented in this fleet yet. The registry advertises the trigger shape but the foundation stack has no Slack event receiver, and the router has no signature verifier. You can still use your selected agents via Asana/GitHub; the Slack path can be added later.
+#### 1. Deploy with Slack enabled
 
-When support lands, this section should cover:
+Redeploy the base platform with `DeploySlack=true` (via `scripts/deploy_fleet.py` / `scripts/bootstrap.py`). Note the `SlackEventsEndpoint` + `SlackCommandsEndpoint` stack outputs.
 
-- Creating a Slack app from a manifest (scopes: `app_mentions:read`, `chat:write`; events: `app_mention`)
-- Installing to the workspace and storing the bot token at `/sdlc-agents/slack-bot-token`
-- Storing `SLACK_SIGNING_SECRET` for inbound event verification
-- Pointing event subscriptions at a new `slack-webhook-${STAGE}` Lambda URL (not yet in the foundation stack)
+#### 2. Register the Slack app + store secrets
 
-Don't try to paper over the gap by writing a partial integration — leave it clean so the user knows what does and doesn't work.
+Run `scripts/bootstrap_slack.py` (operator credentials). It registers the Slack app from a manifest pointed at the two endpoints and writes the secrets to SSM SecureString:
+
+- **App signing secret** at `/sdlc-agents/${STAGE}/slack/signing-secret` — **app-level** (one per Slack app; the `url_verification` handshake carries no team scope, so verification can't depend on a `team_id`).
+- **Bot token** (`xoxb-…`) at `/sdlc-agents/${STAGE}/slack/<team_id>/bot-token` — **per-workspace/installation**; run once per workspace you onboard.
+
+Minimal scopes: `app_mentions:read`, `chat:write`, `commands`.
+
+#### 3. Onboard each workspace + channel
+
+In the dashboard **Connectors → Slack** panel, onboard the workspace (an enabled, active `slack_workspace` row — deliveries from any other `team_id` are rejected). Channel access is default-deny under the recommended allowlist posture: users request a channel with `/sdlc-onboard-channel [agent …]` and an **admin approves** it in the same panel (never self-served). No dispatch is authorized until a trigger-authz grant exists — see the next section.
+
+## Trigger authorization (required — no dispatch runs without it)
+
+Wiring a receiver only gets an event to the Router. The Router then **authorizes every dispatch** against the AVP `TriggerPolicyStore` (`infra/dispatch/trigger_authz.py`), which is the fleet's **sole** trigger-authz mechanism. The old per-capability `authorization.users` allowlist has been **removed** — do not look for it. The store is **default-deny**: an onboarded agent is not triggerable by anyone until an admin authors a grant.
+
+Grants are **data, not policy** — authored in the dashboard **Connectors → Trigger Rules** panel (each grant is a `trigger_rule` DynamoDB row), so granting a user is a data write and the AVP policy count stays fixed. A rule is: subject (a `user` principal id, or a `group`) → agent (`*` = any) → workspace (`*` = any), with an effect of permit or forbid (forbid wins).
+
+Principals are **immutable, source-namespaced** ids (never a display name):
+
+- GitHub → `github:<login>`
+- Asana → `asana:<user_gid>`
+- Slack → `slack:<team_id>:<user_id>` (a channel-scoped grant `channel:<team>:<channel>` permits anyone triggering from an approved channel)
+
+To let one agent trigger another (cross-agent chains), grant the peer agent's bot identity a permit on the callee. Confirm at least one permit grant exists for each agent the user expects to be triggerable before running verify, or every mention will be denied (with a `TriggerDenied` metric + an in-thread reject notice).
 
 ## Verify the pipeline
 

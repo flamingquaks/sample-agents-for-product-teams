@@ -8,17 +8,23 @@ The rendered architecture diagram is [`docs/assets/architecture.mmd`](assets/arc
 (Mermaid — open in any Mermaid renderer). It shows the four planes the deploy
 surface below provisions:
 
-**Trigger plane.** Users `@mention` an agent in GitHub or Asana. Two public,
-HMAC-verified **webhook** Lambdas receive those events: the **GitHub App webhook**
-(`infra/dispatch/github_webhook.py`, verifying `X-Hub-Signature-256`) and the
-**Asana webhook** (`infra/dispatch/asana_webhook.py`). Each validates the
-signature, resolves the mentioned agent, and async-invokes the Dispatch Router.
-There is **no GitHub Actions / OIDC dispatch path** — one App webhook serves every
-onboarded repo, so no per-repo workflow or repo-side AWS credential is needed.
+**Trigger plane.** Users `@mention` an agent in GitHub, Asana, or Slack. Three
+public, signature-verified **webhook** Lambdas receive those events: the **GitHub
+App webhook** (`infra/dispatch/github_webhook.py`, verifying `X-Hub-Signature-256`),
+the **Asana webhook** (`infra/dispatch/asana_webhook.py`), and the **Slack webhook**
+(`infra/dispatch/slack_webhook.py`, `DeploySlack`-gated — verifies the Slack `v0`
+signature with a ±5-min replay window, serves `/slack/events` + `/slack/commands`).
+Each validates the signature, resolves the mentioned agent against the live
+registry (shared `infra/dispatch/mentions.py`), and async-invokes the Dispatch
+Router. There is **no GitHub Actions / OIDC dispatch path** — one App webhook serves
+every onboarded repo, so no per-repo workflow or repo-side AWS credential is needed.
 
 **Dispatch + agent plane.** The **Dispatch Router** Lambda runs an edge
-prompt-injection guardrail (`bedrock-runtime` `apply_guardrail`), authorizes the
-sender against the per-agent allowlist, reads its registry from an SSM parameter
+prompt-injection guardrail (`bedrock-runtime` `apply_guardrail`), **authorizes the
+trigger via Amazon Verified Permissions** (the `TriggerPolicyStore` — a fixed
+Cedar policy set over admin-authored grant *data*; `infra/dispatch/trigger_authz.py`,
+fail-closed; this is the sole trigger-authz mechanism — the old per-capability
+`authorization.users` allowlist is removed), reads its registry from an SSM parameter
 (rendered from the fleet-config capability rows), records the assignment in
 DynamoDB, and calls `InvokeAgentRuntime` on the target agent's **AgentCore
 Runtime** container. Agents run the Strands SDK and call models on the
@@ -37,8 +43,11 @@ SPA on S3 + CloudFront, behind an API Gateway with a Cognito authorizer. Every
 API request is authorized by **Amazon Verified Permissions** (Cedar `Read` for
 operators, `Write` for admins — `infra/dashboard/auth.py`, fail-closed). A
 read-only **query** Lambda serves run history from DynamoDB; an **admin** Lambda
-onboards agents and repos into the `fleet-config` DynamoDB table (and holds only
-`codebuild:StartBuild` — no privileged IAM).
+onboards agents and repos and manages **Connectors** (Slack workspaces/channels,
+trigger rules, and channel-onboarding requests) into the `fleet-config` DynamoDB
+table (and holds only `codebuild:StartBuild` — no privileged IAM). The admin's
+trigger-rule writes are the *data* the Router's AVP trigger authz reads; granting
+a user is a DynamoDB write, not a new Cedar policy.
 
 **Onboarding pipeline.** Onboarding an agent writes a capability row and starts
 the shared **`sdlc-agent-builder-<stage>` CodeBuild** project (parameterized by
@@ -64,13 +73,16 @@ Deployed once per stage with `sam deploy`. Creates:
 |---|---|---|
 | DynamoDB table | `dispatch-assignments-${Stage}` | Assignment tracking (PK `assignment_id`; GSIs on `agent_id+status`, `source+created_at`); 30-day TTL |
 | S3 bucket | `sdlc-agent-artifacts-${AWS::AccountId}-${Stage}` | Agent output artifacts (screenshots, test results); SSE-AES256; lifecycle rules on `screenshots/` (90d) and `test-results/` (180d) |
-| Lambda | `dispatch-router-${Stage}` | Parses `@mentions`, checks auth, invokes the right AgentCore Runtime, writes assignment to DynamoDB |
+| Lambda | `dispatch-router-${Stage}` | Parses `@mentions`, authorizes the trigger via AVP, invokes the right AgentCore Runtime, writes assignment to DynamoDB |
+| Lambda | `github-webhook-${Stage}` | Verifies the GitHub App `X-Hub-Signature-256`, resolves the mention, invokes Dispatch Router async |
 | Lambda | `asana-webhook-${Stage}` | Verifies Asana webhook signatures, normalizes events, invokes Dispatch Router async |
-| API Gateway | `WebhookApi` | Fronts the Asana webhook Lambda at `/asana/webhook` |
+| Lambda (`DeploySlack=true`) | `slack-webhook-${Stage}` | Verifies the Slack `v0` signature (±5-min replay window), serves `/slack/events` + `/slack/commands`, dedups `event_id`, invokes Dispatch Router async |
+| API Gateway | `WebhookApi` | Fronts the webhook Lambdas at `/github/webhook`, `/asana/webhook`, and (when Slack is enabled) `/slack/events` + `/slack/commands` |
+| AVP policy store | `TriggerPolicyStore` (`SdlcTrigger` schema) | **Always-on.** The fleet's trigger-authorization store — a fixed 3-policy Cedar set evaluating admin-authored grant *data* (`trigger_rule`/`slack_workspace`/`slack_channel` rows in `fleet-config-${Stage}`). The Dispatch Router reads it on every dispatch (fail-closed) |
 | SSM parameter | `/sdlc-agents/${Stage}/registry` | Dispatch Router registry, rendered from the active capability rows in `fleet-config-${Stage}` (re-written on every capability change by the admin API / capability deployer) |
-| CloudWatch alarms | Three alarms | Dispatch error rate, webhook error rate, dispatch p99 duration |
+| CloudWatch alarms | Dispatch + webhook alarms | Dispatch error rate, webhook error rate (per receiver, incl. Slack when enabled), dispatch p99 duration |
 
-**Outputs:** `AssignmentsTableName`, `ArtifactsBucketName`, `DispatchRouterArn`, `WebhookEndpoint` (Asana webhook URL), `WebhookApiId`.
+**Outputs:** `AssignmentsTableName`, `ArtifactsBucketName`, `DispatchRouterArn`, `WebhookEndpoint` (Asana webhook URL), `GitHubWebhookEndpoint`, `TriggerPolicyStoreId`, `WebhookApiId`, and — when `DeploySlack=true` — `SlackEventsEndpoint` + `SlackCommandsEndpoint`.
 
 **Optional — fleet monitoring dashboard (`DeployDashboard=true`).** Off by
 default; set the SAM parameter `DeployDashboard=true` to provision an
@@ -169,6 +181,7 @@ Passed to `sam deploy --parameter-overrides`:
 - **`AgentFieldGID`** — Asana custom field GID for the "Agent" dropdown (optional — empty string is fine if you're not using custom-field triggers).
 - **`DeployDashboard`** — `true`/`false` (default `false`). Provisions the Cognito user pool, the operator/admin read+write APIs, and the CloudFront SPA.
 - **`DeployGateway`** — `true`/`false` (default `false`). Provisions the AgentCore Gateway + Cedar policy engine (the deterministic tool-call boundary). Requires `DeployDashboard=true` (the admin API owns the policy sync).
+- **`DeploySlack`** — `true`/`false` (default `false`). Provisions the Slack webhook receiver Lambda (`/slack/events` + `/slack/commands`) on the webhook API. The trigger-authz store (`TriggerPolicyStore`) and the admin Connectors routes exist **regardless** of this flag, so an operator can pre-author trigger rules and Slack workspace rows before pointing Slack at the endpoints. Enabling it requires the Slack app signing secret + per-workspace bot tokens in SSM (see §2.4.1, populated by `scripts/bootstrap_slack.py`).
 - **`GatewayPolicyEnforcement`** — `LOG_ONLY` (default) / `ACTIVE`. The fleet Cedar policy's enforcement mode; roll out `LOG_ONLY` first, watch CloudWatch, then flip to `ACTIVE`.
 - **`DeployMantleProject`** — `true`/`false` (default `true`). Provisions the fleet's shared model cost-attribution project as `AWS::BedrockMantle::Project` and injects its id as `MANTLE_PROJECT_ID` on every agent runtime. **Prerequisite:** activate the resource type in the account+region once before the first deploy — `aws cloudformation activate-type --type RESOURCE --type-name AWS::BedrockMantle::Project` (see below). One project fleet-wide — a dispatch may act across several repos, so per-repo attribution is meaningless. Set `false` to skip provisioning and bring your own id via `MantleProjectId`.
 - **`MantleProjectId`** — a pre-existing Bedrock Mantle project id, used only when `DeployMantleProject=false`. Blank (default) leaves agents on the account's default Mantle project. Ignored when `DeployMantleProject=true`.
@@ -213,6 +226,17 @@ The shipping code expects these. Each is written by the corresponding skill or b
 
 Missing any required parameter produces a clear error at invocation time (not at deploy time). `bootstrap.py` preflights these SSM secrets and points you at the bootstrap scripts for any that are missing.
 
+### 2.4.1 Slack SecureString parameters (only when `DeploySlack=true`)
+
+Populated out-of-band by `scripts/bootstrap_slack.py` (which also registers the Slack app manifest against the `SlackEventsEndpoint`/`SlackCommandsEndpoint` outputs). Note the level split — it matters for blast radius (threat T-36):
+
+| Parameter | Level | Written by | Consumed by |
+|---|---|---|---|
+| `/sdlc-agents/${Stage}/slack/signing-secret` | **App-level** (one per Slack app; the `url_verification` handshake carries no team scope, so verification can't depend on a `team_id`) | `scripts/bootstrap_slack.py` | `slack-webhook-${Stage}` Lambda (signature verify) |
+| `/sdlc-agents/${Stage}/slack/<team_id>/bot-token` | **Per-workspace/installation** (`xoxb-…`) | `scripts/bootstrap_slack.py` (once per onboarded workspace) | `reply.post_slack_message` (agent/router replies to Slack) |
+
+Both are fetched per-invocation and never held on a module global. The receiver Lambda's IAM grants `ssm:GetParameter` on `/sdlc-agents/${Stage}/slack/*` only; it cannot write them. A workspace is not live until (a) `DeploySlack=true`, (b) its bot token is in SSM, and (c) an admin has onboarded it (an enabled, active `slack_workspace` row) in the dashboard Connectors → Slack panel.
+
 ### 2.5 Per-agent runtime environment
 
 Agents no longer get their environment from GitHub Actions variables — there's no deploy workflow to bake them in. Each runtime's env is assembled by the `capability-deployer` Lambda from two sources:
@@ -241,8 +265,10 @@ Top-to-bottom, no skipping.
 5. **Connect integrations** — run `sdlc-agents-connect-asana` and/or `sdlc-agents-connect-github` to populate SSM parameters.
 6. **Onboard each agent** — in the dashboard Admin view's Capabilities panel, onboard each agent (`agent_id` matching a directory under `agents/` in the build source, plus optional description/aliases/env). Each onboard builds the container, stands up the runtime role + AgentCore runtime, waits READY, and republishes the registry.
 7. **Onboard the repos the fleet may act in** — in the Admin view's repo panel (or `bootstrap.py`'s initial-repo seed when the dashboard is off). Mentions from a non-onboarded repo are rejected at dispatch.
-8. **Register the Asana webhook** — `sdlc-agents-register-triggers` calls the Asana API with the `WebhookEndpoint` stack output.
-9. **Verify** — `sdlc-agents-verify` runs layered smoke tests (runtime health → credential freshness → end-to-end mention).
+8. **Author trigger authorization** — no dispatch is authorized until a grant exists (the `TriggerPolicyStore` is default-deny; the old `authorization.users` allowlist is gone). Add `trigger_rule` grants in the dashboard Connectors → Trigger Rules panel (or via `sdlc-agents-register-triggers`), keyed on immutable sender principals (`github:<login>`, `asana:<gid>`, `slack:<team>:<uid>`).
+9. **Register the Asana webhook** — `sdlc-agents-register-triggers` calls the Asana API with the `WebhookEndpoint` stack output.
+10. **(Optional) Enable Slack** — deploy with `DeploySlack=true`, run `scripts/bootstrap_slack.py` to write the app signing secret + per-workspace bot token and register the Slack app manifest against the `SlackEventsEndpoint`/`SlackCommandsEndpoint` outputs, then onboard each workspace/channel in the dashboard Connectors → Slack panel.
+11. **Verify** — `sdlc-agents-verify` runs layered smoke tests (runtime health → credential freshness → end-to-end mention).
 
 Everything except the SSM secrets (populated by the connect skills) and the Asana webhook registration is driven by the base deploy plus dashboard onboarding.
 
@@ -264,9 +290,10 @@ Rough shutdown order:
 2. Delete each onboarded agent's AgentCore Runtime (`bedrock-agentcore-control delete-agent-runtime`).
 3. Delete each agent's IAM runtime role (under path `/sdlc-agents/capabilities/`).
 4. Delete each `sdlc-agents/<agent>` ECR repository (including all images).
-5. Delete the foundation CloudFormation stack (`sam delete`). This removes the Dispatch Router, webhook Lambda, API Gateway, DynamoDB tables, S3 buckets (must be empty first — including the build-source and dashboard buckets), SSM registry parameter, the build pipeline + capability deployer/rebuilder, guardrail, and CloudWatch alarms.
-6. Delete the SSM parameters (`asana-*`, `github-app-*`, `researcher-tavily-api-key`) and the Secrets Manager `sdlc-agents/github-app/private-key` secret.
-7. If you enabled the optional Claude Code on Bedrock feature (§1.4), delete its `ClaudeCodeBedrockRole` and the GitHub OIDC provider/trust you created for it. (The fleet itself creates no OIDC provider or CI role to clean up.)
-8. Disable Bedrock model access (optional).
+5. Delete the foundation CloudFormation stack (`sam delete`). This removes the Dispatch Router, the webhook Lambdas (GitHub, Asana, and Slack when enabled), API Gateway, the `TriggerPolicyStore` (AVP), DynamoDB tables (`dispatch-assignments`, `fleet-config` — the latter holding the trigger-rule/Slack data rows), S3 buckets (must be empty first — including the build-source and dashboard buckets), SSM registry parameter, the build pipeline + capability deployer/rebuilder, guardrail, and CloudWatch alarms.
+6. Delete the SSM parameters (`asana-*`, `github-app-*`, `researcher-tavily-api-key`, and — if Slack was enabled — everything under `/sdlc-agents/${Stage}/slack/*`) and the Secrets Manager `sdlc-agents/github-app/private-key` secret.
+7. If Slack was enabled, delete the Slack app (or its webhook subscriptions) from the Slack side so it stops sending deliveries.
+8. If you enabled the optional Claude Code on Bedrock feature (§1.4), delete its `ClaudeCodeBedrockRole` and the GitHub OIDC provider/trust you created for it. (The fleet itself creates no OIDC provider or CI role to clean up.)
+9. Disable Bedrock model access (optional).
 
 S3 bucket deletion blocks on non-empty. Explicit empty before destroy is required.

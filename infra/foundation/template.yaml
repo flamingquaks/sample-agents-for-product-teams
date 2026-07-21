@@ -97,8 +97,8 @@ Parameters:
       Slack webhook receiver Lambda (Events API + slash commands) on the webhook
       API. Default "false"; the trigger-authz store + admin routes exist
       regardless, so an operator can pre-author rules before pointing Slack here.
-      Per-workspace signing secrets + bot tokens are stored out-of-band via
-      scripts/bootstrap_slack.py.
+      The app-level signing secret and per-workspace bot tokens are stored
+      out-of-band via scripts/bootstrap_slack.py.
 
 Conditions:
   DashboardEnabled: !Equals [!Ref DeployDashboard, "true"]

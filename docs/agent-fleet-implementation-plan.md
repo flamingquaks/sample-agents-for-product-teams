@@ -13,7 +13,7 @@ Four agents are live on AgentCore Runtime today. Each has code under `agents/<na
 | **Docwriter** | Technical writer — API docs, release notes, doc PRs | `@docwriter` in GitHub/Asana |
 | **Adr** | ADR linker — tags issues, reviews PRs against governing ADRs | `@adr` on GitHub issues or PRs |
 
-The **Dispatch Router** Lambda routes mentions from GitHub + Asana to the right runtime. Two HMAC-verified **webhook** Lambdas are the event sources: the **GitHub App webhook** (`github_webhook.py`) and the **Asana webhook** (`asana_webhook.py`) — the old `agent-dispatch.yml` GitHub Actions workflow + OIDC deploy role are retired. State tracks in DynamoDB (`dispatch-assignments-${STAGE}`). Asana credentials live in SSM; the GitHub App key lives in Secrets Manager.
+The **Dispatch Router** Lambda routes mentions from GitHub, Asana, and Slack to the right runtime. Three signature-verified **webhook** Lambdas are the event sources: the **GitHub App webhook** (`github_webhook.py`), the **Asana webhook** (`asana_webhook.py`), and the `DeploySlack`-gated **Slack webhook** (`slack_webhook.py`, `/slack/events` + `/slack/commands`, Slack `v0` signature + replay window) — the old `agent-dispatch.yml` GitHub Actions workflow + OIDC deploy role are retired. **Trigger authorization** is decided by Amazon Verified Permissions (the `TriggerPolicyStore`, `trigger_authz.py`) against admin-authored `trigger_rule` grant *data* — data-driven, fail-closed, default-deny; the old per-capability `authorization.users` allowlist is removed. State tracks in DynamoDB (`dispatch-assignments-${STAGE}`). Asana credentials live in SSM; the GitHub App key lives in Secrets Manager; Slack secrets (app-level signing secret + per-workspace bot tokens) live under `/sdlc-agents/${STAGE}/slack/*`.
 
 All agents run **Claude Sonnet 5** via Bedrock Mantle.
 
@@ -26,18 +26,18 @@ These were in the original plan. Each is cleanly deferrable and none blocks adop
 - **AgentCore Browser** — not used; no agent has a browser dependency today.
 - **UAT agent** — depends on Browser and a maintenance story for tests across UI changes.
 - **Feedback agent** — depends on Memory being provisioned and populated.
-- **Slack dispatch** — the registry advertises Slack triggers but there's no receiver Lambda or signing-secret path. Flagged as a gap in `skills/pdlc-agents-register-triggers`.
 - **Merge, Gtm, Triage, Diagnostics, Monitor, Bugreproducer, Securityreviewer** — each had a design doc in an earlier draft; none have code.
+
+*(Slack dispatch — a receiver Lambda, signature verification, and slash commands — has since shipped, `DeploySlack`-gated. See "What shipped" above.)*
 
 ## Next steps (roadmap order, not commitments)
 
 See [`docs/roadmap.md`](roadmap.md) for the live roadmap. The near-term priorities as of this writing:
 
 1. **Provision AgentCore Memory** in the foundation template and wire seed data for each agent.
-2. **Slack event receiver** so `@workitems status` in Slack works end-to-end.
-3. **Per-agent Cedar evaluator in the invocation path** so policies are enforced, not advisory.
-4. **AgentCore Evaluations** wired up against the `eval_dataset.json` golden sets each agent already ships.
-5. **Jira support** — Atlassian has an official remote MCP server; the agent-side work is lighter than the dispatch side (needs a Jira webhook Lambda).
+2. **Flip the Gateway Cedar policy engine to `ACTIVE`** so tool-grant denies block, not just log (`GatewayPolicyEnforcement`).
+3. **AgentCore Evaluations** wired up against the `eval_dataset.json` golden sets each agent already ships.
+4. **Jira support** — Atlassian has an official remote MCP server; the agent-side work is lighter than the dispatch side (needs a Jira webhook Lambda).
 
 ## Why this document is short
 

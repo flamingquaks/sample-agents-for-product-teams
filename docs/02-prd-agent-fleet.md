@@ -99,9 +99,10 @@ A fleet of autonomous AI agents that operate as specialized team members across 
 | D-05 | Post agent results back to the originating platform in a platform-appropriate format | P1 | Shipped |
 | D-06 | Track all assignments in DynamoDB with status, timing, and result references | P1 | Shipped |
 | D-07 | Per-agent concurrency caps and daily token budgets enforced via registry | P1 | Shipped |
-| D-08 | Slack event routing (mentions, slash commands) | P2 | Roadmap |
+| D-08 | Slack event routing (mentions, slash commands) | P2 | Shipped (`DeploySlack`-gated: `/slack/events` + `/slack/commands`, incl. `/sdlc-onboard-channel` channel-request flow) |
 | D-09 | Slash commands (`/deploy`, `/approve`, `/disable`) for human control | P2 | Roadmap |
 | D-10 | Approval-gate state machine for high-risk agent actions | P2 | Roadmap |
+| D-11 | Trigger authorization via AVP (`TriggerPolicyStore`) — data-driven grants, fail-closed, default-deny; replaces the removed per-capability `authorization.users` allowlist | P1 | Shipped |
 
 ### 4.6 Fleet Memory — Shared Knowledge Layer (roadmap)
 
@@ -179,8 +180,10 @@ Concrete baselines and targets should be set per adopter; these are the categori
 The v1 fleet is live. The four shipping agents handle work decomposition, status, research synthesis, doc generation, and ADR linking. The next priorities on the roadmap (in `docs/roadmap.md`) are:
 
 1. Memory provisioning in the infra template so agents have persistent context out of the box.
-2. Slack dispatch routing so status reports and mentions work in Slack.
-3. Jira and GitLab support so teams not on Asana + GitHub can adopt.
+2. Jira and GitLab support so teams not on Asana + GitHub can adopt.
+3. Flipping the Gateway Cedar policy engine from `LOG_ONLY` to `ACTIVE` enforcement.
+
+(Slack dispatch routing has since shipped — `@mention` and slash commands work in Slack via the `DeploySlack`-gated receiver.)
 
 ## 11. Open Questions
 

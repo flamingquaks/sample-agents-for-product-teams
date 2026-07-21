@@ -1,7 +1,7 @@
 # Dispatch: Unified @Agent Work Assignment System
 ## Cross-Platform Agent Routing for GitHub, Asana, and Slack
 
-> **Status: target design.** The shipping Dispatch layer (`infra/dispatch/router.py` + the HMAC-verified webhook receivers `asana_webhook.py` and `github_webhook.py`) routes mentions from **GitHub** and **Asana** to the right AgentCore Runtime and tracks assignments in DynamoDB. The GitHub path is a **GitHub App webhook** (the earlier `agent-dispatch.yml` GitHub Actions workflow + OIDC deploy role have been retired). **Slack** routing described in this spec is not wired up — there's no Slack event receiver Lambda or signing-secret path today. The registry advertises Slack triggers for some agents but the path is dark end-to-end. For current behavior, read the router and webhook Lambda source.
+> **Status: mostly shipped.** The Dispatch layer (`infra/dispatch/router.py` + the signature-verified webhook receivers `asana_webhook.py`, `github_webhook.py`, and `slack_webhook.py`) routes mentions from **GitHub**, **Asana**, and **Slack** to the right AgentCore Runtime and tracks assignments in DynamoDB. The GitHub path is a **GitHub App webhook** (the earlier `agent-dispatch.yml` GitHub Actions workflow + OIDC deploy role have been retired). **Slack** now ships as a `DeploySlack`-gated receiver serving `/slack/events` + `/slack/commands` (Slack `v0` signature + ±5-min replay window, `event_id` dedup, bot-loop guard); its signing secret is app-level and bot tokens are per-workspace, and users request channel access via `/sdlc-onboard-channel` for admin approval. **Trigger authorization** is now decided by AVP (the `TriggerPolicyStore`, `trigger_authz.py`) against admin-authored `trigger_rule`/`slack_channel`/`slack_workspace` grant *data* — the flat per-capability `authorization.users` allowlist described in older sections of this spec has been **removed**. For current behavior, read the router and webhook Lambda source. See [`slack-connectors-spec.md`](slack-connectors-spec.md) for the connector + trigger-authz design.
 
 ---
 
@@ -430,14 +430,16 @@ dynamodb = boto3.resource('dynamodb')
 assignments_table = dynamodb.Table('dispatch-assignments')
 agentcore = boto3.client('bedrock-agentcore')
 
-# Agent Registry: loaded from SSM Parameter Store or a config file
+# Agent Registry: loaded from SSM Parameter Store or a config file.
+# NOTE: trigger authorization is NOT a registry field — it is decided by AVP
+# (TriggerPolicyStore) against admin-authored trigger_rule grants (default-deny).
+# The `allowed_users` field shown in older revisions has been removed.
 AGENT_REGISTRY = {
     'uat': {
         'runtime_id': 'arn:aws:bedrock-agentcore:us-west-2:ACCT:runtime/uat',
         'aliases': ['uat'],
         'description': 'UAT testing agent — generates and runs Playwright tests',
         'allowed_sources': ['github', 'asana', 'slack'],
-        'allowed_users': ['*'],  # or specific usernames
         'max_concurrent': 5,
         'default_instruction_prefix': 'You are being invoked from {source}. ',
     },
@@ -446,7 +448,6 @@ AGENT_REGISTRY = {
         'aliases': [],
         'description': 'PO/PM agent — status reports, sync, risk detection',
         'allowed_sources': ['github', 'asana', 'slack'],
-        'allowed_users': ['*'],
         'max_concurrent': 3,
         'default_instruction_prefix': 'You are being invoked from {source}. ',
     },
@@ -455,7 +456,6 @@ AGENT_REGISTRY = {
         'aliases': ['security'],
         'description': 'Security review agent',
         'allowed_sources': ['github', 'slack'],
-        'allowed_users': ['josh', 'michelle'],  # restricted
         'max_concurrent': 2,
         'default_instruction_prefix': '',
     },
@@ -491,9 +491,13 @@ def handler(event, context):
     
     agent_config = AGENT_REGISTRY[agent_id]
     
-    # --- Authorization ---
+    # --- Trigger authorization (AVP, not a per-capability allowlist) ---
+    # Decided by the TriggerPolicyStore against admin-authored trigger_rule
+    # grant data; default-deny; fails closed on an unresolved sender. The
+    # sender is namespaced by source into an immutable principal
+    # (github:<login> / asana:<gid> / slack:<team>:<uid>).
     requester = event.get('sender') or event.get('context', {}).get('requester', 'unknown')
-    if agent_config['allowed_users'] != ['*'] and requester not in agent_config['allowed_users']:
+    if not authorize_trigger(agent_config, requester, source, event.get('context')):
         return post_error(event, f"You are not authorized to invoke @{agent_id}.")
     
     if source not in agent_config['allowed_sources']:
@@ -821,10 +825,15 @@ def invoke_agent(
 > `.dispatch/agents.yaml` file. Each agent is a **capability row** in the
 > `fleet-config-${STAGE}` DynamoDB table, onboarded/edited from the dashboard
 > Admin view. The Dispatch Router registry (in SSM) is *rendered* from the
-> active capability rows on every change. The field shape below still reflects
-> the per-agent config (description, aliases, triggers, authorization, limits);
-> `runtime_arn` is filled in by the capability deployer once the runtime is
-> live, not hand-authored.
+> active capability rows on every change. The field shape below reflects the
+> per-agent config (description, aliases, triggers, limits); `runtime_arn` is
+> filled in by the capability deployer once the runtime is live, not
+> hand-authored. **The `authorization` block shown in older revisions of this
+> spec is gone** — trigger authorization is no longer a per-capability
+> `users`/`teams` allowlist. It is decided by AVP (`TriggerPolicyStore`)
+> against admin-authored `trigger_rule` grant *data* (default-deny; see §10.1
+> and `slack-connectors-spec.md`). The examples below therefore carry no
+> `authorization` field.
 
 The per-agent configuration shape:
 
@@ -840,9 +849,8 @@ agents:
       github: [issue_comment, pr_comment, assignment]
       asana: [comment, assignment, custom_field]
       slack: [mention, slash_command]
-    authorization:
-      users: []  # fails closed — populate before first use
-      teams: ["engineering", "qa"]
+    # Trigger authorization is NOT a per-capability field — it lives in AVP
+    # (TriggerPolicyStore) as admin-authored trigger_rule grants (default-deny).
     limits:
       max_concurrent: 5
       timeout_minutes: 30
@@ -859,8 +867,6 @@ agents:
       github: [issue_comment]
       asana: [comment, assignment, custom_field]
       slack: [mention, slash_command]
-    authorization:
-      users: []  # fails closed — populate before first use
     limits:
       max_concurrent: 3
       timeout_minutes: 15
@@ -877,8 +883,6 @@ agents:
       github: [pr_comment, assignment]
       asana: [comment]
       slack: [mention]
-    authorization:
-      users: [josh, michelle]  # restricted access
     limits:
       max_concurrent: 2
       timeout_minutes: 20

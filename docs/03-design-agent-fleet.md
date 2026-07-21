@@ -95,22 +95,24 @@ Event Source                  Normalization                  Routing
 
 GitHub App webhook   ┐                                ┌─ Resolve agent ID
   issue_comment      │                                │  (incl. aliases from
-  pr_review_comment  ├──► Dispatch Router             │   the SSM registry)
-  issue assigned     │    Lambda                      │
-                     │    │                           ├─ Check authorization
-Asana Webhook        ├──► │  Normalize to:            │  (authorization.users)
-  story added        │    │  {                        │
-  task assigned      │    │    source,                ├─ Check concurrency
-  custom_field set   ┘    │    agent_id,              │  (DynamoDB GSI query)
-                          │    instruction,           │
-                          │    context,               ├─ Track assignment
-                          │    requester              │  (DynamoDB put)
-                          │  }                        │
+  pr_review_comment  │                                │   the SSM registry)
+  issue assigned     ├──► Dispatch Router             │
+                     │    Lambda                      ├─ Authorize trigger
+Asana Webhook        │    │                           │  (AVP TriggerPolicyStore,
+  story added        ├──► │  Normalize to:            │   data-driven grants,
+  task assigned      │    │  {                        │   fail-closed)
+  custom_field set   │    │    source,                │
+                     │    │    agent_id,             ├─ Check concurrency
+Slack webhook        ├──► │    instruction,           │  (DynamoDB GSI query)
+  app_mention        │    │    context,               │
+  slash_command      ┘    │    requester              ├─ Track assignment
+                          │  }                        │  (DynamoDB put)
+                          │                           │
                           │                           └─ Invoke AgentCore
                           │                              Runtime (async)
 ```
 
-The Asana webhook Lambda handles signature verification against `/sdlc-agents/asana-webhook-secret` (written on first handshake). The GitHub path arrives via the **GitHub App webhook Lambda** (`infra/dispatch/github_webhook.py`), which verifies the App's `X-Hub-Signature-256` HMAC, extracts the mention, fetches issue/PR context with a per-repo App token, and async-invokes the router — one App webhook covers every onboarded repo. (The earlier `agent-dispatch.yml` GitHub Actions workflow and its OIDC deploy role have been retired.)
+The Asana webhook Lambda handles signature verification against `/sdlc-agents/asana-webhook-secret` (written on first handshake). The GitHub path arrives via the **GitHub App webhook Lambda** (`infra/dispatch/github_webhook.py`), which verifies the App's `X-Hub-Signature-256` HMAC, extracts the mention, fetches issue/PR context with a per-repo App token, and async-invokes the router — one App webhook covers every onboarded repo. (The earlier `agent-dispatch.yml` GitHub Actions workflow and its OIDC deploy role have been retired.) The Slack path (`infra/dispatch/slack_webhook.py`, `DeploySlack`-gated) verifies the Slack `v0` signature (±5-min replay window) and serves `/slack/events` + `/slack/commands`. **Authorization** is decided by Amazon Verified Permissions (the `TriggerPolicyStore`) against admin-authored grant *data* — the flat per-capability `authorization.users` allowlist has been removed (see §4.3.1).
 
 ### 2.2 Assignment State Machine
 
@@ -226,9 +228,27 @@ The runtime's environment is assembled by the `capability-deployer` from the fle
 
 **Authentication:** OAuth2 against Asana's MCP app, bootstrapped once via `scripts/bootstrap_asana_oauth.py`. Tokens refresh at runtime from `/sdlc-agents/asana-mcp-*` SSM paths.
 
-### 4.3 Slack Integration (roadmap)
+### 4.3 Slack Integration
 
-`.dispatch/agents.yaml` advertises Slack triggers for Workitems and Docwriter, but there's no Slack event receiver in the foundation stack and the Dispatch Router has no Slack signature verifier. Adding Slack requires a `slack-webhook-${STAGE}` Lambda, a Slack app manifest, and the signing-secret path in SSM. Flagged as a gap in `skills/pdlc-agents-register-triggers`.
+Shipped, gated behind `DeploySlack=true`. A `slack-webhook-${STAGE}` Lambda (`infra/dispatch/slack_webhook.py`) sits on the webhook API on two routes:
+
+**Inbound triggers:**
+- `/slack/events` — Events API `app_mention` ("@fleetbot @workitems break this up") → Dispatch Router
+- `/slack/commands` — slash commands: `/fleet @agent …` (mention dispatch) and `/sdlc-onboard-channel [agent …]` (files a channel-onboarding **request** an admin approves in the dashboard; never self-served)
+
+**Multi-workspace + security:** each delivery's `team_id` must resolve to an onboarded, enabled, active `slack_workspace` row. Every request is authenticated by the Slack `v0` signature over `v0:{ts}:{raw_body}` with a ±5-min replay window; deliveries are deduped on `event_id` and bot-loops are guarded. The **signing secret is app-level** (one per Slack app; the `url_verification` handshake carries no team scope) and **bot tokens are per-workspace** — both SSM SecureString under `/sdlc-agents/${STAGE}/slack/*`, fetched per-invocation, written out-of-band by `scripts/bootstrap_slack.py`.
+
+**Outbound actions:** replies via `chat.postMessage` using the per-workspace bot token (`infra/dispatch/reply.py`).
+
+### 4.3.1 Trigger Authorization (Amazon Verified Permissions)
+
+The Dispatch Router authorizes **every** dispatch — from all three sources — against the AVP `TriggerPolicyStore` (`infra/dispatch/trigger_authz.py`); this is the fleet's **sole** trigger-authz mechanism. The old flat per-capability `authorization.users` allowlist has been removed.
+
+- **Data-driven:** a small, FIXED 3-policy Cedar set (permit-on-allowed, forbid-on-denied [forbid-wins], forbid-on-blocked-channel) is authored once in the foundation template. Admin-authored grants are **data** — `trigger_rule` (WHO) + `slack_workspace`/`slack_channel` (WHERE) rows in `fleet-config-${STAGE}`, read per dispatch and passed to AVP as entity attributes. Granting a user is a DynamoDB write, so the AVP policy count stays constant (avoids the policy-per-user anti-pattern).
+- **Immutable principals:** `github:<login>`, `asana:<gid>`, `slack:<team>:<uid>` — never a self-editable display name.
+- **Fail-closed:** an unset store, any AVP/grant-read error, or a non-`ALLOW` decision all deny. Default-deny: an agent with no permit grant is not triggerable.
+
+See [`docs/specs/slack-connectors-spec.md`](specs/slack-connectors-spec.md) and [`docs/threat-model.md`](threat-model.md) (T-40, T-32–T-39).
 
 ---
 
@@ -318,6 +338,7 @@ Explicit list of things the earlier design described as load-bearing but which a
 - **AgentCore Memory (provisioned).** Agents already honor `AGENTCORE_MEMORY_ID`; what's missing is a Memory resource in the foundation stack and a story for seeding it. Upside: agents accumulate context across invocations. Downside: memory-quality governance is a non-trivial operational problem.
 - **Feedback agent.** A Haiku-based agent that watches human edits to other agents' output and writes corrections to the `/feedback/` memory namespace. Useful once Memory is provisioned; depends on it.
 - **UAT agent.** Playwright test generation and execution against staging. Depends on AgentCore Browser and a solid story for test-maintenance across UI changes.
-- **Slack dispatch.** Event receiver, signature verification, and slash commands.
+
+*(Slack dispatch — event receiver, signature verification, and slash commands — has since shipped; see §4.3.)*
 
 The [roadmap](roadmap.md) has the ordering.

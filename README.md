@@ -33,8 +33,8 @@ they'll be listed here once their code ships.
 
 ## How It Works
 
-1. A user assigns work via `@agent` mention in Asana or GitHub
-2. An HMAC-verified **webhook** (GitHub App or Asana) async-invokes the **Dispatch Router**, which resolves the mention, applies a prompt-injection guardrail, checks authorization, and routes to the agent
+1. A user assigns work via `@agent` mention in Asana, GitHub, or Slack (or a Slack slash command)
+2. A signature-verified **webhook** (GitHub App HMAC, Asana HMAC, or Slack `v0` — Slack is `DeploySlack`-gated) async-invokes the **Dispatch Router**, which resolves the mention, applies a prompt-injection guardrail, **authorizes the trigger via Amazon Verified Permissions** (the `TriggerPolicyStore`; fail-closed), and routes to the agent
 3. The agent runs on **AgentCore Runtime** (model calls via **Bedrock Mantle**), reaching GitHub/Asana only through the **AgentCore Gateway** (Cedar-enforced, gateway-only)
 4. Results are posted back to the originating platform
 
@@ -58,9 +58,9 @@ agents/
   shared/        Shared tools and helpers
 dashboard/       Fleet monitoring SPA (React + Vite)
 infra/
-  dashboard/     Dashboard query API (Lambda)
-  dispatch/      Dispatch Router + Asana webhook (Lambda)
-  foundation/    Shared AWS resources (DynamoDB, S3, IAM)
+  dashboard/     Dashboard query + admin API, connectors, AVP authz (Lambda)
+  dispatch/      Dispatch Router + GitHub/Asana/Slack webhooks + trigger authz (Lambda)
+  foundation/    Shared AWS resources (DynamoDB, S3, IAM, AVP policy stores)
 cedar/           Cedar policy guardrails
 skills/          Claude Code skills that drive the Quickstart
 scripts/         Operator helpers (base-platform deploy, OAuth/webhook bootstrap)
@@ -273,20 +273,23 @@ repository or workspace. Key findings you should understand before shipping:
 Mitigated surfaces include Dispatch Router IAM scope (T-6), the GitHub App
 webhook HMAC trigger (T-30, which replaced the retired OIDC path T-7), the
 bounded per-owner GitHub App credential (T-11), AVP-authorized dashboard API
-(T-29), the isolated capability-deployer privileged IAM (T-31), ECR image
-immutability (T-19), fail-closed authorization defaults (T-4), and Asana webhook
-credential hygiene (T-8, T-9). See the threat model for the full matrix.
+(T-29), AVP data-driven trigger authorization (T-4, T-40; fail-closed,
+default-deny — replacing the removed per-capability allowlist), the Slack
+connector's signature/replay/bot-loop controls (T-32–T-38), the isolated
+capability-deployer privileged IAM (T-31), ECR image immutability (T-19), and
+Asana webhook credential hygiene (T-8, T-9). See the threat model for the full
+matrix.
 
 ### Before deploying against real repositories
 
 The main **Open** finding that does not block the reference architecture but
 should be handled before you wire the fleet to a production repo or workspace:
 
-- **T-13 — API Gateway throttling.** The public webhook endpoints (Asana and
-  the GitHub App) ship without usage-plan throttling or WAF. Attach an API
-  Gateway usage plan (burst + steady-state limits) and, if the endpoints are
-  discoverable, an AWS WAF web ACL with an IP-based rate rule before exposing
-  them to untrusted inbound traffic.
+- **T-13 — API Gateway throttling.** The public webhook endpoints (Asana, the
+  GitHub App, and — when enabled — Slack) ship without usage-plan throttling or
+  WAF. Attach an API Gateway usage plan (burst + steady-state limits) and, if the
+  endpoints are discoverable, an AWS WAF web ACL with an IP-based rate rule before
+  exposing them to untrusted inbound traffic.
 
 ## Docs
 

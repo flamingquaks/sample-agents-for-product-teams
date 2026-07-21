@@ -1,6 +1,7 @@
 %% PDLC Agent Fleet — current architecture (2026-07)
-%% Triggers → Dispatch Router → AgentCore Runtime → Gateway (Cedar) → SCM/Asana,
-%% plus the dashboard + UI-driven onboarding pipeline, models via Bedrock Mantle.
+%% Triggers (GitHub · Asana · Slack) → Dispatch Router (AVP trigger authz) →
+%% AgentCore Runtime → Gateway (Cedar) → SCM/Asana/Slack, plus the dashboard +
+%% Connectors + UI-driven onboarding pipeline, models via Bedrock Mantle.
 %% Render: any Mermaid renderer (mermaid.live, VS Code Mermaid, GitHub).
 flowchart TB
 
@@ -8,27 +9,33 @@ flowchart TB
   subgraph EXT["External platforms (trusted contributors)"]
     GH["GitHub<br/>issues · PRs · comments"]
     AS["Asana<br/>tasks · stories"]
+    SL["Slack<br/>@mentions · slash commands"]
   end
 
   %% ---------------- Triggers (webhooks) ----------------
   subgraph TRIG["Triggers — API Gateway (public HTTPS)"]
     GHW["GitHub App webhook Lambda<br/>github_webhook.py<br/>HMAC X-Hub-Signature-256"]
     ASW["Asana webhook Lambda<br/>asana_webhook.py<br/>HMAC signature verify"]
+    SLW["Slack webhook Lambda (DeploySlack)<br/>slack_webhook.py<br/>v0 signature + ±5-min replay<br/>/slack/events · /slack/commands"]
   end
 
   GH -->|"@mention event"| GHW
   AS -->|"story / assignment event"| ASW
+  SL -->|"app_mention / slash command"| SLW
 
   %% ---------------- Dispatch ----------------
   subgraph DISP["Dispatch layer (AWS account)"]
-    ROUTER["Dispatch Router Lambda<br/>router.py<br/>• resolve @mention + aliases<br/>• edge guardrail (apply_guardrail)<br/>• authorization (allowlist)<br/>• concurrency + assignment record"]
+    ROUTER["Dispatch Router Lambda<br/>router.py<br/>• resolve @mention + aliases<br/>• edge guardrail (apply_guardrail)<br/>• trigger authz → AVP (fail-closed)<br/>• concurrency + assignment record"]
     REG["SSM param<br/>/sdlc-agents/&lt;stage&gt;/registry<br/>(rendered from capability rows)"]
     DDB["DynamoDB<br/>dispatch-assignments"]
+    TPS["Amazon Verified Permissions<br/>TriggerPolicyStore (SdlcTrigger)<br/>fixed Cedar policies + grant data<br/>trigger_authz.py · default-deny"]
   end
 
   GHW -->|"async invoke"| ROUTER
   ASW -->|"async invoke"| ROUTER
+  SLW -->|"async invoke"| ROUTER
   REG -.->|"read registry"| ROUTER
+  ROUTER -->|"IsAuthorized(Trigger)"| TPS
   ROUTER -->|"write assignment (TTL)"| DDB
 
   %% ---------------- Agent runtime ----------------
@@ -63,15 +70,16 @@ flowchart TB
   INT --> BROKER
   BROKER -->|"per-owner App installation token"| GH
   CEDAR -->|"AsanaTarget (direct MCP)"| AS
+  RT -.->|"replies · chat.postMessage<br/>(per-workspace bot token)"| SL
 
   %% ---------------- Dashboard ----------------
   subgraph DASH["Fleet dashboard + admin (optional)"]
     SPA["SPA (React + Vite)<br/>S3 + CloudFront (OAC)<br/>Cognito Hosted UI login"]
     API["API Gateway<br/>Cognito authorizer"]
     QRY["query Lambda (queries.py)<br/>read-only run history"]
-    ADM["admin Lambda (admin.py)<br/>onboard agents + repos<br/>codebuild:StartBuild only"]
-    AVP["Amazon Verified Permissions<br/>Cedar: Read / Write actions<br/>fail-closed (auth.py)"]
-    FCFG["DynamoDB fleet-config<br/>capability + repo rows"]
+    ADM["admin Lambda (admin.py)<br/>onboard agents + repos + Connectors<br/>(Slack ws/channels · trigger rules ·<br/>channel requests) · StartBuild only"]
+    AVP["Amazon Verified Permissions<br/>DashboardPolicyStore<br/>Cedar: Read / Write actions<br/>fail-closed (auth.py)"]
+    FCFG["DynamoDB fleet-config<br/>capability · repo · trigger_rule ·<br/>slack_workspace/channel · chan_req rows"]
   end
 
   SPA --> API
@@ -79,8 +87,9 @@ flowchart TB
   API --> QRY
   API --> ADM
   QRY -->|"read"| DDB
-  ADM -->|"capability / repo rows"| FCFG
+  ADM -->|"capability / repo / connector rows"| FCFG
   FCFG -.->|"render_registry / publish"| REG
+  FCFG -.->|"grant data (trigger_grants.py)"| TPS
 
   %% ---------------- Onboarding pipeline ----------------
   subgraph ONB["Onboarding pipeline (event-driven)"]
