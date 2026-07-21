@@ -465,6 +465,8 @@ def put_capability(
     limits: dict | None = None,
     env: dict | None = None,
     tool_grants: list[str] | None = None,
+    system_prompt: str = "",
+    requirements: list[str] | None = None,
     enabled: bool = True,
     status: str | None = None,
     onboarded_by: str = "",
@@ -523,6 +525,9 @@ def put_capability(
         "limits": limits or {},
         "env": env or {},
         "tool_grants": list(tool_grants or []),
+        "system_prompt": system_prompt or existing.get("system_prompt", ""),
+        "requirements": list(requirements) if requirements is not None else list(existing.get("requirements", [])),
+        "review_status": existing.get("review_status", "approved"),
         "enabled": bool(enabled),
         "status": status,
         "builtin": bool(builtin),
@@ -554,6 +559,18 @@ def set_capability_status(agent_id: str, status: str, *, detail: str = "") -> No
             ":d": detail,
             ":u": int(time.time()),
         },
+        ConditionExpression="attribute_exists(pk)",
+    )
+
+
+def set_review_status(agent_id: str, review_status: str) -> None:
+    """Set a capability's approval-gate review status (approved | pending_review).
+    Used by the admin API to park a custom agent for second-admin approval when
+    the RequireAgentApproval gate is on (spec §7.5)."""
+    _get_table().update_item(
+        Key={"pk": _capability_pk(agent_id)},
+        UpdateExpression="SET review_status = :r, updated_at = :u",
+        ExpressionAttributeValues={":r": review_status, ":u": int(time.time())},
         ConditionExpression="attribute_exists(pk)",
     )
 

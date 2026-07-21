@@ -624,3 +624,183 @@ def test_tool_catalog_route_lists_read_write_only():
     assert resp["statusCode"] == 200
     tools = json.loads(resp["body"])["tools"]
     assert tools and all(t["klass"] in ("read", "write") for t in tools)
+
+
+# --- clone + requirements + system_prompt (P3) --------------------------------
+
+
+@mock_aws
+def test_clone_copies_config_as_custom(monkeypatch):
+    _make_table()
+    admin = _load_admin()
+    cs = _load_store()
+    # Seed a built-in to clone from.
+    cs.put_capability(
+        "workitems", description="PO/PM", aliases=["pm"], builtin=True,
+        tool_grants=["GitHubTarget___get_issue"],
+        system_prompt="You are a PM agent.",
+        requirements=["tavily-python>=0.5"],
+    )
+    resp = admin.handler(
+        _event(
+            "POST", "/admin/capabilities/{agent_id}/clone",
+            path={"agent_id": "workitems"},
+            body={"new_agent_id": "my-pm"},
+        )
+    )
+    assert resp["statusCode"] == 200, resp["body"]
+    row = cs.get_capability("my-pm")
+    assert row["builtin"] is False
+    assert row["description"] == "PO/PM"
+    assert row["tool_grants"] == ["GitHubTarget___get_issue"]
+    assert row["system_prompt"] == "You are a PM agent."
+    assert row["requirements"] == ["tavily-python>=0.5"]
+    assert row["aliases"] == []  # fresh, not colliding with source
+    assert row["enabled"] is False
+    assert row["status"] == "pending"
+
+
+@mock_aws
+def test_clone_rejects_existing_agent_id(monkeypatch):
+    _make_table()
+    admin = _load_admin()
+    cs = _load_store()
+    cs.put_capability("workitems", builtin=True)
+    cs.put_capability("existing")
+    resp = admin.handler(
+        _event(
+            "POST", "/admin/capabilities/{agent_id}/clone",
+            path={"agent_id": "workitems"},
+            body={"new_agent_id": "existing"},
+        )
+    )
+    assert resp["statusCode"] == 409
+
+
+@mock_aws
+def test_onboard_persists_system_prompt_and_requirements(monkeypatch):
+    _make_table()
+    admin = _load_admin()
+    cs = _load_store()
+    _stub_codebuild(admin, monkeypatch, [])
+    resp = admin.handler(
+        _event("POST", "/admin/capabilities", body={
+            "agent_id": "custom-one",
+            "system_prompt": "You are helpful.",
+            "requirements": ["requests>=2.31"],
+        })
+    )
+    assert resp["statusCode"] == 200, resp["body"]
+    row = cs.get_capability("custom-one")
+    assert row["system_prompt"] == "You are helpful."
+    assert row["requirements"] == ["requests>=2.31"]
+
+
+@mock_aws
+def test_onboard_rejects_requirements_with_flags_or_urls(monkeypatch):
+    _make_table()
+    admin = _load_admin()
+    _stub_codebuild(admin, monkeypatch, [])
+    for bad in ["--index-url http://evil.com", "-e git+https://foo", "https://evil.com/pkg.whl"]:
+        resp = admin.handler(
+            _event("POST", "/admin/capabilities", body={
+                "agent_id": "triage",
+                "requirements": [bad],
+            })
+        )
+        assert resp["statusCode"] == 400, f"should reject: {bad}"
+        assert "not a plain pip specifier" in json.loads(resp["body"])["error"].lower()
+
+
+# --- approval gate (P5, spec §7.5) -------------------------------------------
+
+ADMIN2 = {"sub": "admin-2", "cognito:groups": "[admins]"}
+
+
+@mock_aws
+def test_approval_gate_parks_custom_with_deps_pending_review(monkeypatch):
+    _make_table()
+    admin = _load_admin()
+    cs = _load_store()
+    monkeypatch.setenv("REQUIRE_AGENT_APPROVAL", "true")
+    _stub_codebuild(admin, monkeypatch, [])
+    resp = admin.handler(
+        _event("POST", "/admin/capabilities", body={
+            "agent_id": "triage",
+            "requirements": ["tavily-python"],
+            "enabled": True,
+        })
+    )
+    assert resp["statusCode"] == 200, resp["body"]
+    row = cs.get_capability("triage")
+    assert row["review_status"] == "pending_review"
+    assert row["status"] != "building"  # no build started
+
+
+@mock_aws
+def test_approval_gate_off_builds_immediately(monkeypatch):
+    _make_table()
+    admin = _load_admin()
+    cs = _load_store()
+    builds: list = []
+    monkeypatch.setenv("REQUIRE_AGENT_APPROVAL", "false")
+    _stub_codebuild(admin, monkeypatch, builds)
+    resp = admin.handler(
+        _event("POST", "/admin/capabilities", body={
+            "agent_id": "triage",
+            "requirements": ["tavily-python"],
+            "enabled": True,
+        })
+    )
+    assert resp["statusCode"] == 200, resp["body"]
+    assert len(builds) == 1  # build started immediately
+
+
+@mock_aws
+def test_approve_route_starts_build(monkeypatch):
+    _make_table()
+    admin = _load_admin()
+    cs = _load_store()
+    builds: list = []
+    monkeypatch.setenv("REQUIRE_AGENT_APPROVAL", "true")
+    _stub_codebuild(admin, monkeypatch, builds)
+    # Create a custom pending_review agent (by admin-1).
+    admin.handler(
+        _event("POST", "/admin/capabilities", body={
+            "agent_id": "triage",
+            "requirements": ["foo"],
+            "enabled": True,
+        })
+    )
+    assert cs.get_capability("triage")["review_status"] == "pending_review"
+    # A different admin approves.
+    resp = admin.handler(
+        _event("POST", "/admin/capabilities/{agent_id}/approve",
+               path={"agent_id": "triage"}, claims=ADMIN2)
+    )
+    assert resp["statusCode"] == 200, resp["body"]
+    row = cs.get_capability("triage")
+    assert row["review_status"] == "approved"
+    assert len(builds) == 1
+
+
+@mock_aws
+def test_self_approve_rejected(monkeypatch):
+    _make_table()
+    admin = _load_admin()
+    monkeypatch.setenv("REQUIRE_AGENT_APPROVAL", "true")
+    _stub_codebuild(admin, monkeypatch, [])
+    admin.handler(
+        _event("POST", "/admin/capabilities", body={
+            "agent_id": "triage",
+            "requirements": ["foo"],
+            "enabled": True,
+        })
+    )
+    # Same admin tries to approve — rejected.
+    resp = admin.handler(
+        _event("POST", "/admin/capabilities/{agent_id}/approve",
+               path={"agent_id": "triage"}, claims=ADMIN)
+    )
+    assert resp["statusCode"] == 403
+    assert "different admin" in json.loads(resp["body"])["error"].lower()

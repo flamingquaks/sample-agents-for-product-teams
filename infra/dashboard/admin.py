@@ -304,6 +304,26 @@ def _validate_capability_body(body: dict) -> tuple[dict, dict | None]:
         if t not in norm_grants:
             norm_grants.append(t)
 
+    # system_prompt — the agent's context/instructions (§3.2). Optional; built-in
+    # agents ignore it (their prompt is code-defined).
+    system_prompt = body.get("system_prompt", "")
+    if not isinstance(system_prompt, str):
+        return {}, error(400, "body.system_prompt must be a string")
+
+    # requirements — pip specifiers for the per-agent extra deps (§5). Validated
+    # to be plain specifiers: no --index-url, -e, VCS refs, or direct URLs (§7.1).
+    requirements = body.get("requirements", [])
+    if not isinstance(requirements, list) or any(not isinstance(r, str) for r in requirements):
+        return {}, error(400, "body.requirements must be a list of strings")
+    for r in requirements:
+        stripped = r.strip()
+        if stripped.startswith("-") or stripped.startswith("http://") or stripped.startswith("https://"):
+            return {}, error(
+                400,
+                f"body.requirements entry {r!r} is not a plain pip specifier "
+                "(no flags, VCS refs, or direct URLs allowed — §7.1)",
+            )
+
     return {
         "agent_id": agent_id,
         "description": description,
@@ -312,6 +332,8 @@ def _validate_capability_body(body: dict) -> tuple[dict, dict | None]:
         "limits": limits,
         "env": env,
         "tool_grants": norm_grants,
+        "system_prompt": system_prompt,
+        "requirements": [r.strip() for r in requirements if r.strip()],
         "enabled": bool(body.get("enabled", True)),
     }, None
 
@@ -398,6 +420,8 @@ def _onboard_capability(event: dict, body: dict) -> dict:
             "limits": dict(existing.get("limits", {})),
             "env": dict(existing.get("env", {})),
             "tool_grants": list(existing.get("tool_grants", [])),
+            "system_prompt": existing.get("system_prompt", ""),
+            "requirements": list(existing.get("requirements", [])),
             "enabled": fields["enabled"],
         }
 
@@ -413,6 +437,17 @@ def _onboard_capability(event: dict, body: dict) -> dict:
         return ok(config_store.get_capability(agent_id))
 
     config_store.put_capability(onboarded_by=auth.caller_sub(event), **fields)
+
+    # Approval gate (spec §7.5): if ON and this is a CUSTOM agent with novel
+    # deps/skills, park it as pending_review instead of starting a build.
+    gate_on = os.environ.get("REQUIRE_AGENT_APPROVAL", "true").lower() == "true"
+    is_custom = not (existing and existing.get("builtin"))
+    has_novel = bool(fields.get("requirements") or fields.get("skills"))
+    if gate_on and is_custom and has_novel:
+        config_store.set_review_status(agent_id, "pending_review")
+        _publish_registry_safe()
+        return ok(config_store.get_capability(agent_id))
+
     _publish_registry_safe()
 
     try:
@@ -444,6 +479,66 @@ def _delete_capability(agent_id: str) -> dict:
         return error(409, str(exc))
     _publish_registry_safe()
     return ok({"agent_id": agent_id, "deleted": deleted})
+
+
+def _approve_capability(event: dict, agent_id: str) -> dict:
+    """Second-admin approval of a pending_review custom agent (spec §7.5, §8.2).
+    Sets review_status=approved, then starts the build. The caller must differ
+    from the author — the onboarded_by field records who created/edited it."""
+    cap = config_store.get_capability(agent_id)
+    if cap is None:
+        return error(404, f"no such capability: {agent_id}")
+    if cap.get("review_status") != "pending_review":
+        return error(409, f"{agent_id} is not pending review (status: {cap.get('review_status')})")
+    caller = auth.caller_sub(event)
+    if caller == cap.get("onboarded_by"):
+        return error(403, "the approver must be a different admin than the author")
+    config_store.set_review_status(agent_id, "approved")
+    try:
+        image_tag = _start_capability_build(agent_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("approved but failed to start build for %s", agent_id)
+        config_store.set_capability_status(
+            agent_id, config_store.CAP_FAILED, detail="approved but build failed to start"
+        )
+        return error(502, f"{agent_id} approved but the build could not be started")
+    if image_tag:
+        config_store.set_capability_status(
+            agent_id, config_store.CAP_BUILDING, detail=f"approved + build started ({image_tag})"
+        )
+    _publish_registry_safe()
+    return ok(config_store.get_capability(agent_id))
+
+
+def _clone_capability(event: dict, source_id: str, body: dict) -> dict:
+    """Clone an existing capability (built-in or custom) into a new, editable
+    custom agent (spec §8.2). Copies declarative config, strips deploy-state +
+    builtin, and writes a new ``pending`` row. The admin then edits + enables.
+    The required ``new_agent_id`` comes from the body."""
+    new_id = (body.get("new_agent_id") or "").strip()
+    if not new_id or not config_store.valid_agent_id(new_id):
+        return error(400, "body.new_agent_id must be a valid agent id")
+    source = config_store.get_capability(source_id)
+    if source is None:
+        return error(404, f"no such capability: {source_id}")
+    if config_store.get_capability(new_id) is not None:
+        return error(409, f"agent_id {new_id!r} already exists")
+    cloned = config_store.put_capability(
+        new_id,
+        description=source.get("description", ""),
+        aliases=[],  # fresh — don't collide with source's aliases
+        triggers=source.get("triggers", {}),
+        limits=source.get("limits", {}),
+        env=source.get("env", {}),
+        tool_grants=source.get("tool_grants", []),
+        system_prompt=source.get("system_prompt", ""),
+        requirements=source.get("requirements", []),
+        enabled=False,
+        status=config_store.CAP_PENDING,
+        onboarded_by=auth.caller_sub(event),
+        builtin=False,
+    )
+    return ok(cloned)
 
 
 def _publish_registry_safe() -> None:
@@ -843,6 +938,56 @@ def _route(event: dict) -> dict:
             return error(400, "missing agent_id")
         if method == "DELETE":
             return _delete_capability(agent_id)
+
+    if resource in (
+        "/admin/capabilities/{agent_id}/clone",
+        "/admin/capabilities/{agent_id+}/clone",
+    ):
+        agent_id = (path_params.get("agent_id") or path_params.get("agent_id+") or "").strip()
+        if method == "POST":
+            return _clone_capability(event, agent_id, body)
+
+    if resource in (
+        "/admin/capabilities/{agent_id}/approve",
+        "/admin/capabilities/{agent_id+}/approve",
+    ):
+        agent_id = (path_params.get("agent_id") or path_params.get("agent_id+") or "").strip()
+        if method == "POST":
+            return _approve_capability(event, agent_id)
+
+    # --- Skills (spec §6) ---
+    if resource == "/admin/skills":
+        import skill_store
+
+        if method == "GET":
+            return ok({"skills": skill_store.list_skills()})
+        if method == "POST":
+            # Upload: body carries either `content` (raw .md) or `zip_base64`
+            # (base64-encoded .zip). `scope` defaults to "shared".
+            scope = (body.get("scope") or "shared").strip()
+            try:
+                if body.get("zip_base64"):
+                    import base64
+                    data = base64.b64decode(body["zip_base64"])
+                    ref = skill_store.upload_skill_zip(data, scope=scope)
+                elif body.get("content"):
+                    ref = skill_store.upload_skill_md(body["content"], scope=scope)
+                else:
+                    return error(400, "body must include 'content' (markdown) or 'zip_base64'")
+            except skill_store.SkillValidationError as exc:
+                return error(400, str(exc))
+            return ok(ref)
+
+    if resource in ("/admin/skills/{key}", "/admin/skills/{key+}"):
+        key = (path_params.get("key") or path_params.get("key+") or "").strip()
+        if method == "DELETE":
+            import skill_store
+
+            parts = key.split("/", 1)
+            scope = parts[0] if len(parts) == 2 else "shared"
+            name = parts[-1]
+            deleted = skill_store.delete_skill(scope, name)
+            return ok({"name": name, "scope": scope, "deleted": deleted})
 
     # --- GitHub App setup (manifest flow) ---
     if resource == "/admin/github-app/status" and method == "GET":

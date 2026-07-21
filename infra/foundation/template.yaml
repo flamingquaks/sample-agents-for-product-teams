@@ -76,6 +76,18 @@ Parameters:
       before flipping to ACTIVE. Applied to both the initial CFN policy and the
       admin Lambda's runtime policy sync (via FLEET_POLICY_ENFORCEMENT).
 
+  RequireAgentApproval:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      When "true" (default), a custom agent with novel requirements or skills
+      goes pending_review and needs a second admin to approve before the build
+      starts (spec §7.5). Relaxing it to "false" lets creates go straight to
+      build — appropriate for high-trust/low-friction environments. This is a
+      DEPLOY-TIME control (not a runtime toggle) so changing it requires deploy
+      rights and is an auditable infra change.
+
   AsanaMcpEndpoint:
     Type: String
     Default: "https://mcp.asana.com/v2/mcp"
@@ -1357,11 +1369,20 @@ Resources:
           AVP_POLICY_STORE_ID: !GetAtt DashboardPolicyStore.PolicyStoreId
           # Names the per-workspace Slack secret paths recorded on a workspace row.
           STAGE: !Ref Stage
+          # Skills upload (spec §6): admin writes uploaded skills here; the
+          # deployer reads them into agent containers at build/update.
+          SKILLS_BUCKET: !Ref SkillsBucket
+          # Approval gate (spec §7.5): when "true", custom agents with new
+          # deps/skills need a second admin approval before the build starts.
+          REQUIRE_AGENT_APPROVAL: !Ref RequireAgentApproval
       Policies:
         # Read+write the config table (onboard/enable/disable repos, settings,
         # capabilities, Slack workspaces/channels/trigger-rules/channel-requests).
         - DynamoDBCrudPolicy:
             TableName: !Ref FleetConfigTable
+        # Skills bucket — write on upload, read for the list/content endpoints.
+        - S3CrudPolicy:
+            BucketName: !Ref SkillsBucket
         # Authorize requests against the dashboard Cedar policy store.
         - Statement:
             - Effect: Allow
@@ -1695,6 +1716,28 @@ Resources:
     Condition: DashboardEnabled
     Properties:
       BucketName: !Sub sdlc-agent-source-${AWS::AccountId}-${Stage}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+      VersioningConfiguration:
+        Status: Enabled
+
+  # Skills storage bucket (spec §6.1). Uploaded skills (.md / expanded .zip)
+  # live here as `skills/<scope>/<skill-name>/SKILL.md` trees, referenced by
+  # capability rows (sha256 + prefix). The deployer syncs referenced prefixes
+  # into the agent container's SKILLS_DIR at build/update. SSE + versioned +
+  # private — skills are admin-authored instruction, not public content.
+  SkillsBucket:
+    Type: AWS::S3::Bucket
+    Condition: DashboardEnabled
+    Properties:
+      BucketName: !Sub sdlc-agent-skills-${AWS::AccountId}-${Stage}
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
