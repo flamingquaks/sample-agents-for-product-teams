@@ -92,6 +92,11 @@ _SLACK_WS_PK_PREFIX = "slack_ws#"
 _SLACK_CHAN_PK_PREFIX = "slack_chan#"
 _TRIGGER_RULE_PK_PREFIX = "trigger_rule#"
 _CHANNEL_REQUEST_PK_PREFIX = "chan_req#"
+# Part II (spec §16–§18): cross-source identity, permission groups, notifications.
+_IDENTITY_PK_PREFIX = "identity#"
+_USER_REQUEST_PK_PREFIX = "user_req#"
+_PERM_GROUP_PK_PREFIX = "perm_group#"
+_NOTIF_SUB_PK_PREFIX = "notif_sub#"
 
 # Capability lifecycle. A row starts "pending" the instant it's onboarded, moves
 # to "building" while the shared build pipeline runs, "active" once its runtime is
@@ -164,6 +169,44 @@ CHAN_REQ_PENDING = "pending"
 CHAN_REQ_APPROVED = "approved"
 CHAN_REQ_DENIED = "denied"
 CHAN_REQ_STATUSES = (CHAN_REQ_PENDING, CHAN_REQ_APPROVED, CHAN_REQ_DENIED)
+
+# --- Identity map (spec §16) -------------------------------------------------
+# One record per PERSON, keyed on a synthetic identity_id (uuid). Email is the
+# golden JOIN id (an attribute + lookup, NOT the pk) because a first touch from
+# GitHub/Asana may carry no email. Handles per source are progressively enriched.
+# A record is `pending` (known, not usable) until an admin onboards it `active`.
+IDENTITY_PENDING = "pending"
+IDENTITY_ACTIVE = "active"
+IDENTITY_DISABLED = "disabled"
+IDENTITY_STATUSES = (IDENTITY_PENDING, IDENTITY_ACTIVE, IDENTITY_DISABLED)
+
+# The sources a handle can come from. `slack` handles are per-workspace (a nested
+# {team_id: user_id} map); the rest are a single string handle.
+IDENTITY_SOURCES = ("github", "asana", "slack", "sdlc")
+
+# User-onboarding request lifecycle (spec §16.4) — filed on first touch from an
+# unknown/pending sender; an admin approves (→ identity active + group assign) or
+# denies. One request per identity (reply-every-time, request-once).
+USER_REQ_PENDING = "pending"
+USER_REQ_APPROVED = "approved"
+USER_REQ_DENIED = "denied"
+USER_REQ_STATUSES = (USER_REQ_PENDING, USER_REQ_APPROVED, USER_REQ_DENIED)
+
+# Notification tiers (spec §18) — actionable (a human should engage: proposal,
+# review, question), informative (FYI, no action), error (a flow errored/stopped).
+# Only actionable + error carry @mentions.
+NOTIF_TIER_ACTIONABLE = "actionable"
+NOTIF_TIER_INFORMATIVE = "informative"
+NOTIF_TIER_ERROR = "error"
+NOTIF_TIERS = (NOTIF_TIER_ACTIONABLE, NOTIF_TIER_INFORMATIVE, NOTIF_TIER_ERROR)
+# Tiers that @mention the resolved person (spec §18.4). Kept here so the fan-out
+# and the config UI agree on which tiers connect people vs. stay silent.
+NOTIF_MENTION_TIERS = (NOTIF_TIER_ACTIONABLE, NOTIF_TIER_ERROR)
+
+# A permission-group / notification-subscription id shares the safe-slug shape of
+# an agent id (lowercase, letter-first, [a-z0-9-], 2-64) — it becomes a Cedar
+# group literal and a DynamoDB pk suffix, so keep it injection-proof.
+_GROUP_ID_RE = _AGENT_ID_RE
 
 _table = None
 
@@ -1159,3 +1202,574 @@ def delete_channel_request(request_id: str) -> bool:
         Key={"pk": _channel_request_pk(request_id)}, ReturnValues="ALL_OLD"
     )
     return bool(resp.get("Attributes"))
+
+
+# --- Identity map (spec §16) -------------------------------------------------
+# The cross-source join: email is the golden id, but records are keyed on a
+# synthetic identity_id because a first touch from GitHub/Asana may carry no
+# email. Handles are stored under `handles` (slack is a per-workspace map).
+# Following the fleet-config convention (single pk, no GSIs — cf. fleet_config /
+# trigger_grants), lookups by handle/email are filtered scans over the small
+# identity set, cached at the read layer (identity.py) for the dispatch path.
+
+
+def valid_group_id(group_id: str) -> bool:
+    """Whether ``group_id`` is a safe permission-group / subscription slug."""
+    return bool(_GROUP_ID_RE.match(group_id or ""))
+
+
+def _identity_pk(identity_id: str) -> str:
+    return f"{_IDENTITY_PK_PREFIX}{identity_id}"
+
+
+def _norm_email(email: str) -> str:
+    """Canonical email form for the golden join (trimmed + lowercased). '' when
+    absent — an email-less first touch (GitHub/Asana) is valid; it's filled in
+    later when a source reveals it (§16.3)."""
+    return (email or "").strip().casefold()
+
+
+def _handle_key(source: str, handle: str, workspace: str = "") -> str:
+    """The namespaced handle string stored on the record + matched on resolve —
+    ``github:<login>``, ``asana:<gid>``, ``slack:<team>:<uid>``, ``sdlc:<sub>``.
+    Mirrors router.namespaced_principal so a resolved identity's handle key and
+    the trigger-authz principal are the same string."""
+    source = source.strip().lower()
+    handle = handle.strip()
+    if source == "slack":
+        return f"slack:{workspace.strip()}:{handle}"
+    return f"{source}:{handle}"
+
+
+def list_identities() -> list[dict]:
+    """All identity records, newest first. Paged like the other listers so a
+    large directory never silently drops a person from the admin view."""
+    return _scan_kind("identity", sort_key="created_at")
+
+
+def get_identity(identity_id: str) -> dict | None:
+    resp = _get_table().get_item(Key={"pk": _identity_pk(identity_id)})
+    return resp.get("Item")
+
+
+def find_identity_by_handle(source: str, handle: str, workspace: str = "") -> dict | None:
+    """The identity carrying ``source``'s ``handle`` (per-workspace for slack), or
+    None. Filtered scan over the identity set (small; cached in the dispatch
+    reader). The handle is matched against the record's ``handle_keys`` list — a
+    denormalized set of every namespaced handle the record owns, maintained on
+    every write so this lookup is a single membership test."""
+    key = _handle_key(source, handle, workspace)
+    for rec in list_identities():
+        if key in (rec.get("handle_keys") or []):
+            return rec
+    return None
+
+
+def find_identity_by_email(email: str) -> dict | None:
+    """The identity with this (normalized) email, or None. Email is the golden
+    join id — used for auto-merge on an email match (§16.5)."""
+    norm = _norm_email(email)
+    if not norm:
+        return None
+    for rec in list_identities():
+        if _norm_email(rec.get("email", "")) == norm:
+            return rec
+    return None
+
+
+def _rebuild_handle_keys(handles: dict) -> list[str]:
+    """Flatten a ``handles`` map into the denormalized ``handle_keys`` list used
+    for O(1)-ish handle membership tests. slack is a {team: uid} sub-map."""
+    keys: list[str] = []
+    for source, val in (handles or {}).items():
+        if source == "slack" and isinstance(val, dict):
+            for team, uid in val.items():
+                if uid:
+                    keys.append(_handle_key("slack", str(uid), str(team)))
+        elif val:
+            keys.append(_handle_key(source, str(val)))
+    return keys
+
+
+def put_identity(
+    *,
+    identity_id: str | None = None,
+    email: str = "",
+    display_name: str = "",
+    handles: dict | None = None,
+    groups: list[str] | None = None,
+    verified: dict | None = None,
+    status: str = IDENTITY_PENDING,
+    onboarded_by: str = "",
+    created_from: dict | None = None,
+) -> dict:
+    """Create or replace an identity record. Generates an ``identity_id`` when
+    none is given. Normalizes email, validates group ids, and rebuilds the
+    denormalized ``handle_keys``. Preserves ``created_at``/``created_from`` on an
+    update. Prefer ``upsert_identity`` for the get-or-create + enrich path (§16.3)
+    — this is the low-level replace used by the admin proactive-create."""
+    if status not in IDENTITY_STATUSES:
+        raise ValueError(f"invalid identity status {status!r}")
+    for g in groups or []:
+        if not valid_group_id(g):
+            raise ValueError(f"invalid group id {g!r}")
+    if identity_id is None:
+        import uuid
+
+        identity_id = str(uuid.uuid4())
+    existing = get_identity(identity_id) or {}
+    now = int(time.time())
+    handles = handles or {}
+    item = {
+        "pk": _identity_pk(identity_id),
+        "kind": "identity",
+        "identity_id": identity_id,
+        "email": _norm_email(email),
+        "display_name": display_name or existing.get("display_name", ""),
+        "handles": handles,
+        "handle_keys": _rebuild_handle_keys(handles),
+        "groups": sorted({*(groups or [])}),
+        "verified": verified or existing.get("verified", {}),
+        "status": status,
+        "onboarded_by": onboarded_by or existing.get("onboarded_by", ""),
+        "created_from": created_from or existing.get("created_from", {}),
+        "created_at": existing.get("created_at", now),
+        "updated_at": now,
+        "merged_from": existing.get("merged_from", []),
+    }
+    _get_table().put_item(Item=item)
+    return item
+
+
+def upsert_identity(
+    *,
+    source: str,
+    handle: str,
+    workspace: str = "",
+    email: str = "",
+    display_name: str = "",
+    status: str = IDENTITY_PENDING,
+    created_from: dict | None = None,
+) -> tuple[dict, bool]:
+    """Get-or-create + progressively enrich an identity from a source touch
+    (spec §16.3). Returns ``(identity, created)``.
+
+    Resolution order: by handle, then (if a new email is supplied) by email —
+    the latter is the auto-merge-on-email-match signal (§16.5). On a hit, any
+    new handle/email/display_name is backfilled additively; an existing verified
+    handle is never overwritten by an unverified touch. On a miss, a NEW record
+    is created with whatever is known, ``status`` (default pending), and the
+    source touch stamped in ``created_from``.
+
+    A ``handle`` that resolves to record A while ``email`` resolves to record B
+    triggers a merge of B into A (fold handles + email, record ``merged_from``).
+    """
+    if source not in IDENTITY_SOURCES:
+        raise ValueError(f"invalid identity source {source!r}")
+    if not (handle or "").strip():
+        raise ValueError("handle is required")
+    norm_email = _norm_email(email)
+
+    by_handle = find_identity_by_handle(source, handle, workspace)
+    by_email = find_identity_by_email(norm_email) if norm_email else None
+
+    if by_handle and by_email and by_handle["identity_id"] != by_email["identity_id"]:
+        # Same person reached us under two records (an email-less handle touch
+        # earlier, an email touch now). Merge the email record INTO the handle
+        # record — keep the older created_at, union handles/groups, audit it.
+        merged = _merge_identities(keep=by_handle, drop=by_email)
+        return merged, False
+
+    rec = by_handle or by_email
+    if rec is None:
+        # First touch — create with what we have.
+        handles: dict = {}
+        if source == "slack":
+            handles["slack"] = {workspace: handle}
+        else:
+            handles[source] = handle
+        created = put_identity(
+            email=norm_email,
+            display_name=display_name,
+            handles=handles,
+            status=status,
+            created_from=created_from or {"source": source, "handle": handle, "at": int(time.time())},
+        )
+        return created, True
+
+    # Hit — backfill additively.
+    handles = dict(rec.get("handles") or {})
+    changed = False
+    if source == "slack":
+        slack_map = dict(handles.get("slack") or {})
+        if slack_map.get(workspace) != handle:
+            slack_map[workspace] = handle
+            handles["slack"] = slack_map
+            changed = True
+    elif handles.get(source) != handle:
+        handles[source] = handle
+        changed = True
+    new_email = rec.get("email") or norm_email
+    if new_email != rec.get("email"):
+        changed = True
+    new_name = rec.get("display_name") or display_name
+    if new_name != rec.get("display_name"):
+        changed = True
+    if not changed:
+        return rec, False
+    updated = put_identity(
+        identity_id=rec["identity_id"],
+        email=new_email,
+        display_name=new_name,
+        handles=handles,
+        groups=rec.get("groups", []),
+        verified=rec.get("verified", {}),
+        status=rec.get("status", status),
+    )
+    return updated, False
+
+
+def _merge_identities(*, keep: dict, drop: dict) -> dict:
+    """Fold identity ``drop`` into ``keep``: union handles + groups, prefer
+    ``keep``'s email/status, record the merge in ``merged_from``, then delete the
+    ``drop`` row. Returns the surviving record (§16.5)."""
+    handles = dict(keep.get("handles") or {})
+    for source, val in (drop.get("handles") or {}).items():
+        if source == "slack" and isinstance(val, dict):
+            slack_map = dict(handles.get("slack") or {})
+            for team, uid in val.items():
+                slack_map.setdefault(team, uid)
+            handles["slack"] = slack_map
+        else:
+            handles.setdefault(source, val)
+    groups = sorted({*keep.get("groups", []), *drop.get("groups", [])})
+    verified = {**(drop.get("verified") or {}), **(keep.get("verified") or {})}
+    merged_from = list(keep.get("merged_from", [])) + [drop["identity_id"]]
+    survivor = put_identity(
+        identity_id=keep["identity_id"],
+        email=keep.get("email") or drop.get("email", ""),
+        display_name=keep.get("display_name") or drop.get("display_name", ""),
+        handles=handles,
+        groups=groups,
+        verified=verified,
+        status=keep.get("status", IDENTITY_PENDING),
+        onboarded_by=keep.get("onboarded_by", ""),
+    )
+    # Preserve the merge audit trail (put_identity carried keep's merged_from).
+    _get_table().update_item(
+        Key={"pk": _identity_pk(keep["identity_id"])},
+        UpdateExpression="SET merged_from = :m",
+        ExpressionAttributeValues={":m": merged_from},
+    )
+    delete_identity(drop["identity_id"])
+    survivor["merged_from"] = merged_from
+    return survivor
+
+
+def set_identity_status(identity_id: str, status: str) -> None:
+    if status not in IDENTITY_STATUSES:
+        raise ValueError(f"invalid identity status {status!r}")
+    _get_table().update_item(
+        Key={"pk": _identity_pk(identity_id)},
+        UpdateExpression="SET #s = :s, updated_at = :u",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":s": status, ":u": int(time.time())},
+        ConditionExpression="attribute_exists(pk)",
+    )
+
+
+def set_identity_groups(identity_id: str, groups: list[str]) -> dict | None:
+    """Replace an identity's group membership (the onboarding access step, §17.4).
+    Validates each group id. Returns the updated record, or None if absent."""
+    for g in groups or []:
+        if not valid_group_id(g):
+            raise ValueError(f"invalid group id {g!r}")
+    if get_identity(identity_id) is None:
+        return None
+    _get_table().update_item(
+        Key={"pk": _identity_pk(identity_id)},
+        UpdateExpression="SET #g = :g, updated_at = :u",
+        ExpressionAttributeNames={"#g": "groups"},
+        ExpressionAttributeValues={":g": sorted({*(groups or [])}), ":u": int(time.time())},
+        ConditionExpression="attribute_exists(pk)",
+    )
+    return get_identity(identity_id)
+
+
+def set_identity_verified(identity_id: str, source: str, verified: bool) -> None:
+    """Mark one source handle verified/unverified (admin approval is the trust
+    event — §16.6). A verified link is authz-load-bearing; unverified is
+    display/best-effort only."""
+    if source not in IDENTITY_SOURCES:
+        raise ValueError(f"invalid identity source {source!r}")
+    _get_table().update_item(
+        Key={"pk": _identity_pk(identity_id)},
+        UpdateExpression="SET verified.#src = :v, updated_at = :u",
+        ExpressionAttributeNames={"#src": source},
+        ExpressionAttributeValues={":v": bool(verified), ":u": int(time.time())},
+        ConditionExpression="attribute_exists(pk)",
+    )
+
+
+def delete_identity(identity_id: str) -> bool:
+    resp = _get_table().delete_item(
+        Key={"pk": _identity_pk(identity_id)}, ReturnValues="ALL_OLD"
+    )
+    return bool(resp.get("Attributes"))
+
+
+# --- User-onboarding requests (spec §16.4) -----------------------------------
+# Filed on first touch from an unknown/pending sender. One request per identity;
+# an admin approves (→ identity active + group assign) or denies.
+
+
+def _user_request_pk(request_id: str) -> str:
+    return f"{_USER_REQUEST_PK_PREFIX}{request_id}"
+
+
+def list_user_requests(status: str | None = None) -> list[dict]:
+    """All user-onboarding requests, or just those in ``status``, newest first."""
+    rows = _scan_kind("user_request", sort_key="created_at")
+    if status is not None:
+        rows = [r for r in rows if r.get("status") == status]
+    return rows
+
+
+def get_user_request(request_id: str) -> dict | None:
+    resp = _get_table().get_item(Key={"pk": _user_request_pk(request_id)})
+    return resp.get("Item")
+
+
+def find_user_request_for_identity(identity_id: str) -> dict | None:
+    """The (single) pending request for an identity, if any — enforces
+    request-once: a second touch updates/no-ops rather than stacking duplicates."""
+    for r in list_user_requests(status=USER_REQ_PENDING):
+        if r.get("identity_id") == identity_id:
+            return r
+    return None
+
+
+def put_user_request(
+    *,
+    identity_id: str,
+    source: str,
+    source_context: dict | None = None,
+    proposed_email: str = "",
+    display_name: str = "",
+    request_id: str | None = None,
+) -> dict:
+    """Create (or refresh) a pending user-onboarding request for an identity.
+    ``source_context`` records where to reply on completion (repo+issue/PR, or
+    team+channel+thread_ts). Idempotent per identity via a deterministic id, so a
+    repeated first-touch updates the one request instead of stacking duplicates."""
+    if source not in IDENTITY_SOURCES:
+        raise ValueError(f"invalid identity source {source!r}")
+    if not (identity_id or "").strip():
+        raise ValueError("identity_id is required")
+    if request_id is None:
+        request_id = f"user-{identity_id}"
+    existing = get_user_request(request_id) or {}
+    item = {
+        "pk": _user_request_pk(request_id),
+        "kind": "user_request",
+        "request_id": request_id,
+        "identity_id": identity_id,
+        "source": source,
+        "source_context": source_context or {},
+        "proposed_email": _norm_email(proposed_email) or existing.get("proposed_email", ""),
+        "display_name": display_name or existing.get("display_name", ""),
+        "status": existing.get("status", USER_REQ_PENDING),
+        "created_at": existing.get("created_at", int(time.time())),
+        "decided_by": existing.get("decided_by", ""),
+        "decided_at": existing.get("decided_at"),
+    }
+    _get_table().put_item(Item=item)
+    return item
+
+
+def resolve_user_request(
+    request_id: str, *, status: str, decided_by: str
+) -> dict | None:
+    """Mark a user request approved/denied (records who + when). Does NOT itself
+    flip the identity to active or assign groups — the admin API composes that so
+    the effect is explicit + testable (mirrors resolve_channel_request)."""
+    if status not in (USER_REQ_APPROVED, USER_REQ_DENIED):
+        raise ValueError(f"invalid decision status {status!r}")
+    if get_user_request(request_id) is None:
+        return None
+    _get_table().update_item(
+        Key={"pk": _user_request_pk(request_id)},
+        UpdateExpression="SET #s = :s, decided_by = :b, decided_at = :t",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":s": status, ":b": decided_by, ":t": int(time.time())},
+        ConditionExpression="attribute_exists(pk)",
+    )
+    return get_user_request(request_id)
+
+
+def delete_user_request(request_id: str) -> bool:
+    resp = _get_table().delete_item(
+        Key={"pk": _user_request_pk(request_id)}, ReturnValues="ALL_OLD"
+    )
+    return bool(resp.get("Attributes"))
+
+
+# --- Permission groups (spec §17) --------------------------------------------
+# A named group is metadata only; its ACCESS is expressed as group-scoped
+# trigger_rule rows (subject_type=group). Membership lives on the identity
+# record. This fills the group axis trigger_authz already evaluates — no Cedar
+# policy change, groups are just more grant DATA.
+
+
+def _perm_group_pk(group_id: str) -> str:
+    return f"{_PERM_GROUP_PK_PREFIX}{group_id}"
+
+
+def list_perm_groups() -> list[dict]:
+    return _scan_kind("perm_group", sort_key="created_at")
+
+
+def get_perm_group(group_id: str) -> dict | None:
+    resp = _get_table().get_item(Key={"pk": _perm_group_pk(group_id)})
+    return resp.get("Item")
+
+
+def put_perm_group(
+    group_id: str,
+    *,
+    name: str = "",
+    description: str = "",
+    recommended: bool = False,
+    created_by: str = "",
+) -> dict:
+    """Create/replace a permission group's metadata. Raises ValueError on an
+    invalid id (it becomes a Cedar group literal). Access is granted separately
+    via group-scoped trigger rules; membership via set_identity_groups."""
+    if not valid_group_id(group_id):
+        raise ValueError(
+            f"invalid group id {group_id!r} — must match {_GROUP_ID_RE.pattern}"
+        )
+    existing = get_perm_group(group_id) or {}
+    item = {
+        "pk": _perm_group_pk(group_id),
+        "kind": "perm_group",
+        "group_id": group_id,
+        "name": name or existing.get("name", group_id),
+        "description": description or existing.get("description", ""),
+        "recommended": bool(recommended),
+        "created_by": created_by or existing.get("created_by", ""),
+        "created_at": existing.get("created_at", int(time.time())),
+    }
+    _get_table().put_item(Item=item)
+    return item
+
+
+def group_members(group_id: str) -> list[dict]:
+    """Identities that belong to ``group_id`` (membership lives on the record)."""
+    return [i for i in list_identities() if group_id in (i.get("groups") or [])]
+
+
+def delete_perm_group(group_id: str) -> bool:
+    """Delete a group's metadata row. Does NOT strip membership or group-scoped
+    trigger rules — the admin API handles that lifecycle so a bare delete never
+    leaves a rule referencing a vanished group silently in force."""
+    resp = _get_table().delete_item(
+        Key={"pk": _perm_group_pk(group_id)}, ReturnValues="ALL_OLD"
+    )
+    return bool(resp.get("Attributes"))
+
+
+# --- Notification subscriptions (spec §18) -----------------------------------
+# A channel self-subscribes (via /sdlc-notify) to fleet + SCM events, scoped to
+# repos it's actually granted, split into tiers. A subscription only RECEIVES —
+# it grants no access — so it needs no admin approval.
+
+
+def _notif_sub_pk(team_id: str, channel_id: str) -> str:
+    return f"{_NOTIF_SUB_PK_PREFIX}{team_id}#{channel_id}"
+
+
+def list_notif_subs(team_id: str | None = None) -> list[dict]:
+    """All notification subscriptions, or just one workspace's, newest first."""
+    rows = _scan_kind("notif_sub", sort_key="updated_at")
+    if team_id is not None:
+        rows = [r for r in rows if r.get("team_id") == team_id]
+    return rows
+
+
+def get_notif_sub(team_id: str, channel_id: str) -> dict | None:
+    resp = _get_table().get_item(Key={"pk": _notif_sub_pk(team_id, channel_id)})
+    return resp.get("Item")
+
+
+def put_notif_sub(
+    team_id: str,
+    channel_id: str,
+    *,
+    repos: list[str] | None = None,
+    tiers: dict | None = None,
+    min_severity: str = NOTIF_TIER_INFORMATIVE,
+    created_by: str = "",
+) -> dict:
+    """Create/replace a channel's notification subscription. Validates the Slack
+    ids and the tier map (keys ⊆ NOTIF_TIERS). ``repos`` is stored normalized;
+    the ADMIN API is responsible for bounding it to the channel's granted repos
+    before calling this (§18.2) — the store validates shape, the API validates
+    authorization, matching the repo/capability split elsewhere."""
+    if not valid_slack_team(team_id):
+        raise ValueError(f"invalid Slack team id {team_id!r}")
+    if not valid_slack_channel(channel_id):
+        raise ValueError(f"invalid Slack channel id {channel_id!r}")
+    if min_severity not in NOTIF_TIERS:
+        raise ValueError(f"invalid min_severity {min_severity!r}")
+    clean_tiers: dict[str, list[str]] = {}
+    for tier, events in (tiers or {}).items():
+        if tier not in NOTIF_TIERS:
+            raise ValueError(f"invalid notification tier {tier!r}")
+        clean_tiers[tier] = [str(e).strip() for e in (events or []) if str(e).strip()]
+    existing = get_notif_sub(team_id, channel_id) or {}
+    now = int(time.time())
+    item = {
+        "pk": _notif_sub_pk(team_id, channel_id),
+        "kind": "notif_sub",
+        "team_id": team_id,
+        "channel_id": channel_id,
+        "repos": sorted({_normalize_repo(r) for r in (repos or []) if r}),
+        "tiers": clean_tiers,
+        "min_severity": min_severity,
+        "created_by": created_by or existing.get("created_by", ""),
+        "created_at": existing.get("created_at", now),
+        "updated_at": now,
+    }
+    _get_table().put_item(Item=item)
+    return item
+
+
+def delete_notif_sub(team_id: str, channel_id: str) -> bool:
+    resp = _get_table().delete_item(
+        Key={"pk": _notif_sub_pk(team_id, channel_id)}, ReturnValues="ALL_OLD"
+    )
+    return bool(resp.get("Attributes"))
+
+
+def _scan_kind(kind: str, *, sort_key: str) -> list[dict]:
+    """Paged scan of all rows of one ``kind``, sorted DESC by ``sort_key`` (0 when
+    absent). Shared by the Part II listers — same paged-scan discipline as
+    list_repos/list_capabilities so a >1MB page never silently drops a row."""
+    table = _get_table()
+    rows: list[dict] = []
+    start_key = None
+    while True:
+        kwargs = {
+            "FilterExpression": "kind = :k",
+            "ExpressionAttributeValues": {":k": kind},
+        }
+        if start_key:
+            kwargs["ExclusiveStartKey"] = start_key
+        resp = table.scan(**kwargs)
+        rows.extend(resp.get("Items", []))
+        start_key = resp.get("LastEvaluatedKey")
+        if not start_key:
+            break
+    rows.sort(key=lambda r: r.get(sort_key, 0) or 0, reverse=True)
+    return rows

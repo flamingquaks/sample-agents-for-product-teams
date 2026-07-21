@@ -98,19 +98,29 @@ def post_slack_message(
     team_id: str, channel: str, body: str, thread_ts: str | None = None
 ) -> bool:
     """Post a message to a Slack channel/thread via chat.postMessage. Returns True
-    on success. Multi-workspace: the bot token is fetched per-invocation from the
-    workspace's SSM SecureString (never a module global — threat T-8/T-36).
-    ``thread_ts`` keeps the reply in-thread. Non-fatal on failure — the caller
-    treats a failed reply as best-effort (parity with the GitHub/Asana helpers).
+    on success. Thin bool wrapper over ``post_slack_message_ts`` for the reply
+    call sites that don't need the message ts (block/reject notices)."""
+    ok, _ = post_slack_message_ts(team_id, channel, body, thread_ts)
+    return ok
 
-    Slack's Web API returns HTTP 200 even on a logical error (``{"ok": false}``),
-    so we check the ``ok`` field, not just the status code."""
+
+def post_slack_message_ts(
+    team_id: str, channel: str, body: str, thread_ts: str | None = None
+) -> tuple[bool, str | None]:
+    """Post to Slack and return ``(ok, ts)`` — ``ts`` is the posted message's
+    timestamp (the value a follow-up passes as ``thread_ts`` to thread under it),
+    or None on failure. Used by notify.py for threaded notifications (spec §18.4).
+
+    Multi-workspace: the bot token is fetched per-invocation from the workspace's
+    SSM SecureString (never a module global — threat T-8/T-36). Non-fatal on
+    failure — callers treat a failed post as best-effort. Slack's Web API returns
+    HTTP 200 even on a logical error (``{"ok": false}``), so we check ``ok``."""
     if not team_id or not channel:
         logger.error("post_slack_message missing team_id or channel")
-        return False
+        return False, None
     token = _get_secret(slack_bot_token_param(team_id))
     if not token:
-        return False
+        return False, None
     payload = {"channel": channel, "text": body}
     if thread_ts:
         payload["thread_ts"] = thread_ts
@@ -133,11 +143,11 @@ def post_slack_message(
                 channel,
                 data.get("error", "unknown"),
             )
-            return False
-        return True
+            return False, None
+        return True, data.get("ts")
     except (requests.RequestException, ValueError) as exc:
         logger.error("Failed to post Slack message to %s/%s: %s", team_id, channel, exc)
-        return False
+        return False, None
 
 
 def _github_token(repo: str) -> Optional[str]:

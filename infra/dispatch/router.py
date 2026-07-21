@@ -30,6 +30,8 @@ from botocore.config import Config
 import enrichment
 import fleet_config
 import guardrail
+import identity as identity_map
+import notify
 import reply
 import trigger_authz
 
@@ -166,6 +168,62 @@ def namespaced_principal(sender: str, source: str) -> str:
     if source in ("github", "asana") and not sender.startswith(f"{source}:"):
         return f"{source}:{sender}"
     return sender
+
+
+def _identity_source_and_handle(sender: str, source: str, source_context: dict) -> tuple[str, str, str]:
+    """Split a namespaced principal into (identity_source, handle, workspace) for
+    the identity resolver. Slack senders are ``slack:<team>:<uid>``; github/asana
+    are the bare login/gid (namespaced only for authz). Returns the identity
+    ``source`` (one of IDENTITY_SOURCES), the source-native handle, and the Slack
+    workspace ("" for non-Slack)."""
+    if source == "slack" and sender.startswith("slack:"):
+        parts = sender.split(":", 2)
+        if len(parts) == 3:
+            return "slack", parts[2], parts[1]
+    return source, sender, str(source_context.get("workspace", "") or "")
+
+
+def resolve_dispatch_identity(sender: str, source: str, source_context: dict):
+    """Resolve (get-or-create + enrich) the person behind a dispatch. Returns an
+    identity_map.Identity. Slack/Asana touches carry an email we can seed; GitHub
+    org members are resolvable but we leave email discovery to onboarding. The
+    resolved email + groups feed authorization (traceability spine, §16.7)."""
+    id_source, handle, workspace = _identity_source_and_handle(sender, source, source_context)
+    return identity_map.resolve(
+        source=id_source,
+        handle=handle,
+        workspace=workspace,
+        email=str(source_context.get("requester_email", "") or ""),
+        display_name=str(source_context.get("sender_name", "") or ""),
+    )
+
+
+def onboarding_reply(source: str, source_context: dict, org_owned: bool) -> str:
+    """The reply for a not-onboarded / pending sender (§16.4). Org repos resolve
+    the member's email so we can promise an email on completion; personal repos
+    cannot, so the copy just points at the admin."""
+    if org_owned:
+        return (
+            "A request to onboard you has been sent to the SDLC admin and you'll "
+            "receive an email when onboarding is complete. If you have any "
+            "questions, please contact your SDLC Admin. Once onboarded, please "
+            "try your request again."
+        )
+    return (
+        "You're not onboarded to the SDLC fleet. Please contact your SDLC Admin "
+        "for onboarding."
+    )
+
+
+def _is_org_owned(source: str, source_context: dict) -> bool:
+    """Whether this dispatch originates from an org-owned GitHub repo (drives the
+    onboarding reply copy). Only GitHub has the owner concept; other sources use
+    the email-promise copy since Slack/Asana yield an email at first touch."""
+    if source != "github":
+        return True
+    repo = str(source_context.get("repo", "") or "")
+    owner = repo.split("/", 1)[0] if "/" in repo else ""
+    return fleet_config.owner_type(owner) == "Organization"
 
 
 def authorize_trigger(
@@ -412,6 +470,30 @@ def _post_block_reply(source: str, source_context: dict, message: str) -> bool:
     return False
 
 
+def _notify_fleet_event(
+    *, tier: str, event: str, text: str, source: str, sender: str, source_context: dict
+) -> None:
+    """Fan a fleet lifecycle event out to subscribed Slack channels (spec §18.3).
+    Best-effort — never let a notification failure affect dispatch. The actor
+    (for actionable/error @mentions) is the dispatch requester, resolved to the
+    right Slack user per workspace by the identity map. Repo scope is the GitHub
+    repo when present (so repo-scoped subscriptions match)."""
+    try:
+        id_source, handle, workspace = _identity_source_and_handle(
+            namespaced_principal(sender, source), source, source_context
+        )
+        notify.notify(
+            tier=tier,
+            event=event,
+            text=text,
+            repo=str(source_context.get("repo", "") or ""),
+            unit=source_context.get("assignment_id", "") or "",
+            actor={"source": id_source, "handle": handle, "workspace": workspace},
+        )
+    except Exception:  # noqa: BLE001 — notifications are best-effort
+        logger.exception("fleet-event notification failed (%s/%s)", tier, event)
+
+
 # --- Lambda Handler ----------------------------------------------------------
 
 
@@ -472,6 +554,50 @@ def handler(event, context):
             return _error(400, "no recognized @agent mention found")
 
     agent_id = agent_config["agent_id"]
+
+    # --- Identity resolution + onboarding gate (spec §16) ---
+    # Resolve (get-or-create + enrich) the person behind this dispatch from ANY
+    # source. A first touch from an unknown/pending user is NOT usable: we file a
+    # one-per-identity onboarding request and reply (every time) telling them to
+    # get onboarded — the org/personal-repo copy differs on whether we can email
+    # them. A resolved, ACTIVE identity's email + groups feed authorization so a
+    # grant authored against an email/group applies across all their sources.
+    principal = namespaced_principal(sender, source)
+    if principal and principal not in _UNRESOLVED_SENDERS:
+        person = resolve_dispatch_identity(sender, source, source_context)
+        if not person.usable:
+            org_owned = _is_org_owned(source, source_context)
+            if person.identity_id:
+                identity_map.ensure_user_request(
+                    identity_id=person.identity_id,
+                    source=_identity_source_and_handle(sender, source, source_context)[0],
+                    source_context=source_context,
+                    proposed_email=person.email,
+                    display_name=person.display_name,
+                )
+            _put_metric(
+                "UserNotOnboarded",
+                dimensions={"Source": source, "AgentId": agent_id},
+            )
+            # Reply EVERY time (the user needs the feedback loop); the request is
+            # deduped to one row by ensure_user_request.
+            if not _post_block_reply(
+                source, source_context, onboarding_reply(source, source_context, org_owned)
+            ):
+                _put_metric("OnboardingReplyFailed", dimensions={"Source": source})
+            return _error(
+                403, f"sender '{sender}' is not onboarded (identity {person.status})"
+            )
+        # Active identity — thread email + group membership into the authz context
+        # so trigger_authz evaluates them (email = requester_email attr; groups
+        # merged with any channel/context groups the receiver already stamped).
+        if person.email:
+            source_context["requester_email"] = person.email
+        if person.groups:
+            existing_groups = list(source_context.get("principal_groups") or [])
+            source_context["principal_groups"] = sorted(
+                {*existing_groups, *person.groups}
+            )
 
     # --- Authorization ---
     # Cedar-backed trigger authz (the SdlcTrigger AVP store), keyed on sender +
@@ -555,6 +681,14 @@ def handler(event, context):
         )
         if not _post_block_reply(source, source_context, message):
             _put_metric("GuardrailReplyFailed", dimensions={"Source": source})
+        _notify_fleet_event(
+            tier=notify.TIER_ERROR,
+            event="guardrail_tripped",
+            text=f"⛔ A prompt-injection guardrail tripped on a request to @{agent_id}.",
+            source=source,
+            sender=sender,
+            source_context={**source_context, "assignment_id": assignment_id},
+        )
         return _error(
             400, f"@{agent_id} request blocked by guardrail: {guardrail_result.reason}"
         )
@@ -599,6 +733,14 @@ def handler(event, context):
     except Exception as e:
         logger.error("Failed to invoke agent %s: %s", agent_id, e)
         update_assignment(assignment_id, status="failed", result_summary=str(e))
+        _notify_fleet_event(
+            tier=notify.TIER_ERROR,
+            event="run_failed",
+            text=f"❌ @{agent_id} failed to start (assignment `{assignment_id}`).",
+            source=source,
+            sender=sender,
+            source_context={**source_context, "assignment_id": assignment_id},
+        )
         return _error(500, f"failed to invoke @{agent_id}: {e}")
 
     # Slack dispatches are async (the receiver already 200-acked), so unlike
@@ -609,6 +751,14 @@ def handler(event, context):
             source, source_context, f"🏁 @{agent_id} is on it. (assignment `{assignment_id}`)"
         )
 
+    _notify_fleet_event(
+        tier=notify.TIER_INFORMATIVE,
+        event="run_started",
+        text=f"🏁 @{agent_id} started work (assignment `{assignment_id}`).",
+        source=source,
+        sender=sender,
+        source_context={**source_context, "assignment_id": assignment_id},
+    )
     logger.info("Dispatched assignment %s to %s", assignment_id, agent_id)
 
     return {

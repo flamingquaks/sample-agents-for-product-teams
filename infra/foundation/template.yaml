@@ -88,22 +88,13 @@ Parameters:
       Display name used when registering the fleet's GitHub App from the admin
       UI manifest flow. Must be unique across GitHub.
 
-  DeploySlack:
-    Type: String
-    Default: "false"
-    AllowedValues: ["true", "false"]
-    Description: >
-      Opt-in flag for the Slack trigger source. When "true", provisions the
-      Slack webhook receiver Lambda (Events API + slash commands) on the webhook
-      API. Default "false"; the trigger-authz store + admin routes exist
-      regardless, so an operator can pre-author rules before pointing Slack here.
-      The app-level signing secret and per-workspace bot tokens are stored
-      out-of-band via scripts/bootstrap_slack.py.
+  # NOTE: the former `DeploySlack` opt-in flag was removed (spec §19). The Slack
+  # receiver is serverless + inert at rest and fails closed at runtime, so it is
+  # always deployed; Slack goes live only when an admin onboards a workspace.
 
 Conditions:
   DashboardEnabled: !Equals [!Ref DeployDashboard, "true"]
   GatewayEnabled: !Equals [!Ref DeployGateway, "true"]
-  SlackEnabled: !Equals [!Ref DeploySlack, "true"]
   # Provision the shared Mantle project as a CFN resource (opt-in — the resource
   # type must be activated in the account+region first).
   MantleProjectEnabled: !Equals [!Ref DeployMantleProject, "true"]
@@ -567,11 +558,18 @@ Resources:
             RestApiId: !Ref WebhookApi
 
   # Slack webhook receiver — the Slack trigger source (Events API + slash
-  # commands). Multi-workspace: verifies each delivery against the per-workspace
-  # signing secret and files channel-onboarding requests to the config table.
+  # commands + interactivity). Multi-workspace: verifies each delivery against
+  # the app signing secret and files channel-onboarding requests / notification
+  # subscriptions to the config table.
+  #
+  # ALWAYS deployed (no longer DeploySlack-gated, spec §19): the function is
+  # serverless + inert at rest ($0 idle) and fails closed at runtime — no signing
+  # secret ⇒ 503, no onboarded workspace ⇒ dropped. Slack goes "live" only when
+  # an admin onboards a workspace in the dashboard, so the deploy flag was
+  # redundant with the runtime workspace-onboarding gate. Simple deploy; enable
+  # via Admin.
   SlackWebhookFunction:
     Type: AWS::Serverless::Function
-    Condition: SlackEnabled
     Properties:
       FunctionName: !Sub slack-webhook-${Stage}
       CodeUri: ../dispatch/
@@ -618,6 +616,14 @@ Resources:
           Type: Api
           Properties:
             Path: /slack/commands
+            Method: POST
+            RestApiId: !Ref WebhookApi
+        SlackInteractions:
+          Type: Api
+          Properties:
+            # Block Kit actions + modal submits (the /sdlc-notify config modal,
+            # spec §18) post here — a separate endpoint from the Events API.
+            Path: /slack/interactions
             Method: POST
             RestApiId: !Ref WebhookApi
 
@@ -739,7 +745,6 @@ Resources:
 
   SlackWebhookErrorAlarm:
     Type: AWS::CloudWatch::Alarm
-    Condition: SlackEnabled
     Properties:
       AlarmName: !Sub slack-webhook-errors-${Stage}
       AlarmDescription: Slack webhook receiver error rate
@@ -1399,6 +1404,180 @@ Resources:
           Properties:
             Path: /admin/github-app/setup/callback
             Method: POST
+            RestApiId: !Ref DashboardApi
+        # --- Connectors: Slack workspaces / channels, trigger rules, channel
+        # requests (spec §4/§9). Each admin.py route needs its own API event —
+        # the handler routes on event.resource (the exact path template), so a
+        # greedy proxy would break internal routing.
+        SlackWorkspacesList:
+          Type: Api
+          Properties:
+            Path: /admin/slack/workspaces
+            Method: GET
+            RestApiId: !Ref DashboardApi
+        SlackWorkspacesPost:
+          Type: Api
+          Properties:
+            Path: /admin/slack/workspaces
+            Method: POST
+            RestApiId: !Ref DashboardApi
+        SlackWorkspaceDelete:
+          Type: Api
+          Properties:
+            Path: /admin/slack/workspaces/{team_id}
+            Method: DELETE
+            RestApiId: !Ref DashboardApi
+        SlackChannelsList:
+          Type: Api
+          Properties:
+            Path: /admin/slack/channels
+            Method: GET
+            RestApiId: !Ref DashboardApi
+        SlackChannelsPost:
+          Type: Api
+          Properties:
+            Path: /admin/slack/channels
+            Method: POST
+            RestApiId: !Ref DashboardApi
+        SlackChannelDelete:
+          Type: Api
+          Properties:
+            Path: /admin/slack/channels/{team_id}/{channel_id}
+            Method: DELETE
+            RestApiId: !Ref DashboardApi
+        TriggerRulesList:
+          Type: Api
+          Properties:
+            Path: /admin/trigger-rules
+            Method: GET
+            RestApiId: !Ref DashboardApi
+        TriggerRulesPost:
+          Type: Api
+          Properties:
+            Path: /admin/trigger-rules
+            Method: POST
+            RestApiId: !Ref DashboardApi
+        TriggerRuleDelete:
+          Type: Api
+          Properties:
+            Path: /admin/trigger-rules/{rule_id}
+            Method: DELETE
+            RestApiId: !Ref DashboardApi
+        TriggerRulesSimulate:
+          Type: Api
+          Properties:
+            Path: /admin/trigger-rules/simulate
+            Method: POST
+            RestApiId: !Ref DashboardApi
+        ChannelRequestsList:
+          Type: Api
+          Properties:
+            Path: /admin/channel-requests
+            Method: GET
+            RestApiId: !Ref DashboardApi
+        ChannelRequestApprove:
+          Type: Api
+          Properties:
+            Path: /admin/channel-requests/{request_id}/approve
+            Method: POST
+            RestApiId: !Ref DashboardApi
+        ChannelRequestDeny:
+          Type: Api
+          Properties:
+            Path: /admin/channel-requests/{request_id}/deny
+            Method: POST
+            RestApiId: !Ref DashboardApi
+        # --- Part II: identities, user requests, permission groups, notif subs
+        # (spec §16–§18).
+        IdentitiesList:
+          Type: Api
+          Properties:
+            Path: /admin/identities
+            Method: GET
+            RestApiId: !Ref DashboardApi
+        IdentitiesPost:
+          Type: Api
+          Properties:
+            Path: /admin/identities
+            Method: POST
+            RestApiId: !Ref DashboardApi
+        IdentityGet:
+          Type: Api
+          Properties:
+            Path: /admin/identities/{identity_id}
+            Method: GET
+            RestApiId: !Ref DashboardApi
+        IdentityPut:
+          Type: Api
+          Properties:
+            Path: /admin/identities/{identity_id}
+            Method: PUT
+            RestApiId: !Ref DashboardApi
+        IdentityDelete:
+          Type: Api
+          Properties:
+            Path: /admin/identities/{identity_id}
+            Method: DELETE
+            RestApiId: !Ref DashboardApi
+        UserRequestsList:
+          Type: Api
+          Properties:
+            Path: /admin/user-requests
+            Method: GET
+            RestApiId: !Ref DashboardApi
+        UserRequestApprove:
+          Type: Api
+          Properties:
+            Path: /admin/user-requests/{request_id}/approve
+            Method: POST
+            RestApiId: !Ref DashboardApi
+        UserRequestDeny:
+          Type: Api
+          Properties:
+            Path: /admin/user-requests/{request_id}/deny
+            Method: POST
+            RestApiId: !Ref DashboardApi
+        GroupsList:
+          Type: Api
+          Properties:
+            Path: /admin/groups
+            Method: GET
+            RestApiId: !Ref DashboardApi
+        GroupsPost:
+          Type: Api
+          Properties:
+            Path: /admin/groups
+            Method: POST
+            RestApiId: !Ref DashboardApi
+        GroupGet:
+          Type: Api
+          Properties:
+            Path: /admin/groups/{group_id}
+            Method: GET
+            RestApiId: !Ref DashboardApi
+        GroupDelete:
+          Type: Api
+          Properties:
+            Path: /admin/groups/{group_id}
+            Method: DELETE
+            RestApiId: !Ref DashboardApi
+        NotifSubsList:
+          Type: Api
+          Properties:
+            Path: /admin/notif-subs
+            Method: GET
+            RestApiId: !Ref DashboardApi
+        NotifSubsPost:
+          Type: Api
+          Properties:
+            Path: /admin/notif-subs
+            Method: POST
+            RestApiId: !Ref DashboardApi
+        NotifSubDelete:
+          Type: Api
+          Properties:
+            Path: /admin/notif-subs/{team_id}/{channel_id}
+            Method: DELETE
             RestApiId: !Ref DashboardApi
 
   # ===========================================================================
@@ -2344,14 +2523,16 @@ Outputs:
     Description: GitHub App webhook URL — the manifest flow sets this as the App's hook automatically
 
   SlackEventsEndpoint:
-    Condition: SlackEnabled
     Value: !Sub https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/slack/events
     Description: Slack Events API request URL — set this in the Slack app's Event Subscriptions
 
   SlackCommandsEndpoint:
-    Condition: SlackEnabled
     Value: !Sub https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/slack/commands
     Description: Slack slash-command request URL — set this on each slash command in the Slack app
+
+  SlackInteractionsEndpoint:
+    Value: !Sub https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/slack/interactions
+    Description: Slack interactivity request URL — set this in the Slack app's Interactivity & Shortcuts
 
   TriggerPolicyStoreId:
     Value: !GetAtt TriggerPolicyStore.PolicyStoreId

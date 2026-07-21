@@ -76,13 +76,13 @@ Deployed once per stage with `sam deploy`. Creates:
 | Lambda | `dispatch-router-${Stage}` | Parses `@mentions`, authorizes the trigger via AVP, invokes the right AgentCore Runtime, writes assignment to DynamoDB |
 | Lambda | `github-webhook-${Stage}` | Verifies the GitHub App `X-Hub-Signature-256`, resolves the mention, invokes Dispatch Router async |
 | Lambda | `asana-webhook-${Stage}` | Verifies Asana webhook signatures, normalizes events, invokes Dispatch Router async |
-| Lambda (`DeploySlack=true`) | `slack-webhook-${Stage}` | Verifies the Slack `v0` signature (±5-min replay window), serves `/slack/events` + `/slack/commands`, dedups `event_id`, invokes Dispatch Router async |
+| Lambda | `slack-webhook-${Stage}` | Always deployed. Verifies the Slack `v0` signature (±5-min replay window), serves `/slack/events`, `/slack/commands`, and `/slack/interactions` (the `/sdlc-notify` modal), dedups `event_id`, invokes Dispatch Router async. Inert until an admin onboards a workspace |
 | API Gateway | `WebhookApi` | Fronts the webhook Lambdas at `/github/webhook`, `/asana/webhook`, and (when Slack is enabled) `/slack/events` + `/slack/commands` |
 | AVP policy store | `TriggerPolicyStore` (`SdlcTrigger` schema) | **Always-on.** The fleet's trigger-authorization store — a fixed 3-policy Cedar set evaluating admin-authored grant *data* (`trigger_rule`/`slack_workspace`/`slack_channel` rows in `fleet-config-${Stage}`). The Dispatch Router reads it on every dispatch (fail-closed) |
 | SSM parameter | `/sdlc-agents/${Stage}/registry` | Dispatch Router registry, rendered from the active capability rows in `fleet-config-${Stage}` (re-written on every capability change by the admin API / capability deployer) |
 | CloudWatch alarms | Dispatch + webhook alarms | Dispatch error rate, webhook error rate (per receiver, incl. Slack when enabled), dispatch p99 duration |
 
-**Outputs:** `AssignmentsTableName`, `ArtifactsBucketName`, `DispatchRouterArn`, `WebhookEndpoint` (Asana webhook URL), `GitHubWebhookEndpoint`, `TriggerPolicyStoreId`, `WebhookApiId`, and — when `DeploySlack=true` — `SlackEventsEndpoint` + `SlackCommandsEndpoint`.
+**Outputs:** `AssignmentsTableName`, `ArtifactsBucketName`, `DispatchRouterArn`, `WebhookEndpoint` (Asana webhook URL), `GitHubWebhookEndpoint`, `TriggerPolicyStoreId`, `WebhookApiId`, `SlackEventsEndpoint`, `SlackCommandsEndpoint`, `SlackInteractionsEndpoint` (always emitted — set them on the Slack app when you onboard a workspace).
 
 **Optional — fleet monitoring dashboard (`DeployDashboard=true`).** Off by
 default; set the SAM parameter `DeployDashboard=true` to provision an
@@ -181,7 +181,7 @@ Passed to `sam deploy --parameter-overrides`:
 - **`AgentFieldGID`** — Asana custom field GID for the "Agent" dropdown (optional — empty string is fine if you're not using custom-field triggers).
 - **`DeployDashboard`** — `true`/`false` (default `false`). Provisions the Cognito user pool, the operator/admin read+write APIs, and the CloudFront SPA.
 - **`DeployGateway`** — `true`/`false` (default `false`). Provisions the AgentCore Gateway + Cedar policy engine (the deterministic tool-call boundary). Requires `DeployDashboard=true` (the admin API owns the policy sync).
-- **`DeploySlack`** — `true`/`false` (default `false`). Provisions the Slack webhook receiver Lambda (`/slack/events` + `/slack/commands`) on the webhook API. The trigger-authz store (`TriggerPolicyStore`) and the admin Connectors routes exist **regardless** of this flag, so an operator can pre-author trigger rules and Slack workspace rows before pointing Slack at the endpoints. Enabling it requires the Slack app signing secret + per-workspace bot tokens in SSM (see §2.4.1, populated by `scripts/bootstrap_slack.py`).
+- *(retired)* **`DeploySlack`** — removed (spec §19). The Slack receiver is now **always deployed**: it's serverless + inert at rest and fails closed at runtime (no signing secret → 503; no onboarded workspace → dropped), so a deploy-time gate was redundant with the runtime workspace-onboarding gate. Slack goes live only when an admin onboards a workspace + the secrets are in SSM (§2.4.1). No flag to set.
 - **`GatewayPolicyEnforcement`** — `LOG_ONLY` (default) / `ACTIVE`. The fleet Cedar policy's enforcement mode; roll out `LOG_ONLY` first, watch CloudWatch, then flip to `ACTIVE`.
 - **`DeployMantleProject`** — `true`/`false` (default `true`). Provisions the fleet's shared model cost-attribution project as `AWS::BedrockMantle::Project` and injects its id as `MANTLE_PROJECT_ID` on every agent runtime. **Prerequisite:** activate the resource type in the account+region once before the first deploy — `aws cloudformation activate-type --type RESOURCE --type-name AWS::BedrockMantle::Project` (see below). One project fleet-wide — a dispatch may act across several repos, so per-repo attribution is meaningless. Set `false` to skip provisioning and bring your own id via `MantleProjectId`.
 - **`MantleProjectId`** — a pre-existing Bedrock Mantle project id, used only when `DeployMantleProject=false`. Blank (default) leaves agents on the account's default Mantle project. Ignored when `DeployMantleProject=true`.
@@ -226,7 +226,7 @@ The shipping code expects these. Each is written by the corresponding skill or b
 
 Missing any required parameter produces a clear error at invocation time (not at deploy time). `bootstrap.py` preflights these SSM secrets and points you at the bootstrap scripts for any that are missing.
 
-### 2.4.1 Slack SecureString parameters (only when `DeploySlack=true`)
+### 2.4.1 Slack SecureString parameters (needed once you onboard a Slack workspace)
 
 Populated out-of-band by `scripts/bootstrap_slack.py` (which also registers the Slack app manifest against the `SlackEventsEndpoint`/`SlackCommandsEndpoint` outputs). Note the level split — it matters for blast radius (threat T-36):
 
@@ -235,7 +235,7 @@ Populated out-of-band by `scripts/bootstrap_slack.py` (which also registers the 
 | `/sdlc-agents/${Stage}/slack/signing-secret` | **App-level** (one per Slack app; the `url_verification` handshake carries no team scope, so verification can't depend on a `team_id`) | `scripts/bootstrap_slack.py` | `slack-webhook-${Stage}` Lambda (signature verify) |
 | `/sdlc-agents/${Stage}/slack/<team_id>/bot-token` | **Per-workspace/installation** (`xoxb-…`) | `scripts/bootstrap_slack.py` (once per onboarded workspace) | `reply.post_slack_message` (agent/router replies to Slack) |
 
-Both are fetched per-invocation and never held on a module global. The receiver Lambda's IAM grants `ssm:GetParameter` on `/sdlc-agents/${Stage}/slack/*` only; it cannot write them. A workspace is not live until (a) `DeploySlack=true`, (b) its bot token is in SSM, and (c) an admin has onboarded it (an enabled, active `slack_workspace` row) in the dashboard Connectors → Slack panel.
+Both are fetched per-invocation and never held on a module global. The receiver Lambda's IAM grants `ssm:GetParameter` on `/sdlc-agents/${Stage}/slack/*` only; it cannot write them. A workspace is not live until (a) its bot token is in SSM and (b) an admin has onboarded it (an enabled, active `slack_workspace` row) in the dashboard Connectors → Slack panel. (The receiver Lambda itself is always deployed — there's no deploy flag.)
 
 ### 2.5 Per-agent runtime environment
 
@@ -267,7 +267,7 @@ Top-to-bottom, no skipping.
 7. **Onboard the repos the fleet may act in** — in the Admin view's repo panel (or `bootstrap.py`'s initial-repo seed when the dashboard is off). Mentions from a non-onboarded repo are rejected at dispatch.
 8. **Author trigger authorization** — no dispatch is authorized until a grant exists (the `TriggerPolicyStore` is default-deny; the old `authorization.users` allowlist is gone). Add `trigger_rule` grants in the dashboard Connectors → Trigger Rules panel (or via `sdlc-agents-register-triggers`), keyed on immutable sender principals (`github:<login>`, `asana:<gid>`, `slack:<team>:<uid>`).
 9. **Register the Asana webhook** — `sdlc-agents-register-triggers` calls the Asana API with the `WebhookEndpoint` stack output.
-10. **(Optional) Enable Slack** — deploy with `DeploySlack=true`, run `scripts/bootstrap_slack.py` to write the app signing secret + per-workspace bot token and register the Slack app manifest against the `SlackEventsEndpoint`/`SlackCommandsEndpoint` outputs, then onboard each workspace/channel in the dashboard Connectors → Slack panel.
+10. **(Optional) Enable Slack** — the receiver is already deployed; run `scripts/bootstrap_slack.py` to write the app signing secret + per-workspace bot token and register the Slack app manifest against the `SlackEventsEndpoint`/`SlackCommandsEndpoint`/`SlackInteractionsEndpoint` outputs, then onboard each workspace/channel in the dashboard Connectors → Slack panel. Users self-serve notifications with `/sdlc-notify`.
 11. **Verify** — `sdlc-agents-verify` runs layered smoke tests (runtime health → credential freshness → end-to-end mention).
 
 Everything except the SSM secrets (populated by the connect skills) and the Asana webhook registration is driven by the base deploy plus dashboard onboarding.

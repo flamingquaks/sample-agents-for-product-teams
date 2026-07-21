@@ -34,7 +34,7 @@ they'll be listed here once their code ships.
 ## How It Works
 
 1. A user assigns work via `@agent` mention in Asana, GitHub, or Slack (or a Slack slash command)
-2. A signature-verified **webhook** (GitHub App HMAC, Asana HMAC, or Slack `v0` — Slack is `DeploySlack`-gated) async-invokes the **Dispatch Router**, which resolves the mention, applies a prompt-injection guardrail, **authorizes the trigger via Amazon Verified Permissions** (the `TriggerPolicyStore`; fail-closed), and routes to the agent
+2. A signature-verified **webhook** (GitHub App HMAC, Asana HMAC, or Slack `v0`) async-invokes the **Dispatch Router**, which resolves the sender to a cross-source **identity** (onboarding-gated — a first-touch user is asked to get onboarded), applies a prompt-injection guardrail, **authorizes the trigger via Amazon Verified Permissions** (the `TriggerPolicyStore` + the identity's permission groups; fail-closed), and routes to the agent
 3. The agent runs on **AgentCore Runtime** (model calls via **Bedrock Mantle**), reaching GitHub/Asana only through the **AgentCore Gateway** (Cedar-enforced, gateway-only)
 4. Results are posted back to the originating platform
 

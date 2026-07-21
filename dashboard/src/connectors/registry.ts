@@ -8,6 +8,7 @@ import type { DashboardApi } from "../api";
 import { SlackConnectorPage } from "./SlackConnectorPage";
 import { AsanaConnectorPage } from "./AsanaConnectorPage";
 import { GitHubConnectorPage } from "./GitHubConnectorPage";
+import { AccessConnectorPage } from "./AccessConnectorPage";
 
 export interface ConnectorPageProps {
   api: DashboardApi;
@@ -15,7 +16,7 @@ export interface ConnectorPageProps {
 }
 
 export interface ConnectorDescriptor {
-  id: "slack" | "asana" | "github";
+  id: "slack" | "asana" | "github" | "access";
   label: string;
   blurb: string;
   Page: ComponentType<ConnectorPageProps>;
@@ -40,6 +41,13 @@ export const CONNECTORS: ConnectorDescriptor[] = [
     label: "GitHub",
     blurb: "The GitHub App delivers issue/PR comment mentions. Register + install it here.",
     Page: GitHubConnectorPage,
+  },
+  {
+    id: "access",
+    label: "Access — Users & Groups",
+    blurb:
+      "The cross-source identity directory, the user-onboarding approval queue, and permission groups. Approve first-touch users and assign groups here.",
+    Page: AccessConnectorPage,
   },
 ];
 

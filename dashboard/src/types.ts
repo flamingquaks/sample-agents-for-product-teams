@@ -172,3 +172,65 @@ export interface ChannelRequest {
   decided_by?: string;
   decided_at?: number | null;
 }
+
+// --- Part II: identity map, permission groups, notifications (spec §16–§18) ---
+
+/** A cross-source person record. Email is the golden join id; handles per source. */
+export interface Identity {
+  identity_id: string;
+  email: string;
+  display_name?: string;
+  handles: {
+    github?: string;
+    asana?: string;
+    slack?: Record<string, string>; // team_id -> user_id
+    sdlc?: string;
+  };
+  handle_keys?: string[];
+  groups: string[];
+  verified?: Record<string, boolean>;
+  status: "pending" | "active" | "disabled";
+  onboarded_by?: string;
+  created_from?: { source?: string; handle?: string; at?: number };
+  created_at?: number;
+  updated_at?: number;
+  merged_from?: string[];
+}
+
+/** A user-onboarding request awaiting admin approval (first-touch gate). */
+export interface UserRequest {
+  request_id: string;
+  identity_id: string;
+  source: string;
+  source_context?: Record<string, unknown>;
+  proposed_email?: string;
+  display_name?: string;
+  status: "pending" | "approved" | "denied";
+  created_at?: number;
+  decided_by?: string;
+  decided_at?: number | null;
+}
+
+/** A permission group — named metadata; access via group-scoped trigger rules. */
+export interface PermGroup {
+  group_id: string;
+  name: string;
+  description?: string;
+  recommended?: boolean;
+  member_count?: number;
+  members?: { identity_id: string; email: string; display_name?: string }[];
+  created_by?: string;
+  created_at?: number;
+}
+
+/** A channel's notification subscription (self-served via /sdlc-notify). */
+export interface NotifSub {
+  team_id: string;
+  channel_id: string;
+  repos: string[];
+  tiers: { actionable?: string[]; informative?: string[]; error?: string[] };
+  min_severity: "informative" | "actionable" | "error";
+  created_by?: string;
+  created_at?: number;
+  updated_at?: number;
+}

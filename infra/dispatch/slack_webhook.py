@@ -39,6 +39,7 @@ import boto3
 
 import mentions
 import reply
+import slack_notify
 import trigger_grants
 
 logger = logging.getLogger()
@@ -50,6 +51,8 @@ STAGE = os.environ.get("STAGE", "dev")
 # Slash command that files a channel-onboarding REQUEST (leading slash stripped
 # by Slack; we match on the bare name).
 ONBOARD_COMMAND = os.environ.get("SLACK_ONBOARD_COMMAND", "sdlc-onboard-channel")
+# Slash command that opens the interactive notification-config modal (spec §18).
+NOTIFY_COMMAND = os.environ.get("SLACK_NOTIFY_COMMAND", "sdlc-notify")
 # How long to remember an event_id for de-duplication.
 _DEDUP_TTL_SECONDS = 24 * 60 * 60
 
@@ -245,6 +248,22 @@ def _handle_slash_command(form: dict, team_id: str) -> dict:
         msg = _record_channel_request(team_id, channel_id, channel_name, user_id, text)
         return _ephemeral(msg)
 
+    if command == NOTIFY_COMMAND:
+        # Open the interactive notification-config modal. The slash-command
+        # payload carries a trigger_id (valid ~3s); views.open must use it
+        # promptly, so we open here and return an empty 200 (Slack shows the
+        # modal, no ephemeral text needed).
+        trigger_id = form.get("trigger_id", [""])[0] or ""
+        view = slack_notify.build_notify_modal(
+            team_id=team_id,
+            channel_id=channel_id,
+            channel_name=channel_name,
+            repos=slack_notify.onboarded_repos(),
+        )
+        if not slack_notify.open_modal(team_id=team_id, trigger_id=trigger_id, view=view):
+            return _ephemeral("Couldn't open the notification settings — please try again.")
+        return _ack()
+
     # A mention-style command: resolve the agent from the text.
     resolved = _registry.resolve_mention(text if text.startswith("@") else f"@{text}")
     if not resolved:
@@ -268,6 +287,36 @@ def _handle_slash_command(form: dict, team_id: str) -> dict:
         "slash_command",
     )
     return _ephemeral(f"🏁 Dispatching to `{agent_id}`…")
+
+
+# --- interactivity (Block Kit / modal submits) -------------------------------
+
+
+def _handle_interaction(form: dict) -> dict:
+    """Route a Slack interactivity payload. Slack sends a single ``payload`` form
+    field holding url-encoded JSON. We handle the /sdlc-notify modal submit
+    (``view_submission`` with our callback_id) and save the subscription; a
+    view_submission must return 200 with an empty body to close the modal."""
+    raw = form.get("payload", [""])[0] or ""
+    try:
+        payload = json.loads(raw)
+    except (ValueError, TypeError):
+        return _ack()
+    if payload.get("type") != "view_submission":
+        return _ack()  # button clicks etc. — no-op for now
+    view = payload.get("view", {}) or {}
+    if view.get("callback_id") != slack_notify.NOTIFY_VIEW_CALLBACK:
+        return _ack()
+    # Re-check the workspace is still onboarded before persisting.
+    team_id = (payload.get("team") or {}).get("id") or ""
+    if not trigger_grants.is_workspace_enabled(team_id):
+        return {"statusCode": 200, "body": json.dumps({
+            "response_action": "errors",
+            "errors": {"repos": "This workspace isn't onboarded for the fleet."},
+        })}
+    config = slack_notify.parse_view_submission(view)
+    slack_notify.save_subscription(config)
+    return _ack()  # empty 200 closes the modal
 
 
 # --- Lambda handler ----------------------------------------------------------
@@ -294,6 +343,7 @@ def handler(event, context=None):
     # happens to contain that substring, parse_qs it, and drop the mention.
     resource = event.get("resource", "") or event.get("path", "")
     is_command = resource.endswith("/commands")
+    is_interaction = resource.endswith("/interactions")
 
     # --- authenticate FIRST, against the app-level signing secret ---
     # The signing secret is per-APP, not per-workspace (only bot tokens are
@@ -325,6 +375,18 @@ def handler(event, context=None):
         except Exception:  # noqa: BLE001
             logger.exception("error handling Slack slash command")
             return _ephemeral("Something went wrong handling that command.")
+
+    # --- interactivity (Block Kit actions + modal submits, form-encoded) ---
+    # Interactions POST a `payload=<url-encoded-json>` form field. The only
+    # interaction we handle today is the /sdlc-notify modal submit (view_submission
+    # with our callback_id); anything else is acknowledged as a no-op.
+    if is_interaction:
+        try:
+            return _handle_interaction(parse_qs(raw_body))
+        except Exception:  # noqa: BLE001
+            logger.exception("error handling Slack interaction")
+            # A view_submission expects a 200 (empty body closes the modal).
+            return _ack()
 
     # --- events API (JSON) ---
     try:

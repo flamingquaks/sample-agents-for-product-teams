@@ -671,9 +671,9 @@ Delivery reuses `reply.post_slack_message` with the per-workspace bot token.
 
 The Connectors → Slack sub-page gains a read/edit view of channel subscriptions (admins can see/adjust what a channel self-configured), consistent with how the panel already surfaces channels and trigger rules.
 
-## 19. Retire the `DeploySlack` deploy gate
+## 19. Retire the `DeploySlack` deploy gate — DONE
 
-`DeploySlack` gates only inert-at-rest, serverless resources: the `SlackWebhookFunction` Lambda ($0 idle), its CloudWatch error alarm, and two stack **outputs**. Meanwhile a **runtime gate already exists** — the receiver rejects any delivery whose `team_id` isn't an onboarded, enabled, active `slack_workspace` row (`trigger_grants.is_workspace_enabled`), and `POST /admin/slack/workspaces` is how an admin onboards one. So the deploy flag is **redundant with the admin-onboarding gate**.
+`DeploySlack` gated only inert-at-rest, serverless resources: the `SlackWebhookFunction` Lambda ($0 idle), its CloudWatch error alarm, and two stack **outputs**. Meanwhile a **runtime gate already exists** — the receiver rejects any delivery whose `team_id` isn't an onboarded, enabled, active `slack_workspace` row (`trigger_grants.is_workspace_enabled`), and `POST /admin/slack/workspaces` is how an admin onboards one. So the deploy flag was **redundant with the admin-onboarding gate**. The `SlackEnabled` condition + `DeploySlack` parameter are removed; the Lambda + its three routes + endpoint outputs always deploy.
 
 **Change:** remove the `SlackEnabled` CloudFormation condition so the Slack Lambda + its three routes (`/slack/events`, `/slack/commands`, `/slack/interactions`) and the endpoint outputs **always deploy**. Slack goes "live" only when an admin onboards a workspace. The always-on public endpoint is safe because it **fails closed**: no signing secret → 503; no onboarded workspace → dropped. This yields one onboarding story — deploy the (serverless, inert) infra once; enable via Admin — matching the fleet's "simple deploy, configure in Admin" posture.
 

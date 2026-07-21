@@ -38,6 +38,7 @@ import time
 import boto3
 
 _REPO_PK_PREFIX = "repo#"
+_OWNER_PK_PREFIX = "owner#"
 _SETTINGS_PK = "settings"
 
 # Co-repo reach modes (mirror config_store.CO_REPO_*).
@@ -128,6 +129,23 @@ def is_repo_allowed(repo: str) -> bool:
     if snapshot["settings"]["restrict_repos"] and not record.get("multi_repo_eligible"):
         return False
     return True
+
+
+def owner_type(owner: str) -> str | None:
+    """The GitHub owner type for ``owner`` — "Organization" | "User" | None
+    (unknown). Read from the per-owner install record. Used by the first-touch
+    onboarding gate to branch the reply copy: an org repo can resolve the
+    member's email (so we can promise an email on completion), a personal repo
+    cannot (spec §16.4). Not cached with the repo snapshot — install records key
+    on ``owner#`` and are read directly (rarely, only on a pending-user reject)."""
+    norm = (owner or "").strip().casefold()
+    if not norm:
+        return None
+    try:
+        item = _get_table().get_item(Key={"pk": f"{_OWNER_PK_PREFIX}{norm}"}).get("Item")
+    except Exception:  # noqa: BLE001
+        return None
+    return item.get("owner_type") if item else None
 
 
 def _is_eligible_active(record: dict) -> bool:

@@ -20,6 +20,11 @@ Routes (all admin-only):
     POST   /admin/trigger-rules/simulate    dry-run an access decision (principal, agent, workspace, channel)
     GET    /admin/channel-requests          list channel onboarding requests (?status=pending)
     POST   /admin/channel-requests/{id}/approve|deny   decide a request
+    GET/POST /admin/identities              list / proactively create cross-source identities; GET/PUT/DELETE /{identity_id}
+    GET    /admin/user-requests             list user-onboarding requests (?status=pending)
+    POST   /admin/user-requests/{id}/approve|deny   decide a user request (approve = active + assign groups + verify handles)
+    GET/POST /admin/groups                  list / create permission groups; GET/DELETE /{group_id}
+    GET/POST /admin/notif-subs              list / upsert channel notification subscriptions; DELETE /{team_id}/{channel_id}
 
 Two synchronized effects (see the plan's "exact chain"): a repo change writes
 the config table (drives the Dispatch Router allowlist) AND regenerates the
@@ -538,6 +543,62 @@ def _decide_channel_request(event: dict, request_id: str, approve: bool, body: d
     return ok({"request": rec, "channel_allowed": True, "created_rules": created})
 
 
+def _decide_user_request(event: dict, request_id: str, approve: bool, body: dict) -> dict:
+    """Approve or deny a user-onboarding request (spec §16.4 / §17.4). APPROVAL
+    is the trust event: it flips the identity to ``active``, assigns the admin's
+    chosen permission groups (the access step), and marks every source handle the
+    identity already carries as ``verified`` (admin approval IS the verification —
+    §16.6). Denial just records the decision. Only a pending request can be
+    decided (409 otherwise); all effects are explicit here for auditability."""
+    req = config_store.get_user_request(request_id)
+    if req is None:
+        return error(404, f"no such user request: {request_id}")
+    if req.get("status") != config_store.USER_REQ_PENDING:
+        return error(409, f"request {request_id} already {req.get('status')}")
+    caller = auth.caller_sub(event)
+    identity_id = req.get("identity_id", "")
+    if not approve:
+        rec = config_store.resolve_user_request(
+            request_id, status=config_store.USER_REQ_DENIED, decided_by=caller
+        )
+        return ok({"request": rec})
+
+    identity = config_store.get_identity(identity_id)
+    if identity is None:
+        return error(404, f"identity {identity_id} no longer exists")
+    # The access step: assign the chosen groups (recommended path). Groups may be
+    # empty — an admin can onboard someone with no group yet and grant later — but
+    # then the identity is active-yet-ungranted (default-deny still applies).
+    groups = [g for g in (body.get("groups") or []) if g]
+    for g in groups:
+        if not config_store.valid_group_id(g):
+            return error(400, f"invalid group id {g!r}")
+        if config_store.get_perm_group(g) is None:
+            return error(400, f"no such permission group: {g!r}")
+    config_store.set_identity_groups(identity_id, groups)
+    # Admin approval verifies every handle the identity carries (the trust event).
+    for source in (identity.get("handles") or {}).keys():
+        try:
+            config_store.set_identity_verified(identity_id, source, True)
+        except ValueError:
+            pass  # ignore an unknown source key defensively
+    config_store.set_identity_status(identity_id, config_store.IDENTITY_ACTIVE)
+    rec = config_store.resolve_user_request(
+        request_id, status=config_store.USER_REQ_APPROVED, decided_by=caller
+    )
+    return ok({"request": rec, "identity_id": identity_id, "groups": groups})
+
+
+def _channel_granted_repos(team_id: str, channel_id: str) -> set[str]:
+    """Repos a channel is allowed to receive notifications about (spec §18.2): the
+    fleet's onboarded repos, since a channel's trigger grants are agent-scoped not
+    repo-scoped and the fleet is small. Bounds a notification subscription so a
+    channel can't subscribe to a repo the fleet doesn't even manage. (A tighter
+    per-channel repo grant can layer on later; today the onboarded-repo set is the
+    ceiling.)"""
+    return {r["repo"] for r in config_store.list_repos() if r.get("enabled")}
+
+
 def _route(event: dict) -> dict:
     resource = event.get("resource", "")
     method = event.get("httpMethod", "")
@@ -872,6 +933,130 @@ def _route(event: dict) -> dict:
             request_id = (path_params.get("request_id") or "").strip()
             approve = resource.endswith("/approve")
             return _decide_channel_request(event, request_id, approve, body)
+
+    # --- Identities (cross-source user map, spec §16) ---
+    if resource == "/admin/identities":
+        if method == "GET":
+            return ok({"identities": config_store.list_identities()})
+        if method == "POST":
+            # Admin proactive-create: born active with the supplied handles/email.
+            try:
+                rec = config_store.put_identity(
+                    email=(body.get("email") or "").strip(),
+                    display_name=(body.get("display_name") or "").strip(),
+                    handles=body.get("handles") or {},
+                    groups=body.get("groups") or [],
+                    status=(body.get("status") or config_store.IDENTITY_ACTIVE),
+                    onboarded_by=auth.caller_sub(event),
+                )
+            except ValueError as exc:
+                return error(400, str(exc))
+            return ok(rec)
+
+    if resource in ("/admin/identities/{identity_id}", "/admin/identities/{identity_id+}"):
+        identity_id = (path_params.get("identity_id") or path_params.get("identity_id+") or "").strip()
+        if method == "GET":
+            rec = config_store.get_identity(identity_id)
+            return ok(rec) if rec else error(404, f"no such identity: {identity_id}")
+        if method == "PUT":
+            # Edit groups / status (the access + lifecycle knobs).
+            if "groups" in body:
+                try:
+                    config_store.set_identity_groups(identity_id, body.get("groups") or [])
+                except ValueError as exc:
+                    return error(400, str(exc))
+            if "status" in body:
+                try:
+                    config_store.set_identity_status(identity_id, body["status"])
+                except ValueError as exc:
+                    return error(400, str(exc))
+            rec = config_store.get_identity(identity_id)
+            return ok(rec) if rec else error(404, f"no such identity: {identity_id}")
+        if method == "DELETE":
+            return ok({"identity_id": identity_id, "deleted": config_store.delete_identity(identity_id)})
+
+    # --- User-onboarding requests (approve/deny queue, spec §16.4) ---
+    if resource == "/admin/user-requests":
+        if method == "GET":
+            status = (event.get("queryStringParameters") or {}).get("status")
+            return ok({"requests": config_store.list_user_requests(status)})
+
+    if resource in ("/admin/user-requests/{request_id}/approve",
+                    "/admin/user-requests/{request_id}/deny"):
+        if method == "POST":
+            request_id = (path_params.get("request_id") or "").strip()
+            approve = resource.endswith("/approve")
+            return _decide_user_request(event, request_id, approve, body)
+
+    # --- Permission groups (spec §17) ---
+    if resource == "/admin/groups":
+        if method == "GET":
+            groups = config_store.list_perm_groups()
+            # Annotate each with its member count (cheap; the directory is small).
+            for g in groups:
+                g["member_count"] = len(config_store.group_members(g["group_id"]))
+            return ok({"groups": groups})
+        if method == "POST":
+            group_id = (body.get("group_id") or "").strip()
+            try:
+                rec = config_store.put_perm_group(
+                    group_id,
+                    name=(body.get("name") or "").strip(),
+                    description=(body.get("description") or "").strip(),
+                    recommended=bool(body.get("recommended", False)),
+                    created_by=auth.caller_sub(event),
+                )
+            except ValueError as exc:
+                return error(400, str(exc))
+            return ok(rec)
+
+    if resource in ("/admin/groups/{group_id}", "/admin/groups/{group_id+}"):
+        group_id = (path_params.get("group_id") or path_params.get("group_id+") or "").strip()
+        if method == "GET":
+            rec = config_store.get_perm_group(group_id)
+            if not rec:
+                return error(404, f"no such group: {group_id}")
+            rec["members"] = [
+                {"identity_id": m["identity_id"], "email": m.get("email", ""),
+                 "display_name": m.get("display_name", "")}
+                for m in config_store.group_members(group_id)
+            ]
+            return ok(rec)
+        if method == "DELETE":
+            return ok({"group_id": group_id, "deleted": config_store.delete_perm_group(group_id)})
+
+    # --- Notification subscriptions (read/edit; self-served in Slack, spec §18.5) ---
+    if resource == "/admin/notif-subs":
+        if method == "GET":
+            team_id = (event.get("queryStringParameters") or {}).get("team_id")
+            return ok({"subscriptions": config_store.list_notif_subs(team_id)})
+        if method == "POST":
+            team_id = (body.get("team_id") or "").strip()
+            channel_id = (body.get("channel_id") or "").strip()
+            # Bound the requested repos to what the channel is actually granted
+            # (§18.2) — the store validates shape, the API validates authorization.
+            requested = {config_store._normalize_repo(r) for r in (body.get("repos") or []) if r}
+            granted = _channel_granted_repos(team_id, channel_id)
+            disallowed = requested - granted
+            if disallowed:
+                return error(403, f"channel not granted repos: {sorted(disallowed)}")
+            try:
+                rec = config_store.put_notif_sub(
+                    team_id, channel_id,
+                    repos=sorted(requested),
+                    tiers=body.get("tiers") or {},
+                    min_severity=(body.get("min_severity") or config_store.NOTIF_TIER_INFORMATIVE),
+                    created_by=auth.caller_sub(event),
+                )
+            except ValueError as exc:
+                return error(400, str(exc))
+            return ok(rec)
+
+    if resource == "/admin/notif-subs/{team_id}/{channel_id}":
+        if method == "DELETE":
+            team_id = (path_params.get("team_id") or "").strip()
+            channel_id = (path_params.get("channel_id") or "").strip()
+            return ok({"deleted": config_store.delete_notif_sub(team_id, channel_id)})
 
     return error(404, f"no such admin route: {method} {resource}")
 

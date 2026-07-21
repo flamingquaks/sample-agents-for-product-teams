@@ -52,6 +52,18 @@ def router(monkeypatch):
     # test_router_authorization; here we assume the sender is permitted so these
     # tests focus on guardrail handling.
     monkeypatch.setattr(router_mod, "authorize_trigger", lambda *a, **k: (True, ""))
+    # Identity resolution + onboarding gate (spec §16) is exercised in
+    # test_identity + test_router_identity_gate; here we assume the sender is an
+    # onboarded, ACTIVE identity so these tests focus on guardrail handling.
+    import identity as identity_mod
+
+    monkeypatch.setattr(
+        router_mod,
+        "resolve_dispatch_identity",
+        lambda *a, **k: identity_mod.Identity(
+            identity_id="id-alice", email="alice@acme.com", status="active"
+        ),
+    )
     yield router_mod
 
 

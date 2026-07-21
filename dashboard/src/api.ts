@@ -14,12 +14,16 @@ import type {
   FleetStats,
   GitHubAppStatus,
   GitHubManifest,
+  Identity,
+  NotifSub,
+  PermGroup,
   RepoConfig,
   Run,
   RunsPage,
   SlackWorkspace,
   TraceResult,
   TriggerRule,
+  UserRequest,
 } from "./types";
 
 export class ApiError extends Error {
@@ -294,5 +298,86 @@ export class DashboardApi {
     return this.request("POST", `/admin/channel-requests/${encodeURIComponent(requestId)}/deny`, {
       body: {},
     });
+  }
+
+  // --- identities (cross-source user map, spec §16) --------------------------
+
+  listIdentities(): Promise<{ identities: Identity[] }> {
+    return this.get<{ identities: Identity[] }>("/admin/identities");
+  }
+
+  createIdentity(body: Partial<Identity>): Promise<Identity> {
+    return this.request<Identity>("POST", "/admin/identities", { body });
+  }
+
+  updateIdentity(
+    identityId: string,
+    body: { groups?: string[]; status?: string },
+  ): Promise<Identity> {
+    return this.request<Identity>(
+      "PUT",
+      `/admin/identities/${encodeURIComponent(identityId)}`,
+      { body },
+    );
+  }
+
+  deleteIdentity(identityId: string): Promise<{ deleted: boolean }> {
+    return this.request("DELETE", `/admin/identities/${encodeURIComponent(identityId)}`);
+  }
+
+  // --- user-onboarding requests (approve/deny queue, spec §16.4) -------------
+
+  listUserRequests(status?: string): Promise<{ requests: UserRequest[] }> {
+    return this.get<{ requests: UserRequest[] }>("/admin/user-requests", { status });
+  }
+
+  approveUserRequest(
+    requestId: string,
+    groups: string[],
+  ): Promise<{ request: UserRequest; identity_id: string; groups: string[] }> {
+    return this.request("POST", `/admin/user-requests/${encodeURIComponent(requestId)}/approve`, {
+      body: { groups },
+    });
+  }
+
+  denyUserRequest(requestId: string): Promise<{ request: UserRequest }> {
+    return this.request("POST", `/admin/user-requests/${encodeURIComponent(requestId)}/deny`, {
+      body: {},
+    });
+  }
+
+  // --- permission groups (spec §17) ------------------------------------------
+
+  listGroups(): Promise<{ groups: PermGroup[] }> {
+    return this.get<{ groups: PermGroup[] }>("/admin/groups");
+  }
+
+  createGroup(body: Partial<PermGroup>): Promise<PermGroup> {
+    return this.request<PermGroup>("POST", "/admin/groups", { body });
+  }
+
+  getGroup(groupId: string): Promise<PermGroup> {
+    return this.get<PermGroup>(`/admin/groups/${encodeURIComponent(groupId)}`);
+  }
+
+  deleteGroup(groupId: string): Promise<{ deleted: boolean }> {
+    return this.request("DELETE", `/admin/groups/${encodeURIComponent(groupId)}`);
+  }
+
+  // --- notification subscriptions (read/edit, spec §18.5) --------------------
+
+  listNotifSubs(teamId?: string): Promise<{ subscriptions: NotifSub[] }> {
+    return this.get<{ subscriptions: NotifSub[] }>("/admin/notif-subs", { team_id: teamId });
+  }
+
+  upsertNotifSub(body: Partial<NotifSub>): Promise<NotifSub> {
+    return this.request<NotifSub>("POST", "/admin/notif-subs", { body });
+  }
+
+  deleteNotifSub(teamId: string, channelId: string): Promise<{ deleted: boolean }> {
+    return this.request(
+      "DELETE",
+      `/admin/notif-subs/${encodeURIComponent(teamId)}/${encodeURIComponent(channelId)}`,
+    );
   }
 }

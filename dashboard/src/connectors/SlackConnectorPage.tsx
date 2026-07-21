@@ -4,7 +4,7 @@
 import { useCallback, useState } from "react";
 import { ApiError } from "../api";
 import { usePolling } from "../hooks";
-import type { ChannelPolicy, ChannelRequest, SlackWorkspace } from "../types";
+import type { ChannelPolicy, ChannelRequest, NotifSub, SlackWorkspace } from "../types";
 import { ConnectorLayout } from "./ConnectorLayout";
 import { TriggerRulesPanel } from "./TriggerRulesPanel";
 import type { ConnectorPageProps } from "./registry";
@@ -19,6 +19,7 @@ export function SlackConnectorPage({ api, onAuthError }: ConnectorPageProps) {
         { key: "channels", label: "Channels", render: () => <ChannelsTab api={api} onAuthError={onAuthError} /> },
         { key: "rules", label: "Access rules", render: () => <TriggerRulesPanel api={api} connector="slack" onAuthError={onAuthError} /> },
         { key: "requests", label: "Requests", render: () => <RequestsTab api={api} onAuthError={onAuthError} /> },
+        { key: "notifications", label: "Notifications", render: () => <NotificationsTab api={api} onAuthError={onAuthError} /> },
         { key: "simulate", label: "Test access", render: () => <SimulatorTab api={api} onAuthError={onAuthError} /> },
       ]}
     />
@@ -212,6 +213,56 @@ function RequestsTab({ api, onAuthError }: ConnectorPageProps) {
           ))}
           {requests.length === 0 && !poll.loading && (
             <tr><td colSpan={5} className="muted">No pending requests.</td></tr>
+          )}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function NotificationsTab({ api, onAuthError }: ConnectorPageProps) {
+  const handleErr = useErr(onAuthError);
+  const poll = usePolling<{ subscriptions: NotifSub[] }>(() => api.listNotifSubs(), {
+    isActive: () => false, deps: [api], onError: handleErr,
+  });
+  const [busy, setBusy] = useState(false);
+
+  const remove = async (teamId: string, channelId: string) => {
+    if (!window.confirm(`Remove notifications for ${channelId}?`)) return;
+    setBusy(true);
+    try { await api.deleteNotifSub(teamId, channelId); poll.refresh(); }
+    catch (e) { handleErr(e); } finally { setBusy(false); }
+  };
+
+  const tierSummary = (s: NotifSub) =>
+    (["actionable", "informative", "error"] as const)
+      .filter((t) => (s.tiers[t] ?? []).length)
+      .map((t) => `${t} (${s.tiers[t]!.length})`)
+      .join(", ") || "—";
+
+  const subs = poll.data?.subscriptions ?? [];
+  return (
+    <div>
+      <p className="muted">
+        Channels self-configure notifications with <code>/sdlc-notify</code> (three tiers:
+        actionable, informative, error). Admins can review and remove subscriptions here — a
+        subscription only receives, it grants no access.
+      </p>
+      <table>
+        <thead><tr><th>Channel</th><th>Workspace</th><th>Repos</th><th>Tiers</th><th>Floor</th><th /></tr></thead>
+        <tbody>
+          {subs.map((s) => (
+            <tr key={`${s.team_id}#${s.channel_id}`}>
+              <td><code>{s.channel_id}</code></td>
+              <td><code>{s.team_id}</code></td>
+              <td>{s.repos.length ? s.repos.join(", ") : "—"}</td>
+              <td>{tierSummary(s)}</td>
+              <td>{s.min_severity}</td>
+              <td><button disabled={busy} onClick={() => void remove(s.team_id, s.channel_id)}>Remove</button></td>
+            </tr>
+          ))}
+          {subs.length === 0 && !poll.loading && (
+            <tr><td colSpan={6} className="muted">No notification subscriptions yet.</td></tr>
           )}
         </tbody>
       </table>
