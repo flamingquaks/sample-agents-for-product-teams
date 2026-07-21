@@ -1,7 +1,11 @@
-# Connectors: Multi-Workspace Slack + Cedar-Backed Trigger Authorization
+# Connectors: Multi-Workspace Slack, Trigger Authorization, Identity & Notifications
 ## Admin-managed event sources with per-connector access rules
 
-> **Status: BUILT (behind `DeploySlack`).** This spec defines (1) a first-class **Slack** dispatch source at parity with GitHub and Asana, (2) a **Cedar-backed, data-driven trigger-authorization** layer (a third AVP policy store, evaluated by the Dispatch Router) that decides *who* may trigger *which* agent *where*, (3) a **channel onboarding request** flow — users request channel access via the `/sdlc-onboard-channel` slash command and admins approve/deny in the panel (§4.5), and (4) a **Connectors** section **inside the Admin panel** of the dashboard SPA, with a dedicated sub-page per connector (Slack, Asana, GitHub) that owns that connector's connection, triggers, and **per-connector access rules**. It supersedes the Slack sections of `dispatch-agent-assignment-spec.md` §4c. Implemented under `infra/dispatch/` (`slack_webhook.py`, `trigger_authz.py`, `trigger_grants.py`, `reply.py`, `mentions.py`), `infra/dashboard/` (`config_store.py`, `admin.py`), `infra/foundation/template.yaml` (`TriggerPolicyStore` + `SlackWebhookFunction`), `dashboard/src/connectors/`, and `scripts/bootstrap_slack.py`. The Slack receiver is gated by `DeploySlack` (default off); the trigger-authz store is always-on foundation.
+> **Status: Part I BUILT (behind `DeploySlack`); Part II PROPOSED.**
+>
+> **Part I (§1–§15, built):** (1) a first-class **Slack** dispatch source at parity with GitHub and Asana, (2) a **Cedar-backed, data-driven trigger-authorization** layer (a third AVP policy store, evaluated by the Dispatch Router) that decides *who* may trigger *which* agent *where*, (3) a **channel onboarding request** flow — users request channel access via the `/sdlc-onboard-channel` slash command and admins approve/deny in the panel (§4.5), and (4) a **Connectors** section **inside the Admin panel** of the dashboard SPA, with a dedicated sub-page per connector (Slack, Asana, GitHub) that owns that connector's connection, triggers, and **per-connector access rules**. It supersedes the Slack sections of `dispatch-agent-assignment-spec.md` §4c. Implemented under `infra/dispatch/` (`slack_webhook.py`, `trigger_authz.py`, `trigger_grants.py`, `reply.py`, `mentions.py`), `infra/dashboard/` (`config_store.py`, `admin.py`), `infra/foundation/template.yaml` (`TriggerPolicyStore` + `SlackWebhookFunction`), `dashboard/src/connectors/`, and `scripts/bootstrap_slack.py`. The Slack receiver is gated by `DeploySlack` (default off); the trigger-authz store is always-on foundation.
+>
+> **Part II (§16–§20, proposed, not built):** a cross-source **identity map** (email as golden join id, get-or-create on first touch from any source, admin-approved onboarding), **permission groups** (the recommended access mechanism, reusing the existing Cedar group axis), **self-serve interactive Slack notifications** (tiered: actionable / informative / error, via `/sdlc-notify` modals + threading + identity-resolved mentions), and **retirement of the `DeploySlack` deploy gate** in favor of admin workspace-onboarding.
 
 ---
 
@@ -496,6 +500,192 @@ Plus a `1.10` changelog row and DF entries for the Slack inbound + reply flows a
 
 ---
 
-## 15. Open decision (single remaining)
+## 15. Open decision (resolved by §17)
 
-**Group-membership source for group-scoped rules (§5.6):** dashboard-maintained role mappings (recommended — no extra Slack scopes, admin-controlled) vs. Slack usergroups (`usergroups.users.list`, needs `usergroups:read`) vs. corporate-SSO groups. This determines the `User → Group` parent entities the router passes to Cedar. Recommendation stands: ship dashboard-maintained mappings first, add Slack usergroups as a fast-follow. Everything else in this spec is resolved.
+**Group-membership source for group-scoped rules (§5.6):** ~~dashboard-maintained role mappings vs. Slack usergroups vs. corporate-SSO groups.~~ **Resolved.** Group membership is carried on the **identity record** (§16) and assigned during user onboarding (§17). It is source-agnostic by construction — a user's groups apply to every source (GitHub / Asana / Slack) because authz keys on the resolved identity, not the source handle. Slack usergroups / SSO-group *import* remains a possible enrichment source that could populate identity `groups`, but is not required. This retires the "dashboard role-mapping vs. Slack usergroup" fork.
+
+---
+
+# Part II — Identity, Permission Groups, and Notifications (v3, PROPOSED)
+
+> **Status: PROPOSED (not built).** Part I above (Slack source + trigger authz + Connectors UI) is shipped. Part II specifies the next increment: a **cross-source identity map** keyed on email, **permission groups** as the recommended access mechanism, and **self-serve interactive Slack notifications**. It also removes the `DeploySlack` deploy gate in favor of admin workspace-onboarding. These sections are dependency-ordered: identity (§16) underpins groups (§17), which underpin notification mentions (§18). Nothing here is implemented; sections are independently shippable in the order given.
+
+## 16. Cross-source identity map
+
+### 16.1 Why
+
+Today a person is four disjoint handles with no join: `slack:<team>:<uid>`, `github:<login>`, `asana:<gid>`, and the dashboard Cognito `sub`. `trigger_authz` already reserves an optional `requester_email` Cedar attribute (`infra/dispatch/trigger_authz.py`) but **nothing populates it** — so traceability fractures at every source boundary, and a notification can't reliably reach "the right person" across platforms. The identity map makes **email the golden id for joining** the handles, so every assignment record, authz decision, and notification mention resolves to one person regardless of which source it came from.
+
+### 16.2 Record shape — uuid-keyed, email is a join attribute (not the key)
+
+Email is the golden *join* id but **cannot be the primary key**: a first-touch from GitHub or Asana often yields no email (GitHub exposes it only if public; Asana needs the added scope). So the record is keyed on a synthetic `identity_id` (uuid) and email is an attribute + a lookup index, populated the moment any source reveals it.
+
+```
+pk = identity#<uuid>            kind = "identity"
+  identity_id:  <uuid>
+  email:        jane@corp.com   # golden join id; may be "" until a source reveals it
+  display_name: "Jane Doe"
+  status:       pending | active | disabled
+  handles:      { github: "jane-gh",
+                  asana:  "12009...",           # gid
+                  slack:  { "T04": "U123", "T09": "U777" } }   # per-workspace
+  groups:       [ "<group_id>", ... ]           # §17; source-agnostic membership
+  verified:     { github: true, asana: false, slack: true }   # per-handle trust
+  created_from: { source: "github", handle: "jane-gh", at: <ts> }
+  onboarded_by: "<admin cognito sub>" | "self-first-touch"
+  merged_from:  [ "<identity_id>", ... ]        # audit trail of merges (§16.5)
+```
+
+**Global secondary indexes** (resolution is O(1) from any direction):
+- `email → identity_id`
+- one handle GSI per source: `gsi_handle` on a synthesized `handle_key` attribute list — `github:jane-gh`, `asana:12009...`, `slack:T04:U123` — so a source resolver looks up by the exact namespaced handle it holds.
+
+### 16.3 The resolver — `identity.py` (shared by dispatch + dashboard)
+
+One function every source calls on the way in:
+
+```
+resolve_identity(source, handle, known={email?, display_name?}, source_context={}) -> Identity
+```
+
+Behavior:
+1. **Look up** the namespaced handle via `gsi_handle`.
+2. **Hit** → return it, and **backfill** any new identifiers in `known` that the record lacks (progressive enrichment — a GitHub-born record gains `slack` + `email` the first time the person speaks in Slack). Backfill of a *handle for a different source* is additive; backfill of an email that already keys a **different** record triggers a merge (§16.5).
+3. **Miss** → **get-or-create**: write a new `identity#<uuid>` with whatever `known` carries, `status = pending`, `created_from` stamped, and file a **user-onboarding request** (§16.4). Return the pending record.
+
+The resolver never assumes a dashboard/Cognito user exists — non-admins who never touch the dashboard still get a record on first touch from any source.
+
+### 16.4 First-touch onboarding gate (default-deny, admin-approved)
+
+A `pending` identity is **known but not usable**: the Router rejects its dispatch (fail-closed, mirroring channel onboarding). On the rejecting reply, the copy branches on what we can promise:
+
+- **Org-owned GitHub repo** (owner type = Organization on the resolved installation): the App can read the org member list (`GET /orgs/{org}/members`) and resolve the member's email, so we *can* email them on completion. Reply (verbatim):
+  > A request to onboard you has been sent to the SDLC admin and you'll receive an email when onboarding is complete. If you have any questions, please contact your SDLC Admin. Once onboarded, please try your request again.
+- **Personal GitHub repo** (owner type = User; no org directory, likely no email): reply without an email promise:
+  > You're not onboarded to the SDLC fleet. Please contact your SDLC Admin for onboarding.
+- **Slack / Asana** (email available from `users.info` / the added Asana scope): use the org-style copy; completion notice goes to the originating thread and to the resolved email.
+
+**Reply-every-time, request-once.** Every mention from a pending/unknown user gets the reply (the user needs the feedback loop; it's a threaded reply, not a ping-storm). But only **one** `user_req#<uuid>` row is filed per identity — a subsequent mention updates/no-ops the request rather than stacking duplicates in the admin queue. Clean split: **request deduped, reply always.**
+
+```
+pk = user_req#<uuid>            kind = "user_request"
+  identity_id:   <uuid>         # the pending identity created at first touch
+  source:        github | asana | slack
+  source_context: {...}         # repo+issue/PR, or team+channel+thread_ts — for the completion reply
+  proposed_email: "..." | ""    # resolved from org members / users.info when available
+  status:        pending | approved | denied
+  created_at / decided_by / decided_at
+```
+
+**Admins can also create identities proactively** in the dashboard (email + handles up front, born `active`) — the lazy path is the fallback, not the only path.
+
+### 16.5 Merges
+
+Lazy creation from email-less sources means one person can spawn two records before we know they're the same (GitHub-first record with no email; later a Slack-first record with email). Reconciliation:
+
+- **Auto-merge on email match (high confidence):** when a resolve/backfill surfaces an email that already keys an `active` record, fold the two into one `identity_id`, union the handles, keep `merged_from` for audit. Email is the golden id, so an email collision is the strongest signal.
+- **Admin-reviewed merge (weaker signals):** a handle-only or display-name collision is surfaced in the dashboard for an admin to confirm (approve-as-new vs. link-into-existing) — this is also the natural moment at user-onboarding approval to show "likely matches."
+
+### 16.6 Verification & authz trust
+
+A cross-source handle link is **authz-load-bearing only when verified**. Because **admin approval is the trust event** (a human confirms "this Slack user is `github:jane-gh`"), handles attached during admin onboarding/merge are `verified: true` by construction — no separate self-verify challenge needed. Unverified links (e.g. an auto-backfilled handle we haven't confirmed) are fine for *display* and *best-effort* notification routing, but must not be trusted to grant access or to author an authoritative audit claim.
+
+### 16.7 Traceability payoff
+
+Every assignment record and every `trigger_authz` decision is stamped with the resolved `email` (populating the long-reserved `requester_email` Cedar attribute), not just the source handle. Authz grants and group membership can then be authored against **email/identity** and apply across all sources at once — one grant, every platform. This is the audit spine the rest of Part II builds on.
+
+## 17. Permission groups
+
+### 17.1 Why groups (and why this is a seam, not a bolt-on)
+
+`trigger_authz`'s fixed Cedar policy set **already** evaluates `principal.groups.containsAny(resource.allowedGroups)` and the denied-group mirror — group membership is first-class in the policy today; there has simply been no place to *define* groups or *assign* users. `trigger_grants` already distinguishes `RULE_SUBJECT_GROUP` from `RULE_SUBJECT_USER`. So permission groups fill a designed-for seam: **no Cedar policy change**, groups are more grant *data*.
+
+### 17.2 Model
+
+- **`perm_group#<id>`** — a named group ("edtech-engineers", "adr-reviewers"). Metadata only (name, description, `recommended` flag).
+- **Membership on the identity record** — `identity#<uuid>.groups: [<group_id>, ...]`. Adding a user to a group during onboarding (§16.4 approval) is an edit to *their* identity, so the group's access applies to **every** source that identity resolves from.
+- **Group access = group-scoped `trigger_rule` rows** — a group is a subject: author `trigger_rule` with `subject_type: group`, `subject_id: <group_id>` (the schema already supports this). "Create a group and give it access" = create the `perm_group#` row + author group-scoped trigger rules. **One grant mechanism, not two.** Direct per-user `trigger_rule`s remain the scalpel for exceptions; **groups are the recommended default.**
+
+```
+pk = perm_group#<id>            kind = "perm_group"
+  group_id:    <id>
+  name:        "edtech-engineers"
+  description: "..."
+  recommended: true
+  created_by / created_at
+```
+
+### 17.3 Dispatch path
+
+At dispatch, `resolve_identity` (§16) yields the user's `groups`; the Router passes them to `trigger_authz.is_authorized` as the principal's `groups` attribute + `Group` parent entities (the code already assembles these — it just receives `[]` today). The existing fixed policies do the rest. **Scope:** flat/global groups first (matches how `trigger_rule` workspace-wildcards work today); workspace/org-scoped groups only if a real need appears.
+
+### 17.4 Onboarding becomes: approve + assign groups
+
+The user-onboarding approval (§16.4) *is* the permission/access step: admin approves the pending identity → assigns one or more groups → status `active`. This is decision **A** from the design discussion (identity + baseline access are one coherent gate for a newcomer), with groups as the mechanism — avoiding the confusing "onboarded but can't do anything" state.
+
+## 18. Self-serve interactive Slack notifications
+
+### 18.1 What's posted today vs. proposed
+
+**Today the fleet posts to Slack exactly once path:** a block/reject notice via `reply.post_slack_message` (single caller, `router._post_block_reply`). There is **no** success reply, no result-posted-back, no notifications. This section adds a configurable, tiered notification capability. It is **self-serve** (a channel configures its own subscription — a subscription only *receives*, it grants no access, so no admin approval is needed), unlike channel onboarding (§4.5) which gates *access* and does require admin approval.
+
+### 18.2 New inbound route — `/slack/interactions`
+
+Block Kit actions (checkboxes, dropdowns, buttons) and modal submits (`view_submission`) post back on a **separate** endpoint from the Events API, so the Slack receiver gains a third route `/slack/interactions` (same `v0` signature verification + replay window as the others). Flow:
+
+1. User runs `/sdlc-notify` in a channel → receiver calls `views.open` with the `trigger_id` → renders a **modal**.
+2. Modal fields (Block Kit):
+   - **Three tier checkbox groups**, each expandable into specific event types:
+     - **Actionable** — an agent posted something a human should engage with: a decomposition/proposal awaiting approval, a PR that needs review, a question back to the requester. *(These mention people — §18.4.)*
+     - **Informative** — no action needed: a run kicked off, a run completed cleanly, an agent picked up a task. *(No mention.)*
+     - **Error** — something errored and may have stopped a flow/run: run failed, guardrail tripped, credential expired, assignment stuck.
+   - **Repo multi-select dropdown**, **bounded to repos the channel is actually granted** (a channel can't subscribe to notifications for a repo it has no co-repo/trigger access to — enforced against the channel's grants, not a free list).
+   - **Severity floor** (e.g. "error + actionable only, skip informative").
+3. `view_submission` → writes a `notif_sub#` row. Editing re-opens the modal pre-filled from the row.
+
+```
+pk = notif_sub#<team>#<channel>   kind = "notif_sub"
+  team_id / channel_id
+  repos:      [ "owner/repo", ... ]   # validated ⊆ channel's granted repos
+  tiers:      { actionable: [event...], informative: [event...], error: [event...] }
+  min_severity
+  created_by  # slack:<team>:<uid>, resolved to identity for audit
+  created_at / updated_at
+```
+
+### 18.3 Notification sources (fan-out)
+
+Two origins, deliberately separated:
+- **Fleet-internal events** — run started / completed / failed, guardrail tripped, awaiting-approval. The Router and agents already have these signals; fan-out matches them against `notif_sub#` rows and posts to subscribed channels.
+- **External SCM events** — PR opened/merged, issue activity. The **GitHub App webhook already receives these deliveries** (it ignores non-mentions today), so routing matching events to subscribed channels reuses the same signed webhook — low marginal cost.
+
+Delivery reuses `reply.post_slack_message` with the per-workspace bot token.
+
+### 18.4 Threading & mentions — anti-spam + connect-the-right-people
+
+- **One root message per unit of work** (per `assignment_id`, or per PR number), with all follow-ups posted **into that thread** via `thread_ts`. A whole run's lifecycle (`started → proposal ready → completed`) collapses into one thread, not N channel posts.
+- **Mentions only on Actionable + Error tiers.** Informative stays unmentioned so it pings no one.
+- **Mention the resolved person, in the right workspace** — via the identity map (§16), "the PR author" / "the requester" → `<@U…>` using that person's `slack` handle **for this team**. This is the concrete payoff of email-as-golden-id: an event whose actor is a GitHub login gets routed to the correct Slack user. If identity can't resolve (unverified / no slack handle for the team), **degrade to an unmentioned post** rather than mis-ping.
+
+### 18.5 Dashboard parity
+
+The Connectors → Slack sub-page gains a read/edit view of channel subscriptions (admins can see/adjust what a channel self-configured), consistent with how the panel already surfaces channels and trigger rules.
+
+## 19. Retire the `DeploySlack` deploy gate
+
+`DeploySlack` gates only inert-at-rest, serverless resources: the `SlackWebhookFunction` Lambda ($0 idle), its CloudWatch error alarm, and two stack **outputs**. Meanwhile a **runtime gate already exists** — the receiver rejects any delivery whose `team_id` isn't an onboarded, enabled, active `slack_workspace` row (`trigger_grants.is_workspace_enabled`), and `POST /admin/slack/workspaces` is how an admin onboards one. So the deploy flag is **redundant with the admin-onboarding gate**.
+
+**Change:** remove the `SlackEnabled` CloudFormation condition so the Slack Lambda + its three routes (`/slack/events`, `/slack/commands`, `/slack/interactions`) and the endpoint outputs **always deploy**. Slack goes "live" only when an admin onboards a workspace. The always-on public endpoint is safe because it **fails closed**: no signing secret → 503; no onboarded workspace → dropped. This yields one onboarding story — deploy the (serverless, inert) infra once; enable via Admin — matching the fleet's "simple deploy, configure in Admin" posture.
+
+## 20. New surfaces & threat-model deltas (Part II)
+
+**New/changed surfaces:** `identity#` rows + `email`/`gsi_handle` GSIs + `identity.py` resolver (dispatch + dashboard); `user_req#` rows + admin approval queue; `perm_group#` rows + group membership on identity + group-scoped `trigger_rule`s; `/slack/interactions` route + modal builders; `notif_sub#` rows + fan-out from fleet + SCM events; Slack scope `users:read.email`, added Asana user-email scope, GitHub org-member read; retire `SlackEnabled` condition.
+
+**Threat-model additions (to draft in `docs/threat-model.md`):**
+- **Identity-link spoofing** — a wrongly-claimed cross-source handle is impersonation. Mitigated: links are authz-load-bearing only when `verified`, and verification = admin approval (§16.6).
+- **Merge poisoning** — a bad auto-merge fuses two people. Mitigated: auto-merge only on exact email match (strongest signal); weaker signals go to admin review (§16.5); `merged_from` audit trail.
+- **Notification-scope leak** — a channel subscribing to a repo it shouldn't see. Mitigated: subscription repos validated ⊆ the channel's granted repos (§18.2).
+- **New public inbound route** (`/slack/interactions`) — same `v0` signature + replay-window verification as the existing routes; fails closed.
+- **Group over-grant** — a group's `trigger_rule`s apply to every member across every source. Accepted/By-design; bounded by admin authoring groups (`recommended`) and per-user forbid rules as the scalpel.
+
+Plus a `2.1` changelog row (identity map + permission groups + interactive notifications + `DeploySlack` retirement) and DF entries for identity resolution, the interactions route, and notification fan-out.
