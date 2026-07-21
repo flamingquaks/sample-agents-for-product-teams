@@ -226,9 +226,30 @@ Resources:
       AttributeDefinitions:
         - AttributeName: pk
           AttributeType: S
+        # Every fleet-config row carries a `kind` ("repo", "identity",
+        # "notif_sub", "trigger_rule", …). Every reader wants "all rows of one
+        # kind"; without an index they Scan the whole table + a `kind` filter,
+        # which reads (and bills) O(table) per call and grows with the entire
+        # fleet's data rather than the one kind. The kind-index turns each read
+        # into a Query bounded to that kind's rows. `pk` is the index sort key so
+        # team/channel-prefixed kinds (slack_channel, notif_sub) still range-Query
+        # by their `<kind>#<team>#…` pk prefix. Indexing the existing `kind`
+        # attribute directly needs no extra write — DynamoDB projects every item
+        # that has both key attributes, and all rows have `kind` + `pk`.
+        - AttributeName: kind
+          AttributeType: S
       KeySchema:
         - AttributeName: pk
           KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: kind-index
+          KeySchema:
+            - AttributeName: kind
+              KeyType: HASH
+            - AttributeName: pk
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
       Tags:
@@ -395,7 +416,7 @@ Resources:
           # reply.py mints per-owner GitHub App installation tokens (the shared
           # PAT was retired). The App id param + key secret ARN are unconditional
           # resources; the per-owner install record it reads lives in the
-          # fleet-config table (DynamoDBReadPolicy below). Registering the App
+          # fleet-config table (DynamoDBCrudPolicy below). Registering the App
           # (populating these) is a dashboard-only step — a documented prereq.
           GITHUB_APP_ID_PARAM: !Ref GitHubAppIdParam
           GITHUB_APP_PRIVATE_KEY_SECRET_ARN: !Ref GitHubAppPrivateKey
@@ -407,7 +428,13 @@ Resources:
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref AssignmentsTable
-        - DynamoDBReadPolicy:
+        # CRUD (not Read-only): besides reading trigger grants / install records,
+        # the router resolves the sender's cross-source identity on every dispatch
+        # (identity.py, spec §16) — a first touch writes an identity# row + a
+        # user_req# onboarding request, and enrichment/merge update or delete
+        # rows. With Read-only here the first dispatch from any new user would
+        # AccessDenied on PutItem and 500 instead of filing the onboarding request.
+        - DynamoDBCrudPolicy:
             TableName: !Ref FleetConfigTable
         - SSMParameterReadPolicy:
             ParameterName: !Sub sdlc-agents/${Stage}/registry
@@ -418,7 +445,7 @@ Resources:
         # GitHub App (reply.py): read the App private key + app-id to mint
         # per-owner installation tokens (the shared PAT was retired). The App
         # credential resources are unconditional; the per-owner install record
-        # read is already covered by DynamoDBReadPolicy on FleetConfigTable above.
+        # read is already covered by DynamoDBCrudPolicy on FleetConfigTable above.
         - Statement:
             - Effect: Allow
               Action: secretsmanager:GetSecretValue
@@ -533,6 +560,11 @@ Resources:
           GITHUB_WEBHOOK_SECRET_PARAM: !Sub /sdlc-agents/${Stage}/github-webhook-secret
           REGISTRY_PARAM: !Sub /sdlc-agents/${Stage}/registry
           FLEET_CONFIG_TABLE: !Ref FleetConfigTable
+          # notify.notify() (SCM event fan-out, spec §18.3) reads notif_sub rows
+          # from FLEET_CONFIG_TABLE and threads posts via the assignments table;
+          # STAGE names the per-workspace Slack bot-token SSM path (reply.py).
+          ASSIGNMENTS_TABLE: !Ref AssignmentsTable
+          STAGE: !Ref Stage
           GITHUB_APP_ID_PARAM: !Ref GitHubAppIdParam
           GITHUB_APP_PRIVATE_KEY_SECRET_ARN: !Ref GitHubAppPrivateKey
       Policies:
@@ -541,18 +573,24 @@ Resources:
         # Read the per-owner install records to mint context-enrichment tokens.
         - DynamoDBReadPolicy:
             TableName: !Ref FleetConfigTable
+        # SCM notifications (notify.notify) remember each PR/issue thread's parent
+        # ts in the assignments table so follow-ups collapse into one thread.
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AssignmentsTable
         - Statement:
             # Verify inbound HMAC signatures (webhook secret) + mint per-repo App
             # installation tokens for issue-context enrichment (app id + private
             # key) + read the agent registry to resolve @mentions to onboarded
-            # agents. ssm:PutParameter is intentionally NOT granted — the secret
-            # is written once by the admin manifest flow (github_client), not here.
+            # agents + read per-workspace Slack bot tokens for SCM notifications.
+            # ssm:PutParameter is intentionally NOT granted — the secret is
+            # written once by the admin manifest flow (github_client), not here.
             - Effect: Allow
               Action: ssm:GetParameter
               Resource:
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/github-webhook-secret
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/github-app-id
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/registry
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/slack/*
             - Effect: Allow
               Action: secretsmanager:GetSecretValue
               Resource: !Ref GitHubAppPrivateKey

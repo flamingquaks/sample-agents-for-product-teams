@@ -219,6 +219,44 @@ def _get_table():
     return _table
 
 
+# The GSI (template.yaml FleetConfigTable) that indexes every row's `kind`
+# attribute (partition) by `pk` (sort). Every "all rows of one kind" read goes
+# through it as a bounded Query instead of a full-table Scan + FilterExpression.
+KIND_INDEX = "kind-index"
+
+
+def _query_kind(kind: str, *, pk_prefix: str | None = None) -> list[dict]:
+    """All rows of one ``kind`` via the kind-index, draining every page.
+
+    ``pk_prefix`` (optional) range-narrows on the index sort key (``pk``) so e.g.
+    one workspace's ``slack_channel#<team>#…`` rows are read without touching the
+    other teams'. This is the single place the index name + paging live so a
+    change to either is one edit, not a hand-copied loop per lister that could
+    drift and silently drop rows past the first 1 MB page.
+    """
+    table = _get_table()
+    rows: list[dict] = []
+    start_key = None
+    while True:
+        kwargs: dict = {
+            "IndexName": KIND_INDEX,
+            "KeyConditionExpression": "#k = :k",
+            "ExpressionAttributeNames": {"#k": "kind"},
+            "ExpressionAttributeValues": {":k": kind},
+        }
+        if pk_prefix:
+            kwargs["KeyConditionExpression"] = "#k = :k AND begins_with(pk, :p)"
+            kwargs["ExpressionAttributeValues"][":p"] = pk_prefix
+        if start_key:
+            kwargs["ExclusiveStartKey"] = start_key
+        resp = table.query(**kwargs)
+        rows.extend(resp.get("Items", []))
+        start_key = resp.get("LastEvaluatedKey")
+        if not start_key:
+            break
+    return rows
+
+
 def _normalize_repo(repo: str) -> str:
     """Canonical repo form: trimmed + lowercased. GitHub owner/repo is
     case-insensitive, so we store one canonical casing. This keeps every
@@ -256,26 +294,7 @@ def get_settings() -> dict:
 
 def list_repos() -> list[dict]:
     """All onboarded repo records, newest first (by onboarded_at)."""
-    # A Query on a constant would need a GSI; the repo set is small (an admin
-    # onboards a handful), so a Scan filtered to repo records is fine here. We
-    # still page on LastEvaluatedKey: a single scan() returns only the first 1MB
-    # page, and silently dropping repos past it would omit them from both the
-    # admin listing and the Cedar allowlist (allowed_repos builds on this).
-    table = _get_table()
-    repos: list[dict] = []
-    start_key = None
-    while True:
-        kwargs = {
-            "FilterExpression": "kind = :k",
-            "ExpressionAttributeValues": {":k": "repo"},
-        }
-        if start_key:
-            kwargs["ExclusiveStartKey"] = start_key
-        resp = table.scan(**kwargs)
-        repos.extend(resp.get("Items", []))
-        start_key = resp.get("LastEvaluatedKey")
-        if not start_key:
-            break
+    repos = _query_kind("repo")
     repos.sort(key=lambda r: r.get("onboarded_at", 0), reverse=True)
     return repos
 
@@ -424,24 +443,10 @@ def _capability_pk(agent_id: str) -> str:
 
 
 def list_capabilities() -> list[dict]:
-    """All onboarded capability records, newest first (by onboarded_at). Pages on
-    LastEvaluatedKey for the same reason list_repos does — a dropped row would be
-    silently missing from both the admin listing and the rendered registry."""
-    table = _get_table()
-    caps: list[dict] = []
-    start_key = None
-    while True:
-        kwargs = {
-            "FilterExpression": "kind = :k",
-            "ExpressionAttributeValues": {":k": "capability"},
-        }
-        if start_key:
-            kwargs["ExclusiveStartKey"] = start_key
-        resp = table.scan(**kwargs)
-        caps.extend(resp.get("Items", []))
-        start_key = resp.get("LastEvaluatedKey")
-        if not start_key:
-            break
+    """All onboarded capability records, newest first (by onboarded_at). A dropped
+    row would be silently missing from both the admin listing and the rendered
+    registry, so the kind-index Query drains every page."""
+    caps = _query_kind("capability")
     caps.sort(key=lambda c: c.get("onboarded_at", 0), reverse=True)
     return caps
 
@@ -793,23 +798,9 @@ def _slack_bot_token_param(stage: str, team_id: str) -> str:
 
 
 def list_slack_workspaces() -> list[dict]:
-    """All onboarded Slack workspace records, newest first. Paged like list_repos
-    so a large fleet never silently drops a workspace from the admin listing."""
-    table = _get_table()
-    rows: list[dict] = []
-    start_key = None
-    while True:
-        kwargs = {
-            "FilterExpression": "kind = :k",
-            "ExpressionAttributeValues": {":k": "slack_workspace"},
-        }
-        if start_key:
-            kwargs["ExclusiveStartKey"] = start_key
-        resp = table.scan(**kwargs)
-        rows.extend(resp.get("Items", []))
-        start_key = resp.get("LastEvaluatedKey")
-        if not start_key:
-            break
+    """All onboarded Slack workspace records, newest first (kind-index Query,
+    drained across pages so a large fleet never drops a workspace)."""
+    rows = _query_kind("slack_workspace")
     rows.sort(key=lambda r: r.get("onboarded_at", 0), reverse=True)
     return rows
 
@@ -894,24 +885,11 @@ def _slack_chan_pk(team_id: str, channel_id: str) -> str:
 
 
 def list_channels(team_id: str) -> list[dict]:
-    """All channel-policy rows for a workspace. The set is small (an admin lists a
-    handful), and we query by pk prefix via a filtered scan; paged for safety."""
-    table = _get_table()
+    """All channel-policy rows for a workspace — a kind-index Query range-narrowed
+    to this team's ``slack_chan#<team>#…`` pk prefix, so it reads only this
+    workspace's channels rather than every team's."""
     prefix = f"{_SLACK_CHAN_PK_PREFIX}{team_id}#"
-    rows: list[dict] = []
-    start_key = None
-    while True:
-        kwargs = {
-            "FilterExpression": "kind = :k AND begins_with(pk, :p)",
-            "ExpressionAttributeValues": {":k": "slack_channel", ":p": prefix},
-        }
-        if start_key:
-            kwargs["ExclusiveStartKey"] = start_key
-        resp = table.scan(**kwargs)
-        rows.extend(resp.get("Items", []))
-        start_key = resp.get("LastEvaluatedKey")
-        if not start_key:
-            break
+    rows = _query_kind("slack_channel", pk_prefix=prefix)
     rows.sort(key=lambda r: r.get("channel_id", ""))
     return rows
 
@@ -991,22 +969,8 @@ def valid_rule_shape(
 
 def list_trigger_rules(connector: str | None = None) -> list[dict]:
     """All trigger rules, or just one connector's (per-connector listing). Newest
-    first. Paged so no rule is silently dropped from the admin UI or a sync."""
-    table = _get_table()
-    rows: list[dict] = []
-    start_key = None
-    while True:
-        kwargs = {
-            "FilterExpression": "kind = :k",
-            "ExpressionAttributeValues": {":k": "trigger_rule"},
-        }
-        if start_key:
-            kwargs["ExclusiveStartKey"] = start_key
-        resp = table.scan(**kwargs)
-        rows.extend(resp.get("Items", []))
-        start_key = resp.get("LastEvaluatedKey")
-        if not start_key:
-            break
+    first. kind-index Query drains every page so no rule is silently dropped."""
+    rows = _query_kind("trigger_rule")
     if connector is not None:
         rows = [r for r in rows if r.get("connector") == connector]
     rows.sort(key=lambda r: r.get("created_at", 0), reverse=True)
@@ -1094,22 +1058,8 @@ def _channel_request_pk(request_id: str) -> str:
 
 def list_channel_requests(status: str | None = None) -> list[dict]:
     """All channel onboarding requests, or just those in ``status``. Newest first.
-    Paged so a pending request is never silently dropped from the admin queue."""
-    table = _get_table()
-    rows: list[dict] = []
-    start_key = None
-    while True:
-        kwargs = {
-            "FilterExpression": "kind = :k",
-            "ExpressionAttributeValues": {":k": "channel_request"},
-        }
-        if start_key:
-            kwargs["ExclusiveStartKey"] = start_key
-        resp = table.scan(**kwargs)
-        rows.extend(resp.get("Items", []))
-        start_key = resp.get("LastEvaluatedKey")
-        if not start_key:
-            break
+    kind-index Query drains every page so a pending request is never dropped."""
+    rows = _query_kind("channel_request")
     if status is not None:
         rows = [r for r in rows if r.get("status") == status]
     rows.sort(key=lambda r: r.get("created_at", 0), reverse=True)
@@ -1252,31 +1202,6 @@ def get_identity(identity_id: str) -> dict | None:
     return resp.get("Item")
 
 
-def find_identity_by_handle(source: str, handle: str, workspace: str = "") -> dict | None:
-    """The identity carrying ``source``'s ``handle`` (per-workspace for slack), or
-    None. Filtered scan over the identity set (small; cached in the dispatch
-    reader). The handle is matched against the record's ``handle_keys`` list — a
-    denormalized set of every namespaced handle the record owns, maintained on
-    every write so this lookup is a single membership test."""
-    key = _handle_key(source, handle, workspace)
-    for rec in list_identities():
-        if key in (rec.get("handle_keys") or []):
-            return rec
-    return None
-
-
-def find_identity_by_email(email: str) -> dict | None:
-    """The identity with this (normalized) email, or None. Email is the golden
-    join id — used for auto-merge on an email match (§16.5)."""
-    norm = _norm_email(email)
-    if not norm:
-        return None
-    for rec in list_identities():
-        if _norm_email(rec.get("email", "")) == norm:
-            return rec
-    return None
-
-
 def _rebuild_handle_keys(handles: dict) -> list[str]:
     """Flatten a ``handles`` map into the denormalized ``handle_keys`` list used
     for O(1)-ish handle membership tests. slack is a {team: uid} sub-map."""
@@ -1306,8 +1231,9 @@ def put_identity(
     """Create or replace an identity record. Generates an ``identity_id`` when
     none is given. Normalizes email, validates group ids, and rebuilds the
     denormalized ``handle_keys``. Preserves ``created_at``/``created_from`` on an
-    update. Prefer ``upsert_identity`` for the get-or-create + enrich path (§16.3)
-    — this is the low-level replace used by the admin proactive-create."""
+    update. This is the admin proactive-create path (an admin-supplied, trusted
+    email); the get-or-create-on-touch enrich path lives on the dispatch side
+    (``identity.resolve``), which owns the runtime identity map."""
     if status not in IDENTITY_STATUSES:
         raise ValueError(f"invalid identity status {status!r}")
     for g in groups or []:
@@ -1339,131 +1265,6 @@ def put_identity(
     }
     _get_table().put_item(Item=item)
     return item
-
-
-def upsert_identity(
-    *,
-    source: str,
-    handle: str,
-    workspace: str = "",
-    email: str = "",
-    display_name: str = "",
-    status: str = IDENTITY_PENDING,
-    created_from: dict | None = None,
-) -> tuple[dict, bool]:
-    """Get-or-create + progressively enrich an identity from a source touch
-    (spec §16.3). Returns ``(identity, created)``.
-
-    Resolution order: by handle, then (if a new email is supplied) by email —
-    the latter is the auto-merge-on-email-match signal (§16.5). On a hit, any
-    new handle/email/display_name is backfilled additively; an existing verified
-    handle is never overwritten by an unverified touch. On a miss, a NEW record
-    is created with whatever is known, ``status`` (default pending), and the
-    source touch stamped in ``created_from``.
-
-    A ``handle`` that resolves to record A while ``email`` resolves to record B
-    triggers a merge of B into A (fold handles + email, record ``merged_from``).
-    """
-    if source not in IDENTITY_SOURCES:
-        raise ValueError(f"invalid identity source {source!r}")
-    if not (handle or "").strip():
-        raise ValueError("handle is required")
-    norm_email = _norm_email(email)
-
-    by_handle = find_identity_by_handle(source, handle, workspace)
-    by_email = find_identity_by_email(norm_email) if norm_email else None
-
-    if by_handle and by_email and by_handle["identity_id"] != by_email["identity_id"]:
-        # Same person reached us under two records (an email-less handle touch
-        # earlier, an email touch now). Merge the email record INTO the handle
-        # record — keep the older created_at, union handles/groups, audit it.
-        merged = _merge_identities(keep=by_handle, drop=by_email)
-        return merged, False
-
-    rec = by_handle or by_email
-    if rec is None:
-        # First touch — create with what we have.
-        handles: dict = {}
-        if source == "slack":
-            handles["slack"] = {workspace: handle}
-        else:
-            handles[source] = handle
-        created = put_identity(
-            email=norm_email,
-            display_name=display_name,
-            handles=handles,
-            status=status,
-            created_from=created_from or {"source": source, "handle": handle, "at": int(time.time())},
-        )
-        return created, True
-
-    # Hit — backfill additively.
-    handles = dict(rec.get("handles") or {})
-    changed = False
-    if source == "slack":
-        slack_map = dict(handles.get("slack") or {})
-        if slack_map.get(workspace) != handle:
-            slack_map[workspace] = handle
-            handles["slack"] = slack_map
-            changed = True
-    elif handles.get(source) != handle:
-        handles[source] = handle
-        changed = True
-    new_email = rec.get("email") or norm_email
-    if new_email != rec.get("email"):
-        changed = True
-    new_name = rec.get("display_name") or display_name
-    if new_name != rec.get("display_name"):
-        changed = True
-    if not changed:
-        return rec, False
-    updated = put_identity(
-        identity_id=rec["identity_id"],
-        email=new_email,
-        display_name=new_name,
-        handles=handles,
-        groups=rec.get("groups", []),
-        verified=rec.get("verified", {}),
-        status=rec.get("status", status),
-    )
-    return updated, False
-
-
-def _merge_identities(*, keep: dict, drop: dict) -> dict:
-    """Fold identity ``drop`` into ``keep``: union handles + groups, prefer
-    ``keep``'s email/status, record the merge in ``merged_from``, then delete the
-    ``drop`` row. Returns the surviving record (§16.5)."""
-    handles = dict(keep.get("handles") or {})
-    for source, val in (drop.get("handles") or {}).items():
-        if source == "slack" and isinstance(val, dict):
-            slack_map = dict(handles.get("slack") or {})
-            for team, uid in val.items():
-                slack_map.setdefault(team, uid)
-            handles["slack"] = slack_map
-        else:
-            handles.setdefault(source, val)
-    groups = sorted({*keep.get("groups", []), *drop.get("groups", [])})
-    verified = {**(drop.get("verified") or {}), **(keep.get("verified") or {})}
-    merged_from = list(keep.get("merged_from", [])) + [drop["identity_id"]]
-    survivor = put_identity(
-        identity_id=keep["identity_id"],
-        email=keep.get("email") or drop.get("email", ""),
-        display_name=keep.get("display_name") or drop.get("display_name", ""),
-        handles=handles,
-        groups=groups,
-        verified=verified,
-        status=keep.get("status", IDENTITY_PENDING),
-        onboarded_by=keep.get("onboarded_by", ""),
-    )
-    # Preserve the merge audit trail (put_identity carried keep's merged_from).
-    _get_table().update_item(
-        Key={"pk": _identity_pk(keep["identity_id"])},
-        UpdateExpression="SET merged_from = :m",
-        ExpressionAttributeValues={":m": merged_from},
-    )
-    delete_identity(drop["identity_id"])
-    survivor["merged_from"] = merged_from
-    return survivor
 
 
 def set_identity_status(identity_id: str, status: str) -> None:
@@ -1753,23 +1554,9 @@ def delete_notif_sub(team_id: str, channel_id: str) -> bool:
 
 
 def _scan_kind(kind: str, *, sort_key: str) -> list[dict]:
-    """Paged scan of all rows of one ``kind``, sorted DESC by ``sort_key`` (0 when
-    absent). Shared by the Part II listers — same paged-scan discipline as
-    list_repos/list_capabilities so a >1MB page never silently drops a row."""
-    table = _get_table()
-    rows: list[dict] = []
-    start_key = None
-    while True:
-        kwargs = {
-            "FilterExpression": "kind = :k",
-            "ExpressionAttributeValues": {":k": kind},
-        }
-        if start_key:
-            kwargs["ExclusiveStartKey"] = start_key
-        resp = table.scan(**kwargs)
-        rows.extend(resp.get("Items", []))
-        start_key = resp.get("LastEvaluatedKey")
-        if not start_key:
-            break
+    """All rows of one ``kind`` via the kind-index, sorted DESC by ``sort_key``
+    (0 when absent). Shared by the Part II listers — the bounded Query drains
+    every page so a >1MB result never silently drops a row."""
+    rows = _query_kind(kind)
     rows.sort(key=lambda r: r.get(sort_key, 0) or 0, reverse=True)
     return rows

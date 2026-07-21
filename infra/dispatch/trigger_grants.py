@@ -38,9 +38,7 @@ from dataclasses import dataclass, field
 
 import boto3
 
-_TRIGGER_RULE_PK_PREFIX = "trigger_rule#"
-_SLACK_WS_PK_PREFIX = "slack_ws#"
-_SLACK_CHAN_PK_PREFIX = "slack_chan#"
+import config_query
 
 # Mirror config_store.CHANNEL_POLICY_* / CHANNEL_MODE_* (schema contract).
 CHANNEL_POLICY_ALLOWLIST = "allowlist"
@@ -86,33 +84,23 @@ def _get_table():
 def _load_snapshot() -> dict:
     """Read the trigger rules + Slack workspace/channel rows from DynamoDB.
 
-    Paged on LastEvaluatedKey: a single scan() returns only the first 1MB page,
-    and a dropped rule/channel would silently change an authorization decision —
-    a granted user would be denied, or a denied channel would be allowed. So we
-    always drain every page (mirrors fleet_config._load_snapshot)."""
-    table = _get_table()
-    rules: list[dict] = []
+    One bounded Query per kind on the kind-index (each drained across pages — a
+    dropped rule/channel would silently change an authorization decision: a
+    granted user denied, or a denied channel allowed). Unlike the previous
+    full-table Scan, this reads only the three authz kinds, not every config row
+    (mirrors fleet_config._load_snapshot)."""
+    rules = config_query.query_kind("trigger_rule")
     workspaces: dict[str, dict] = {}
+    for item in config_query.query_kind("slack_workspace"):
+        tid = str(item.get("team_id", ""))
+        if tid:
+            workspaces[tid] = item
     channels: dict[tuple, dict] = {}
-    start_key = None
-    while True:
-        resp = table.scan(ExclusiveStartKey=start_key) if start_key else table.scan()
-        for item in resp.get("Items", []):
-            pk = str(item.get("pk", ""))
-            if pk.startswith(_TRIGGER_RULE_PK_PREFIX):
-                rules.append(item)
-            elif pk.startswith(_SLACK_WS_PK_PREFIX):
-                tid = str(item.get("team_id", ""))
-                if tid:
-                    workspaces[tid] = item
-            elif pk.startswith(_SLACK_CHAN_PK_PREFIX):
-                tid = str(item.get("team_id", ""))
-                cid = str(item.get("channel_id", ""))
-                if tid and cid:
-                    channels[(tid, cid)] = item
-        start_key = resp.get("LastEvaluatedKey")
-        if not start_key:
-            break
+    for item in config_query.query_kind("slack_channel"):
+        tid = str(item.get("team_id", ""))
+        cid = str(item.get("channel_id", ""))
+        if tid and cid:
+            channels[(tid, cid)] = item
     return {"rules": rules, "workspaces": workspaces, "channels": channels}
 
 

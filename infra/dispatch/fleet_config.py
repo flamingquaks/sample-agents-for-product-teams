@@ -37,6 +37,8 @@ import time
 
 import boto3
 
+import config_query
+
 _REPO_PK_PREFIX = "repo#"
 _OWNER_PK_PREFIX = "owner#"
 _SETTINGS_PK = "settings"
@@ -65,32 +67,23 @@ def _get_table():
 
 
 def _load_snapshot() -> dict:
-    """Read the full config (settings + repo records) from DynamoDB.
+    """Read the config (settings + repo records) from DynamoDB.
 
-    The table is small (a handful of repos + one settings row), so a Scan is
-    cheaper than the GSI a constant-PK Query would need. We page on
-    LastEvaluatedKey regardless: a single scan() returns only the first 1MB
-    page, and a repo (or the settings row) beyond it would silently drop out of
-    the allowlist — a legitimately onboarded repo would then be rejected as "not
-    onboarded", or a missed settings row would default restrict_repos to False.
+    Repo rows come from a single bounded Query on the kind-index (drained across
+    pages — a dropped repo would be wrongly rejected as "not onboarded"); the
+    settings row is a direct key get (its pk is a known constant). Neither reads
+    the rest of the table's kinds, unlike the previous full-table Scan.
     """
     table = _get_table()
     settings = {"restrict_repos": False}
+    settings_item = table.get_item(Key={"pk": _SETTINGS_PK}).get("Item")
+    if settings_item:
+        settings = {"restrict_repos": bool(settings_item.get("restrict_repos", False))}
     repos: dict[str, dict] = {}
-    start_key = None
-    while True:
-        resp = table.scan(ExclusiveStartKey=start_key) if start_key else table.scan()
-        for item in resp.get("Items", []):
-            pk = str(item.get("pk", ""))
-            if pk == _SETTINGS_PK:
-                settings = {"restrict_repos": bool(item.get("restrict_repos", False))}
-            elif pk.startswith(_REPO_PK_PREFIX):
-                repo = str(item.get("repo", "")).strip()
-                if repo:
-                    repos[repo.casefold()] = item
-        start_key = resp.get("LastEvaluatedKey")
-        if not start_key:
-            break
+    for item in config_query.query_kind("repo"):
+        repo = str(item.get("repo", "")).strip()
+        if repo:
+            repos[repo.casefold()] = item
     return {"settings": settings, "repos": repos}
 
 

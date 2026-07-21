@@ -29,6 +29,7 @@ import time
 
 import boto3
 
+import config_query
 import identity as identity_map
 import reply
 
@@ -46,18 +47,10 @@ _SEVERITY_RANK = {TIER_INFORMATIVE: 0, TIER_ACTIONABLE: 1, TIER_ERROR: 2}
 _NOTIF_SUB_PK_PREFIX = "notif_sub#"
 _THREAD_PK_PREFIX = "notif_thread#"
 
-_table = None
 _assignments = None
 _cache = None  # list of notif_sub records
 _cache_expires_at = 0.0
 _CACHE_TTL_SECONDS = 30
-
-
-def _config_table():
-    global _table
-    if _table is None:
-        _table = boto3.resource("dynamodb").Table(os.environ["FLEET_CONFIG_TABLE"])
-    return _table
 
 
 def _assignments_table():
@@ -73,22 +66,7 @@ def _subs_snapshot(now: float | None = None) -> list[dict]:
     global _cache, _cache_expires_at
     current = time.time() if now is None else now
     if _cache is None or current >= _cache_expires_at:
-        table = _config_table()
-        rows: list[dict] = []
-        start_key = None
-        while True:
-            kwargs = {
-                "FilterExpression": "kind = :k",
-                "ExpressionAttributeValues": {":k": "notif_sub"},
-            }
-            if start_key:
-                kwargs["ExclusiveStartKey"] = start_key
-            resp = table.scan(**kwargs)
-            rows.extend(resp.get("Items", []))
-            start_key = resp.get("LastEvaluatedKey")
-            if not start_key:
-                break
-        _cache = rows
+        _cache = config_query.query_kind("notif_sub")
         _cache_expires_at = current + _CACHE_TTL_SECONDS
     return _cache
 
@@ -154,21 +132,24 @@ def _remember_thread_ts(team_id: str, channel_id: str, unit: str, ts: str) -> No
         logger.exception("failed to remember thread ts for %s", unit)
 
 
-def _mention_for(actor: dict, team_id: str) -> str:
-    """Render an @mention for ``actor`` in ``team_id`` via the identity map, or ''
-    if unresolvable (degrade to an unmentioned post — never mis-ping, §18.4).
-
-    ``actor`` is ``{"source": ..., "handle": ..., "workspace": ...}`` — e.g. the
-    GitHub login of a PR author, or a Slack uid. We resolve the person, then find
-    THEIR slack handle in THIS workspace."""
+def _resolve_actor_identity_id(actor: dict | None) -> str:
+    """Resolve ``actor`` (``{source, handle, workspace}``) to an identity_id once,
+    independent of any workspace — the per-workspace Slack uid is looked up later.
+    '' if unresolvable (the caller degrades to an unmentioned post, §18.4)."""
     if not actor:
         return ""
     person = identity_map.find_by_handle(
         actor.get("source", ""), actor.get("handle", ""), actor.get("workspace", "")
     )
-    if not person or not person.identity_id:
+    return person.identity_id if person and person.identity_id else ""
+
+
+def _mention_in(identity_id: str, team_id: str) -> str:
+    """Render an @mention for an already-resolved identity in ``team_id``, or ''
+    if that person has no Slack handle in this workspace (never mis-ping)."""
+    if not identity_id:
         return ""
-    uid = identity_map.slack_handle_for(person.identity_id, team_id)
+    uid = identity_map.slack_handle_for(identity_id, team_id)
     return f"<@{uid}>" if uid else ""
 
 
@@ -196,6 +177,12 @@ def notify(
     if tier not in TIERS:
         logger.warning("notify called with unknown tier %r", tier)
         return 0
+    # Resolve the actor→person ONCE (workspace-independent); inside the fan-out we
+    # only look up that person's Slack uid per workspace. Avoids re-scanning the
+    # identity set for the same actor on every subscribed channel.
+    actor_identity_id = (
+        _resolve_actor_identity_id(actor) if tier in MENTION_TIERS else ""
+    )
     posted = 0
     for sub in _subs_snapshot():
         if not _subscription_wants(sub, tier=tier, event=event, repo=repo):
@@ -205,8 +192,8 @@ def notify(
         body = text
         # Mentions only on actionable + error, and only if we can resolve the
         # person to a Slack user in THIS workspace.
-        if tier in MENTION_TIERS and actor:
-            mention = _mention_for(actor, team_id)
+        if actor_identity_id:
+            mention = _mention_in(actor_identity_id, team_id)
             if mention:
                 body = f"{mention} {text}"
         thread_ts = _get_thread_ts(team_id, channel_id, unit)

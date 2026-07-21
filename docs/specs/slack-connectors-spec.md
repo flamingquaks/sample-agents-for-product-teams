@@ -536,22 +536,33 @@ pk = identity#<uuid>            kind = "identity"
   merged_from:  [ "<identity_id>", ... ]        # audit trail of merges (§16.5)
 ```
 
-**Global secondary indexes** (resolution is O(1) from any direction):
-- `email → identity_id`
-- one handle GSI per source: `gsi_handle` on a synthesized `handle_key` attribute list — `github:jane-gh`, `asana:12009...`, `slack:T04:U123` — so a source resolver looks up by the exact namespaced handle it holds.
+**Reads (as built).** A single `kind-index` GSI (partition `kind`, sort `pk`)
+loads *all* identity rows in one bounded Query — not a full-table Scan — behind a
+short-TTL snapshot cache (§16, mirrors `fleet_config`/`trigger_grants`). Handle
+and email matches then run **in memory** over that cached snapshot: the
+denormalized `handle_keys` list (`github:jane-gh`, `asana:12009…`,
+`slack:T04:U123`) is a membership test, and email is a normalized-equality scan
+of the list. This keeps resolution off the per-dispatch DynamoDB path entirely
+(the snapshot serves many dispatches) while the kind-index bounds the periodic
+reload to the identity set rather than the whole config table. (An earlier draft
+proposed a per-source `gsi_handle` + an `email→identity_id` GSI for O(1) point
+lookups; the cached-snapshot + kind-index design was chosen instead — one index
+serves every kind, and the cache removes the point-lookup from the hot path.)
 
-### 16.3 The resolver — `identity.py` (shared by dispatch + dashboard)
+### 16.3 The resolver — `identity.resolve` (dispatch side)
+
+The get-or-create + enrich resolver lives on the **dispatch** side (`infra/dispatch/identity.py`), because that's where a source touch arrives. The dashboard never needs a runtime "someone just touched us" path — an admin either proactively creates an identity (`config_store.put_identity`) or mutates one through the narrow lifecycle helpers (`set_identity_groups` / `set_identity_status` / `set_identity_verified`) when approving an onboarding request. Both packages write the same `identity#` row shape (schema contract), so the earlier draft's single "shared by dispatch + dashboard" resolver collapsed to the one caller that exists.
 
 One function every source calls on the way in:
 
 ```
-resolve_identity(source, handle, known={email?, display_name?}, source_context={}) -> Identity
+resolve(source, handle, workspace="", email="", email_verified=False, display_name="") -> Identity
 ```
 
 Behavior:
-1. **Look up** the namespaced handle via `gsi_handle`.
-2. **Hit** → return it, and **backfill** any new identifiers in `known` that the record lacks (progressive enrichment — a GitHub-born record gains `slack` + `email` the first time the person speaks in Slack). Backfill of a *handle for a different source* is additive; backfill of an email that already keys a **different** record triggers a merge (§16.5).
-3. **Miss** → **get-or-create**: write a new `identity#<uuid>` with whatever `known` carries, `status = pending`, `created_from` stamped, and file a **user-onboarding request** (§16.4). Return the pending record.
+1. **Look up** the namespaced handle against the cached identity snapshot (loaded via the `kind-index` GSI, §16.2) — the denormalized `handle_keys` list makes this a membership test.
+2. **Hit** → return it, and **backfill** any newly-supplied handle/email/display_name the record lacks (progressive enrichment — a GitHub-born record gains `slack` + `email` the first time the person speaks in Slack). Backfill of a *handle for a different source* is additive; a **verified** email that already keys a **different** record triggers a merge (§16.5). An **unverified** email is dropped (never stored, never matched — §16.5 / T-42).
+3. **Miss** → **get-or-create**: write a new `identity#<uuid>` with whatever is known, `status = pending`, `created_from` stamped; the router then files a **user-onboarding request** (§16.4). Return the pending record.
 
 The resolver never assumes a dashboard/Cognito user exists — non-admins who never touch the dashboard still get a record on first touch from any source.
 
@@ -583,7 +594,7 @@ pk = user_req#<uuid>            kind = "user_request"
 
 Lazy creation from email-less sources means one person can spawn two records before we know they're the same (GitHub-first record with no email; later a Slack-first record with email). Reconciliation:
 
-- **Auto-merge on email match (high confidence):** when a resolve/backfill surfaces an email that already keys an `active` record, fold the two into one `identity_id`, union the handles, keep `merged_from` for audit. Email is the golden id, so an email collision is the strongest signal.
+- **Auto-merge on email match (high confidence):** when `identity.resolve` (dispatch) surfaces an email that already keys a different record, fold the two into one `identity_id`, union the handles, keep `merged_from` for audit. Email is the golden id, so an email collision is the strongest signal. **This fires only for a VERIFIED email** — the caller passes `email_verified=True`, asserting the address came from the platform's authenticated directory (Slack `users.info`, a signed GitHub/Asana event), never a user-editable profile field. An unverified email is dropped — never stored, never matched — so a caller can't plant a victim's address to inherit their identity's status + groups (T-42). The flag defaults `False` (fail-closed). (Admin identity creation on the dashboard uses `config_store.put_identity` with an admin-typed, trusted email — it doesn't go through this merge path.)
 - **Admin-reviewed merge (weaker signals):** a handle-only or display-name collision is surfaced in the dashboard for an admin to confirm (approve-as-new vs. link-into-existing) — this is also the natural moment at user-onboarding approval to show "likely matches."
 
 ### 16.6 Verification & authz trust
@@ -639,7 +650,7 @@ Block Kit actions (checkboxes, dropdowns, buttons) and modal submits (`view_subm
      - **Actionable** — an agent posted something a human should engage with: a decomposition/proposal awaiting approval, a PR that needs review, a question back to the requester. *(These mention people — §18.4.)*
      - **Informative** — no action needed: a run kicked off, a run completed cleanly, an agent picked up a task. *(No mention.)*
      - **Error** — something errored and may have stopped a flow/run: run failed, guardrail tripped, credential expired, assignment stuck.
-   - **Repo multi-select dropdown**, **bounded to the fleet's onboarded repos**. A Slack channel's access is expressed as agent-scoped `trigger_rule` grants, not a repo binding — there is no channel→repo edge in the data model — so the enforceable ceiling is "a repo the fleet manages." The subscription's `repos` is validated ⊆ that set at write time (admin API `_channel_granted_repos` **and** the Slack self-serve `save_subscription`), so a channel can never be notified about a repo the fleet doesn't manage. (A finer per-channel repo grant would need a new grant type + authz surface; deliberately not introduced.)
+   - **Repo multi-select dropdown**, **bounded to the fleet's onboarded repos**. A Slack channel's access is expressed as agent-scoped `trigger_rule` grants, not a repo binding — there is no channel→repo edge in the data model — so the enforceable ceiling is "a repo the fleet manages." The subscription's `repos` is validated ⊆ that set at write time (admin API `_channel_granted_repos` **and** the Slack self-serve `save_subscription`), so a channel can never be notified about a repo the fleet doesn't manage. (A finer per-channel repo grant would need a new grant type + authz surface; deliberately not introduced.) Each option's **`value` is the repo's list index, not its full name** — Slack caps an option value at 75 chars and a repo `owner/repo` can exceed that (which would make `views.open` fail outright); `build_notify_modal` stashes the ordered repo list in `private_metadata` and `parse_view_submission` maps the selected indices back, ignoring any that don't resolve (stale/tampered submit).
    - **Severity floor** (e.g. "error + actionable only, skip informative").
 3. `view_submission` → writes a `notif_sub#` row. Editing re-opens the modal pre-filled from the row.
 
@@ -679,13 +690,13 @@ The Connectors → Slack sub-page gains a read/edit view of channel subscription
 
 ## 20. New surfaces & threat-model deltas (Part II)
 
-**New/changed surfaces (as built):** `identity#` rows + `identity.py` resolver (dispatch) / `config_store` identity CRUD (dashboard) — keyed on a synthetic uuid with email as a join attribute + a denormalized `handle_keys` list; lookups are **filtered scans over the small identity set with a short-TTL cache** (matching the fleet-config single-`pk`, no-GSI convention — `fleet_config`/`trigger_grants`), not a GSI. `user_req#` rows + admin approval queue; `perm_group#` rows + group membership on identity + group-scoped `trigger_rule`s; `/slack/interactions` route + `slack_notify.py` modal builders; `notif_sub#` rows + `notify.py` fan-out from fleet events (SCM-event fan-out reuses the same `notify()` seam — the GitHub webhook hook is a follow-up); Slack scope `users:read.email` (already present) + manifest interactivity; **`DeploySlack` parameter + `SlackEnabled` condition removed** (receiver always deployed).
+**New/changed surfaces (as built):** `identity#` rows + `identity.py` resolver (dispatch) / `config_store` identity CRUD (dashboard) — keyed on a synthetic uuid with email as a join attribute + a denormalized `handle_keys` list; the identity set (and every other `kind`) is loaded via the **`kind-index` GSI** (partition `kind`, sort `pk`) as one bounded Query behind a short-TTL cache, then handle/email matched in memory — replacing the full-table `Scan`+filter the dispatch readers (`fleet_config`/`trigger_grants`) and admin listers previously used. The single paged-Query helper is `config_query.query_kind` (dispatch) / `config_store._query_kind` (dashboard). `user_req#` rows + admin approval queue; `perm_group#` rows + group membership on identity + group-scoped `trigger_rule`s; `/slack/interactions` route + `slack_notify.py` modal builders; `notif_sub#` rows + `notify.py` fan-out from fleet events (SCM-event fan-out reuses the same `notify()` seam — the GitHub webhook hook is a follow-up); Slack scope `users:read.email` (already present) + manifest interactivity; **`DeploySlack` parameter + `SlackEnabled` condition removed** (receiver always deployed).
 
 **Threat-model additions (landed in `docs/threat-model.md` v2.1 as C-20–C-22 + §3.10 T-41–T-45):**
 - **T-41 Identity-link spoofing** — a wrongly-claimed cross-source handle is impersonation. Mitigated: links are authz-load-bearing only when `verified`, and verification = admin approval (§16.6).
-- **T-42 Merge poisoning** — a bad auto-merge fuses two people. Partially mitigated: auto-merge only on exact email match (strongest signal); weaker signals go to admin review (§16.5); `merged_from` audit trail.
+- **T-42 Merge poisoning** — a bad auto-merge fuses two people. Mitigated: auto-merge only on an exact match of a **verified** email (`email_verified=True`; unverified emails are dropped, never stored or matched — §16.5), so a caller can't forge a victim's address to inherit their identity; weaker signals go to admin review; `merged_from` audit trail.
 - **T-43 Notification-scope leak** — a channel subscribing to a repo it shouldn't see. Mitigated: subscription repos validated ⊆ the fleet's onboarded repos, in both the admin API and the Slack self-serve path (§18.2).
 - **T-44 New public inbound route** (`/slack/interactions`) — same `v0` signature + replay-window verification as the existing routes; fails closed; target channel from server-set `private_metadata`.
 - **T-45 Group over-grant** — a group's `trigger_rule`s apply to every member across every source. Accepted/By-design; bounded by admin authoring groups (`recommended`) and per-user forbid rules (forbid-wins) as the scalpel.
 
-The `2.1` changelog row + these C/T entries are in the threat model, along with DF-21–DF-25 (identity resolution, onboarding reject, the `/sdlc-notify` modal write, SCM fan-out, and the assignments-stream notifier). **All of Part II's fan-out sources are now wired:** the Router emits dispatch-time events directly, the GitHub webhook emits SCM events (PR opened/merged/review-requested, issue opened — the App manifest subscribes to `pull_request` + `issues`), and a DynamoDB **stream** on the assignments table drives the `assignment-notifier` Lambda for agent-side `completed`/`failed`/`awaiting_approval` (so agents stay credential-free). Notification repo scope is bounded to the fleet's onboarded repos — the enforceable ceiling, since a Slack channel has no repo binding in the data model (§18.2).
+The `2.1` changelog row + these C/T entries are in the threat model, along with DF-21–DF-25 (identity resolution, onboarding reject, the `/sdlc-notify` modal write, SCM fan-out, and the assignments-stream notifier). **All of Part II's fan-out sources are now wired, and their event sets are disjoint so nothing double-notifies:** the Router emits only its dispatch-time events directly (`run_started`, `guardrail_tripped`), the GitHub webhook emits SCM events (PR opened/merged/review-requested, issue opened — the App manifest subscribes to `pull_request` + `issues`), and a DynamoDB **stream** on the assignments table drives the `assignment-notifier` Lambda for every terminal/agent-side status transition — `completed`/`failed`/`awaiting_approval` (so agents stay credential-free). `run_failed` in particular is owned by the stream Lambda: the Router's invoke-failure path writes `status='failed'` (which the stream turns into the notification) but does **not** re-emit the event itself. Notification repo scope is bounded to the fleet's onboarded repos — the enforceable ceiling, since a Slack channel has no repo binding in the data model (§18.2).

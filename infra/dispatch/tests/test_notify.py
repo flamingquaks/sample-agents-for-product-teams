@@ -26,13 +26,31 @@ os.environ["ASSIGNMENTS_TABLE"] = ASSIGN_TABLE
 
 def _make_tables():
     ddb = boto3.client("dynamodb", region_name=REGION)
-    for name in (CONFIG_TABLE, ASSIGN_TABLE):
-        ddb.create_table(
-            TableName=name,
-            BillingMode="PAY_PER_REQUEST",
-            AttributeDefinitions=[{"AttributeName": "pk" if name == CONFIG_TABLE else "assignment_id", "AttributeType": "S"}],
-            KeySchema=[{"AttributeName": "pk" if name == CONFIG_TABLE else "assignment_id", "KeyType": "HASH"}],
-        )
+    ddb.create_table(
+        TableName=CONFIG_TABLE,
+        BillingMode="PAY_PER_REQUEST",
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "kind", "AttributeType": "S"},
+        ],
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": "kind-index",
+                "KeySchema": [
+                    {"AttributeName": "kind", "KeyType": "HASH"},
+                    {"AttributeName": "pk", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        ],
+    )
+    ddb.create_table(
+        TableName=ASSIGN_TABLE,
+        BillingMode="PAY_PER_REQUEST",
+        AttributeDefinitions=[{"AttributeName": "assignment_id", "AttributeType": "S"}],
+        KeySchema=[{"AttributeName": "assignment_id", "KeyType": "HASH"}],
+    )
 
 
 def _sub(table, *, team="T0ACME01", channel="C0ENG001", repos=None, tiers=None, min_severity="informative"):

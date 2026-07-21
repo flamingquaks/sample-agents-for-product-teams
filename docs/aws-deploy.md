@@ -72,9 +72,10 @@ Deployed once per stage with `sam deploy`. Creates:
 | Resource | Logical name | Purpose |
 |---|---|---|
 | DynamoDB table | `dispatch-assignments-${Stage}` | Assignment tracking (PK `assignment_id`; GSIs on `agent_id+status`, `source+created_at`); 30-day TTL |
+| DynamoDB table | `fleet-config-${Stage}` | Runtime config + authz data (PK `pk`; every row tagged with a `kind`). `kind-index` GSI (partition `kind`, sort `pk`) so each "all rows of one kind" read — repos, identities, trigger rules, Slack workspaces/channels, notif subs — is a bounded Query, not a full-table Scan. PITR on |
 | S3 bucket | `sdlc-agent-artifacts-${AWS::AccountId}-${Stage}` | Agent output artifacts (screenshots, test results); SSE-AES256; lifecycle rules on `screenshots/` (90d) and `test-results/` (180d) |
 | Lambda | `dispatch-router-${Stage}` | Parses `@mentions`, authorizes the trigger via AVP, invokes the right AgentCore Runtime, writes assignment to DynamoDB |
-| Lambda | `github-webhook-${Stage}` | Verifies the GitHub App `X-Hub-Signature-256`, resolves the mention, invokes Dispatch Router async |
+| Lambda | `github-webhook-${Stage}` | Verifies the GitHub App `X-Hub-Signature-256`, resolves the mention, invokes Dispatch Router async, and fans SCM events (PR opened/merged/review-requested, issue opened) out to subscribed Slack channels via `notify.py` (reads the per-workspace Slack bot token from `/sdlc-agents/${Stage}/slack/*`; threads posts via the assignments table) |
 | Lambda | `asana-webhook-${Stage}` | Verifies Asana webhook signatures, normalizes events, invokes Dispatch Router async |
 | Lambda | `slack-webhook-${Stage}` | Always deployed. Verifies the Slack `v0` signature (±5-min replay window), serves `/slack/events`, `/slack/commands`, and `/slack/interactions` (the `/sdlc-notify` modal), dedups `event_id`, invokes Dispatch Router async. Inert until an admin onboards a workspace |
 | API Gateway | `WebhookApi` | Fronts the webhook Lambdas at `/github/webhook`, `/asana/webhook`, and (when Slack is enabled) `/slack/events` + `/slack/commands` |
@@ -233,7 +234,7 @@ Populated out-of-band by `scripts/bootstrap_slack.py` (which also registers the 
 | Parameter | Level | Written by | Consumed by |
 |---|---|---|---|
 | `/sdlc-agents/${Stage}/slack/signing-secret` | **App-level** (one per Slack app; the `url_verification` handshake carries no team scope, so verification can't depend on a `team_id`) | `scripts/bootstrap_slack.py` | `slack-webhook-${Stage}` Lambda (signature verify) |
-| `/sdlc-agents/${Stage}/slack/<team_id>/bot-token` | **Per-workspace/installation** (`xoxb-…`) | `scripts/bootstrap_slack.py` (once per onboarded workspace) | `reply.post_slack_message` (agent/router replies to Slack) |
+| `/sdlc-agents/${Stage}/slack/<team_id>/bot-token` | **Per-workspace/installation** (`xoxb-…`) | `scripts/bootstrap_slack.py` (once per onboarded workspace) | `reply.post_slack_message` — used by the Dispatch Router (replies + fleet-event notifications), the `github-webhook` Lambda (SCM notifications), and the `assignment-notifier` Lambda (terminal-status notifications), all via `notify.py`/`reply.py` |
 
 Both are fetched per-invocation and never held on a module global. The receiver Lambda's IAM grants `ssm:GetParameter` on `/sdlc-agents/${Stage}/slack/*` only; it cannot write them. A workspace is not live until (a) its bot token is in SSM and (b) an admin has onboarded it (an enabled, active `slack_workspace` row) in the dashboard Connectors → Slack panel. (The receiver Lambda itself is always deployed — there's no deploy flag.)
 

@@ -25,6 +25,8 @@ import time
 import boto3
 import requests
 
+import config_query
+
 logger = logging.getLogger(__name__)
 
 SLACK_API = "https://slack.com/api"
@@ -100,10 +102,17 @@ def _tier_block(tier: str) -> dict:
 def build_notify_modal(*, team_id: str, channel_id: str, channel_name: str, repos: list[str]) -> dict:
     """The Block Kit view for `/sdlc-notify`. ``repos`` is the channel's grantable
     repo set (fleet-onboarded); rendered as a multi-select so the channel scopes
-    which repos' events it wants. ``private_metadata`` carries the team/channel so
-    the submit handler doesn't trust client-supplied ids."""
+    which repos' events it wants. ``private_metadata`` carries the team/channel
+    AND the ordered repo list so the submit handler doesn't trust client-supplied
+    ids and can map option values back to full repo names."""
+    # Slack caps an option's `value` at 75 chars; a repo full_name (owner/repo,
+    # up to ~100 chars) can exceed that and would make views.open fail outright.
+    # Use the repo's index as the value (always short) and resolve it back to the
+    # full name on submit via the repo list stashed in private_metadata.
+    shown = repos[:100]
     repo_options = [
-        {"text": {"type": "plain_text", "text": r[:75]}, "value": r} for r in repos[:100]
+        {"text": {"type": "plain_text", "text": r[:75]}, "value": str(i)}
+        for i, r in enumerate(shown)
     ]
     blocks = [
         {
@@ -142,7 +151,9 @@ def build_notify_modal(*, team_id: str, channel_id: str, channel_name: str, repo
     return {
         "type": "modal",
         "callback_id": NOTIFY_VIEW_CALLBACK,
-        "private_metadata": json.dumps({"team_id": team_id, "channel_id": channel_id, "channel_name": channel_name}),
+        "private_metadata": json.dumps(
+            {"team_id": team_id, "channel_id": channel_id, "channel_name": channel_name, "repos": shown}
+        ),
         "title": {"type": "plain_text", "text": "Fleet Notifications"},
         "submit": {"type": "plain_text", "text": "Save"},
         "close": {"type": "plain_text", "text": "Cancel"},
@@ -175,23 +186,13 @@ def open_modal(*, team_id: str, trigger_id: str, view: dict) -> bool:
 
 def onboarded_repos() -> list[str]:
     """The fleet's onboarded, enabled repos — the grantable notification scope
-    (§18.2). Read directly from the config table (small; only on modal open)."""
+    (§18.2). One bounded Query on the kind-index (not a full-table scan)."""
     try:
-        table = boto3.resource("dynamodb").Table(os.environ["FLEET_CONFIG_TABLE"])
-        rows: list[str] = []
-        start_key = None
-        while True:
-            kwargs = {"FilterExpression": "kind = :k", "ExpressionAttributeValues": {":k": "repo"}}
-            if start_key:
-                kwargs["ExclusiveStartKey"] = start_key
-            resp = table.scan(**kwargs)
-            for item in resp.get("Items", []):
-                if item.get("enabled") and item.get("repo"):
-                    rows.append(item["repo"])
-            start_key = resp.get("LastEvaluatedKey")
-            if not start_key:
-                break
-        return sorted(rows)
+        return sorted(
+            item["repo"]
+            for item in config_query.query_kind("repo")
+            if item.get("enabled") and item.get("repo")
+        )
     except Exception:  # noqa: BLE001
         logger.exception("could not list onboarded repos")
         return []
@@ -209,10 +210,24 @@ def parse_view_submission(view: dict) -> dict:
         pass
     state = (view.get("state") or {}).get("values") or {}
 
-    repos = []
+    # Option values are indices into the repo list stashed in private_metadata at
+    # build time (Slack caps option values at 75 chars, so we can't put the full
+    # repo name there). Map each selected index back to its repo name; ignore any
+    # index that doesn't resolve (stale/tampered submit).
+    meta_repos = meta.get("repos") or []
     repo_block = state.get("repos") or {}
     selected = (repo_block.get("selected") or {}).get("selected_options") or []
-    repos = [o.get("value") for o in selected if o.get("value")]
+    repos = []
+    for o in selected:
+        val = o.get("value")
+        if val is None:
+            continue
+        try:
+            idx = int(val)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= idx < len(meta_repos):
+            repos.append(meta_repos[idx])
 
     tiers: dict[str, list[str]] = {}
     for tier in ("actionable", "informative", "error"):

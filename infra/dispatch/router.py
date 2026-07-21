@@ -185,15 +185,22 @@ def _identity_source_and_handle(sender: str, source: str, source_context: dict) 
 
 def resolve_dispatch_identity(sender: str, source: str, source_context: dict):
     """Resolve (get-or-create + enrich) the person behind a dispatch. Returns an
-    identity_map.Identity. Slack/Asana touches carry an email we can seed; GitHub
-    org members are resolvable but we leave email discovery to onboarding. The
-    resolved email + groups feed authorization (traceability spine, §16.7)."""
+    identity_map.Identity. The resolved email + groups feed authorization
+    (traceability spine, §16.7).
+
+    A receiver may seed ``requester_email`` ONLY from the platform's
+    authenticated directory (e.g. Slack ``users.info``, a signed GitHub/Asana
+    event) and MUST then set ``requester_email_verified`` — email is the golden
+    join id, so an unverified address a caller could forge must not attach them
+    to another person's identity (T-42). No receiver seeds it today; the resolver
+    fails closed on the missing flag regardless."""
     id_source, handle, workspace = _identity_source_and_handle(sender, source, source_context)
     return identity_map.resolve(
         source=id_source,
         handle=handle,
         workspace=workspace,
         email=str(source_context.get("requester_email", "") or ""),
+        email_verified=bool(source_context.get("requester_email_verified", False)),
         display_name=str(source_context.get("sender_name", "") or ""),
     )
 
@@ -479,8 +486,13 @@ def _notify_fleet_event(
     right Slack user per workspace by the identity map. Repo scope is the GitHub
     repo when present (so repo-scoped subscriptions match)."""
     try:
+        # Pass the RAW sender (as resolve_dispatch_identity / ensure_user_request
+        # do). _identity_source_and_handle already namespaces internally; feeding
+        # it a pre-namespaced principal would double-prefix github/asana handles
+        # (github:github:<login>) so the identity-map @mention lookup never
+        # matches and error/actionable posts silently degrade to unmentioned.
         id_source, handle, workspace = _identity_source_and_handle(
-            namespaced_principal(sender, source), source, source_context
+            sender, source, source_context
         )
         notify.notify(
             tier=tier,
@@ -732,15 +744,12 @@ def handler(event, context):
         invoke_agent(agent_config, instruction, source, source_context, assignment_id)
     except Exception as e:
         logger.error("Failed to invoke agent %s: %s", agent_id, e)
+        # The dispatched→failed status write below is a DynamoDB MODIFY that the
+        # assignment-stream notifier maps to a run_failed fan-out (spec §18.1);
+        # emitting run_failed here too would double-notify subscribed channels.
+        # Terminal-status events belong to the stream notifier; the router only
+        # emits its own pre-dispatch events (run_started, guardrail_tripped).
         update_assignment(assignment_id, status="failed", result_summary=str(e))
-        _notify_fleet_event(
-            tier=notify.TIER_ERROR,
-            event="run_failed",
-            text=f"❌ @{agent_id} failed to start (assignment `{assignment_id}`).",
-            source=source,
-            sender=sender,
-            source_context={**source_context, "assignment_id": assignment_id},
-        )
         return _error(500, f"failed to invoke @{agent_id}: {e}")
 
     # Slack dispatches are async (the receiver already 200-acked), so unlike

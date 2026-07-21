@@ -116,6 +116,25 @@ def test_guardrail_error_posts_reply_and_returns_503(router):
     assert "blocked_guardrail_error" in joined
 
 
+def test_invoke_failure_does_not_directly_notify_run_failed(router):
+    # On an invoke failure the router writes status='failed' (a DynamoDB MODIFY
+    # the assignment-stream notifier turns into the run_failed fan-out). The
+    # router must NOT also emit run_failed itself, or subscribed channels get two
+    # identical error posts for one failure.
+    with patch("guardrail.check_prompt") as mock_check, \
+         patch.object(router, "invoke_agent", side_effect=RuntimeError("boom")), \
+         patch.object(router, "_notify_fleet_event") as mock_notify:
+        mock_check.return_value = MagicMock(outcome="passed", reason="")
+        resp = router.handler(_event_github(), None)
+    assert resp["statusCode"] == 500
+    # status='failed' was written (drives the stream notifier).
+    joined = "".join(str(c) for c in router.assignments_table.update_item.call_args_list)
+    assert "failed" in joined
+    # No run_failed emitted directly by the router.
+    events = [c.kwargs.get("event") for c in mock_notify.call_args_list]
+    assert "run_failed" not in events
+
+
 def test_reply_failure_does_not_revert_block(router):
     with patch("guardrail.check_prompt") as mock_check, \
          patch("reply.post_github_comment", return_value=False), \

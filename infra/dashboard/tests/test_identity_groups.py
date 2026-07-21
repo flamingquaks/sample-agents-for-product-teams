@@ -25,8 +25,21 @@ def _make_table():
     boto3.client("dynamodb", region_name=REGION).create_table(
         TableName=TABLE,
         BillingMode="PAY_PER_REQUEST",
-        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "kind", "AttributeType": "S"},
+        ],
         KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": "kind-index",
+                "KeySchema": [
+                    {"AttributeName": "kind", "KeyType": "HASH"},
+                    {"AttributeName": "pk", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        ],
     )
 
 
@@ -61,45 +74,6 @@ def test_put_and_get_identity(store):
     assert rec["email"] == "jane@acme.com"  # normalized
     assert "github:jane-gh" in rec["handle_keys"]
     assert store.get_identity(rec["identity_id"])["status"] == "pending"
-
-
-def test_find_identity_by_handle_and_email(store):
-    rec = store.put_identity(
-        email="jane@acme.com",
-        handles={"github": "jane-gh", "slack": {"T0ACME01": "U1"}},
-    )
-    assert store.find_identity_by_handle("github", "jane-gh")["identity_id"] == rec["identity_id"]
-    assert store.find_identity_by_handle("slack", "U1", "T0ACME01")["identity_id"] == rec["identity_id"]
-    assert store.find_identity_by_email("jane@acme.com")["identity_id"] == rec["identity_id"]
-    assert store.find_identity_by_handle("github", "someone-else") is None
-
-
-def test_upsert_identity_create_then_enrich(store):
-    rec, created = store.upsert_identity(source="github", handle="jane-gh")
-    assert created is True and rec["email"] == ""
-    rec2, created2 = store.upsert_identity(
-        source="github", handle="jane-gh", email="jane@acme.com"
-    )
-    assert created2 is False
-    assert rec2["identity_id"] == rec["identity_id"]
-    assert rec2["email"] == "jane@acme.com"
-
-
-def test_upsert_merges_on_email_match(store):
-    gh, _ = store.upsert_identity(source="github", handle="jane-gh")
-    sl, _ = store.upsert_identity(
-        source="slack", handle="U1", workspace="T0ACME01", email="jane@acme.com"
-    )
-    assert gh["identity_id"] != sl["identity_id"]
-    merged, created = store.upsert_identity(
-        source="github", handle="jane-gh", email="jane@acme.com"
-    )
-    assert created is False
-    assert merged["identity_id"] == gh["identity_id"]
-    assert sl["identity_id"] in merged["merged_from"]
-    # The dropped record is gone; both handles resolve to the survivor.
-    assert store.get_identity(sl["identity_id"]) is None
-    assert store.find_identity_by_handle("slack", "U1", "T0ACME01")["identity_id"] == gh["identity_id"]
 
 
 def test_set_identity_groups_validates(store):
@@ -167,7 +141,7 @@ def test_decide_user_request_approve_activates_and_groups(admin_mod, monkeypatch
     admin, store = admin_mod
     monkeypatch.setattr(admin.auth, "is_admin", lambda e: True)
     store.put_perm_group("edtech-eng")
-    ident, _ = store.upsert_identity(source="github", handle="jane-gh")
+    ident = store.put_identity(handles={"github": "jane-gh"})
     store.put_user_request(identity_id=ident["identity_id"], source="github")
     req_id = f"user-{ident['identity_id']}"
 
@@ -187,7 +161,7 @@ def test_decide_user_request_approve_activates_and_groups(admin_mod, monkeypatch
 def test_decide_user_request_rejects_unknown_group(admin_mod, monkeypatch):
     admin, store = admin_mod
     monkeypatch.setattr(admin.auth, "is_admin", lambda e: True)
-    ident, _ = store.upsert_identity(source="github", handle="jane-gh")
+    ident = store.put_identity(handles={"github": "jane-gh"})
     store.put_user_request(identity_id=ident["identity_id"], source="github")
     resp = admin.handler(
         _admin_event(

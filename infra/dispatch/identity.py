@@ -23,9 +23,10 @@ email or a group applies across GitHub / Asana / Slack at once.
 
 Reads go through a short-TTL cache (mirrors trigger_grants / fleet_config) so an
 admin onboarding/grouping a user propagates fleet-wide within the TTL without a
-DynamoDB read per dispatch. Handle/email lookups are filtered scans over the
-small identity set — the fleet-config table is single-pk with no GSIs by design,
-so this matches the established convention rather than adding the first GSI.
+DynamoDB read per dispatch. On a cache miss the snapshot is loaded with a single
+bounded Query on the ``kind-index`` GSI (``config_query.query_kind``) — not a
+full-table Scan — so the load cost scales with the directory size, not the whole
+fleet's config. Handle/email matches then run in memory over that snapshot.
 """
 
 import os
@@ -33,6 +34,8 @@ import time
 from dataclasses import dataclass, field
 
 import boto3
+
+import config_query
 
 _IDENTITY_PK_PREFIX = "identity#"
 
@@ -78,24 +81,9 @@ def _get_table():
 
 
 def _load_identities() -> list[dict]:
-    """All identity records (paged — a dropped record would fracture a person's
-    identity into a duplicate on the next touch)."""
-    table = _get_table()
-    rows: list[dict] = []
-    start_key = None
-    while True:
-        kwargs = {
-            "FilterExpression": "kind = :k",
-            "ExpressionAttributeValues": {":k": "identity"},
-        }
-        if start_key:
-            kwargs["ExclusiveStartKey"] = start_key
-        resp = table.scan(**kwargs)
-        rows.extend(resp.get("Items", []))
-        start_key = resp.get("LastEvaluatedKey")
-        if not start_key:
-            break
-    return rows
+    """All identity records via the kind-index (paged — a dropped record would
+    fracture a person's identity into a duplicate on the next touch)."""
+    return config_query.query_kind("identity")
 
 
 def _snapshot(now: float | None = None) -> list[dict]:
@@ -172,6 +160,7 @@ def resolve(
     handle: str,
     workspace: str = "",
     email: str = "",
+    email_verified: bool = False,
     display_name: str = "",
 ) -> Identity:
     """Get-or-create + enrich the identity for a source touch. See module docstring.
@@ -181,6 +170,15 @@ def resolve(
     Never raises on a normal miss — a first-touch create is the expected path;
     the caller inspects ``.usable`` for the onboarding gate and ``.created`` /
     ``.status`` to decide whether to file/refresh a user-onboarding request.
+
+    ``email_verified`` gates the email's identity power (§16.5, T-42). Email is
+    the golden join id, so a matched email attaches the caller's handle to — or
+    merges them with — the identity that already owns it, inheriting its status +
+    groups. That is safe ONLY when the email came from the platform's
+    authenticated directory (Slack ``users.info``, a signed GitHub/Asana event),
+    NOT a user-editable profile field a caller could set to a victim's address.
+    So an UNVERIFIED email is ignored entirely — never stored, never matched — and
+    the default is ``False`` (fail-closed: a caller must assert verification).
     """
     if source not in IDENTITY_SOURCES or not (handle or "").strip():
         # Unresolvable — return a synthetic unusable identity so the caller
@@ -188,7 +186,10 @@ def resolve(
         return Identity(identity_id="", status=IDENTITY_PENDING)
 
     records = _snapshot()
-    norm_email = (email or "").strip().casefold()
+    # An unverified email carries no identity weight — drop it so it neither
+    # joins the caller onto another person's record nor gets stored to be matched
+    # by a later touch.
+    norm_email = (email or "").strip().casefold() if email_verified else ""
     by_handle = _find_by_handle(records, source, handle, workspace)
     by_email = _find_by_email(records, norm_email) if norm_email else None
 
@@ -285,7 +286,8 @@ def _backfill(rec: dict, source: str, handle: str, workspace: str, email: str, d
 
 def _merge(*, keep: dict, drop: dict) -> dict:
     """Fold ``drop`` into ``keep`` on an email-match collision (§16.5): union
-    handles + groups, keep ``keep``'s email/status, record ``merged_from``, delete
+    handles + groups, keep ``keep``'s status, keep its email or fall back to
+    ``drop``'s (the survivor may be email-less), record ``merged_from``, delete
     ``drop``. This is the auto-merge on the strongest signal (email); weaker
     signals are left to admin review in the dashboard."""
     handles = dict(keep.get("handles") or {})
@@ -300,12 +302,17 @@ def _merge(*, keep: dict, drop: dict) -> dict:
     groups = sorted({*keep.get("groups", []), *drop.get("groups", [])})
     verified = {**(drop.get("verified") or {}), **(keep.get("verified") or {})}
     merged_from = list(keep.get("merged_from", [])) + [drop["identity_id"]]
+    # Preserve the golden join key: the survivor is the handle-matched record,
+    # which may itself carry no email (GitHub-first touch). The drop was found BY
+    # email, so it always has one — fall back to it rather than dropping the email
+    # entirely (which would break every future find_by_email join).
+    email = keep.get("email") or drop.get("email", "")
     now = int(time.time())
     _get_table().update_item(
         Key={"pk": f"{_IDENTITY_PK_PREFIX}{keep['identity_id']}"},
         UpdateExpression=(
             "SET handles = :h, handle_keys = :hk, #g = :g, verified = :v, "
-            "merged_from = :m, updated_at = :u"
+            "email = :e, merged_from = :m, updated_at = :u"
         ),
         ExpressionAttributeNames={"#g": "groups"},
         ExpressionAttributeValues={
@@ -313,6 +320,7 @@ def _merge(*, keep: dict, drop: dict) -> dict:
             ":hk": _rebuild_handle_keys(handles),
             ":g": groups,
             ":v": verified,
+            ":e": email,
             ":m": merged_from,
             ":u": now,
         },
@@ -320,7 +328,9 @@ def _merge(*, keep: dict, drop: dict) -> dict:
     )
     _get_table().delete_item(Key={"pk": f"{_IDENTITY_PK_PREFIX}{drop['identity_id']}"})
     survivor = dict(keep)
-    survivor.update(handles=handles, groups=groups, verified=verified, merged_from=merged_from)
+    survivor.update(
+        handles=handles, groups=groups, verified=verified, email=email, merged_from=merged_from
+    )
     return survivor
 
 

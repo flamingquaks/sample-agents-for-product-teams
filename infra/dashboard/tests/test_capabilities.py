@@ -32,8 +32,21 @@ def _make_table():
     boto3.client("dynamodb", region_name=REGION).create_table(
         TableName=TABLE,
         BillingMode="PAY_PER_REQUEST",
-        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "kind", "AttributeType": "S"},
+        ],
         KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": "kind-index",
+                "KeySchema": [
+                    {"AttributeName": "kind", "KeyType": "HASH"},
+                    {"AttributeName": "pk", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        ],
     )
 
 
