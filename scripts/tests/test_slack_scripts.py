@@ -22,7 +22,7 @@ def test_manifest_urls_and_scopes():
     scopes = m["oauth_config"]["scopes"]["bot"]
     assert "app_mentions:read" in scopes and "chat:write" in scopes and "commands" in scopes
     cmds = {c["command"]: c["url"] for c in m["features"]["slash_commands"]}
-    assert cmds["/onboard-channel"] == "https://x.example.com/dev/slack/commands"
+    assert cmds["/sdlc-onboard-channel"] == "https://x.example.com/dev/slack/commands"
     assert cmds["/fleet"] == "https://x.example.com/dev/slack/commands"
 
 

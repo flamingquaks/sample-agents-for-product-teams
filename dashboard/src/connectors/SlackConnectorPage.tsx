@@ -191,7 +191,7 @@ function RequestsTab({ api, onAuthError }: ConnectorPageProps) {
   return (
     <div>
       <p className="muted">
-        Pending channel-onboarding requests filed by users via <code>/onboard-channel</code>.
+        Pending channel-onboarding requests filed by users via <code>/sdlc-onboard-channel</code>.
         Approving allows the channel and grants the requested agents; denying just records the
         decision.
       </p>

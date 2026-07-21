@@ -26,7 +26,7 @@ export const CONNECTORS: ConnectorDescriptor[] = [
     id: "slack",
     label: "Slack",
     blurb:
-      "Onboard workspaces, gate channels, and manage who may trigger agents. Users can request channel access with /onboard-channel.",
+      "Onboard workspaces, gate channels, and manage who may trigger agents. Users can request channel access with /sdlc-onboard-channel.",
     Page: SlackConnectorPage,
   },
   {

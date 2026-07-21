@@ -3,7 +3,7 @@
 Covers the security contract (v0 signature verification, replay window,
 per-workspace secret selection, unknown/disabled workspace rejection), event
 handling (url_verification, app_mention → dispatch, bot-loop, dedup), and slash
-commands (mention dispatch + the /onboard-channel request flow). External
+commands (mention dispatch + the /sdlc-onboard-channel request flow). External
 clients (SSM, Lambda, DDB dedup, trigger_grants, registry) are stubbed.
 """
 
@@ -238,7 +238,7 @@ def test_slash_command_mention_dispatches(monkeypatch):
 
 def test_onboard_channel_files_request(monkeypatch):
     sw, state = _fresh(monkeypatch)
-    ev = _command_event({"command": "/onboard-channel", "text": "workitems, researcher",
+    ev = _command_event({"command": "/sdlc-onboard-channel", "text": "workitems, researcher",
                          "team_id": TEAM, "user_id": "U0ALICE", "channel_id": "C0ENG",
                          "channel_name": "eng"})
     resp = sw.handler(ev)
@@ -254,7 +254,7 @@ def test_onboard_channel_files_request(monkeypatch):
 
 def test_onboard_channel_no_scope_means_any(monkeypatch):
     sw, state = _fresh(monkeypatch)
-    ev = _command_event({"command": "/onboard-channel", "text": "",
+    ev = _command_event({"command": "/sdlc-onboard-channel", "text": "",
                          "team_id": TEAM, "user_id": "U1", "channel_id": "C0ENG",
                          "channel_name": "eng"})
     sw.handler(ev)

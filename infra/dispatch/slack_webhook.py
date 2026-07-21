@@ -6,8 +6,8 @@ behind API Gateway (public HTTPS) on two routes:
   - POST /slack/events   — the Events API: ``url_verification`` handshake +
     ``app_mention`` events ("@fleetbot @workitems break this up").
   - POST /slack/commands — slash commands: ``/fleet <@agent> …`` (mention
-    dispatch) and ``/onboard-channel [agent …]`` (a CHANNEL ONBOARDING REQUEST
-    that an admin approves in the Connectors panel — access is never self-served).
+    dispatch) and ``/sdlc-onboard-channel [agent …]`` (a CHANNEL ONBOARDING
+    REQUEST an admin approves in the Connectors panel — never self-served).
 
 Multi-workspace: every delivery carries a ``team_id``; we resolve it to an
 onboarded, enabled ``slack_workspace`` row and verify the signature against THAT
@@ -49,7 +49,7 @@ REGISTRY_PARAM = os.environ.get("REGISTRY_PARAM", "/dispatch/agents")
 STAGE = os.environ.get("STAGE", "dev")
 # Slash command that files a channel-onboarding REQUEST (leading slash stripped
 # by Slack; we match on the bare name).
-ONBOARD_COMMAND = os.environ.get("SLACK_ONBOARD_COMMAND", "onboard-channel")
+ONBOARD_COMMAND = os.environ.get("SLACK_ONBOARD_COMMAND", "sdlc-onboard-channel")
 # How long to remember an event_id for de-duplication.
 _DEDUP_TTL_SECONDS = 24 * 60 * 60
 
@@ -232,7 +232,7 @@ def _ack(text: str = "") -> dict:
 
 
 def _handle_slash_command(form: dict, team_id: str) -> dict:
-    """Route a slash command. ``/onboard-channel`` files a request; any other
+    """Route a slash command. ``/sdlc-onboard-channel`` files a request; any other
     configured command carries an @mention we dispatch. Returns the HTTP response
     (ephemeral so only the invoking user sees it)."""
     command = (form.get("command", [""])[0] or "").lstrip("/")

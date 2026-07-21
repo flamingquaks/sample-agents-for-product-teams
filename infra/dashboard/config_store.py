@@ -1038,7 +1038,7 @@ def delete_trigger_rule(rule_id: str) -> bool:
 
 
 # --- Channel onboarding requests ---------------------------------------------
-# A Slack user runs a slash command (/onboard-channel) to REQUEST their channel
+# A Slack user runs a slash command (/sdlc-onboard-channel) to REQUEST their channel
 # be onboarded for specific agents (spec §4.5). The request is captured here
 # ``pending``; an admin approves or denies it in the Connectors panel. Approval
 # is the ONLY path that grants access — a request never self-applies. The

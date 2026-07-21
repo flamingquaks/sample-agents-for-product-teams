@@ -40,7 +40,7 @@ import sys
 
 # The slash command that files a channel-onboarding request (matches the
 # receiver's ONBOARD_COMMAND default).
-ONBOARD_COMMAND = "onboard-channel"
+ONBOARD_COMMAND = "sdlc-onboard-channel"
 
 
 def build_manifest(webhook_base: str, app_name: str = "SDLC Agent Fleet") -> dict:
