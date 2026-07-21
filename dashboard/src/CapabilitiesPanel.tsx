@@ -83,6 +83,36 @@ export function CapabilitiesPanel({
     [api, poll, onAuthError],
   );
 
+  // Enable/disable toggle. Enabling (re)builds + deploys; disabling de-routes the
+  // agent WITHOUT tearing its runtime down (spec §9). For a built-in this is the
+  // ONLY lever — its config is fixed server-side, so we send just the flag.
+  const setEnabled = useCallback(
+    async (agentId: string, enabled: boolean) => {
+      setBusy(true);
+      setErr(null);
+      setMsg(null);
+      try {
+        await api.onboardCapability({ agent_id: agentId, enabled });
+        setMsg(
+          enabled
+            ? `Enabling ${agentId} — building the container and standing up its runtime.`
+            : `Disabled ${agentId} — de-routed (its runtime is left running, not torn down).`,
+        );
+        poll.refresh();
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 401) {
+          onAuthError();
+          return;
+        }
+        const status = e instanceof ApiError ? ` (HTTP ${e.status})` : "";
+        setErr(`${enabled ? "Enable" : "Disable"} ${agentId} failed${status}: ${(e as Error).message}`);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [api, poll, onAuthError],
+  );
+
   const caps = poll.data?.capabilities ?? [];
 
   return (
@@ -126,6 +156,7 @@ export function CapabilitiesPanel({
         <thead>
           <tr>
             <th>Agent</th>
+            <th>Type</th>
             <th>Description</th>
             <th>Aliases</th>
             <th>Dispatchable</th>
@@ -141,6 +172,7 @@ export function CapabilitiesPanel({
               <td>
                 <code>{c.agent_id}</code>
               </td>
+              <td>{c.builtin ? "built-in" : "custom"}</td>
               <td>{c.description || "—"}</td>
               <td>{(c.aliases ?? []).join(", ") || "—"}</td>
               <td>{c.enabled ? "yes" : "no"}</td>
@@ -151,23 +183,45 @@ export function CapabilitiesPanel({
               </td>
               <td>{c.onboarded_by || "—"}</td>
               <td>{fmtTime(c.updated_at ?? c.onboarded_at)}</td>
-              <td>
-                <button
-                  disabled={busy}
-                  onClick={() => {
-                    if (window.confirm(`Remove capability ${c.agent_id}?`)) {
-                      void remove(c.agent_id);
-                    }
-                  }}
-                >
-                  Remove
-                </button>
+              <td className="row-actions">
+                {c.enabled ? (
+                  <button
+                    disabled={busy}
+                    onClick={() => {
+                      if (window.confirm(`Disable ${c.agent_id}? It stops being dispatchable (its runtime is left running, not torn down).`)) {
+                        void setEnabled(c.agent_id, false);
+                      }
+                    }}
+                  >
+                    Disable
+                  </button>
+                ) : (
+                  <button
+                    disabled={busy}
+                    onClick={() => void setEnabled(c.agent_id, true)}
+                  >
+                    Enable
+                  </button>
+                )}
+                {/* Built-in (system) agents are undeletable — enable/disable only. */}
+                {!c.builtin && (
+                  <button
+                    disabled={busy}
+                    onClick={() => {
+                      if (window.confirm(`Delete capability ${c.agent_id}? This destroys the custom agent.`)) {
+                        void remove(c.agent_id);
+                      }
+                    }}
+                  >
+                    Delete
+                  </button>
+                )}
               </td>
             </tr>
           ))}
           {caps.length === 0 && !poll.loading && (
             <tr>
-              <td colSpan={8} className="muted">
+              <td colSpan={9} className="muted">
                 No capabilities onboarded yet. Use “Onboard capability” to add one.
               </td>
             </tr>

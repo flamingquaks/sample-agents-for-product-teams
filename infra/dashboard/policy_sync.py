@@ -178,15 +178,47 @@ def sync_fleet_policy() -> None:
     logger.info("Fleet policy set synced (allowed=%s)", allowed)
 
 
+def _grants_by_agent() -> dict[str, list[str]]:
+    """Build the agent → tool-grant map that drives the permit policies (spec
+    §3.5). DATA-DRIVEN: a **custom** agent contributes its row's ``tool_grants``;
+    a **built-in** agent keeps its fixed, code-defined ``AGENT_TOOL_GRANTS`` list
+    (its row carries no tool_grants — config is locked), so system agents can't be
+    silently narrowed/widened by a row edit. Only enabled, non-disabled agents get
+    a permit; a disabled/empty-grant agent is omitted (default-deny → no tools).
+
+    Falls back to the built-in map if the config store can't be read (e.g. table
+    unset in a degraded path) so the built-ins never lose their permits."""
+    grants = dict(fleet_policy.AGENT_TOOL_GRANTS)  # built-in defaults
+    try:
+        caps = config_store.list_capabilities()
+    except Exception:  # noqa: BLE001 — degraded read; keep built-in defaults
+        logger.exception("could not read capabilities for tool grants; using built-in defaults")
+        return grants
+    for cap in caps:
+        agent_id = cap.get("agent_id", "")
+        if not agent_id:
+            continue
+        if not cap.get("enabled") or cap.get("status") == config_store.CAP_DISABLED:
+            grants.pop(agent_id, None)  # disabled → no permit
+            continue
+        if cap.get("builtin"):
+            continue  # built-in keeps its fixed code-defined grants
+        grants[agent_id] = list(cap.get("tool_grants") or [])
+    return grants
+
+
 def _sync_agent_permits(client, engine_id: str, account_id: str, gateway_arn: str) -> None:
     """Provision one permit policy per agent (default-deny means the fleet does
     nothing without them). Skipped when the account is unknown — the forbid
     policies still apply, but under ENFORCE nothing is permitted until the permits
-    land, which is why rollout is LOG_ONLY first."""
+    land, which is why rollout is LOG_ONLY first.
+
+    Grants are DATA-DRIVEN (`_grants_by_agent`): custom agents' authored
+    ``tool_grants`` and the built-ins' fixed lists render through one path."""
     if not account_id:
         logger.info("AWS_ACCOUNT_ID unset — skipping per-agent permits")
         return
     for name, statement in fleet_policy.agent_permit_policies(
-        account_id, gateway_arn
+        account_id, gateway_arn, _grants_by_agent()
     ).items():
         _upsert_policy(client, engine_id, name, statement)

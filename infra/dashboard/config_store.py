@@ -464,9 +464,11 @@ def put_capability(
     triggers: dict | None = None,
     limits: dict | None = None,
     env: dict | None = None,
+    tool_grants: list[str] | None = None,
     enabled: bool = True,
     status: str | None = None,
     onboarded_by: str = "",
+    builtin: bool | None = None,
 ) -> dict:
     """Create/replace a capability record's DECLARATIVE fields (the parts an admin
     edits). Deploy-state fields — image_tag, runtime_arn, build_id, status_detail —
@@ -479,6 +481,12 @@ def put_capability(
     field: on a NEW row it defaults to ``pending``; on an EDIT it is preserved
     (an admin editing an active capability's aliases must not knock it back to
     pending and out of the registry). Pass it explicitly only to force a state.
+
+    ``builtin`` marks a seeded system agent (fixed config, enable/disable-only,
+    undeletable — spec §3.1). It is a PROVENANCE flag, not admin-editable: passing
+    ``None`` (the admin-API path) preserves the existing row's value and defaults a
+    new row to ``False``; only the deploy-time seeder passes ``True``. So the
+    onboard form can never turn a custom agent into a built-in or vice versa.
 
     Raises ValueError on an invalid agent_id — it flows into resource names and
     filesystem paths downstream, so it's validated at the store boundary."""
@@ -501,6 +509,10 @@ def put_capability(
         low = a.strip().lower()
         if low and low not in norm_aliases:
             norm_aliases.append(low)
+    # builtin is provenance, preserved across edits: None (admin path) keeps the
+    # existing value / defaults new rows False; only the seeder passes True.
+    if builtin is None:
+        builtin = bool(existing.get("builtin", False))
     item = {
         "pk": _capability_pk(agent_id),
         "kind": "capability",
@@ -510,8 +522,10 @@ def put_capability(
         "triggers": triggers or {},
         "limits": limits or {},
         "env": env or {},
+        "tool_grants": list(tool_grants or []),
         "enabled": bool(enabled),
         "status": status,
+        "builtin": bool(builtin),
         "onboarded_by": onboarded_by or existing.get("onboarded_by", ""),
         "onboarded_at": existing.get("onboarded_at", now),
         "updated_at": now,
@@ -573,11 +587,26 @@ def set_capability_deploy_state(
     )
 
 
+class BuiltinCapabilityError(Exception):
+    """Raised when a delete targets a seeded built-in capability. Built-ins are
+    system agents (spec §3.1) — enable/disable only, never removed. The admin API
+    maps this to a 409."""
+
+
 def delete_capability(agent_id: str) -> bool:
     """Delete a capability row. Returns True if a row was removed. Does NOT tear
     down the runtime/role/image — the admin API handles that lifecycle before
     removing the row, so a bare delete here never orphans the record ahead of its
-    resources."""
+    resources.
+
+    Refuses a built-in (``BuiltinCapabilityError``): a system agent is fixed and
+    undeletable; disable it instead. This is the store-level backstop to the admin
+    API's own 409 guard (defense in depth — a non-API caller can't delete one)."""
+    existing = get_capability(agent_id)
+    if existing and existing.get("builtin"):
+        raise BuiltinCapabilityError(
+            f"{agent_id} is a built-in system agent and cannot be deleted; disable it instead"
+        )
     resp = _get_table().delete_item(
         Key={"pk": _capability_pk(agent_id)}, ReturnValues="ALL_OLD"
     )

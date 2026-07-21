@@ -224,3 +224,46 @@ def test_permit_deterministic():
     a = fleet_policy.render_agent_permit("docwriter", ACCT, GW)
     b = fleet_policy.render_agent_permit("docwriter", ACCT, GW)
     assert a == b
+
+
+# --- classified tool catalog + data-driven grants (P2, spec §3.5) ------------
+
+
+def test_tool_classes_are_disjoint():
+    r, w, d = set(fleet_policy.READ_TOOLS), set(fleet_policy.WRITE_TOOLS), set(fleet_policy.DESTRUCTIVE_TOOLS)
+    assert not (r & w) and not (r & d) and not (w & d)
+
+
+def test_classify_tool_read_write_destructive():
+    gh = fleet_policy.GITHUB_TARGET
+    assert fleet_policy.classify_tool(f"{gh}___get_issue") == "read"
+    assert fleet_policy.classify_tool(f"{gh}___create_issue") == "write"
+    assert fleet_policy.classify_tool(f"{gh}___delete_branch") == "destructive"
+    assert fleet_policy.classify_tool("AsanaTarget___get_task") == "read"
+    assert fleet_policy.classify_tool("AsanaTarget___create_task") == "write"
+    # Unknown target / tool / malformed → None (fails closed).
+    assert fleet_policy.classify_tool(f"{gh}___nonexistent") is None
+    assert fleet_policy.classify_tool("Unknown___get_task") is None
+    assert fleet_policy.classify_tool("no-separator") is None
+
+
+def test_tool_catalog_excludes_destructive():
+    catalog = fleet_policy.tool_catalog()
+    klasses = {t["klass"] for t in catalog}
+    assert klasses == {"read", "write"}  # never destructive
+    ids = {t["action_id"] for t in catalog}
+    assert f"{fleet_policy.GITHUB_TARGET}___get_issue" in ids
+    assert f"{fleet_policy.GITHUB_TARGET}___delete_branch" not in ids
+
+
+def test_data_driven_grants_render_custom_agent():
+    grants = {"triage": [f"{fleet_policy.GITHUB_TARGET}___get_issue"]}
+    policies = fleet_policy.agent_permit_policies(ACCT, GW, grants)
+    assert set(policies) == {"sdlc_permit_triage"}
+    assert "GitHubTarget___get_issue" in policies["sdlc_permit_triage"]
+
+
+def test_empty_grant_agent_omitted():
+    # A custom agent that granted no tools gets no permit → default-deny.
+    policies = fleet_policy.agent_permit_policies(ACCT, GW, {"triage": []})
+    assert policies == {}

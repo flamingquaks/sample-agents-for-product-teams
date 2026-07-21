@@ -31,6 +31,7 @@ import logging
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -183,6 +184,88 @@ def upload_build_source(runner: Runner, outputs: dict[str, str]) -> None:
     logger.info("uploaded build source")
 
 
+# --- built-in capability seeding ---------------------------------------------
+
+# The 4 repo-resident system agents. Seeded as `builtin` capability rows so they
+# appear in the dashboard as fixed, enable/disable-only agents (spec §3.1). Config
+# here is DECLARATIVE metadata only (aliases/triggers/description) — the actual
+# behavior is the code under agents/<id>/. Aliases mirror CLAUDE.md's agent table.
+# `triggers` is registry metadata (the router doesn't gate on it today), seeded to
+# the sources each agent is designed for.
+_BUILTIN_AGENTS = {
+    "workitems": {
+        "description": "PO/PM — decomposition, status, risk, sync",
+        "aliases": ["pm", "status", "plan"],
+        "triggers": {"github": ["comment_mention"], "asana": ["assignment", "comment_mention"]},
+    },
+    "researcher": {
+        "description": "BA — research, competitive intel, backlog",
+        "aliases": ["ba", "research", "analyze"],
+        "triggers": {"asana": ["assignment", "comment_mention"]},
+    },
+    "docwriter": {
+        "description": "Tech writer — API docs, guides, release notes",
+        "aliases": ["docs", "doc", "writer"],
+        "triggers": {"github": ["comment_mention"]},
+    },
+    "adr": {
+        "description": "ADR linker — tags issues, reviews PRs vs the ADR library",
+        "aliases": ["decisions", "architecture"],
+        "triggers": {"github": ["comment_mention"]},
+    },
+}
+
+
+def seed_builtin_capabilities(runner: Runner, outputs: dict[str, str]) -> None:
+    """Idempotently seed a `builtin` capability row for each system agent so the
+    dashboard lists them as fixed, enable/disable-only agents (spec §3.1, §8.3).
+
+    Idempotent + non-destructive: an already-seeded (or already-ENABLED/active)
+    built-in is left untouched except for its declarative metadata — we NEVER
+    reset `enabled`/`status`/deploy-state, so re-running the deployer can't knock a
+    live built-in out of the registry. A brand-new row is written disabled +
+    pending (`enabled:false`, `status:disabled`) so enabling it in the UI is the
+    explicit first deploy.
+
+    No-op when the dashboard/config table isn't deployed (no table output)."""
+    table_name = outputs.get("FleetConfigTableName")
+    if not table_name:
+        logger.info("no fleet-config table on the stack (dashboard off) — skipping built-in seed")
+        return
+    logger.info("== Seed built-in capabilities → %s ==", table_name)
+    if runner.dry_run:
+        for agent_id in _BUILTIN_AGENTS:
+            logger.info("DRY-RUN seed built-in capability %s", agent_id)
+        return
+    table = boto3.resource("dynamodb").Table(table_name)
+    now = int(time.time())
+    for agent_id, meta in _BUILTIN_AGENTS.items():
+        existing = table.get_item(Key={"pk": f"capability#{agent_id}"}).get("Item") or {}
+        item = {
+            "pk": f"capability#{agent_id}",
+            "kind": "capability",
+            "agent_id": agent_id,
+            "description": meta["description"],
+            "aliases": meta["aliases"],
+            "triggers": meta["triggers"],
+            "limits": existing.get("limits", {}),
+            "env": existing.get("env", {}),
+            "builtin": True,
+            # Preserve lifecycle + deploy state on an existing row; a NEW row is
+            # born disabled so enabling it in the UI is the explicit first deploy.
+            "enabled": bool(existing.get("enabled", False)),
+            "status": existing.get("status", "disabled"),
+            "onboarded_by": existing.get("onboarded_by", "system-seed"),
+            "onboarded_at": existing.get("onboarded_at", now),
+            "updated_at": now,
+        }
+        for k in ("image_tag", "runtime_arn", "build_id", "status_detail"):
+            if k in existing:
+                item[k] = existing[k]
+        table.put_item(Item=item)
+        logger.info("seeded built-in capability %s (enabled=%s)", agent_id, item["enabled"])
+
+
 # --- dashboard ---------------------------------------------------------------
 
 
@@ -266,6 +349,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         outputs = {
             "CapabilitySourceBucketName": "<source-bucket>",
+            "FleetConfigTableName": "<fleet-config-table>",
             "DashboardSiteBucketName": "<bucket>", "DashboardDistributionId": "<dist>",
             "DashboardApiEndpoint": "<api>", "DashboardUserPoolId": "<pool>",
             "DashboardUserPoolClientId": "<client>", "DashboardLoginDomain": "<login>",
@@ -276,6 +360,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.skip_source:
         upload_build_source(runner, outputs)
+        # After the source that defines them exists, seed the built-in agents so
+        # they appear in the dashboard as fixed, enable/disable-only capabilities.
+        seed_builtin_capabilities(runner, outputs)
 
     if not args.skip_dashboard:
         deploy_dashboard(runner, args.region, outputs)

@@ -108,6 +108,12 @@ button.primary {
   margin-top: 4px;
 }
 
+/* Table row action buttons (e.g. Enable/Disable/Delete) */
+.row-actions {
+  display: flex;
+  gap: 8px;
+}
+
 /* Filters */
 .filters {
   display: flex;

@@ -460,3 +460,167 @@ def test_delete_capability_route():
         ]
         == []
     )
+
+
+# --- built-in (system) agents + lifecycle (P1) -------------------------------
+
+
+@mock_aws
+def test_builtin_flag_defaults_false_and_is_preserved_not_editable():
+    """put_capability defaults builtin False; the admin path (builtin=None) never
+    changes an existing row's provenance — so the onboard form can't promote a
+    custom agent to built-in or demote a built-in."""
+    _make_table()
+    cs = _load_store()
+    custom = cs.put_capability("triage")
+    assert custom["builtin"] is False
+    seeded = cs.put_capability("workitems", builtin=True)
+    assert seeded["builtin"] is True
+    # Re-put via the admin path (builtin omitted) keeps it built-in.
+    again = cs.put_capability("workitems", description="edited")
+    assert again["builtin"] is True
+
+
+@mock_aws
+def test_delete_builtin_refused_at_store():
+    _make_table()
+    cs = _load_store()
+    cs.put_capability("workitems", builtin=True)
+    with pytest.raises(cs.BuiltinCapabilityError):
+        cs.delete_capability("workitems")
+    assert cs.get_capability("workitems") is not None  # untouched
+
+
+@mock_aws
+def test_delete_builtin_route_returns_409():
+    _make_table()
+    admin = _load_admin()
+    cs = _load_store()
+    cs.put_capability("workitems", builtin=True)
+    resp = admin.handler(
+        _event("DELETE", "/admin/capabilities/{agent_id}", path={"agent_id": "workitems"})
+    )
+    assert resp["statusCode"] == 409
+    assert "built-in" in json.loads(resp["body"])["error"].lower()
+
+
+@mock_aws
+def test_builtin_onboard_honors_only_enabled_not_config(monkeypatch):
+    """A submit against a built-in ignores config fields — only enable/disable
+    applies. Enabling a built-in starts a build like any enable."""
+    _make_table()
+    admin = _load_admin()
+    cs = _load_store()
+    builds: list = []
+    _stub_codebuild(admin, monkeypatch, builds)
+    cs.put_capability(
+        "workitems", description="PO/PM", aliases=["pm"], builtin=True, enabled=False,
+        status=cs.CAP_DISABLED,
+    )
+    resp = admin.handler(
+        _event(
+            "POST", "/admin/capabilities",
+            body={
+                "agent_id": "workitems",
+                "enabled": True,
+                # These MUST be ignored for a built-in:
+                "description": "HIJACKED",
+                "aliases": ["evil"],
+                "env": {"FOO": "bar"},
+            },
+        )
+    )
+    assert resp["statusCode"] == 200, resp["body"]
+    row = cs.get_capability("workitems")
+    assert row["description"] == "PO/PM"  # seeded config preserved
+    assert row["aliases"] == ["pm"]
+    assert row["env"] == {}
+    assert row["builtin"] is True
+    assert len(builds) == 1  # enabling built-in still builds
+
+
+@mock_aws
+def test_disable_deroutes_without_build(monkeypatch):
+    """Disabling sets disabled + de-routes (registry skip) and does NOT start a
+    build (spec §9 — runtime left running, not torn down)."""
+    _make_table()
+    admin = _load_admin()
+    cs = _load_store()
+    builds: list = []
+    _stub_codebuild(admin, monkeypatch, builds)
+    # A live custom agent with a runtime.
+    cs.put_capability("triage", enabled=True)
+    cs.set_capability_deploy_state(
+        "triage", image_tag="t1", runtime_arn="arn:aws:bedrock-agentcore:::runtime/triage",
+        build_id="b1",
+    )
+    cs.set_capability_status("triage", cs.CAP_ACTIVE)
+    resp = admin.handler(
+        _event("POST", "/admin/capabilities", body={"agent_id": "triage", "enabled": False})
+    )
+    assert resp["statusCode"] == 200, resp["body"]
+    row = cs.get_capability("triage")
+    assert row["enabled"] is False
+    assert row["status"] == "disabled"
+    assert builds == []  # NO rebuild on disable
+    assert _read_registry() == {"agents": {}}  # de-routed
+
+
+# --- per-tool grants + read/write split (P2, spec §3.5) ----------------------
+
+
+@mock_aws
+def test_onboard_persists_tool_grants(monkeypatch):
+    _make_table()
+    admin = _load_admin()
+    cs = _load_store()
+    _stub_codebuild(admin, monkeypatch, [])
+    resp = admin.handler(
+        _event("POST", "/admin/capabilities", body={
+            "agent_id": "triage",
+            "tool_grants": ["GitHubTarget___get_issue", "GitHubTarget___create_issue"],
+        })
+    )
+    assert resp["statusCode"] == 200, resp["body"]
+    row = cs.get_capability("triage")
+    assert row["tool_grants"] == ["GitHubTarget___get_issue", "GitHubTarget___create_issue"]
+
+
+@mock_aws
+def test_onboard_rejects_destructive_tool_grant(monkeypatch):
+    _make_table()
+    admin = _load_admin()
+    _stub_codebuild(admin, monkeypatch, [])
+    resp = admin.handler(
+        _event("POST", "/admin/capabilities", body={
+            "agent_id": "triage",
+            "tool_grants": ["GitHubTarget___delete_branch"],
+        })
+    )
+    assert resp["statusCode"] == 400
+    assert "destructive" in json.loads(resp["body"])["error"].lower()
+
+
+@mock_aws
+def test_onboard_rejects_unknown_tool_grant(monkeypatch):
+    _make_table()
+    admin = _load_admin()
+    _stub_codebuild(admin, monkeypatch, [])
+    resp = admin.handler(
+        _event("POST", "/admin/capabilities", body={
+            "agent_id": "triage",
+            "tool_grants": ["GitHubTarget___nonexistent_tool"],
+        })
+    )
+    assert resp["statusCode"] == 400
+    assert "not a known grantable tool" in json.loads(resp["body"])["error"].lower()
+
+
+@mock_aws
+def test_tool_catalog_route_lists_read_write_only():
+    _make_table()
+    admin = _load_admin()
+    resp = admin.handler(_event("GET", "/admin/tool-catalog"))
+    assert resp["statusCode"] == 200
+    tools = json.loads(resp["body"])["tools"]
+    assert tools and all(t["klass"] in ("read", "write") for t in tools)

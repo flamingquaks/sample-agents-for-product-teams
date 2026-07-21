@@ -44,6 +44,7 @@ from urllib.parse import unquote
 
 import auth
 import config_store
+import fleet_policy
 from http_responses import error, json_response, ok
 
 # GitHub owner/repo segment: letters, digits, hyphen, underscore, dot. This is
@@ -276,6 +277,33 @@ def _validate_capability_body(body: dict) -> tuple[dict, dict | None]:
         if "," in v:
             return {}, error(400, f"body.env.{k} must not contain a comma")
 
+    # tool_grants — the per-tool allowlist for a custom agent (spec §3.5). Each
+    # entry must be a KNOWN read/write tool in the fleet catalog; a destructive
+    # tool (or an unknown/unclassified id) is rejected here so a config-authored
+    # agent can never exceed the read/write/destructive envelope. Built-in agents
+    # ignore this (their grants are the fixed AGENT_TOOL_GRANTS), but validating
+    # it for every body keeps one code path.
+    tool_grants = body.get("tool_grants", [])
+    if not isinstance(tool_grants, list) or any(not isinstance(t, str) for t in tool_grants):
+        return {}, error(400, "body.tool_grants must be a list of strings")
+    norm_grants: list[str] = []
+    for t in tool_grants:
+        klass = fleet_policy.classify_tool(t)
+        if klass is None:
+            return {}, error(
+                400,
+                f"body.tool_grants entry {t!r} is not a known grantable tool "
+                "(unknown or unclassified in the fleet tool catalog)",
+            )
+        if klass == fleet_policy.CLASS_DESTRUCTIVE:
+            return {}, error(
+                400,
+                f"body.tool_grants entry {t!r} is a destructive tool and can never "
+                "be granted",
+            )
+        if t not in norm_grants:
+            norm_grants.append(t)
+
     return {
         "agent_id": agent_id,
         "description": description,
@@ -283,6 +311,7 @@ def _validate_capability_body(body: dict) -> tuple[dict, dict | None]:
         "triggers": triggers,
         "limits": limits,
         "env": env,
+        "tool_grants": norm_grants,
         "enabled": bool(body.get("enabled", True)),
     }, None
 
@@ -344,11 +373,45 @@ def _onboard_capability(event: dict, body: dict) -> dict:
     how env is re-applied (update-agent-runtime replaces env wholesale). Editing
     only registry-level fields (aliases) also rebuilds — cheap, and it keeps one
     code path. A build failure marks the row ``failed`` without disturbing any
-    existing runtime."""
+    existing runtime.
+
+    **Built-in (system) agents** are fixed config, enable/disable-only (spec
+    §3.1): a submit against a built-in row honors ONLY ``enabled`` — every other
+    declarative field is taken from the seeded row, so the onboard form can never
+    edit a system agent's config. **Disabling** any agent (built-in or custom)
+    de-routes it WITHOUT a rebuild; only **enabling** builds/deploys."""
     fields, err = _validate_capability_body(body)
     if err is not None:
         return err
     agent_id = fields["agent_id"]
+
+    existing = config_store.get_capability(agent_id)
+    if existing and existing.get("builtin"):
+        # System agent: config is fixed. Preserve the seeded declarative fields;
+        # the only admin lever is enable/disable. (put_capability re-preserves
+        # builtin/deploy-state itself; we just avoid overwriting config from body.)
+        fields = {
+            "agent_id": agent_id,
+            "description": existing.get("description", ""),
+            "aliases": list(existing.get("aliases", [])),
+            "triggers": dict(existing.get("triggers", {})),
+            "limits": dict(existing.get("limits", {})),
+            "env": dict(existing.get("env", {})),
+            "tool_grants": list(existing.get("tool_grants", [])),
+            "enabled": fields["enabled"],
+        }
+
+    # Disabling de-routes without a rebuild — building a disabled agent is wasted
+    # work, and render_registry already drops it. This is "disable = de-route,
+    # runtime left running, not torn down" (spec §9).
+    if not fields["enabled"]:
+        config_store.put_capability(onboarded_by=auth.caller_sub(event), **fields)
+        config_store.set_capability_status(
+            agent_id, config_store.CAP_DISABLED, detail="disabled by admin (de-routed)"
+        )
+        _publish_registry_safe()
+        return ok(config_store.get_capability(agent_id))
+
     config_store.put_capability(onboarded_by=auth.caller_sub(event), **fields)
     _publish_registry_safe()
 
@@ -369,12 +432,16 @@ def _onboard_capability(event: dict, body: dict) -> dict:
 
 
 def _delete_capability(agent_id: str) -> dict:
-    """Remove a capability row and republish the registry so the router stops
-    resolving it. Phase 4 adds runtime/role teardown ahead of this delete; for now
-    a delete just removes the row + drops it from the registry."""
+    """Remove a CUSTOM capability row and republish the registry so the router
+    stops resolving it. A built-in (system) agent is undeletable (409) — it's
+    disabled, not removed (spec §3.1). Runtime/role/image teardown for custom
+    agents is a later phase; for now a delete removes the row + de-routes it."""
     if not config_store.valid_agent_id(agent_id):
         return error(400, "invalid agent_id")
-    deleted = config_store.delete_capability(agent_id)
+    try:
+        deleted = config_store.delete_capability(agent_id)
+    except config_store.BuiltinCapabilityError as exc:
+        return error(409, str(exc))
     _publish_registry_safe()
     return ok({"agent_id": agent_id, "deleted": deleted})
 
@@ -758,6 +825,12 @@ def _route(event: dict) -> dict:
             return ok(settings)
 
     # --- Capabilities (UI-onboarded agents) ---
+    if resource == "/admin/tool-catalog":
+        if method == "GET":
+            # The grantable read/write tool catalog for the authoring UI (§3.5);
+            # destructive tools are excluded (never grantable).
+            return ok({"tools": fleet_policy.tool_catalog()})
+
     if resource == "/admin/capabilities":
         if method == "GET":
             return ok({"capabilities": config_store.list_capabilities()})

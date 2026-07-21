@@ -54,6 +54,25 @@ WRITE_TOOLS = (
     "add_labels_to_issue",
 )
 
+# GitHub READ tools — safe, unrestricted reads. Enumerated (not just "everything
+# not write/destructive") so the authoring UI can positively OFFER a tool as a
+# read and the API can validate a custom agent's grant against a known set (spec
+# §3.5). Seeded from the reads the built-ins are granted (AGENT_TOOL_GRANTS +
+# cedar/*.cedar // read blocks). Keep in sync with the live manifest —
+# check_gateway_manifest.py fails on any manifest tool left unclassified.
+READ_TOOLS = (
+    "get_issue",
+    "list_issues",
+    "get_pull_request",
+    "list_pull_requests",
+    "get_pull_request_diff",
+    "list_pull_request_files",
+    "list_commits",
+    "list_milestones",
+    "get_file_contents",
+    "search_code",
+)
+
 # Destructive GitHub tools the fleet forbids for EVERY repo, onboarded or not —
 # the gateway-plane equivalent of cedar/shared.cedar's unconditional destructive
 # forbid, which CLAUDE.md ("Agents NEVER close issues, merge PRs, or delete …")
@@ -77,6 +96,87 @@ DESTRUCTIVE_TOOLS = (
 # regresses — the same defense-in-depth the destructive tools get. Conditioned on
 # the tool-call input ``event`` (addressed as context.input.event by the engine).
 COMMENT_ONLY_REVIEW_TOOLS = ("create_pull_request_review",)
+
+# --- classified tool catalog (spec §3.5) -------------------------------------
+# The single classification of every GitHub tool the fleet knows: read | write |
+# destructive. The three lists MUST be disjoint (a tool in two classes is an
+# error — a repo-allowlisted write forbid is LIFTED for an allowed repo, so a
+# destructive tool wrongly in WRITE_TOOLS would be permitted there). The authoring
+# UI reads this to render each tool's read/write tag; the admin API reads it to
+# reject granting a destructive tool. Note create_pull_request_review is a WRITE
+# (it posts) bounded to event=COMMENT by COMMENT_ONLY_REVIEW_TOOLS, not a
+# separate class. Asana tools are classified in ASANA_TOOL_CLASS below.
+
+CLASS_READ = "read"
+CLASS_WRITE = "write"
+CLASS_DESTRUCTIVE = "destructive"
+
+
+def _assert_disjoint() -> None:
+    """Guard: the three GitHub classes must not overlap (import-time invariant)."""
+    r, w, d = set(READ_TOOLS), set(WRITE_TOOLS), set(DESTRUCTIVE_TOOLS)
+    for a, b, name in ((r, w, "READ/WRITE"), (r, d, "READ/DESTRUCTIVE"), (w, d, "WRITE/DESTRUCTIVE")):
+        overlap = a & b
+        if overlap:
+            raise ValueError(f"tool catalog {name} overlap: {sorted(overlap)}")
+
+
+_assert_disjoint()
+
+# Asana tool classification. The Asana target is not repo-scoped (writes aren't
+# bounded by sdlc_allowed_repos), but the read/write split still governs which
+# tools a custom agent may be granted. Destructive Asana ops (delete_task, …) are
+# simply never listed here, so they can't be granted.
+ASANA_TOOL_CLASS = {
+    "get_task": CLASS_READ,
+    "list_tasks": CLASS_READ,
+    "list_projects": CLASS_READ,
+    "get_project_status": CLASS_READ,
+    "get_task_stories": CLASS_READ,
+    "search": CLASS_READ,
+    "create_task": CLASS_WRITE,
+    "update_task": CLASS_WRITE,
+    "create_project_status": CLASS_WRITE,
+    "add_comment": CLASS_WRITE,
+}
+
+_ASANA_TARGET = "AsanaTarget"
+
+
+def classify_tool(action_id: str) -> str | None:
+    """Classify a gateway ``Target___tool`` action id as read|write|destructive,
+    or None if the tool is unknown/unclassified. Used by the admin API to reject
+    granting a destructive tool and by the UI to tag tools. Unknown → None so a
+    caller fails closed (an unclassified tool is not offered / not grantable)."""
+    if "___" not in action_id:
+        return None
+    target, tool = action_id.split("___", 1)
+    if target == GITHUB_TARGET:
+        if tool in DESTRUCTIVE_TOOLS:
+            return CLASS_DESTRUCTIVE
+        if tool in WRITE_TOOLS:
+            return CLASS_WRITE
+        if tool in READ_TOOLS:
+            return CLASS_READ
+        return None
+    if target == _ASANA_TARGET:
+        return ASANA_TOOL_CLASS.get(tool)
+    return None
+
+
+def tool_catalog() -> list[dict]:
+    """The full grantable tool catalog for the authoring UI: every known
+    read/write tool as ``{action_id, target, tool, klass}``. Destructive tools
+    are DELIBERATELY excluded — they are never grantable (§3.5)."""
+    out: list[dict] = []
+    for tool in READ_TOOLS:
+        out.append({"action_id": f"{GITHUB_TARGET}___{tool}", "target": GITHUB_TARGET, "tool": tool, "klass": CLASS_READ})
+    for tool in WRITE_TOOLS:
+        out.append({"action_id": f"{GITHUB_TARGET}___{tool}", "target": GITHUB_TARGET, "tool": tool, "klass": CLASS_WRITE})
+    for tool, klass in ASANA_TOOL_CLASS.items():
+        out.append({"action_id": f"{_ASANA_TARGET}___{tool}", "target": _ASANA_TARGET, "tool": tool, "klass": klass})
+    return out
+
 
 # "pair"  → GitHub MCP exposes separate owner + repo params (the default/common
 #           shape); condition on both.
@@ -317,12 +417,17 @@ def runtime_role_arn(account_id: str, agent: str) -> str:
     return f"arn:aws:sts::{account_id}:assumed-role/{agent}-agentcore-runtime"
 
 
-def render_agent_permit(agent: str, account_id: str, gateway_arn: str) -> str:
+def render_agent_permit(
+    agent: str, account_id: str, gateway_arn: str, actions: list[str] | None = None
+) -> str:
     """Render the permit policy statement granting ``agent`` its allowed tools.
 
-    Deterministic. Raises KeyError for an unknown agent (caller controls the
-    set)."""
-    actions = AGENT_TOOL_GRANTS[agent]
+    ``actions`` overrides the tool list (a custom agent's authored ``tool_grants``,
+    §3.5); when None the built-in ``AGENT_TOOL_GRANTS[agent]`` is used. A custom
+    agent with an EMPTY grant renders no permit — the caller (agent_permit_policies)
+    skips it, so default-deny leaves it able to call nothing. Deterministic;
+    raises KeyError only for an unknown built-in agent with no override."""
+    actions = AGENT_TOOL_GRANTS[agent] if actions is None else actions
     action_lines = ",\n".join(f'    AgentCore::Action::"{a}"' for a in actions)
     principal = runtime_role_arn(account_id, agent)
     return (
@@ -334,10 +439,22 @@ def render_agent_permit(agent: str, account_id: str, gateway_arn: str) -> str:
     )
 
 
-def agent_permit_policies(account_id: str, gateway_arn: str) -> dict[str, str]:
+def agent_permit_policies(
+    account_id: str, gateway_arn: str, grants_by_agent: dict[str, list[str]] | None = None
+) -> dict[str, str]:
     """All per-agent permit policies, keyed by the policy name to sync them under
-    (``sdlc_permit_<agent>``)."""
+    (``sdlc_permit_<agent>``).
+
+    ``grants_by_agent`` (agent_id → tool action ids) makes the grant set
+    DATA-DRIVEN so custom agents' authored ``tool_grants`` flow through the SAME
+    enforcement path as the built-ins (spec §3.5) — policy_sync builds it from the
+    capability rows. When None, only the hardcoded built-in ``AGENT_TOOL_GRANTS``
+    are rendered (the pre-P2 behavior). An agent with an empty grant list is
+    omitted (nothing to permit → default-deny)."""
+    if grants_by_agent is None:
+        grants_by_agent = AGENT_TOOL_GRANTS
     return {
-        f"sdlc_permit_{agent}": render_agent_permit(agent, account_id, gateway_arn)
-        for agent in AGENT_TOOL_GRANTS
+        f"sdlc_permit_{agent}": render_agent_permit(agent, account_id, gateway_arn, actions)
+        for agent, actions in grants_by_agent.items()
+        if actions
     }

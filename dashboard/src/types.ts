@@ -100,6 +100,8 @@ export interface CapabilityConfig {
   /** Per-agent runtime env (e.g. ASANA_PROJECT_GID); values injected at deploy. */
   env?: Record<string, string>;
   enabled?: boolean;
+  /** Seeded system agent — fixed config, enable/disable-only, undeletable (§3.1). */
+  builtin?: boolean;
   /** pending | building | active | failed | disabled. */
   status?: string;
   status_detail?: string;

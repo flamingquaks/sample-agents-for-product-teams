@@ -192,3 +192,41 @@ def test_permits_skipped_without_account(monkeypatch):
         "sdlc_forbid_destructive",
         "sdlc_forbid_noncomment_review",
     ]
+
+
+# --- data-driven tool grants (P2, spec §3.5) ---------------------------------
+
+
+def test_grants_by_agent_merges_custom_over_builtins(monkeypatch):
+    ps = _load(monkeypatch)
+    import config_store
+    import fleet_policy
+
+    monkeypatch.setattr(config_store, "list_capabilities", lambda: [
+        # Custom, enabled → its authored grants are used.
+        {"agent_id": "triage", "enabled": True, "status": "active",
+         "builtin": False, "tool_grants": ["GitHubTarget___get_issue"]},
+        # Built-in, enabled → keeps its fixed code-defined grants (row ignored).
+        {"agent_id": "workitems", "enabled": True, "status": "active",
+         "builtin": True, "tool_grants": ["SHOULD_BE_IGNORED"]},
+        # Disabled custom → dropped (no permit).
+        {"agent_id": "old", "enabled": False, "status": "disabled",
+         "builtin": False, "tool_grants": ["GitHubTarget___get_issue"]},
+    ])
+    grants = ps._grants_by_agent()
+    assert grants["triage"] == ["GitHubTarget___get_issue"]
+    assert grants["workitems"] == fleet_policy.AGENT_TOOL_GRANTS["workitems"]  # fixed
+    assert "old" not in grants  # disabled → no permit
+
+
+def test_grants_by_agent_falls_back_on_read_error(monkeypatch):
+    ps = _load(monkeypatch)
+    import config_store
+    import fleet_policy
+
+    def boom():
+        raise RuntimeError("table gone")
+
+    monkeypatch.setattr(config_store, "list_capabilities", boom)
+    # Degraded read → built-in defaults preserved (agents never lose permits).
+    assert ps._grants_by_agent() == fleet_policy.AGENT_TOOL_GRANTS

@@ -92,32 +92,26 @@ def main() -> int:
         print(f"could not list gateway tools: {exc}", file=sys.stderr)
         return 2
 
-    # Everything the policies reference, in <Target>___<tool> shape.
+    # Everything the classified catalog names, in <Target>___<tool> shape. All
+    # three classes (read/write/destructive) plus the built-in grants.
+    github_prefix = f"{fleet_policy.GITHUB_TARGET}___"
     referenced = set()
-    referenced.update(
-        f"{fleet_policy.GITHUB_TARGET}___{t}" for t in fleet_policy.WRITE_TOOLS
-    )
-    referenced.update(
-        f"{fleet_policy.GITHUB_TARGET}___{t}" for t in fleet_policy.DESTRUCTIVE_TOOLS
-    )
+    for t in (*fleet_policy.READ_TOOLS, *fleet_policy.WRITE_TOOLS, *fleet_policy.DESTRUCTIVE_TOOLS):
+        referenced.add(f"{github_prefix}{t}")
     for actions in fleet_policy.AGENT_TOOL_GRANTS.values():
         referenced.update(actions)
 
     missing = sorted(referenced - manifest)
-    github_prefix = f"{fleet_policy.GITHUB_TARGET}___"
-    covered_github = {
-        f"{github_prefix}{t}"
-        for t in (*fleet_policy.WRITE_TOOLS, *fleet_policy.DESTRUCTIVE_TOOLS)
-    }
-    uncovered_github_writes = sorted(
+
+    # EXHAUSTIVENESS (spec §3.5): every GitHub-target tool the manifest exposes
+    # MUST carry a read/write/destructive classification. An UNCLASSIFIED tool is
+    # a hard failure — it could be a new write/destructive op that would silently
+    # become uncovered by any forbid AND unofferable to the authoring UI. Forcing
+    # a classification decision here is the gate.
+    unclassified = sorted(
         t
         for t in manifest
-        if t.startswith(github_prefix)
-        and t not in covered_github
-        and any(
-            kw in t.lower()
-            for kw in ("create", "update", "delete", "merge", "push", "add", "remove")
-        )
+        if t.startswith(github_prefix) and fleet_policy.classify_tool(t) is None
     )
 
     print(f"gateway: {url}")
@@ -128,16 +122,16 @@ def main() -> int:
             print(f"  ✗ {m}")
     else:
         print("\n✅ every policy-referenced action exists in the manifest")
-    if uncovered_github_writes:
-        print("\nPOTENTIAL GAPS — GitHub write-like tools not covered by any forbid:")
-        for t in uncovered_github_writes:
-            print(f"  ⚠️  {t}")
+    if unclassified:
+        print("\nUNCLASSIFIED — GitHub manifest tools with no read/write/destructive class:")
+        for t in unclassified:
+            print(f"  ✗ {t}  (add to READ_TOOLS / WRITE_TOOLS / DESTRUCTIVE_TOOLS)")
     print(
         f"\nREPO_PARAM_MODE is '{fleet_policy.REPO_PARAM_MODE}' — confirm this "
         "matches the GitHub write tools' input schema (owner+repo vs combined repo)."
     )
 
-    return 1 if missing else 0
+    return 1 if (missing or unclassified) else 0
 
 
 if __name__ == "__main__":
