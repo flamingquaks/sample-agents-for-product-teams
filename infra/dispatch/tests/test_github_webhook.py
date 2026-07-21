@@ -214,3 +214,88 @@ def test_pr_review_comment_routes(monkeypatch):
     assert resp["statusCode"] == 200
     assert dispatched[0]["agent_id"] == "adr"
     assert dispatched[0]["trigger_type"] == "pr_comment"
+
+
+# --- SCM notifications (spec §18.3) — pull_request / issues fan out, no dispatch
+
+
+def _pr_body(action, *, repo="acme/web", number=5, merged=False, author="alice"):
+    return json.dumps(
+        {
+            "action": action,
+            "pull_request": {"number": number, "title": "Add feature", "merged": merged,
+                             "user": {"login": author}},
+            "repository": {"full_name": repo},
+        }
+    )
+
+
+def test_pr_opened_notifies_not_dispatches(monkeypatch):
+    gw, dispatched = _fresh(monkeypatch)
+    calls = []
+    monkeypatch.setattr(gw.notify, "notify", lambda **kw: calls.append(kw) or 1)
+    resp = gw.handler(_event(_pr_body("opened"), event="pull_request"))
+    assert resp["statusCode"] == 200
+    assert not dispatched  # SCM events never dispatch an agent
+    assert len(calls) == 1
+    assert calls[0]["event"] == "pr_opened" and calls[0]["tier"] == "informative"
+    assert calls[0]["repo"] == "acme/web" and calls[0]["unit"] == "pr:acme/web:5"
+
+
+def test_pr_merged_notifies(monkeypatch):
+    gw, dispatched = _fresh(monkeypatch)
+    calls = []
+    monkeypatch.setattr(gw.notify, "notify", lambda **kw: calls.append(kw) or 1)
+    gw.handler(_event(_pr_body("closed", merged=True), event="pull_request"))
+    assert calls and calls[0]["event"] == "pr_merged"
+
+
+def test_pr_closed_unmerged_does_not_notify(monkeypatch):
+    gw, dispatched = _fresh(monkeypatch)
+    calls = []
+    monkeypatch.setattr(gw.notify, "notify", lambda **kw: calls.append(kw) or 1)
+    gw.handler(_event(_pr_body("closed", merged=False), event="pull_request"))
+    assert not calls  # a closed-without-merge PR isn't a notify event
+
+
+def test_review_requested_is_actionable(monkeypatch):
+    gw, dispatched = _fresh(monkeypatch)
+    calls = []
+    monkeypatch.setattr(gw.notify, "notify", lambda **kw: calls.append(kw) or 1)
+    body = json.dumps(
+        {
+            "action": "review_requested",
+            "pull_request": {"number": 3, "title": "Fix", "user": {"login": "alice"}},
+            "requested_reviewer": {"login": "bob"},
+            "repository": {"full_name": "acme/web"},
+        }
+    )
+    gw.handler(_event(body, event="pull_request"))
+    assert calls and calls[0]["tier"] == "actionable"
+    assert calls[0]["actor"] == {"source": "github", "handle": "bob", "workspace": ""}
+
+
+def test_issue_opened_notifies(monkeypatch):
+    gw, dispatched = _fresh(monkeypatch)
+    calls = []
+    monkeypatch.setattr(gw.notify, "notify", lambda **kw: calls.append(kw) or 1)
+    body = json.dumps(
+        {
+            "action": "opened",
+            "issue": {"number": 11, "title": "Bug", "user": {"login": "carol"}},
+            "repository": {"full_name": "acme/web"},
+        }
+    )
+    gw.handler(_event(body, event="issues"))
+    assert calls and calls[0]["event"] == "issue_opened"
+
+
+def test_scm_notify_failure_does_not_fail_webhook(monkeypatch):
+    gw, dispatched = _fresh(monkeypatch)
+
+    def _boom(**kw):
+        raise RuntimeError("slack down")
+
+    monkeypatch.setattr(gw.notify, "notify", _boom)
+    resp = gw.handler(_event(_pr_body("opened"), event="pull_request"))
+    assert resp["statusCode"] == 200  # best-effort — never fails the delivery

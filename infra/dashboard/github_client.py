@@ -43,7 +43,17 @@ APP_PERMISSIONS = {
     "pull_requests": "write",
     "contents": "write",
 }
-APP_EVENTS = ["issue_comment", "pull_request", "pull_request_review", "push"]
+# ``issue_comment`` / ``pull_request_review_comment`` drive @mention dispatch;
+# ``issues`` + ``pull_request`` additionally feed SCM notifications (spec §18.3 —
+# PR opened/merged/review-requested, issue opened → subscribed Slack channels).
+APP_EVENTS = [
+    "issue_comment",
+    "pull_request",
+    "pull_request_review",
+    "pull_request_review_comment",
+    "issues",
+    "push",
+]
 
 
 class GitHubError(Exception):

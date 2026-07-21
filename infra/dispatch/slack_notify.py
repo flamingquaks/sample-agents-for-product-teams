@@ -47,6 +47,9 @@ TIER_EVENTS = {
         ("run_started", "A run kicked off"),
         ("run_completed", "A run completed"),
         ("task_picked_up", "An agent picked up a task"),
+        ("pr_opened", "A pull request was opened"),
+        ("pr_merged", "A pull request was merged"),
+        ("issue_opened", "An issue was opened"),
     ],
     "error": [
         ("run_failed", "A run failed"),

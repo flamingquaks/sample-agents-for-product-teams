@@ -198,6 +198,13 @@ Resources:
         Enabled: true
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
+      # Stream drives the assignment-notifier Lambda — agent-side status
+      # transitions (completed / failed / awaiting_approval) fan out to
+      # subscribed Slack channels without giving agents Slack credentials
+      # (spec §18.1). NEW_AND_OLD so the notifier can tell a real status change
+      # from an unrelated field update.
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
       Tags:
         - Key: Project
           Value: sdlc-agents
@@ -626,6 +633,49 @@ Resources:
             Path: /slack/interactions
             Method: POST
             RestApiId: !Ref WebhookApi
+
+  # Assignment-stream notifier — fans agent-side status transitions
+  # (completed / failed / awaiting_approval) out to subscribed Slack channels via
+  # the DynamoDB stream on the assignments table (spec §18.1). Agents hold no
+  # Slack credential; this Lambda does the fan-out on their behalf.
+  AssignmentNotifierFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub assignment-notifier-${Stage}
+      CodeUri: ../dispatch/
+      Handler: assignment_notifier.handler
+      Timeout: 30
+      ReservedConcurrentExecutions: 5
+      Environment:
+        Variables:
+          FLEET_CONFIG_TABLE: !Ref FleetConfigTable
+          ASSIGNMENTS_TABLE: !Ref AssignmentsTable
+          STAGE: !Ref Stage
+      Policies:
+        # Read notif_sub + identity rows (fan-out targets + mention resolution).
+        - DynamoDBReadPolicy:
+            TableName: !Ref FleetConfigTable
+        # Read/write the assignments table: read for context, write the
+        # notif_thread# bookkeeping rows notify.py uses for threading.
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AssignmentsTable
+        - Statement:
+            # Per-workspace Slack bot tokens to post messages.
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/slack/*
+      Events:
+        AssignmentStream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt AssignmentsTable.StreamArn
+            StartingPosition: LATEST
+            BatchSize: 25
+            MaximumRetryAttempts: 2
+            # A poison record must not wedge the shard — bisect + skip so
+            # notifications stay best-effort (the handler also self-guards).
+            BisectBatchOnFunctionError: true
 
   WebhookApiAccessLogs:
     Type: AWS::Logs::LogGroup

@@ -19,7 +19,10 @@ Sits behind API Gateway (public HTTPS). Security model mirrors the Asana receive
     replacing the workflow's ``gh api`` calls that ran with the Actions token.
 
 Handled events: ``issue_comment`` (created) and ``pull_request_review_comment``
-(created). A comment must @mention a known agent; otherwise it's a no-op 200.
+(created) — a comment must @mention a known agent, else no-op 200. Additionally
+``pull_request`` (opened / closed-merged / review_requested) and ``issues``
+(opened) are fanned out to subscribed Slack channels as **SCM notifications**
+(spec §18.3) — these never dispatch an agent; they only notify.
 """
 
 import base64
@@ -30,6 +33,7 @@ import os
 import boto3
 
 import mentions
+import notify
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -167,6 +171,61 @@ _EVENT_TRIGGER = {
 }
 
 
+def _notify_scm(event_type: str, payload: dict) -> None:
+    """Fan a GitHub SCM event out to subscribed Slack channels (spec §18.3). These
+    are NOT agent dispatches — they only notify channels that opted into the
+    matching tier/event for the repo. Best-effort: a notification failure never
+    fails the webhook. The @mention actor is the PR/issue author, resolved to the
+    right Slack user per workspace by the identity map (informative tier for
+    open/merge, so no mention fires; kept for parity + future actionable events)."""
+    action = payload.get("action", "")
+    repo = (payload.get("repository") or {}).get("full_name", "")
+    if not repo:
+        return
+
+    # (event, action) → (tier, notify-event id, text builder). Only the
+    # transitions a channel can subscribe to in the modal are mapped.
+    if event_type == "pull_request":
+        pr = payload.get("pull_request") or {}
+        num = pr.get("number")
+        title = pr.get("title", "")
+        author = (pr.get("user") or {}).get("login", "")
+        unit = f"pr:{repo}:{num}"
+        actor = {"source": "github", "handle": author, "workspace": ""}
+        if action == "opened":
+            notify.notify(
+                tier=notify.TIER_INFORMATIVE, event="pr_opened",
+                text=f"📥 PR opened in `{repo}` #{num}: {title}",
+                repo=repo, unit=unit, actor=actor,
+            )
+        elif action == "closed" and pr.get("merged"):
+            notify.notify(
+                tier=notify.TIER_INFORMATIVE, event="pr_merged",
+                text=f"✅ PR merged in `{repo}` #{num}: {title}",
+                repo=repo, unit=unit, actor=actor,
+            )
+        elif action == "review_requested":
+            # Actionable — a review is being asked for. Mention the reviewer.
+            reviewer = (payload.get("requested_reviewer") or {}).get("login", "")
+            notify.notify(
+                tier=notify.TIER_ACTIONABLE, event="review_requested",
+                text=f"👀 Review requested on `{repo}` #{num}: {title}",
+                repo=repo, unit=unit,
+                actor={"source": "github", "handle": reviewer, "workspace": ""},
+            )
+    elif event_type == "issues" and action == "opened":
+        issue = payload.get("issue") or {}
+        num = issue.get("number")
+        title = issue.get("title", "")
+        author = (issue.get("user") or {}).get("login", "")
+        notify.notify(
+            tier=notify.TIER_INFORMATIVE, event="issue_opened",
+            text=f"🐛 Issue opened in `{repo}` #{num}: {title}",
+            repo=repo, unit=f"issue:{repo}:{num}",
+            actor={"source": "github", "handle": author, "workspace": ""},
+        )
+
+
 def handler(event, context=None):
     """API Gateway entry point for GitHub App webhook deliveries."""
     headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
@@ -201,14 +260,26 @@ def handler(event, context=None):
         return {"statusCode": 200, "body": "pong"}
 
     trigger_type = _EVENT_TRIGGER.get(event_type)
-    if not trigger_type:
-        # A subscribed event we don't route (push, etc.) — ack without action.
-        return {"statusCode": 200, "body": "ignored"}
 
     try:
         payload = json.loads(raw_body)
     except json.JSONDecodeError:
         return {"statusCode": 400, "body": "invalid JSON"}
+
+    # SCM notification events (pull_request / issues) don't dispatch an agent —
+    # they fan out to subscribed Slack channels (spec §18.3). A comment event
+    # can ALSO be worth notifying, but today only the mention→dispatch path runs
+    # for comments; SCM notifications cover the non-comment lifecycle.
+    if event_type in ("pull_request", "issues"):
+        try:
+            _notify_scm(event_type, payload)
+        except Exception:  # noqa: BLE001 — notifications are best-effort
+            logger.exception("SCM notification fan-out failed for %s", event_type)
+        return {"statusCode": 200, "body": "ok"}
+
+    if not trigger_type:
+        # A subscribed event we neither route nor notify (push, etc.) — ack.
+        return {"statusCode": 200, "body": "ignored"}
 
     try:
         _process_comment(payload, trigger_type)
