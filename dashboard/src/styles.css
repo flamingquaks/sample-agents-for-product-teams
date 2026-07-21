@@ -183,6 +183,10 @@ td.mono,
   color: var(--unknown);
   border-color: var(--unknown);
 }
+.pill.warn {
+  color: var(--active);
+  border-color: var(--active);
+}
 
 /* Separates the repos section from the capabilities section in the admin view */
 .section-divider {

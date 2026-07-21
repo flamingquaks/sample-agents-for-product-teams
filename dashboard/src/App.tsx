@@ -225,7 +225,7 @@ export function App({ config }: { config: AppConfig }) {
                 onOpenConnectors={() => setView({ name: "connectors" })}
               />
             ) : view.name === "connectors" ? (
-              <ConnectorsView onOpen={(id) => setView({ name: "connector", id })} />
+              <ConnectorsView api={api} onOpen={(id) => setView({ name: "connector", id })} />
             ) : (
               <ConnectorPageHost
                 id={(view as { id: string }).id}

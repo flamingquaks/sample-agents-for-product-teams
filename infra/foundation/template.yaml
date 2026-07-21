@@ -1477,6 +1477,12 @@ Resources:
             Path: /admin/slack/workspaces/{team_id}
             Method: DELETE
             RestApiId: !Ref DashboardApi
+        SlackWorkspaceManifest:
+          Type: Api
+          Properties:
+            Path: /admin/slack/workspaces/{team_id}/manifest
+            Method: GET
+            RestApiId: !Ref DashboardApi
         SlackChannelsList:
           Type: Api
           Properties:

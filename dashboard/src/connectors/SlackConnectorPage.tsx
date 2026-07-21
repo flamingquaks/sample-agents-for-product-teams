@@ -5,6 +5,7 @@ import { useCallback, useState } from "react";
 import { ApiError } from "../api";
 import { usePolling } from "../hooks";
 import type { ChannelPolicy, ChannelRequest, NotifSub, SlackWorkspace } from "../types";
+import { ActivityPanel } from "./ActivityPanel";
 import { ConnectorLayout } from "./ConnectorLayout";
 import { TriggerRulesPanel } from "./TriggerRulesPanel";
 import type { ConnectorPageProps } from "./registry";
@@ -21,6 +22,7 @@ export function SlackConnectorPage({ api, onAuthError }: ConnectorPageProps) {
         { key: "requests", label: "Requests", render: () => <RequestsTab api={api} onAuthError={onAuthError} /> },
         { key: "notifications", label: "Notifications", render: () => <NotificationsTab api={api} onAuthError={onAuthError} /> },
         { key: "simulate", label: "Test access", render: () => <SimulatorTab api={api} onAuthError={onAuthError} /> },
+        { key: "activity", label: "Activity", render: () => <ActivityPanel api={api} source="slack" onAuthError={onAuthError} /> },
       ]}
     />
   );
@@ -61,14 +63,32 @@ function WorkspacesTab({ api, onAuthError }: ConnectorPageProps) {
     catch (e) { handleErr(e); } finally { setBusy(false); }
   };
 
+  const [manifest, setManifest] = useState<string | null>(null);
+  const showManifest = async () => {
+    setMsg(null);
+    try {
+      const r = await api.slackManifest();
+      setManifest(JSON.stringify(r.manifest, null, 2));
+    } catch (e) {
+      handleErr(e);
+      setMsg(`Failed to build manifest: ${(e as Error).message}`);
+    }
+  };
+
   const workspaces = poll.data?.workspaces ?? [];
   return (
     <div>
       <p className="muted">
-        Onboard each Slack workspace the fleet serves. Store its signing secret + bot token with
-        <code> scripts/bootstrap_slack.py</code>, then point the Slack app at the endpoints shown in
-        the stack outputs.
+        Onboard each Slack workspace the fleet serves. Get the app manifest below (Create app → From
+        manifest at api.slack.com), install it, then store its signing secret + bot token with
+        <code> scripts/bootstrap_slack.py</code>.
       </p>
+      <div className="filters">
+        <button disabled={busy} onClick={() => void showManifest()}>Show Slack app manifest</button>
+      </div>
+      {manifest && (
+        <pre className="manifest" style={{ maxHeight: 240, overflow: "auto" }}>{manifest}</pre>
+      )}
       <div className="filters">
         <input placeholder="team id (T…)" value={teamId} disabled={busy} onChange={(e) => setTeamId(e.target.value)} />
         <input placeholder="workspace name" value={teamName} disabled={busy} onChange={(e) => setTeamName(e.target.value)} />
@@ -234,6 +254,20 @@ function NotificationsTab({ api, onAuthError }: ConnectorPageProps) {
     catch (e) { handleErr(e); } finally { setBusy(false); }
   };
 
+  // §18.5: admins can adjust the severity floor of a self-configured subscription
+  // in-dashboard (the tier/event/repo detail is edited by the channel via the
+  // /sdlc-notify modal; the floor is the one knob worth an admin override here).
+  const setFloor = async (s: NotifSub, floor: NotifSub["min_severity"]) => {
+    setBusy(true);
+    try {
+      await api.upsertNotifSub({
+        team_id: s.team_id, channel_id: s.channel_id, repos: s.repos,
+        tiers: s.tiers, min_severity: floor,
+      });
+      poll.refresh();
+    } catch (e) { handleErr(e); } finally { setBusy(false); }
+  };
+
   const tierSummary = (s: NotifSub) =>
     (["actionable", "informative", "error"] as const)
       .filter((t) => (s.tiers[t] ?? []).length)
@@ -257,7 +291,17 @@ function NotificationsTab({ api, onAuthError }: ConnectorPageProps) {
               <td><code>{s.team_id}</code></td>
               <td>{s.repos.length ? s.repos.join(", ") : "—"}</td>
               <td>{tierSummary(s)}</td>
-              <td>{s.min_severity}</td>
+              <td>
+                <select
+                  value={s.min_severity}
+                  disabled={busy}
+                  onChange={(e) => void setFloor(s, e.target.value as NotifSub["min_severity"])}
+                >
+                  <option value="informative">informative</option>
+                  <option value="actionable">actionable</option>
+                  <option value="error">error</option>
+                </select>
+              </td>
               <td><button disabled={busy} onClick={() => void remove(s.team_id, s.channel_id)}>Remove</button></td>
             </tr>
           ))}

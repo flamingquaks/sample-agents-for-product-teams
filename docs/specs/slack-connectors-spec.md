@@ -430,12 +430,12 @@ All `auth.is_admin`, fail-closed, using the existing `_route` + `_sync_after_wri
 | Method + path | Purpose |
 |---|---|
 | `GET/POST /admin/slack/workspaces`, `DELETE …/{team_id}` | Onboard / list / remove workspaces |
-| `GET /admin/slack/workspaces/{team_id}/manifest` | Slack app manifest (parallels `github-app/setup/manifest`) |
+| `GET /admin/slack/workspaces/{team_id}/manifest` | Slack app manifest (parallels `github-app/setup/manifest`) — server-side builder in `infra/dashboard/slack_manifest.py`, surfaced in the Slack connector's Workspaces tab |
 | `GET/POST /admin/slack/channels`, `DELETE …/{team_id}/{channel_id}` | Per-workspace channel allow/deny |
 | `GET/POST /admin/trigger-rules?connector=<id>`, `DELETE …/{rule_id}` | Per-connector rule CRUD (pure `config_store` writes; no AVP projection — §5.5) |
 | `POST /admin/trigger-rules/simulate` | Read-only AVP `IsAuthorized` dry-run → ALLOW/DENY + deciding policy |
 
-Admin Lambda IAM gains `verifiedpermissions:CreatePolicy/DeletePolicy/ListPolicies/GetPolicy/IsAuthorized` on the trigger store, and SSM read/write for the per-workspace Slack secret paths (`/sdlc-agents/${Stage}/slack/*`).
+**As built (reconciled with the data-driven redesign, §5.5):** the admin Lambda needs **neither** `verifiedpermissions:*` on the trigger store **nor** SSM access to `/sdlc-agents/${Stage}/slack/*`. Grants are data (`config_store` DynamoDB writes, no per-rule `CreatePolicy`); the Test-access simulator does a **local** evaluation (`admin._simulate_access`, mirroring the router's fixed-policy math) rather than an AVP round-trip; and the Slack secrets are placed out-of-band by `scripts/bootstrap_slack.py` (the admin API only builds the *manifest*, which contains no secret). So the admin Lambda's IAM is unchanged from Part I — DynamoDB CRUD on the config table + `codebuild:StartBuild`. The earlier draft of this section (which granted AVP + SSM write) predated the data-driven model and is superseded.
 
 ---
 

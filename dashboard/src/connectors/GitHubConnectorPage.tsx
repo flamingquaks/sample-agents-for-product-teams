@@ -4,6 +4,7 @@
 // resource concern, not the connection), cross-linked here.
 
 import { GitHubAppPanel } from "../GitHubAppPanel";
+import { ActivityPanel } from "./ActivityPanel";
 import { ConnectorLayout } from "./ConnectorLayout";
 import type { ConnectorPageProps } from "./registry";
 
@@ -25,6 +26,11 @@ export function GitHubConnectorPage({ api, onAuthError }: ConnectorPageProps) {
               </p>
             </div>
           ),
+        },
+        {
+          key: "activity",
+          label: "Activity",
+          render: () => <ActivityPanel api={api} source="github" onAuthError={onAuthError} />,
         },
       ]}
     />

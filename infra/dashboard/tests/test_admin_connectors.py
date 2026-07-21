@@ -85,6 +85,34 @@ def test_workspace_bad_team_id_rejected():
 
 
 @mock_aws
+def test_slack_manifest_route(monkeypatch):
+    _make_table()
+    monkeypatch.setenv("WEBHOOK_API_BASE", "https://wh.example.com/test")
+    admin = _load_admin()
+    resp = admin.handler(_event("GET", "/admin/slack/workspaces/{team_id}/manifest",
+                                path={"team_id": "app"}))
+    assert resp["statusCode"] == 200, resp["body"]
+    m = _body(resp)["manifest"]
+    # Interactivity + all three slash commands + the events request URL are set.
+    assert m["settings"]["interactivity"]["request_url"] == "https://wh.example.com/test/slack/interactions"
+    assert m["settings"]["event_subscriptions"]["request_url"] == "https://wh.example.com/test/slack/events"
+    cmds = {c["command"] for c in m["features"]["slash_commands"]}
+    assert cmds == {"/sdlc-onboard-channel", "/sdlc-notify", "/fleet"}
+    assert "users:read.email" in m["oauth_config"]["scopes"]["bot"]
+
+
+def test_slack_manifest_matches_cli_builder():
+    # The dashboard manifest and the CLI (bootstrap_slack) manifest must stay
+    # byte-for-byte identical — they configure the same Slack app.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
+    import slack_manifest  # dashboard copy
+    import bootstrap_slack  # CLI copy
+
+    base = "https://wh.example.com/test"
+    assert slack_manifest.build_manifest(base) == bootstrap_slack.build_manifest(base)
+
+
+@mock_aws
 def test_operator_cannot_write_workspace():
     _make_table()
     admin = _load_admin()

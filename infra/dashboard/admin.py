@@ -862,6 +862,19 @@ def _route(event: dict) -> dict:
                 return error(400, str(exc))
             return ok(rec)
 
+    if resource == "/admin/slack/workspaces/{team_id}/manifest" and method == "GET":
+        # Hand the admin the ready-to-paste Slack app manifest (parallels
+        # github-app/setup/manifest). The webhook API base is env-supplied
+        # (a different API Gateway than this admin API).
+        import slack_manifest
+
+        webhook_base = os.environ.get("WEBHOOK_API_BASE", "")
+        if not webhook_base:
+            return error(500, "WEBHOOK_API_BASE not configured")
+        qs = event.get("queryStringParameters") or {}
+        app_name = qs.get("app_name") or "SDLC Agent Fleet"
+        return ok({"manifest": slack_manifest.build_manifest(webhook_base, app_name)})
+
     if resource in ("/admin/slack/workspaces/{team_id}", "/admin/slack/workspaces/{team_id+}"):
         team_id = (path_params.get("team_id") or path_params.get("team_id+") or "").strip()
         if method == "DELETE":

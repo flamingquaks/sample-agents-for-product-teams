@@ -227,6 +227,14 @@ export class DashboardApi {
     return this.request("DELETE", `/admin/slack/workspaces/${encodeURIComponent(teamId)}`);
   }
 
+  slackManifest(appName?: string): Promise<{ manifest: unknown }> {
+    // The manifest is app-level (not per-workspace); `app` is a path placeholder
+    // so the route parallels github-app/setup/manifest.
+    return this.get<{ manifest: unknown }>("/admin/slack/workspaces/app/manifest", {
+      app_name: appName,
+    });
+  }
+
   listChannels(teamId: string): Promise<{ channels: ChannelPolicy[] }> {
     return this.get<{ channels: ChannelPolicy[] }>("/admin/slack/channels", { team_id: teamId });
   }

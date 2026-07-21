@@ -4,6 +4,7 @@
 // rules scoped to connector="asana"). A future iteration can make the secrets +
 // GID mapping editable here.
 
+import { ActivityPanel } from "./ActivityPanel";
 import { ConnectorLayout } from "./ConnectorLayout";
 import { TriggerRulesPanel } from "./TriggerRulesPanel";
 import type { ConnectorPageProps } from "./registry";
@@ -34,6 +35,11 @@ export function AsanaConnectorPage({ api, onAuthError }: ConnectorPageProps) {
           render: () => (
             <TriggerRulesPanel api={api} connector="asana" onAuthError={onAuthError} />
           ),
+        },
+        {
+          key: "activity",
+          label: "Activity",
+          render: () => <ActivityPanel api={api} source="asana" onAuthError={onAuthError} />,
         },
       ]}
     />
