@@ -99,10 +99,19 @@ export interface CapabilityConfig {
   limits?: Record<string, number>;
   /** Per-agent runtime env (e.g. ASANA_PROJECT_GID); values injected at deploy. */
   env?: Record<string, string>;
+  /** Config-driven (custom) agent fields (spec §3.2). Built-ins ignore these —
+   *  their prompt/deps/grants are code-defined and shown read-only. */
+  system_prompt?: string;
+  requirements?: string[];
+  /** Per-TOOL allowlist, Target___tool ids (§3.5). */
+  tool_grants?: string[];
+  skills?: SkillRef[];
+  /** approved | pending_review — set when the approval gate is on (§7.5). */
+  review_status?: string;
   enabled?: boolean;
   /** Seeded system agent — fixed config, enable/disable-only, undeletable (§3.1). */
   builtin?: boolean;
-  /** pending | building | active | failed | disabled. */
+  /** pending | building | active | failed | disabled | deleting. */
   status?: string;
   status_detail?: string;
   image_tag?: string;
@@ -111,6 +120,23 @@ export interface CapabilityConfig {
   onboarded_by?: string;
   onboarded_at?: number;
   updated_at?: number;
+}
+
+/** A skill package reference on a capability (spec §6.1) / in the skills library. */
+export interface SkillRef {
+  name: string;
+  s3_prefix: string;
+  sha256?: string;
+  scope?: "capability" | "shared" | string;
+}
+
+/** A grantable tool in the fleet catalog (spec §3.5), for the authoring picker.
+ *  Destructive tools are excluded server-side — never grantable. */
+export interface ToolCatalogEntry {
+  action_id: string;
+  target: string;
+  tool: string;
+  klass: "read" | "write";
 }
 
 /** GitHub App registration status for the admin setup panel. */

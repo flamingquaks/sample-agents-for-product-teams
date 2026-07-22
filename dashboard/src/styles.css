@@ -368,9 +368,63 @@ h3 {
   border-radius: 6px;
   padding: 8px 10px;
 }
+.modal .field textarea {
+  font: inherit;
+  background: var(--surface-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  resize: vertical;
+  min-height: 72px;
+}
 .modal .field-inline {
   display: block;
   margin: 14px 0;
+}
+/* Tool-grant / skill checklist inside the authoring modal. */
+.tool-grid {
+  max-height: 220px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  background: var(--surface-2);
+}
+.tool-grid .connector-group {
+  margin-bottom: 10px;
+}
+.tool-grid .connector-group > .group-label {
+  color: var(--text-dim);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 4px;
+}
+.tool-grid label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+  font-size: 13px;
+  text-transform: none;
+  letter-spacing: 0;
+}
+.tool-grid label.disabled {
+  opacity: 0.5;
+}
+.klass-tag {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+}
+.klass-tag.write {
+  color: var(--warn, #b7791f);
+  border-color: var(--warn, #b7791f);
 }
 .modal-actions {
   display: flex;

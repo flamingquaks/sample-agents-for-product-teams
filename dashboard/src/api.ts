@@ -20,7 +20,9 @@ import type {
   RepoConfig,
   Run,
   RunsPage,
+  SkillRef,
   SlackWorkspace,
+  ToolCatalogEntry,
   TraceResult,
   TriggerRule,
   UserRequest,
@@ -178,15 +180,75 @@ export class DashboardApi {
     triggers?: Record<string, string[]>;
     limits?: Record<string, number>;
     env?: Record<string, string>;
+    // Config-driven (custom) agent fields (§3.2). Ignored for built-ins, which
+    // accept only `enabled`.
+    system_prompt?: string;
+    requirements?: string[];
+    tool_grants?: string[];
+    skills?: SkillRef[];
     enabled?: boolean;
   }): Promise<CapabilityConfig> {
     return this.request<CapabilityConfig>("POST", "/admin/capabilities", { body });
   }
 
+  /** Delete a CUSTOM agent: de-routes immediately and hands teardown to the
+   *  deployer (§8.2), so the row lands in `deleting` rather than being gone. */
   deleteCapability(
-    agentId: string
-  ): Promise<{ agent_id: string; deleted: boolean }> {
+    agentId: string,
+  ): Promise<{ agent_id: string; status: string }> {
     return this.request("DELETE", `/admin/capabilities/${encodeURIComponent(agentId)}`);
+  }
+
+  /** Clone any capability (built-in or custom) into a new editable custom agent
+   *  (§8.2). The new id comes from `newAgentId`. */
+  cloneCapability(sourceId: string, newAgentId: string): Promise<CapabilityConfig> {
+    return this.request<CapabilityConfig>(
+      "POST",
+      `/admin/capabilities/${encodeURIComponent(sourceId)}/clone`,
+      { body: { new_agent_id: newAgentId } },
+    );
+  }
+
+  /** Second-admin approval of a pending_review custom agent (§7.5). The caller
+   *  must differ from the author (enforced server-side). */
+  approveCapability(agentId: string): Promise<CapabilityConfig> {
+    return this.request<CapabilityConfig>(
+      "POST",
+      `/admin/capabilities/${encodeURIComponent(agentId)}/approve`,
+      { body: {} },
+    );
+  }
+
+  /** The grantable tool catalog for the authoring picker (§3.5). Read/write only
+   *  — destructive tools are excluded server-side. */
+  toolCatalog(): Promise<{ tools: ToolCatalogEntry[] }> {
+    return this.get<{ tools: ToolCatalogEntry[] }>("/admin/tool-catalog");
+  }
+
+  // --- skills (spec §6) ------------------------------------------------------
+
+  listSkills(): Promise<{ skills: SkillRef[] }> {
+    return this.get<{ skills: SkillRef[] }>("/admin/skills");
+  }
+
+  /** Upload a raw SKILL.md. */
+  uploadSkillMd(content: string, scope = "shared"): Promise<SkillRef> {
+    return this.request<SkillRef>("POST", "/admin/skills", { body: { content, scope } });
+  }
+
+  /** Upload a .zip skill package (base64). Validated + expanded by the isolated
+   *  unpacker Lambda server-side (§6.3). */
+  uploadSkillZip(zipBase64: string, scope = "shared"): Promise<SkillRef> {
+    return this.request<SkillRef>("POST", "/admin/skills", {
+      body: { zip_base64: zipBase64, scope },
+    });
+  }
+
+  deleteSkill(scope: string, name: string): Promise<{ name: string; scope: string; deleted: boolean }> {
+    return this.request(
+      "DELETE",
+      `/admin/skills/${encodeURIComponent(scope)}/${encodeURIComponent(name)}`,
+    );
   }
 
   // --- GitHub App setup (manifest flow) --------------------------------------

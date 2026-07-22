@@ -12,6 +12,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError, type DashboardApi } from "./api";
 import { CapabilitiesPanel } from "./CapabilitiesPanel";
+import { SkillsPanel } from "./SkillsPanel";
 import { fmtTime } from "./format";
 import { usePolling } from "./hooks";
 import type { FleetSettings, RepoConfig } from "./types";
@@ -250,6 +251,10 @@ export function AdminView({
       <hr className="section-divider" />
 
       <CapabilitiesPanel api={api} onAuthError={onAuthError} />
+
+      <hr className="section-divider" />
+
+      <SkillsPanel api={api} onAuthError={onAuthError} />
     </div>
   );
 }
