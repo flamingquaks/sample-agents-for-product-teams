@@ -1534,6 +1534,12 @@ Resources:
             Path: /admin/github-app/status
             Method: GET
             RestApiId: !Ref DashboardApi
+        GitHubAppRepos:
+          Type: Api
+          Properties:
+            Path: /admin/github-app/repos
+            Method: GET
+            RestApiId: !Ref DashboardApi
         GitHubAppManifest:
           Type: Api
           Properties:

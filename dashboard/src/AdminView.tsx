@@ -1,21 +1,22 @@
-// Admin view: fleet configuration (admins group only). Onboard/remove repos,
-// toggle per-repo multi-repo eligibility, and flip the fleet-wide "restrict to
-// allowlist" setting. The dashboard nav gates this cosmetically on the admins
-// group; the admin API is the real authority (non-admins get 403).
+// Admin view: fleet configuration (admins group only). Onboard/remove repos
+// (picked from what the GitHub App can reach — never typed by hand) and flip
+// the fleet-wide "restrict to allowlist" setting. The dashboard nav gates this
+// cosmetically on the admins group; the admin API is the real authority
+// (non-admins get 403).
 //
 // Two records back this view (see infra/dashboard/config_store.py): repo rows
-// (enabled = dispatchable, multi_repo_eligible = cross-repo tool-call allowed,
-// status = pending until the Gateway policy sync lands) and a settings
-// singleton (restrict_repos). Every write re-fetches so the table reflects the
-// server's post-sync truth rather than an optimistic guess.
+// (enabled = dispatchable, co_repo_mode/repo_group = which other repos a
+// dispatch may reach, status = pending until the Gateway policy sync lands)
+// and a settings singleton (restrict_repos). Every write re-fetches so the
+// table reflects the server's post-sync truth rather than an optimistic guess.
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiError, type DashboardApi } from "./api";
 import { CapabilitiesPanel } from "./CapabilitiesPanel";
 import { SkillsPanel } from "./SkillsPanel";
 import { fmtTime } from "./format";
 import { usePolling } from "./hooks";
-import type { FleetSettings, RepoConfig } from "./types";
+import type { FleetSettings, GitHubAvailableRepos, RepoConfig } from "./types";
 
 export function AdminView({
   api,
@@ -141,12 +142,11 @@ export function AdminView({
           <h2>Fleet configuration</h2>
           <p className="muted">
             Onboard the repositories the fleet may act in. Mentions from a non-onboarded repo are
-            rejected at dispatch; a repo that is onboarded but not multi-repo eligible is
-            dispatchable but blocked from cross-repo tool actions at the Gateway.
+            rejected at dispatch; “Runs with” controls which other repos a dispatch may reach.
           </p>
         </div>
         <button className="primary" disabled={busy} onClick={() => setOnboardOpen(true)}>
-          Onboard repository
+          Onboard repositories
         </button>
       </div>
 
@@ -174,10 +174,11 @@ export function AdminView({
         <OnboardModal
           api={api}
           onClose={() => setOnboardOpen(false)}
-          onSuccess={(repo, warning) => {
+          onSuccess={(repos, warning) => {
             setOnboardOpen(false);
             setActionError(null);
-            setActionMsg(warning ? `Onboarded ${repo} — ${warning}` : `Onboarded ${repo}.`);
+            const what = repos.length === 1 ? repos[0] : `${repos.length} repositories`;
+            setActionMsg(warning ? `Onboarded ${what} — ${warning}` : `Onboarded ${what}.`);
             reposPoll.refresh();
           }}
         />
@@ -192,7 +193,6 @@ export function AdminView({
           <tr>
             <th>Repository</th>
             <th>Dispatchable</th>
-            <th>Multi-repo eligible</th>
             <th>Runs with</th>
             <th>Status</th>
             <th>Onboarded by</th>
@@ -207,10 +207,9 @@ export function AdminView({
                 <code>{r.repo}</code>
               </td>
               <td>{r.enabled ? "yes" : "no"}</td>
-              <td>{r.multi_repo_eligible ? "yes" : "no"}</td>
               <td>
                 {!r.multi_repo_eligible
-                  ? "—"
+                  ? "itself only"
                   : r.co_repo_mode === "all"
                     ? "all repos"
                     : r.co_repo_mode === "group"
@@ -240,8 +239,8 @@ export function AdminView({
           ))}
           {repos.length === 0 && !reposPoll.loading && (
             <tr>
-              <td colSpan={8} className="muted">
-                No repositories onboarded yet. Use “Onboard repository” to add one.
+              <td colSpan={7} className="muted">
+                No repositories onboarded yet. Use “Onboard repositories” to add some.
               </td>
             </tr>
           )}
@@ -288,42 +287,45 @@ function SettingsPanel({
   );
 }
 
-// owner/repo with GitHub-legal segment chars — mirrors admin._valid_repo so the
-// client rejects the same inputs the server would, with an inline reason.
-const REPO_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
-
-// Modal onboarding workflow. The old inline form buried a two-step interaction
-// (type owner/repo, THEN click a separate button) in a filter row, which read
-// as ambient page furniture — it wasn't obvious the field and button were one
-// action. A modal makes the flow explicit: click "Onboard repository", fill the
-// form in a focused dialog, submit. The dialog only closes on success (the
-// parent's onOnboard resolves after the write); a validation or API failure
-// keeps it open with the reason shown so the input isn't lost.
-// The modal owns its submit so it can handle the GitHub-App verification loop:
-// a 409 "not installed" / "not covered" carries an `install_url` the dialog
-// surfaces as an install button + a Re-check (retry) — a guided loop, not a
-// dead end. On success it calls onSuccess (which closes the dialog + refreshes
-// the parent's list).
+// Modal onboarding workflow — a PICKER, not a form. The App already knows
+// exactly which repos it can reach, so the admin never types owner/repo: the
+// dialog loads GET /admin/github-app/repos and renders a filterable checkbox
+// list (already-onboarded repos shown checked+disabled). Multiple repos onboard
+// in one submit; the only access decision is how the batch runs together:
+//   - isolated — each repo runs alone (dispatches can't cross repos), or
+//   - shared   — the selected repos may act on each other (one mutual group).
+// (The old "multi-repo eligible" checkbox is gone — eligibility is implied; a
+// repo that runs isolated simply reaches no other repo.)
+// If the App isn't installed anywhere (or a wanted repo is missing from the
+// list), the dialog deep-links to GitHub's install page and POLLS the repo list
+// so the moment the admin finishes installing in the other tab, the new repos
+// appear here — no manual re-check, no dead end.
 function OnboardModal({
   api,
   onSuccess,
   onClose,
 }: {
   api: DashboardApi;
-  onSuccess: (repo: string, warning?: string) => void;
+  onSuccess: (repos: string[], warning?: string) => void;
   onClose: () => void;
 }) {
-  const [repo, setRepo] = useState("");
-  const [eligible, setEligible] = useState(true);
-  const [coRepoMode, setCoRepoMode] = useState<"isolated" | "group" | "all">("isolated");
-  const [repoGroup, setRepoGroup] = useState("");
   const [busy, setBusy] = useState(false);
   const [hint, setHint] = useState<string | null>(null);
-  const [installUrl, setInstallUrl] = useState<string | null>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const [filter, setFilter] = useState("");
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [access, setAccess] = useState<"isolated" | "shared">("isolated");
+  // Poll while the install page is open in another tab so a fresh install/
+  // selection change shows up without a manual refresh.
+  const [watching, setWatching] = useState(false);
+  const availPoll = usePolling<GitHubAvailableRepos>(() => api.gitHubAppRepos(), {
+    isActive: () => watching,
+    deps: [api],
+  });
+  const avail = availPoll.data;
+  const filterRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    inputRef.current?.focus();
+    filterRef.current?.focus();
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape" && !busy) onClose();
     };
@@ -331,38 +333,47 @@ function OnboardModal({
     return () => window.removeEventListener("keydown", onKey);
   }, [busy, onClose]);
 
+  const rows = useMemo(() => {
+    const all = (avail?.installations ?? []).flatMap((inst) =>
+      inst.repos.map((r) => ({ ...r, owner: inst.owner })),
+    );
+    const q = filter.trim().toLowerCase();
+    return q ? all.filter((r) => r.repo.toLowerCase().includes(q)) : all;
+  }, [avail, filter]);
+
+  const toggle = (repo: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(repo)) next.delete(repo);
+      else next.add(repo);
+      return next;
+    });
+    if (hint) setHint(null);
+  };
+
   const submit = async () => {
-    const trimmed = repo.trim();
-    if (!trimmed) {
-      setHint("Enter a repository as owner/repo (e.g. octocat/hello-world).");
-      return;
-    }
-    if (!REPO_RE.test(trimmed)) {
-      setHint(`"${trimmed}" isn't a valid owner/repo — one slash, letters/digits/._- only.`);
-      return;
-    }
-    if (coRepoMode === "group" && !repoGroup.trim()) {
-      setHint("Enter a group name when co-repo mode is “group”.");
+    const repos = [...selected];
+    if (repos.length === 0) {
+      setHint("Select at least one repository.");
       return;
     }
     setHint(null);
-    setInstallUrl(null);
     setBusy(true);
     try {
-      const rec = (await api.onboardRepo({
-        repo: trimmed,
-        enabled: true,
-        multi_repo_eligible: eligible,
-        co_repo_mode: coRepoMode,
-        repo_group: coRepoMode === "group" ? repoGroup.trim() : undefined,
-      })) as { policy_sync_warning?: string };
-      onSuccess(trimmed, rec.policy_sync_warning);
+      // "Shared" = the batch forms one mutual group; a deterministic label from
+      // the first repo keeps re-onboards of the same batch in the same group.
+      const result = await api.onboardRepos({
+        repos,
+        co_repo_mode: access === "shared" && repos.length > 1 ? "group" : "isolated",
+        repo_group:
+          access === "shared" && repos.length > 1
+            ? repos[0].replace("/", "-")
+            : undefined,
+      });
+      onSuccess(repos, result.policy_sync_warning);
     } catch (e) {
       if (e instanceof ApiError) {
         setHint(e.message);
-        // 409 with an install deep-link → offer to install + re-check.
-        const link = e.body?.install_url;
-        if (typeof link === "string") setInstallUrl(link);
       } else {
         setHint((e as Error).message);
       }
@@ -370,6 +381,9 @@ function OnboardModal({
       setBusy(false);
     }
   };
+
+  const installUrl = avail?.install_url;
+  const noInstalls = avail !== null && avail.configured && rows.length === 0 && !filter;
 
   return (
     <div
@@ -385,99 +399,124 @@ function OnboardModal({
         aria-labelledby="onboard-title"
         onClick={(e) => e.stopPropagation()}
       >
-        <h3 id="onboard-title">Onboard repository</h3>
-        <p className="muted">
-          Enter the repository as <code>owner/repo</code>. It becomes dispatchable immediately;
-          leave “multi-repo eligible” checked to also allow cross-repo tool actions at the Gateway.
-        </p>
+        <h3 id="onboard-title">Onboard repositories</h3>
 
-        <label className="field">
-          <span>Repository</span>
-          <input
-            ref={inputRef}
-            placeholder="owner/repo"
-            value={repo}
-            disabled={busy}
-            onChange={(e) => {
-              setRepo(e.target.value);
-              if (hint) setHint(null);
-            }}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") void submit();
-            }}
-            aria-label="Repository (owner/repo)"
-          />
-        </label>
-
-        <label className="field-inline">
-          <input
-            type="checkbox"
-            checked={eligible}
-            disabled={busy}
-            onChange={(e) => setEligible(e.target.checked)}
-          />{" "}
-          Multi-repo eligible
-        </label>
-
-        {eligible && (
-          <>
-            <label className="field">
-              <span>Approved to run with</span>
-              <select
-                value={coRepoMode}
-                disabled={busy}
-                onChange={(e) =>
-                  setCoRepoMode(e.target.value as "isolated" | "group" | "all")
-                }
-                aria-label="Co-repo mode"
-              >
-                <option value="isolated">Only itself (isolated)</option>
-                <option value="group">Repos in a named group</option>
-                <option value="all">All eligible repos</option>
-              </select>
-            </label>
-            {coRepoMode === "group" && (
-              <label className="field">
-                <span>Group name</span>
-                <input
-                  placeholder="e.g. acme-platform"
-                  value={repoGroup}
-                  disabled={busy}
-                  onChange={(e) => setRepoGroup(e.target.value)}
-                  aria-label="Repo group name"
-                />
-              </label>
-            )}
-            <p className="muted" style={{ marginTop: 4 }}>
-              Controls which OTHER repos a dispatch from this repo may act on. A
-              group is mutual — repos sharing a group name (and set to “group”)
-              may operate on each other, across owners/orgs.
-            </p>
-          </>
+        {avail === null && !availPoll.error && <p className="muted">Loading repositories the GitHub App can access…</p>}
+        {availPoll.error && (
+          <div className="banner error">Could not list repositories: {availPoll.error}</div>
         )}
 
-        {hint && (
-          <div className="banner error" role="alert">
-            {hint}
+        {avail !== null && !avail.configured && (
+          <p className="muted">
+            The GitHub App isn’t set up yet — configure it under{" "}
+            <b>Connectors → GitHub</b> first.
+          </p>
+        )}
+
+        {avail?.configured && (
+          <>
+            <p className="muted">
+              Pick the repositories the fleet may act in. Missing one? Install the App on its
+              owner (or add it to the installation’s repository selection) and it appears here.
+            </p>
             {installUrl && (
-              <div style={{ marginTop: 8 }}>
-                <a className="button-link" href={installUrl} target="_blank" rel="noreferrer">
-                  Install the GitHub App ↗
+              <div style={{ marginBottom: 8 }}>
+                <a
+                  className="button-link"
+                  href={installUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  onClick={() => setWatching(true)}
+                >
+                  Install / add repositories on GitHub ↗
                 </a>{" "}
-                then Re-check.
+                {watching && <span className="muted">watching for changes…</span>}
               </div>
             )}
-          </div>
-        )}
 
-        <div className="modal-actions">
-          <button disabled={busy} onClick={onClose}>
-            Cancel
-          </button>
-          <button className="primary" disabled={busy} onClick={() => void submit()}>
-            {busy ? "Onboarding…" : installUrl ? "Re-check" : "Onboard repo"}
-          </button>
-        </div>
+            <input
+              ref={filterRef}
+              placeholder="Filter repositories…"
+              value={filter}
+              disabled={busy}
+              onChange={(e) => setFilter(e.target.value)}
+              aria-label="Filter repositories"
+              style={{ width: "100%", marginBottom: 8 }}
+            />
+
+            <div className="repo-picker" role="listbox" aria-multiselectable="true">
+              {rows.map((r) => (
+                <label key={r.repo} className="field-inline" style={{ display: "block" }}>
+                  <input
+                    type="checkbox"
+                    checked={r.onboarded || selected.has(r.repo)}
+                    disabled={busy || r.onboarded}
+                    onChange={() => toggle(r.repo)}
+                  />{" "}
+                  <code>{r.repo}</code>
+                  {r.private && <span className="muted"> · private</span>}
+                  {r.onboarded && <span className="muted"> · already onboarded</span>}
+                </label>
+              ))}
+              {noInstalls && (
+                <p className="muted">
+                  The App has no repositories yet — use the install link above, then they’ll
+                  show up here automatically.
+                </p>
+              )}
+              {rows.length === 0 && filter && (
+                <p className="muted">No repositories match “{filter}”.</p>
+              )}
+            </div>
+
+            {selected.size > 1 && (
+              <div className="field" style={{ marginTop: 8 }}>
+                <span>How these {selected.size} repositories run</span>
+                <label className="field-inline">
+                  <input
+                    type="radio"
+                    name="access"
+                    checked={access === "isolated"}
+                    disabled={busy}
+                    onChange={() => setAccess("isolated")}
+                  />{" "}
+                  Isolated — each repo runs alone
+                </label>
+                <label className="field-inline">
+                  <input
+                    type="radio"
+                    name="access"
+                    checked={access === "shared"}
+                    disabled={busy}
+                    onChange={() => setAccess("shared")}
+                  />{" "}
+                  Shared — these repos may act on each other
+                </label>
+              </div>
+            )}
+
+            {hint && (
+              <div className="banner error" role="alert">
+                {hint}
+              </div>
+            )}
+
+            <div className="modal-actions">
+              <button disabled={busy} onClick={onClose}>
+                Cancel
+              </button>
+              <button
+                className="primary"
+                disabled={busy || selected.size === 0}
+                onClick={() => void submit()}
+              >
+                {busy
+                  ? "Onboarding…"
+                  : `Onboard ${selected.size || ""} ${selected.size === 1 ? "repository" : "repositories"}`}
+              </button>
+            </div>
+          </>
+        )}
       </div>
     </div>
   );

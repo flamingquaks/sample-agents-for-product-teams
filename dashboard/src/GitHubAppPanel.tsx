@@ -14,7 +14,7 @@
 import { useCallback, useState } from "react";
 import { ApiError, type DashboardApi } from "./api";
 import { usePolling } from "./hooks";
-import type { GitHubAppStatus } from "./types";
+import type { GitHubAppStatus, GitHubAvailableRepos } from "./types";
 
 /** POST the manifest to GitHub via a transient auto-submitting form. GitHub's
  *  manifest flow requires an HTML form POST of a `manifest` field — it then
@@ -61,8 +61,19 @@ export function GitHubAppPanel({
   const [org, setOrg] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // After "Install on GitHub" opens the other tab, poll installations fast so
+  // the panel reflects the finished install without a manual refresh.
+  const [watching, setWatching] = useState(false);
+  const installsPoll = usePolling<GitHubAvailableRepos>(() => api.gitHubAppRepos(), {
+    // Fast only while waiting for a first install to land; once installations
+    // exist, drop back to the idle beat.
+    isActive: (d) => watching && d.installations.length === 0,
+    deps: [api, refreshKey],
+    onError: handleError,
+  });
 
   const status = statusPoll.data;
+  const installations = installsPoll.data?.installations ?? [];
 
   const startSetup = async () => {
     setBusy(true);
@@ -95,9 +106,41 @@ export function GitHubAppPanel({
               href={status.install_url}
               target="_blank"
               rel="noreferrer"
+              onClick={() => setWatching(true)}
             >
               Install on GitHub ↗
             </a>
+          )}
+          {installations.length > 0 ? (
+            <table style={{ marginTop: 12 }}>
+              <thead>
+                <tr>
+                  <th>Installed on</th>
+                  <th>Type</th>
+                  <th>Repositories</th>
+                </tr>
+              </thead>
+              <tbody>
+                {installations.map((inst) => (
+                  <tr key={inst.installation_id}>
+                    <td>
+                      <code>{inst.owner}</code>
+                    </td>
+                    <td>{inst.owner_type}</td>
+                    <td>
+                      {inst.repos.length}
+                      {inst.repos.some((r) => r.onboarded) &&
+                        ` (${inst.repos.filter((r) => r.onboarded).length} onboarded)`}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <p className="muted" style={{ marginTop: 12 }}>
+              Not installed anywhere yet
+              {watching && " — watching for the install to complete…"}
+            </p>
           )}
         </>
       ) : (

@@ -400,14 +400,16 @@ class _FakeGitHub:
     def app_configured(self):
         return self._configured
 
-    def get_owner_type(self, owner):
-        return self._owner_type
+    def find_repo_installation(self, owner, repo):
+        # Covered ⇔ App installed on the owner AND repo in its selection.
+        if self._installation_id is None or not self._reachable:
+            return None
+        return self._installation_id, self._owner_type
 
-    def find_installation(self, owner, owner_type):
-        return self._installation_id
-
-    def repo_reachable(self, owner, name, installation_id):
-        return self._reachable
+    def find_installation(self, owner):
+        if self._installation_id is None:
+            return None
+        return self._installation_id, self._owner_type
 
     def install_url(self, owner=None):
         return "https://github.com/apps/sdlc-fleet/installations/new"
@@ -496,11 +498,106 @@ def test_update_existing_repo_skips_verification(monkeypatch):
 
 
 @mock_aws
+def test_bulk_onboard_shared_group(monkeypatch):
+    # Several repos in one action, shared access together: one group-mode batch
+    # → every row lands active with the same group, ONE policy sync.
+    _make_table()
+    syncs = {"n": 0}
+    admin = _load_admin(_FakeGitHub(installation_id=9))
+
+    def count_sync():
+        syncs["n"] += 1
+
+    monkeypatch.setattr(admin, "_sync_repo_policy", count_sync)
+    resp = admin.handler(
+        _event(
+            "POST",
+            "/admin/repos",
+            body={
+                "repos": ["acme/web", "acme/api", "acme/docs"],
+                "co_repo_mode": "group",
+                "repo_group": "batch-1",
+            },
+        )
+    )
+    assert resp["statusCode"] == 200
+    recs = _body(resp)["repos"]
+    assert [r["repo"] for r in recs] == ["acme/web", "acme/api", "acme/docs"]
+    assert all(r["status"] == "active" and r["repo_group"] == "batch-1" for r in recs)
+    assert syncs["n"] == 1  # one sync for the whole batch, not one per repo
+
+
+@mock_aws
+def test_bulk_onboard_atomic_on_verify_failure(monkeypatch):
+    # One uncovered repo fails the WHOLE batch before anything is written.
+    class _OnlyWeb(_FakeGitHub):
+        def find_repo_installation(self, owner, repo):
+            return (9, "User") if repo == "web" else None
+
+    _make_table()
+    admin = _load_admin_app_mode(monkeypatch, _OnlyWeb())
+    resp = admin.handler(
+        _event("POST", "/admin/repos", body={"repos": ["acme/web", "acme/ghost"]})
+    )
+    assert resp["statusCode"] == 409
+    import config_store
+
+    assert config_store.list_repos() == []  # nothing half-onboarded
+
+
+@mock_aws
+def test_bulk_onboard_rejects_bad_entry(monkeypatch):
+    _make_table()
+    admin = _load_admin_app_mode(monkeypatch, _FakeGitHub())
+    resp = admin.handler(
+        _event("POST", "/admin/repos", body={"repos": ["acme/web", "not-a-repo"]})
+    )
+    assert resp["statusCode"] == 400
+
+
+@mock_aws
+def test_github_app_repos_listing(monkeypatch):
+    # The onboarding picker's source: installations + reachable repos, with
+    # already-onboarded ones flagged.
+    class _Listing(_FakeGitHub):
+        def list_installations(self):
+            return [{"installation_id": 9, "owner": "acme", "owner_type": "User"}]
+
+        def list_installation_repos(self, installation_id):
+            return [
+                {"repo": "acme/web", "private": True},
+                {"repo": "acme/api", "private": False},
+            ]
+
+    _make_table()
+    admin = _load_admin_app_mode(monkeypatch, _Listing())
+    admin.handler(_event("POST", "/admin/repos", body={"repo": "acme/web"}))
+    resp = admin.handler(_event("GET", "/admin/github-app/repos"))
+    assert resp["statusCode"] == 200
+    body = _body(resp)
+    assert body["configured"] is True
+    repos = body["installations"][0]["repos"]
+    assert {r["repo"]: r["onboarded"] for r in repos} == {
+        "acme/web": True,
+        "acme/api": False,
+    }
+
+
+@mock_aws
+def test_github_app_repos_unconfigured(monkeypatch):
+    _make_table()
+    admin = _load_admin_app_mode(monkeypatch, _FakeGitHub(configured=False))
+    resp = admin.handler(_event("GET", "/admin/github-app/repos"))
+    assert resp["statusCode"] == 200
+    assert _body(resp) == {"configured": False, "installations": []}
+
+
+@mock_aws
 def test_verification_error_is_actionable_not_500(monkeypatch):
     # A non-GitHubError during verification (e.g. bad key → ValueError) must
     # surface as an actionable 502, not an opaque 500.
     class _Boom(_FakeGitHub):
-        def get_owner_type(self, owner):
+        def find_repo_installation(self, owner, repo):
             raise ValueError("could not deserialize key data")
 
     _make_table()

@@ -112,22 +112,84 @@ def test_generate_manifest_shape():
     assert "#" not in m["redirect_url"]
 
 
-def test_get_owner_type(monkeypatch):
+def test_find_repo_installation_present_and_absent(monkeypatch):
+    # 200 with an id + account type → (id, owner_type); 404 → None (covers both
+    # "App not installed" and "repo not in the installation's selection").
     monkeypatch.setattr(
-        github_client, "_request", lambda *a, **k: (200, {"type": "Organization"})
+        github_client,
+        "_request",
+        lambda *a, **k: (200, {"id": 42, "account": {"type": "Organization"}}),
     )
-    assert github_client.get_owner_type("acme") == "Organization"
-
-
-def test_find_installation_present_and_absent(monkeypatch):
-    monkeypatch.setattr(github_client, "_request", lambda *a, **k: (200, {"id": 42}))
-    assert github_client.find_installation("acme", "Organization") == 42
+    assert github_client.find_repo_installation("acme", "web") == (42, "Organization")
 
     def not_found(*a, **k):
         raise github_client.GitHubError("nope", status=404)
 
     monkeypatch.setattr(github_client, "_request", not_found)
-    assert github_client.find_installation("alice", "User") is None
+    assert github_client.find_repo_installation("acme", "ghost") is None
+
+
+def test_find_repo_installation_never_hits_users_endpoint(monkeypatch):
+    # Regression: GET /users/{owner} rejects an App JWT (401 Bad credentials) —
+    # verification must route only through JWT-accepting installation endpoints.
+    urls = []
+
+    def record(method, url, **k):
+        urls.append(url)
+        return 200, {"id": 42, "account": {"type": "User"}}
+
+    monkeypatch.setattr(github_client, "_request", record)
+    github_client.find_repo_installation("alice", "web")
+    assert urls == [f"{github_client.GITHUB_API_BASE}/repos/alice/web/installation"]
+
+
+def test_find_installation_present_and_absent(monkeypatch):
+    # Org path hits first; a user-owned App 404s it and falls through to /users.
+    def org_404_user_ok(method, url, **k):
+        if "/orgs/" in url:
+            raise github_client.GitHubError("nope", status=404)
+        return 200, {"id": 42, "account": {"type": "User"}}
+
+    monkeypatch.setattr(github_client, "_request", org_404_user_ok)
+    assert github_client.find_installation("alice") == (42, "User")
+
+    def not_found(*a, **k):
+        raise github_client.GitHubError("nope", status=404)
+
+    monkeypatch.setattr(github_client, "_request", not_found)
+    assert github_client.find_installation("alice") is None
+
+
+def test_list_installations_and_repos(monkeypatch):
+    future = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
+
+    def fake(method, url, **k):
+        # Order matters: the access-tokens URL also contains /app/installations.
+        if "/access_tokens" in url:
+            return 201, {"token": "ghs_x", "expires_at": future}
+        if "/app/installations" in url:
+            return 200, [
+                {"id": 7, "account": {"login": "acme", "type": "Organization"}}
+            ]
+        if "/installation/repositories" in url:
+            return 200, {
+                "repositories": [
+                    {"full_name": "acme/web", "private": True},
+                    {"full_name": "acme/api", "private": False},
+                ]
+            }
+        raise AssertionError(f"unexpected URL {url}")
+
+    monkeypatch.setattr(github_client, "_request", fake)
+    installs = github_client.list_installations()
+    assert installs == [
+        {"installation_id": 7, "owner": "acme", "owner_type": "Organization"}
+    ]
+    repos = github_client.list_installation_repos(7)
+    assert repos == [
+        {"repo": "acme/web", "private": True},
+        {"repo": "acme/api", "private": False},
+    ]
 
 
 def test_mint_installation_token_caches(monkeypatch):
@@ -150,23 +212,6 @@ def test_mint_installation_token_caches(monkeypatch):
     _tok, cached_exp = github_client._token_cache[99]
     true_epoch = calendar.timegm(time.strptime(future, "%Y-%m-%dT%H:%M:%SZ"))
     assert abs(cached_exp - true_epoch) < 60
-
-
-def test_repo_reachable_true_false(monkeypatch):
-    future = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
-    monkeypatch.setattr(
-        github_client,
-        "mint_installation_token",
-        lambda _id: ("ghs_x", future),
-    )
-    monkeypatch.setattr(github_client, "_request", lambda *a, **k: (200, {"id": 1}))
-    assert github_client.repo_reachable("acme", "web", 1) is True
-
-    def not_found(*a, **k):
-        raise github_client.GitHubError("404", status=404)
-
-    monkeypatch.setattr(github_client, "_request", not_found)
-    assert github_client.repo_reachable("acme", "ghost", 1) is False
 
 
 def test_install_url_uses_slug():

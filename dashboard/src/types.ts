@@ -152,6 +152,29 @@ export interface GitHubManifest {
   post_url: string;
 }
 
+/** A repo an App installation can reach (the onboarding picker's rows). */
+export interface GitHubAvailableRepo {
+  repo: string;
+  private: boolean;
+  /** Already onboarded to the fleet — shown but not re-selectable. */
+  onboarded: boolean;
+}
+
+/** One App installation + its reachable repos. */
+export interface GitHubInstallation {
+  installation_id: number;
+  owner: string;
+  owner_type: string;
+  repos: GitHubAvailableRepo[];
+}
+
+/** GET /admin/github-app/repos — everything the App can reach right now. */
+export interface GitHubAvailableRepos {
+  configured: boolean;
+  installations: GitHubInstallation[];
+  install_url?: string | null;
+}
+
 // --- Connectors: Slack workspaces, channel policy, trigger rules, requests ---
 
 /** A Slack workspace onboarded for the fleet. */

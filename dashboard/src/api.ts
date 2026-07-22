@@ -13,6 +13,7 @@ import type {
   FleetSettings,
   FleetStats,
   GitHubAppStatus,
+  GitHubAvailableRepos,
   GitHubManifest,
   Identity,
   NotifSub,
@@ -145,6 +146,22 @@ export class DashboardApi {
     repo_group?: string;
   }): Promise<RepoConfig> {
     return this.request<RepoConfig>("POST", "/admin/repos", { body });
+  }
+
+  /** Batch onboard: all repos share the same access mode; ONE policy sync
+   *  server-side, and the batch is atomic (a verify failure writes nothing). */
+  onboardRepos(body: {
+    repos: string[];
+    co_repo_mode?: "isolated" | "group" | "all";
+    repo_group?: string;
+  }): Promise<{ repos: RepoConfig[]; policy_sync_warning?: string }> {
+    return this.request("POST", "/admin/repos", { body });
+  }
+
+  /** Everything the GitHub App can reach right now — the onboarding picker's
+   *  source. Live from GitHub (installations + per-installation repo lists). */
+  gitHubAppRepos(): Promise<GitHubAvailableRepos> {
+    return this.get<GitHubAvailableRepos>("/admin/github-app/repos");
   }
 
   deleteRepo(repo: string): Promise<{ repo: string; deleted: boolean }> {

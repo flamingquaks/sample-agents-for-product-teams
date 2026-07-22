@@ -7,7 +7,8 @@ closed); the read API's operators can view but not configure.
 
 Routes (all admin-only):
     GET    /admin/repos                     list onboarded repos
-    POST   /admin/repos                     onboard/update a repo (body: repo, enabled?, multi_repo_eligible?, co_repo_mode?, repo_group?)
+    POST   /admin/repos                     onboard/update repo(s) (body: repo | repos[], enabled?, multi_repo_eligible?, co_repo_mode?, repo_group?)
+    GET    /admin/github-app/repos          installations + accessible repos (the onboarding picker's source)
     DELETE /admin/repos/{repo}              remove a repo
     GET    /admin/settings                  get fleet settings
     PUT    /admin/settings                  update settings (body: restrict_repos)
@@ -140,28 +141,35 @@ def _verify_github_install(repo: str):
 
     owner, name = repo.split("/", 1)
     try:
-        owner_type = github_client.get_owner_type(owner)
-        installation_id = github_client.find_installation(owner, owner_type)
-        if installation_id is None:
+        # One JWT call answers "does an installation cover this exact repo?".
+        # (Never GET /users/{owner} here — that endpoint rejects an App JWT with
+        # 401 Bad credentials.)
+        found = github_client.find_repo_installation(owner, name)
+        if found is None:
+            # Distinguish the two actionable 409s: App not installed on the
+            # owner at all, vs installed but the repo isn't in its selection.
+            owner_install = github_client.find_installation(owner)
             link = github_client.install_url()
-            payload = {
-                "error": f"the GitHub App is not installed on '{owner}'. Install "
-                "it, then re-check.",
-                "install_url": link,
-                "owner_type": owner_type,
-            }
-            return None, json_response(409, payload)
-        if not github_client.repo_reachable(owner, name, installation_id):
+            if owner_install is None:
+                return None, json_response(
+                    409,
+                    {
+                        "error": f"the GitHub App is not installed on '{owner}'. "
+                        "Install it, then re-check.",
+                        "install_url": link,
+                    },
+                )
             return None, json_response(
                 409,
                 {
                     "error": f"'{repo}' isn't covered by the App installation on "
                     f"'{owner}'. Add it to the installation's repository "
                     "selection, then re-check.",
-                    "install_url": github_client.install_url(),
-                    "owner_type": owner_type,
+                    "install_url": link,
+                    "owner_type": owner_install[1],
                 },
             )
+        installation_id, owner_type = found
         # Record the per-owner installation (source of truth) before returning.
         config_store.put_installation(
             owner, owner_type=owner_type, installation_id=installation_id
@@ -184,6 +192,135 @@ def _verify_github_install(repo: str):
             f"GitHub App verification could not complete for {repo} — check the "
             "App's private key is configured, then retry",
         )
+
+
+def _onboard_repos(event: dict, body: dict) -> dict:
+    """Onboard/update one or more repos in a single admin action.
+
+    ``body.repos`` (list) or the legacy ``body.repo`` (single). All repos in the
+    batch share the same access settings; ``co_repo_mode`` declares which OTHER
+    repos a dispatch originating in each may reach (isolated | group | all) —
+    the UI's "share access together" sends group mode with one group name for
+    the whole batch. Batch semantics:
+
+      - Validate + GitHub-verify EVERY new repo up front, writing nothing on a
+        failure — a batch never half-onboards; the 409/502 names the repo and
+        carries the install deep-link so the admin can fix and resubmit whole.
+      - Already-onboarded repos in the batch are updated (settings applied) but
+        NOT re-verified — same incident-tolerance rationale as before: an admin
+        must be able to adjust a repo while GitHub is down or the App was just
+        uninstalled.
+      - ONE policy sync for the whole batch (not one per repo). On sync failure
+        with the gateway ENFORCING, every row this call activated is rolled back
+        to pending; in LOG_ONLY the batch succeeds with a warning.
+
+    Single-repo calls return the repo record itself (the shape the UI and tests
+    have always consumed); a multi-repo batch returns {repos: [...]}."""
+    raw_list = body.get("repos")
+    single = raw_list is None
+    if single:
+        raw_list = [body.get("repo")]
+    if not isinstance(raw_list, list) or not raw_list:
+        return error(400, "body.repos must be a non-empty list of 'owner/repo'")
+    repos: list[str] = []
+    for raw in raw_list:
+        repo = (raw or "").strip() if isinstance(raw, str) else ""
+        if not _valid_repo(repo):
+            return error(400, f"repo {raw!r} must be 'owner/repo'")
+        norm = config_store._normalize_repo(repo)
+        if norm not in repos:
+            repos.append(norm)
+
+    enabled = bool(body.get("enabled", True))
+    eligible = bool(body.get("multi_repo_eligible", True))
+    # Co-repo rule: validate the enum and the group-label shape so a bad value
+    # can't silently widen reach or smuggle metacharacters.
+    co_repo_mode = (body.get("co_repo_mode") or config_store.CO_REPO_ISOLATED).strip()
+    if co_repo_mode not in config_store.CO_REPO_MODES:
+        return error(
+            400,
+            f"body.co_repo_mode must be one of {list(config_store.CO_REPO_MODES)}",
+        )
+    repo_group = (body.get("repo_group") or "").strip() or None
+    if co_repo_mode == config_store.CO_REPO_GROUP:
+        if not repo_group:
+            return error(400, "body.repo_group is required when co_repo_mode='group'")
+        if not _REPO_SEGMENT.match(repo_group):
+            return error(400, "body.repo_group must match [A-Za-z0-9._-]")
+
+    # GitHub App verification gates bringing a repo INTO the fleet — confirm an
+    # installation covers each NEW repo BEFORE writing anything, so we never
+    # silently activate an unreachable repo and a batch never half-onboards.
+    # UPDATES to an already-onboarded repo skip verification and preserve the
+    # recorded installation_id (incident tolerance — see docstring).
+    plan: list[tuple[str, int | None, int | None]] = []  # (repo, install_id, verified_at)
+    for repo in repos:
+        existing = config_store.get_repo(repo)
+        if existing is not None:
+            plan.append(
+                (repo, existing.get("installation_id"), existing.get("install_verified_at"))
+            )
+            continue
+        installation_id, verify_response = _verify_github_install(repo)
+        if verify_response is not None:
+            return verify_response
+        plan.append((repo, installation_id, int(time.time()) if installation_id else None))
+
+    # 1) write every row active, 2) ONE policy sync from the allowed set (which
+    # now includes the whole batch — allowed_repos() only returns active rows),
+    # 3) roll the batch back to pending if the sync fails while enforcing. A repo
+    # is only ever left active once its policy sync succeeded, so dispatch never
+    # treats as allowed a repo the tool-call policy still denies.
+    # Model cost attribution is fleet-wide (one shared Mantle project), not
+    # per-repo — nothing repo-scoped to create here.
+    caller = auth.caller_sub(event)
+    for repo, installation_id, verified_at in plan:
+        config_store.put_repo(
+            repo,
+            enabled=enabled,
+            multi_repo_eligible=eligible,
+            co_repo_mode=co_repo_mode,
+            repo_group=repo_group,
+            onboarded_by=caller,
+            status="active",
+            installation_id=installation_id,
+            install_verified_at=verified_at,
+        )
+    warning = None
+    try:
+        _sync_repo_policy()
+    except PolicySyncError:
+        # ENFORCING: dispatch would widen ahead of a tool-call policy that still
+        # denies — roll the batch back to pending and fail. LOG_ONLY (or gateway
+        # not fully wired): the policy blocks nothing, so onboarding succeeds and
+        # the sync retries on the next admin action.
+        if _gateway_enforcing():
+            logger.exception("policy sync failed for %s; rolling back", repos)
+            for repo, _, _ in plan:
+                config_store.set_repo_status(repo, "pending")
+            return error(
+                502,
+                f"repos recorded but policy update failed for {', '.join(repos)}; "
+                "left pending, retry",
+            )
+        logger.warning(
+            "policy sync failed for %s but gateway is not enforcing; repos left "
+            "active, policy will re-sync on next change",
+            repos,
+        )
+        warning = (
+            "onboarded; Gateway policy not yet synced (gateway in LOG_ONLY "
+            "or not fully wired)"
+        )
+    if single:
+        rec = config_store.get_repo(repos[0])
+        if warning:
+            rec["policy_sync_warning"] = warning
+        return ok(rec)
+    result: dict = {"repos": [config_store.get_repo(r) for r in repos]}
+    if warning:
+        result["policy_sync_warning"] = warning
+    return ok(result)
 
 
 def _parse_body(event: dict) -> dict:
@@ -1117,102 +1254,7 @@ def _route(event: dict) -> dict:
         if method == "GET":
             return ok({"repos": config_store.list_repos()})
         if method == "POST":
-            repo = (body.get("repo") or "").strip()
-            if not _valid_repo(repo):
-                return error(400, "body.repo must be 'owner/repo'")
-            enabled = bool(body.get("enabled", True))
-            eligible = bool(body.get("multi_repo_eligible", True))
-            # Co-repo rule: which OTHER repos a dispatch originating here may reach
-            # (isolated|group|all). Validate the enum and the group-label shape so
-            # a bad value can't silently widen reach or smuggle metacharacters.
-            co_repo_mode = (body.get("co_repo_mode") or config_store.CO_REPO_ISOLATED).strip()
-            if co_repo_mode not in config_store.CO_REPO_MODES:
-                return error(
-                    400,
-                    "body.co_repo_mode must be one of "
-                    f"{list(config_store.CO_REPO_MODES)}",
-                )
-            repo_group = (body.get("repo_group") or "").strip() or None
-            if co_repo_mode == config_store.CO_REPO_GROUP:
-                if not repo_group:
-                    return error(400, "body.repo_group is required when co_repo_mode='group'")
-                if not _REPO_SEGMENT.match(repo_group):
-                    return error(400, "body.repo_group must match [A-Za-z0-9._-]")
-            # GitHub App verification gates bringing a repo INTO the fleet —
-            # confirm the App is installed on the owner and
-            # can reach the repo BEFORE a NEW onboard, so we never silently
-            # activate an unreachable repo. It must NOT gate UPDATES to an
-            # already-onboarded repo: an admin has to be able to disable/adjust a
-            # repo during an incident (e.g. the App was just uninstalled, or
-            # GitHub is down) — blocking that on live reachability is the opposite
-            # of what's needed. So for an existing repo we skip verification and
-            # preserve its recorded installation_id.
-            existing = config_store.get_repo(repo)
-            if existing is not None:
-                installation_id = existing.get("installation_id")
-            else:
-                installation_id, verify_response = _verify_github_install(repo)
-                if verify_response is not None:
-                    return verify_response
-            # 1) write the row active, 2) sync the tool-call policy from the
-            # allowed set (which now INCLUDES this repo — allowed_repos() only
-            # returns active rows, so syncing while pending would omit the very
-            # repo being onboarded), 3) roll back to pending if the sync fails.
-            # A repo is only ever left active once its policy sync succeeded, so
-            # dispatch never treats as allowed a repo the tool-call policy still
-            # denies. During the brief window before the sync lands the policy
-            # still denies (the safe direction), and the dispatch config cache is
-            # stale anyway, so dispatch does not widen ahead of the policy.
-            # Preserve the prior verification timestamp on an update (we didn't
-            # re-verify); stamp now only on a fresh verified onboard.
-            if existing is not None:
-                verified_at = existing.get("install_verified_at")
-            else:
-                verified_at = int(time.time()) if installation_id else None
-            # Model cost attribution is fleet-wide (one shared Mantle project set
-            # as MANTLE_PROJECT_ID on the agent runtimes), not per-repo — a
-            # dispatch may span repos, so there's nothing repo-scoped to create
-            # here.
-            config_store.put_repo(
-                repo,
-                enabled=enabled,
-                multi_repo_eligible=eligible,
-                co_repo_mode=co_repo_mode,
-                repo_group=repo_group,
-                onboarded_by=auth.caller_sub(event),
-                status="active",
-                installation_id=installation_id,
-                install_verified_at=verified_at,
-            )
-            try:
-                _sync_repo_policy()
-            except PolicySyncError:
-                # When the gateway is ENFORCING, a sync failure means dispatch
-                # would widen ahead of a tool-call policy that still denies — roll
-                # back to pending and fail. When it's LOG_ONLY (or the gateway
-                # isn't fully wired yet), the policy blocks nothing, so onboarding
-                # succeeds and the sync is retried on the next admin action; we
-                # return the repo with a warning rather than failing.
-                if _gateway_enforcing():
-                    logger.exception("policy sync failed for %s; rolling back", repo)
-                    config_store.set_repo_status(repo, "pending")
-                    return error(
-                        502,
-                        f"repo recorded but policy update failed for {repo}; "
-                        "left pending, retry",
-                    )
-                logger.warning(
-                    "policy sync failed for %s but gateway is not enforcing; "
-                    "repo left active, policy will re-sync on next change",
-                    repo,
-                )
-                rec = config_store.get_repo(repo)
-                rec["policy_sync_warning"] = (
-                    "onboarded; Gateway policy not yet synced (gateway in LOG_ONLY "
-                    "or not fully wired)"
-                )
-                return ok(rec)
-            return ok(config_store.get_repo(repo))
+            return _onboard_repos(event, body)
 
     # Greedy {repo+} so an "owner/repo" (with its slash) is one path parameter;
     # accept the plain {repo} form too so the handler isn't coupled to the exact
@@ -1377,6 +1419,42 @@ def _route(event: dict) -> dict:
                 "configured": configured,
                 "slug": slug,
                 "install_url": install,
+            }
+        )
+
+    if resource == "/admin/github-app/repos" and method == "GET":
+        import github_client
+
+        # Everything the App can reach RIGHT NOW, for the onboarding picker:
+        # each installation with its accessible repos, plus which of them are
+        # already onboarded. Live from GitHub (no cache) — the picker's whole
+        # point is reflecting an install/selection change the admin just made.
+        if not github_client.app_configured():
+            return ok({"configured": False, "installations": []})
+        onboarded = {r["repo"] for r in config_store.list_repos()}
+        try:
+            installations = []
+            for inst in github_client.list_installations():
+                repos = github_client.list_installation_repos(
+                    inst["installation_id"]
+                )
+                installations.append(
+                    {
+                        **inst,
+                        "repos": [
+                            {**r, "onboarded": r["repo"].casefold() in onboarded}
+                            for r in repos
+                        ],
+                    }
+                )
+        except github_client.GitHubError as exc:
+            logger.exception("listing installation repos failed")
+            return error(502, f"could not list the App's repositories: {exc}")
+        return ok(
+            {
+                "configured": True,
+                "installations": installations,
+                "install_url": github_client.install_url(),
             }
         )
 

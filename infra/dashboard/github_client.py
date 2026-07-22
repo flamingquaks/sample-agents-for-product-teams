@@ -74,7 +74,7 @@ _PEM_TTL = 1800  # re-read the key from Secrets Manager at most every 30 min
 _token_cache: dict[int, tuple[str, float]] = {}
 _TOKEN_REFRESH_MARGIN = 60  # refresh a bit before the 1h expiry
 # App-JWT cache — one sign serves every call in a request (a single onboard hits
-# get_owner_type + find_installation + mint_installation_token). Valid ~9 min.
+# find_repo_installation + mint_installation_token). Valid ~9 min.
 _jwt_cache: tuple[str, float] | None = None  # (jwt, expires_at_epoch)
 _JWT_REFRESH_MARGIN = 30
 
@@ -332,30 +332,104 @@ def install_url() -> str | None:
 # --- installation lookup + token ---------------------------------------------
 
 
-def get_owner_type(owner: str) -> str:
-    """'User' | 'Organization' for a GitHub account. Raises GitHubError (404) if
-    the owner doesn't exist."""
-    _status, data = _request(
-        "GET", f"{GITHUB_API_BASE}/users/{owner}", token=_app_jwt()
-    )
-    return data.get("type", "User")
+def find_repo_installation(owner: str, repo: str) -> tuple[int, str] | None:
+    """The App installation that covers ``owner/repo`` → (installation_id,
+    owner_type), or None if the App can't reach the repo (not installed on the
+    owner, OR installed but the repo isn't in its repository selection).
 
-
-def find_installation(owner: str, owner_type: str) -> int | None:
-    """The App's installation id on ``owner``, or None if the App isn't installed
-    there. Uses the org- or user-scoped lookup per owner type."""
-    path = "orgs" if owner_type == "Organization" else "users"
+    One JWT call to GET /repos/{owner}/{repo}/installation — the App-JWT-scoped
+    endpoint made for exactly this question. (GET /users/{owner} does NOT accept
+    an App JWT — GitHub returns 401 Bad credentials — which is why verification
+    must never route through a user lookup.)"""
     try:
         _status, data = _request(
             "GET",
-            f"{GITHUB_API_BASE}/{path}/{owner}/installation",
+            f"{GITHUB_API_BASE}/repos/{owner}/{repo}/installation",
             token=_app_jwt(),
         )
     except GitHubError as exc:
         if exc.status == 404:
-            return None  # App not installed on this owner
+            return None
         raise
-    return data.get("id")
+    install_id = data.get("id")
+    if install_id is None:
+        return None
+    return int(install_id), (data.get("account") or {}).get("type", "User")
+
+
+def find_installation(owner: str) -> tuple[int, str] | None:
+    """The App's installation on ``owner`` → (installation_id, owner_type), or
+    None if the App isn't installed there. Tries the org lookup then the user
+    lookup — both accept the App JWT, and probing both avoids a separate
+    owner-type call (which has no JWT-accepting endpoint)."""
+    for path, owner_type in (("orgs", "Organization"), ("users", "User")):
+        try:
+            _status, data = _request(
+                "GET",
+                f"{GITHUB_API_BASE}/{path}/{owner}/installation",
+                token=_app_jwt(),
+            )
+        except GitHubError as exc:
+            if exc.status == 404:
+                continue  # not installed under this owner type
+            raise
+        if data.get("id") is not None:
+            # The account's real type (an org 404s the user path anyway, but
+            # trust the response over the path we happened to hit).
+            return int(data["id"]), (data.get("account") or {}).get("type", owner_type)
+    return None
+
+
+def list_installations() -> list[dict]:
+    """Every installation of the App → [{installation_id, owner, owner_type}].
+    Paginated GET /app/installations with the App JWT."""
+    installs: list[dict] = []
+    page = 1
+    while True:
+        _status, data = _request(
+            "GET",
+            f"{GITHUB_API_BASE}/app/installations?per_page=100&page={page}",
+            token=_app_jwt(),
+        )
+        if not isinstance(data, list) or not data:
+            break
+        for inst in data:
+            account = inst.get("account") or {}
+            installs.append(
+                {
+                    "installation_id": inst.get("id"),
+                    "owner": account.get("login", ""),
+                    "owner_type": account.get("type", "User"),
+                }
+            )
+        if len(data) < 100:
+            break
+        page += 1
+    return installs
+
+
+def list_installation_repos(installation_id: int) -> list[dict]:
+    """The repos an installation can reach → [{repo: "owner/name", private}].
+    Paginated GET /installation/repositories with an installation token — this is
+    the ground truth for 'which repos could the fleet onboard right now'."""
+    token, _ = mint_installation_token(installation_id)
+    repos: list[dict] = []
+    page = 1
+    while True:
+        _status, data = _request(
+            "GET",
+            f"{GITHUB_API_BASE}/installation/repositories?per_page=100&page={page}",
+            token=token,
+        )
+        batch = data.get("repositories", [])
+        for r in batch:
+            repos.append(
+                {"repo": r.get("full_name", ""), "private": bool(r.get("private"))}
+            )
+        if len(batch) < 100:
+            break
+        page += 1
+    return repos
 
 
 def mint_installation_token(installation_id: int) -> tuple[str, str]:
@@ -386,14 +460,3 @@ def mint_installation_token(installation_id: int) -> tuple[str, str]:
     return token, expires_at
 
 
-def repo_reachable(owner: str, repo: str, installation_id: int) -> bool:
-    """Whether the installation can actually reach ``owner/repo`` (200 vs 404).
-    Confirms the repo is included in the App's installation selection."""
-    token, _ = mint_installation_token(installation_id)
-    try:
-        _request("GET", f"{GITHUB_API_BASE}/repos/{owner}/{repo}", token=token)
-        return True
-    except GitHubError as exc:
-        if exc.status == 404:
-            return False
-        raise

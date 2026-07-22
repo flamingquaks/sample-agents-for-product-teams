@@ -382,6 +382,19 @@ h3 {
   display: block;
   margin: 14px 0;
 }
+/* Repo picker inside the onboarding modal — same scrolling-checklist shape as
+   .tool-grid, but rows are denser (one repo per line, no grouping). */
+.repo-picker {
+  max-height: 260px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  background: var(--surface-2);
+}
+.repo-picker .field-inline {
+  margin: 4px 0;
+}
 /* Tool-grant / skill checklist inside the authoring modal. */
 .tool-grid {
   max-height: 220px;
