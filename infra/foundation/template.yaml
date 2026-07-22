@@ -1448,6 +1448,8 @@ Resources:
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/github-app-id
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/github-app-slug
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/github-webhook-secret
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/slack/signing-secret
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/slack/*
         # Sync the fleet Cedar policy to the engine (gateway deploys only).
         - !If
           - GatewayEnabled
@@ -1528,6 +1530,42 @@ Resources:
             Path: /admin/capabilities/{agent_id}
             Method: DELETE
             RestApiId: !Ref DashboardApi
+        CloneCapability:
+          Type: Api
+          Properties:
+            Path: /admin/capabilities/{agent_id+}/clone
+            Method: POST
+            RestApiId: !Ref DashboardApi
+        ApproveCapability:
+          Type: Api
+          Properties:
+            Path: /admin/capabilities/{agent_id+}/approve
+            Method: POST
+            RestApiId: !Ref DashboardApi
+        ToolCatalog:
+          Type: Api
+          Properties:
+            Path: /admin/tool-catalog
+            Method: GET
+            RestApiId: !Ref DashboardApi
+        ListSkills:
+          Type: Api
+          Properties:
+            Path: /admin/skills
+            Method: GET
+            RestApiId: !Ref DashboardApi
+        UploadSkill:
+          Type: Api
+          Properties:
+            Path: /admin/skills
+            Method: POST
+            RestApiId: !Ref DashboardApi
+        DeleteSkill:
+          Type: Api
+          Properties:
+            Path: /admin/skills/{key+}
+            Method: DELETE
+            RestApiId: !Ref DashboardApi
         GitHubAppStatus:
           Type: Api
           Properties:
@@ -1566,6 +1604,12 @@ Resources:
           Type: Api
           Properties:
             Path: /admin/slack/workspaces
+            Method: POST
+            RestApiId: !Ref DashboardApi
+        SlackWorkspacesConnect:
+          Type: Api
+          Properties:
+            Path: /admin/slack/workspaces/connect
             Method: POST
             RestApiId: !Ref DashboardApi
         SlackWorkspaceDelete:

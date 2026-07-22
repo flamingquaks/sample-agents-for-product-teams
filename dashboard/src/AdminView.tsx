@@ -280,8 +280,8 @@ function SettingsPanel({
       </label>
       <span className="muted">
         {restrict
-          ? "Only enabled + multi-repo-eligible repos are allowed for cross-repo tool actions."
-          : "Any enabled repo is allowed."}
+          ? "Only repos that run with others (shared/group/all) can be acted on cross-repo."
+          : "Any enabled repo can be acted on by a dispatch from another repo."}
       </span>
     </div>
   );

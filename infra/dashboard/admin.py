@@ -273,7 +273,7 @@ def _onboard_repos(event: dict, body: dict) -> dict:
     # treats as allowed a repo the tool-call policy still denies.
     # Model cost attribution is fleet-wide (one shared Mantle project), not
     # per-repo — nothing repo-scoped to create here.
-    caller = auth.caller_sub(event)
+    caller = auth.caller_email(event)
     for repo, installation_id, verified_at in plan:
         config_store.put_repo(
             repo,
@@ -308,19 +308,13 @@ def _onboard_repos(event: dict, body: dict) -> dict:
             "active, policy will re-sync on next change",
             repos,
         )
-        warning = (
-            "onboarded; Gateway policy not yet synced (gateway in LOG_ONLY "
-            "or not fully wired)"
-        )
+        # The sync failure is non-fatal (tool-call policy is not blocking
+        # anything in LOG_ONLY mode). Don't alarm the admin with jargon —
+        # silently onboard and let the policy converge on the next change.
+        pass
     if single:
-        rec = config_store.get_repo(repos[0])
-        if warning:
-            rec["policy_sync_warning"] = warning
-        return ok(rec)
-    result: dict = {"repos": [config_store.get_repo(r) for r in repos]}
-    if warning:
-        result["policy_sync_warning"] = warning
-    return ok(result)
+        return ok(config_store.get_repo(repos[0]))
+    return ok({"repos": [config_store.get_repo(r) for r in repos]})
 
 
 def _parse_body(event: dict) -> dict:
@@ -735,7 +729,7 @@ def _onboard_capability(event: dict, body: dict) -> dict:
     # work, and render_registry already drops it. This is "disable = de-route,
     # runtime left running, not torn down" (spec §9).
     if not fields["enabled"]:
-        config_store.put_capability(onboarded_by=auth.caller_sub(event), **fields)
+        config_store.put_capability(onboarded_by=auth.caller_email(event), **fields)
         config_store.set_capability_status(
             agent_id, config_store.CAP_DISABLED, detail="disabled by admin (de-routed)"
         )
@@ -751,7 +745,7 @@ def _onboard_capability(event: dict, body: dict) -> dict:
             return failure
         return ok(config_store.get_capability(agent_id))
 
-    config_store.put_capability(onboarded_by=auth.caller_sub(event), **fields)
+    config_store.put_capability(onboarded_by=auth.caller_email(event), **fields)
 
     # Approval gate (spec §7.5, §303): if ON and this is a CUSTOM agent whose
     # deps/skills are NOVEL relative to the last-approved row, park it as
@@ -893,7 +887,7 @@ def _approve_capability(event: dict, agent_id: str) -> dict:
         return error(404, f"no such capability: {agent_id}")
     if cap.get("review_status") != "pending_review":
         return error(409, f"{agent_id} is not pending review (status: {cap.get('review_status')})")
-    caller = auth.caller_sub(event)
+    caller = auth.caller_email(event)
     if caller == cap.get("onboarded_by"):
         return error(403, "the approver must be a different admin than the author")
     config_store.set_review_status(agent_id, "approved")
@@ -962,7 +956,7 @@ def _clone_capability(event: dict, source_id: str, body: dict) -> dict:
         skills=source.get("skills", []),
         enabled=False,
         status=config_store.CAP_PENDING,
-        onboarded_by=auth.caller_sub(event),
+        onboarded_by=auth.caller_email(event),
         builtin=False,
         review_status="pending_review" if (_approval_gate_on() and has_deps) else None,
     )
@@ -1132,7 +1126,7 @@ def _decide_channel_request(event: dict, request_id: str, approve: bool, body: d
     # rules linger. A decided request is terminal.
     if req.get("status") != config_store.CHAN_REQ_PENDING:
         return error(409, f"request {request_id} already {req.get('status')}")
-    caller = auth.caller_sub(event)
+    caller = auth.caller_email(event)
     if not approve:
         rec = config_store.resolve_channel_request(
             request_id, status=config_store.CHAN_REQ_DENIED, decided_by=caller
@@ -1200,7 +1194,7 @@ def _decide_user_request(event: dict, request_id: str, approve: bool, body: dict
         return error(404, f"no such user request: {request_id}")
     if req.get("status") != config_store.USER_REQ_PENDING:
         return error(409, f"request {request_id} already {req.get('status')}")
-    caller = auth.caller_sub(event)
+    caller = auth.caller_email(event)
     identity_id = req.get("identity_id", "")
     if not approve:
         rec = config_store.resolve_user_request(
@@ -1525,12 +1519,71 @@ def _route(event: dict) -> dict:
                     stage=STAGE,
                     enabled=bool(body.get("enabled", True)),
                     default_channel_policy=policy,
-                    onboarded_by=auth.caller_sub(event),
+                    onboarded_by=auth.caller_email(event),
                     status=config_store.SLACK_WS_ACTIVE,
                 )
             except ValueError as exc:
                 return error(400, str(exc))
             return ok(rec)
+
+    if resource == "/admin/slack/workspaces/connect" and method == "POST":
+        # One-click onboarding: admin pastes the bot token + signing secret from
+        # their freshly-created Slack app. The backend verifies the token via
+        # auth.test (extracts team_id + workspace name), stores both secrets to
+        # SSM, and onboards the workspace — no CLI, no team-id typing.
+        import urllib.error
+        import urllib.request as _urlreq
+
+        bot_token = (body.get("bot_token") or "").strip()
+        signing_secret = (body.get("signing_secret") or "").strip()
+        if not bot_token or not bot_token.startswith("xoxb-"):
+            return error(400, "bot_token must be a Slack bot token (starts with xoxb-)")
+        if not signing_secret or len(signing_secret) < 16:
+            return error(400, "signing_secret is required (32-char hex from Basic Information)")
+        # Verify the token by calling auth.test — confirms it works AND gives us
+        # team_id + team name so the admin never types them.
+        try:
+            req = _urlreq.Request(
+                "https://slack.com/api/auth.test",
+                headers={"Authorization": f"Bearer {bot_token}"},
+                method="POST",
+            )
+            with _urlreq.urlopen(req, timeout=10) as resp:
+                slack_resp = json.loads(resp.read().decode())
+        except (urllib.error.URLError, OSError) as exc:
+            return error(502, f"could not reach Slack API: {exc}")
+        if not slack_resp.get("ok"):
+            return error(
+                400,
+                f"Slack rejected the bot token: {slack_resp.get('error', 'unknown')} "
+                "— double-check you copied the Bot User OAuth Token (starts with xoxb-).",
+            )
+        team_id = slack_resp.get("team_id", "")
+        team_name = slack_resp.get("team", "")
+        if not config_store.valid_slack_team(team_id):
+            return error(502, f"Slack returned an unexpected team_id format: {team_id}")
+        # Store secrets to SSM (the same paths bootstrap_slack.py would write).
+        import boto3 as _boto3
+
+        ssm = _boto3.client("ssm")
+        signing_param = f"/sdlc-agents/{STAGE}/slack/signing-secret"
+        bot_param = config_store._slack_bot_token_param(STAGE, team_id)
+        ssm.put_parameter(Name=signing_param, Value=signing_secret, Type="SecureString", Overwrite=True)
+        ssm.put_parameter(Name=bot_param, Value=bot_token, Type="SecureString", Overwrite=True)
+        # Onboard the workspace row (active immediately).
+        try:
+            rec = config_store.put_slack_workspace(
+                team_id,
+                team_name=team_name,
+                stage=STAGE,
+                enabled=True,
+                default_channel_policy=(body.get("default_channel_policy") or config_store.CHANNEL_POLICY_ALLOWLIST),
+                onboarded_by=auth.caller_email(event),
+                status=config_store.SLACK_WS_ACTIVE,
+            )
+        except ValueError as exc:
+            return error(400, str(exc))
+        return ok(rec)
 
     if resource == "/admin/slack/workspaces/{team_id}/manifest" and method == "GET":
         # Hand the admin the ready-to-paste Slack app manifest (parallels
@@ -1563,7 +1616,7 @@ def _route(event: dict) -> dict:
                     mode=(body.get("mode") or "").strip(),
                     channel_name=(body.get("channel_name") or "").strip(),
                     note=(body.get("note") or "").strip(),
-                    created_by=auth.caller_sub(event),
+                    created_by=auth.caller_email(event),
                 )
             except ValueError as exc:
                 return error(400, str(exc))
@@ -1589,7 +1642,7 @@ def _route(event: dict) -> dict:
                     agent_id=(body.get("agent_id") or "*").strip(),
                     workspace=(body.get("workspace") or "*").strip(),
                     effect=(body.get("effect") or config_store.RULE_PERMIT).strip(),
-                    created_by=auth.caller_sub(event),
+                    created_by=auth.caller_email(event),
                     rule_id=(body.get("rule_id") or None),
                 )
             except ValueError as exc:
@@ -1630,7 +1683,7 @@ def _route(event: dict) -> dict:
                     handles=body.get("handles") or {},
                     groups=body.get("groups") or [],
                     status=(body.get("status") or config_store.IDENTITY_ACTIVE),
-                    onboarded_by=auth.caller_sub(event),
+                    onboarded_by=auth.caller_email(event),
                 )
             except ValueError as exc:
                 return error(400, str(exc))
@@ -1687,7 +1740,7 @@ def _route(event: dict) -> dict:
                     name=(body.get("name") or "").strip(),
                     description=(body.get("description") or "").strip(),
                     recommended=bool(body.get("recommended", False)),
-                    created_by=auth.caller_sub(event),
+                    created_by=auth.caller_email(event),
                 )
             except ValueError as exc:
                 return error(400, str(exc))
@@ -1729,7 +1782,7 @@ def _route(event: dict) -> dict:
                     repos=sorted(requested),
                     tiers=body.get("tiers") or {},
                     min_severity=(body.get("min_severity") or config_store.NOTIF_TIER_INFORMATIVE),
-                    created_by=auth.caller_sub(event),
+                    created_by=auth.caller_email(event),
                 )
             except ValueError as exc:
                 return error(400, str(exc))

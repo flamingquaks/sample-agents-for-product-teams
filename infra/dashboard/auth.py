@@ -150,3 +150,17 @@ def caller_sub(event: dict) -> str:
     """The authenticated Cognito ``sub``, for audit logging. '' if absent."""
     claims = _claims(event)
     return claims.get("sub", "") if isinstance(claims, dict) else ""
+
+
+def caller_email(event: dict) -> str:
+    """The caller's email (human-readable identity for display). Falls back to
+    cognito:username, then sub — always returns something non-empty for an
+    authenticated request, but prefers the readable email."""
+    claims = _claims(event)
+    if not isinstance(claims, dict):
+        return ""
+    return (
+        claims.get("email")
+        or claims.get("cognito:username")
+        or claims.get("sub", "")
+    )

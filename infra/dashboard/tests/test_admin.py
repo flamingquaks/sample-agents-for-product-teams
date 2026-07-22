@@ -328,7 +328,8 @@ def test_pending_left_on_policy_sync_failure_when_enforcing(monkeypatch):
 @mock_aws
 def test_onboard_succeeds_on_sync_failure_when_log_only(monkeypatch):
     # LOG_ONLY (default): the policy blocks nothing, so a sync failure must NOT
-    # fail onboarding — the repo stays active and the response carries a warning.
+    # fail onboarding — the repo stays active. No warning is surfaced to the user
+    # (it's non-actionable jargon); the backend logs it.
     monkeypatch.setenv("GATEWAY_ENFORCEMENT", "LOG_ONLY")
     _make_table()
     admin = _load_admin()
@@ -341,7 +342,8 @@ def test_onboard_succeeds_on_sync_failure_when_log_only(monkeypatch):
     assert resp["statusCode"] == 200
     rec = _body(resp)
     assert rec["status"] == "active"
-    assert "policy_sync_warning" in rec
+    # No jargon warning in the response — just a clean onboard result.
+    assert "policy_sync_warning" not in rec
     import config_store
 
     assert config_store.allowed_repos() == ["acme/web"]

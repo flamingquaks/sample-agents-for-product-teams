@@ -42,20 +42,41 @@ function WorkspacesTab({ api, onAuthError }: ConnectorPageProps) {
   const poll = usePolling<{ workspaces: SlackWorkspace[] }>(() => api.listSlackWorkspaces(), {
     isActive: () => false, deps: [api], onError: handleErr,
   });
-  const [teamId, setTeamId] = useState("");
-  const [teamName, setTeamName] = useState("");
-  const [policy, setPolicy] = useState<"allowlist" | "denylist">("allowlist");
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
+  const [errMsg, setErrMsg] = useState<string | null>(null);
+  // Guided connect flow state
+  const [manifest, setManifest] = useState<string | null>(null);
+  const [botToken, setBotToken] = useState("");
+  const [signingSecret, setSigningSecret] = useState("");
 
-  const add = async () => {
-    setBusy(true); setMsg(null);
+  const showManifest = async () => {
+    setErrMsg(null);
     try {
-      await api.onboardSlackWorkspace({ team_id: teamId.trim(), team_name: teamName.trim(), default_channel_policy: policy });
-      setTeamId(""); setTeamName(""); poll.refresh();
-    } catch (e) { handleErr(e); setMsg(`Failed: ${(e as Error).message}`); }
-    finally { setBusy(false); }
+      const r = await api.slackManifest();
+      setManifest(JSON.stringify(r.manifest, null, 2));
+    } catch (e) {
+      handleErr(e);
+      setErrMsg(`Failed to build manifest: ${(e as Error).message}`);
+    }
   };
+
+  const connect = async () => {
+    setBusy(true); setErrMsg(null); setMsg(null);
+    try {
+      const rec = await api.connectSlackWorkspace({
+        bot_token: botToken.trim(),
+        signing_secret: signingSecret.trim(),
+      });
+      setBotToken(""); setSigningSecret(""); setManifest(null);
+      setMsg(`Connected workspace "${rec.team_name || rec.team_id}".`);
+      poll.refresh();
+    } catch (e) {
+      handleErr(e);
+      setErrMsg((e as Error).message);
+    } finally { setBusy(false); }
+  };
+
   const remove = async (id: string) => {
     if (!window.confirm(`Remove workspace ${id}?`)) return;
     setBusy(true);
@@ -63,59 +84,82 @@ function WorkspacesTab({ api, onAuthError }: ConnectorPageProps) {
     catch (e) { handleErr(e); } finally { setBusy(false); }
   };
 
-  const [manifest, setManifest] = useState<string | null>(null);
-  const showManifest = async () => {
-    setMsg(null);
-    try {
-      const r = await api.slackManifest();
-      setManifest(JSON.stringify(r.manifest, null, 2));
-    } catch (e) {
-      handleErr(e);
-      setMsg(`Failed to build manifest: ${(e as Error).message}`);
-    }
-  };
-
   const workspaces = poll.data?.workspaces ?? [];
+  const hasWorkspaces = workspaces.length > 0;
   return (
     <div>
-      <p className="muted">
-        Onboard each Slack workspace the fleet serves. Get the app manifest below (Create app → From
-        manifest at api.slack.com), install it, then store its signing secret + bot token with
-        <code> scripts/bootstrap_slack.py</code>.
-      </p>
-      <div className="filters">
-        <button disabled={busy} onClick={() => void showManifest()}>Show Slack app manifest</button>
-      </div>
-      {manifest && (
-        <pre className="manifest" style={{ maxHeight: 240, overflow: "auto" }}>{manifest}</pre>
+      {hasWorkspaces && (
+        <table>
+          <thead><tr><th>Workspace</th><th>Team ID</th><th>Channel policy</th><th>Status</th><th /></tr></thead>
+          <tbody>
+            {workspaces.map((w) => (
+              <tr key={w.team_id}>
+                <td>{w.team_name || "—"}</td>
+                <td><code>{w.team_id}</code></td>
+                <td>{w.default_channel_policy}</td>
+                <td><span className={`pill ${w.status === "active" ? "ok" : "unknown"}`}>{w.status}</span></td>
+                <td><button disabled={busy} onClick={() => void remove(w.team_id)}>Remove</button></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       )}
-      <div className="filters">
-        <input placeholder="team id (T…)" value={teamId} disabled={busy} onChange={(e) => setTeamId(e.target.value)} />
-        <input placeholder="workspace name" value={teamName} disabled={busy} onChange={(e) => setTeamName(e.target.value)} />
-        <select value={policy} disabled={busy} onChange={(e) => setPolicy(e.target.value as "allowlist" | "denylist")}>
-          <option value="allowlist">allowlist (default-deny channels)</option>
-          <option value="denylist">denylist (default-allow channels)</option>
-        </select>
-        <button className="primary" disabled={busy} onClick={() => void add()}>Onboard workspace</button>
+
+      <div className="panel" style={{ marginTop: 16 }}>
+        <h4>Connect a workspace</h4>
+        <p className="muted">Three steps — all done right here, no CLI needed.</p>
+        <ol className="muted" style={{ lineHeight: 1.8 }}>
+          <li>
+            <button disabled={busy} onClick={() => void showManifest()} style={{ verticalAlign: "middle" }}>
+              Get the app manifest
+            </button>{" "}
+            then{" "}
+            <a href="https://api.slack.com/apps?new_app=1&manifest_format=json" target="_blank" rel="noreferrer">
+              create the Slack app from it ↗
+            </a>
+          </li>
+          <li>Install the app to your workspace (OAuth & Permissions → Install to Workspace)</li>
+          <li>Paste the credentials below (from Basic Information + OAuth pages)</li>
+        </ol>
+        {manifest && (
+          <div style={{ position: "relative" }}>
+            <button
+              style={{ position: "absolute", top: 4, right: 8, fontSize: 12 }}
+              onClick={() => void navigator.clipboard.writeText(manifest)}
+            >
+              Copy
+            </button>
+            <pre className="manifest" style={{ maxHeight: 200, overflow: "auto", marginBottom: 12 }}>{manifest}</pre>
+          </div>
+        )}
+        <div className="filters" style={{ flexWrap: "wrap" }}>
+          <input
+            style={{ flex: "1 1 260px" }}
+            type="password"
+            placeholder="Signing Secret (Basic Information → App Credentials)"
+            value={signingSecret}
+            disabled={busy}
+            onChange={(e) => setSigningSecret(e.target.value)}
+          />
+          <input
+            style={{ flex: "1 1 320px" }}
+            type="password"
+            placeholder="Bot Token (xoxb-… from OAuth & Permissions)"
+            value={botToken}
+            disabled={busy}
+            onChange={(e) => setBotToken(e.target.value)}
+          />
+          <button
+            className="primary"
+            disabled={busy || !botToken.trim() || !signingSecret.trim()}
+            onClick={() => void connect()}
+          >
+            {busy ? "Connecting…" : "Connect workspace"}
+          </button>
+        </div>
+        {errMsg && <div className="banner error">{errMsg}</div>}
+        {msg && <div className="banner ok">{msg}</div>}
       </div>
-      {msg && <div className="banner error">{msg}</div>}
-      <table>
-        <thead><tr><th>Team</th><th>Name</th><th>Channel policy</th><th>Status</th><th /></tr></thead>
-        <tbody>
-          {workspaces.map((w) => (
-            <tr key={w.team_id}>
-              <td><code>{w.team_id}</code></td>
-              <td>{w.team_name || "—"}</td>
-              <td>{w.default_channel_policy}</td>
-              <td><span className={`pill ${w.status === "active" ? "ok" : "unknown"}`}>{w.status}</span></td>
-              <td><button disabled={busy} onClick={() => void remove(w.team_id)}>Remove</button></td>
-            </tr>
-          ))}
-          {workspaces.length === 0 && !poll.loading && (
-            <tr><td colSpan={5} className="muted">No workspaces onboarded.</td></tr>
-          )}
-        </tbody>
-      </table>
     </div>
   );
 }
@@ -154,7 +198,7 @@ function ChannelsTab({ api, onAuthError }: ConnectorPageProps) {
   const workspaces = wsPoll.data?.workspaces ?? [];
   return (
     <div>
-      <p className="muted">The WHERE axis: which channels may trigger agents, per the workspace’s policy.</p>
+      <p className="muted">Control which channels can trigger agents. A workspace using the allowlist policy (the default) blocks all channels except those listed here.</p>
       <div className="filters">
         <select value={teamId} onChange={(e) => void load(e.target.value)}>
           <option value="">select a workspace…</option>
@@ -164,8 +208,8 @@ function ChannelsTab({ api, onAuthError }: ConnectorPageProps) {
       {teamId && (
         <>
           <div className="filters">
-            <input placeholder="channel id (C…)" value={channelId} disabled={busy} onChange={(e) => setChannelId(e.target.value)} />
-            <input placeholder="#channel-name" value={channelName} disabled={busy} onChange={(e) => setChannelName(e.target.value)} />
+            <input placeholder="channel ID (right-click channel → Copy link → last segment)" value={channelId} disabled={busy} onChange={(e) => setChannelId(e.target.value)} />
+            <input placeholder="#channel-name (optional, for your reference)" value={channelName} disabled={busy} onChange={(e) => setChannelName(e.target.value)} />
             <select value={mode} disabled={busy} onChange={(e) => setMode(e.target.value as "allow" | "deny")}>
               <option value="allow">allow</option>
               <option value="deny">deny</option>
@@ -339,13 +383,13 @@ function SimulatorTab({ api, onAuthError }: ConnectorPageProps) {
 
   return (
     <div>
-      <p className="muted">Dry-run a trigger decision to confirm the right users get access — or a proper reject.</p>
+      <p className="muted">Test whether a specific user would be allowed to trigger an agent from a given channel. Useful for verifying rules before telling users they have access.</p>
       <div className="filters">
-        <input placeholder="principal (slack:T…:U…)" value={principal} onChange={(e) => setPrincipal(e.target.value)} />
-        <input placeholder="agent id" value={agentId} onChange={(e) => setAgentId(e.target.value)} />
-        <input placeholder="workspace (T…)" value={workspace} onChange={(e) => setWorkspace(e.target.value)} />
-        <input placeholder="channel (C…)" value={channel} onChange={(e) => setChannel(e.target.value)} />
-        <input placeholder="groups (comma-sep)" value={groups} onChange={(e) => setGroups(e.target.value)} />
+        <input placeholder="user identity (e.g. slack:TXXXXXX:UXXXXXX or email)" value={principal} onChange={(e) => setPrincipal(e.target.value)} />
+        <input placeholder="agent (e.g. workitems)" value={agentId} onChange={(e) => setAgentId(e.target.value)} />
+        <input placeholder="workspace team ID (optional)" value={workspace} onChange={(e) => setWorkspace(e.target.value)} />
+        <input placeholder="channel ID (optional)" value={channel} onChange={(e) => setChannel(e.target.value)} />
+        <input placeholder="permission groups (comma-separated, optional)" value={groups} onChange={(e) => setGroups(e.target.value)} />
         <button className="primary" disabled={busy || !principal || !agentId} onClick={() => void run()}>Test</button>
       </div>
       {result && (

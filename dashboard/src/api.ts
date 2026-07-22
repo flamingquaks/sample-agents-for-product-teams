@@ -306,6 +306,15 @@ export class DashboardApi {
     return this.request("DELETE", `/admin/slack/workspaces/${encodeURIComponent(teamId)}`);
   }
 
+  /** One-step connect: verify token + store secrets + onboard workspace. */
+  connectSlackWorkspace(body: {
+    bot_token: string;
+    signing_secret: string;
+    default_channel_policy?: "allowlist" | "denylist";
+  }): Promise<SlackWorkspace> {
+    return this.request<SlackWorkspace>("POST", "/admin/slack/workspaces/connect", { body });
+  }
+
   slackManifest(appName?: string): Promise<{ manifest: unknown }> {
     // The manifest is app-level (not per-workspace); `app` is a path placeholder
     // so the route parallels github-app/setup/manifest.
