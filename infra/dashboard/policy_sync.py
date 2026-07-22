@@ -63,12 +63,23 @@ def _find_policy_id(
     client, engine_id: str, name: str = FLEET_POLICY_NAME
 ) -> str | None:
     """Return the id of the policy called ``name``, or None if absent."""
+    return _list_policy_ids(client, engine_id).get(name)
+
+
+def _list_policy_ids(client, engine_id: str) -> dict[str, str]:
+    """One full pagination of the engine's policies → ``{name: policy_id}``.
+    Shared by the upsert lookups and the stale-permit scan so a sync makes ONE
+    listing pass, not one per policy (which is quadratic in policy count and
+    invites control-plane throttling as the fleet grows)."""
+    ids: dict[str, str] = {}
     paginator = client.get_paginator("list_policies")
     for page in paginator.paginate(policyEngineId=engine_id):
         for policy in page.get("policies", []):
-            if policy.get("name") == name:
-                return policy.get("policyId") or policy.get("id")
-    return None
+            name = policy.get("name")
+            pid = policy.get("policyId") or policy.get("id")
+            if name and pid:
+                ids[name] = pid
+    return ids
 
 
 def _poll_until_ready(client, engine_id: str, policy_id: str) -> str:
@@ -92,11 +103,17 @@ def _poll_until_ready(client, engine_id: str, policy_id: str) -> str:
     )
 
 
-def _upsert_policy(client, engine_id: str, name: str, statement: str) -> str:
+def _upsert_policy(
+    client, engine_id: str, name: str, statement: str,
+    known_ids: dict[str, str] | None = None,
+) -> str:
     """Create-or-update the named policy with ``statement``, then poll to ready.
     Returns the policy id. Raises PolicySyncError (via _poll_until_ready) or the
     underlying ClientError on failure — callers wrap those. Enforcement mode is
     NOT set here — it lives on the gateway→engine attachment.
+
+    ``known_ids`` (a name→id map from one _list_policy_ids pass) avoids a fresh
+    full listing per policy when the caller upserts several in one sync.
 
     Concurrency: an update is last-writer-wins but always writes the FULL current
     statement (not a diff), so a re-sync converges. The one non-convergent race
@@ -104,7 +121,10 @@ def _upsert_policy(client, engine_id: str, name: str, statement: str) -> str:
     name; we treat a create conflict as "someone created it first" and adopt +
     update the existing one instead of leaving a duplicate."""
     definition = {"cedar": {"statement": statement}}
-    policy_id = _find_policy_id(client, engine_id, name)
+    if known_ids is not None:
+        policy_id = known_ids.get(name)
+    else:
+        policy_id = _find_policy_id(client, engine_id, name)
     if policy_id is None:
         try:
             resp = client.create_policy(
@@ -165,11 +185,14 @@ def sync_fleet_policy() -> None:
 
     client = _get_client()
     try:
+        # ONE listing pass, reused by every upsert lookup and the stale-permit
+        # scan — a per-policy listing would be quadratic in policy count.
+        known_ids = _list_policy_ids(client, engine_id)
         for name, statement in fleet_policy.render_fleet_policies(
             allowed, gateway_arn
         ).items():
-            _upsert_policy(client, engine_id, name, statement)
-        _sync_agent_permits(client, engine_id, account_id, gateway_arn)
+            _upsert_policy(client, engine_id, name, statement, known_ids=known_ids)
+        _sync_agent_permits(client, engine_id, account_id, gateway_arn, known_ids)
     except (ClientError, BotoCoreError) as exc:
         # A Cedar-analysis rejection surfaces here (validation is at create/update
         # time); treat every control-plane error as a sync failure.
@@ -178,7 +201,7 @@ def sync_fleet_policy() -> None:
     logger.info("Fleet policy set synced (allowed=%s)", allowed)
 
 
-def _grants_by_agent() -> dict[str, list[str]]:
+def _grants_by_agent() -> tuple[dict[str, list[str]], bool]:
     """Build the agent → tool-grant map that drives the permit policies (spec
     §3.5). DATA-DRIVEN: a **custom** agent contributes its row's ``tool_grants``;
     a **built-in** agent keeps its fixed, code-defined ``AGENT_TOOL_GRANTS`` list
@@ -186,30 +209,52 @@ def _grants_by_agent() -> dict[str, list[str]]:
     silently narrowed/widened by a row edit. Only enabled, non-disabled agents get
     a permit; a disabled/empty-grant agent is omitted (default-deny → no tools).
 
-    Falls back to the built-in map if the config store can't be read (e.g. table
-    unset in a degraded path) so the built-ins never lose their permits."""
+    Returns ``(grants, complete)``: ``complete`` is False when the config store
+    couldn't be read — the caller then still upserts the (built-in default)
+    permits but MUST NOT run the stale-permit deletion pass, because with the
+    custom rows unreadable every custom agent's permit would look stale and a
+    transient DynamoDB error would strip all custom agents of tool access."""
     grants = dict(fleet_policy.AGENT_TOOL_GRANTS)  # built-in defaults
     try:
         caps = config_store.list_capabilities()
     except Exception:  # noqa: BLE001 — degraded read; keep built-in defaults
         logger.exception("could not read capabilities for tool grants; using built-in defaults")
-        return grants
+        return grants, False
     for cap in caps:
         agent_id = cap.get("agent_id", "")
         if not agent_id:
             continue
-        if not cap.get("enabled") or cap.get("status") == config_store.CAP_DISABLED:
-            grants.pop(agent_id, None)  # disabled → no permit
+        if not cap.get("enabled") or cap.get("status") in (
+            config_store.CAP_DISABLED,
+            config_store.CAP_DELETING,
+        ):
+            grants.pop(agent_id, None)  # disabled/deleting → no permit
             continue
         if cap.get("builtin"):
             continue  # built-in keeps its fixed code-defined grants
+        if cap.get("review_status") == "pending_review":
+            # The row's grants are UNAPPROVED (an edit may have just widened
+            # them, spec §7.5) — rendering them would put a never-approved
+            # permit on the Gateway the next time ANY sync runs. Fail closed:
+            # no permit until a second admin approves. (Approve re-syncs.)
+            grants.pop(agent_id, None)
+            continue
         grants[agent_id] = list(cap.get("tool_grants") or [])
-    return grants
+    return grants, True
 
 
-def _sync_agent_permits(client, engine_id: str, account_id: str, gateway_arn: str) -> None:
+_AGENT_PERMIT_PREFIX = "sdlc_permit_"
+
+
+def _sync_agent_permits(
+    client, engine_id: str, account_id: str, gateway_arn: str,
+    known_ids: dict[str, str] | None = None,
+) -> None:
     """Provision one permit policy per agent (default-deny means the fleet does
-    nothing without them). Skipped when the account is unknown — the forbid
+    nothing without them), and DELETE any stale ``sdlc_permit_*`` policy whose
+    agent no longer has a grant (disabled, deleting, deleted, or grants cleared) —
+    an orphaned permit would keep a torn-down agent's role authorized on the
+    Gateway indefinitely. Skipped when the account is unknown — the forbid
     policies still apply, but under ENFORCE nothing is permitted until the permits
     land, which is why rollout is LOG_ONLY first.
 
@@ -218,7 +263,23 @@ def _sync_agent_permits(client, engine_id: str, account_id: str, gateway_arn: st
     if not account_id:
         logger.info("AWS_ACCOUNT_ID unset — skipping per-agent permits")
         return
-    for name, statement in fleet_policy.agent_permit_policies(
-        account_id, gateway_arn, _grants_by_agent()
-    ).items():
-        _upsert_policy(client, engine_id, name, statement)
+    if known_ids is None:
+        known_ids = _list_policy_ids(client, engine_id)
+    grants, complete = _grants_by_agent()
+    desired = fleet_policy.agent_permit_policies(account_id, gateway_arn, grants)
+    for name, statement in desired.items():
+        _upsert_policy(client, engine_id, name, statement, known_ids=known_ids)
+    # Retract permits for agents that no longer have one. Only our own
+    # namespaced policies are ever considered — the fleet forbids and any
+    # foreign policy on the engine are untouched. Skipped entirely on a
+    # degraded config read: with the custom rows unreadable every custom
+    # permit would look stale, and a transient DynamoDB error must never strip
+    # running custom agents of tool access.
+    if not complete:
+        logger.warning("config read degraded — skipping stale-permit deletion this sync")
+        return
+    for name, policy_id in known_ids.items():
+        if not name.startswith(_AGENT_PERMIT_PREFIX) or name in desired:
+            continue
+        client.delete_policy(policyEngineId=engine_id, policyId=policy_id)
+        logger.info("Deleted stale agent permit %s (%s)", name, policy_id)

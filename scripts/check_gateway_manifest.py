@@ -93,25 +93,32 @@ def main() -> int:
         return 2
 
     # Everything the classified catalog names, in <Target>___<tool> shape. All
-    # three classes (read/write/destructive) plus the built-in grants.
+    # three classes (read/write/destructive) plus the built-in grants, plus the
+    # Asana classification map.
     github_prefix = f"{fleet_policy.GITHUB_TARGET}___"
+    asana_prefix = f"{fleet_policy._ASANA_TARGET}___"
     referenced = set()
     for t in (*fleet_policy.READ_TOOLS, *fleet_policy.WRITE_TOOLS, *fleet_policy.DESTRUCTIVE_TOOLS):
         referenced.add(f"{github_prefix}{t}")
+    for t in fleet_policy.ASANA_TOOL_CLASS:
+        referenced.add(f"{asana_prefix}{t}")
     for actions in fleet_policy.AGENT_TOOL_GRANTS.values():
         referenced.update(actions)
 
     missing = sorted(referenced - manifest)
 
-    # EXHAUSTIVENESS (spec §3.5): every GitHub-target tool the manifest exposes
-    # MUST carry a read/write/destructive classification. An UNCLASSIFIED tool is
-    # a hard failure — it could be a new write/destructive op that would silently
-    # become uncovered by any forbid AND unofferable to the authoring UI. Forcing
-    # a classification decision here is the gate.
+    # EXHAUSTIVENESS (spec §3.5): every tool the manifest exposes — on ANY fleet
+    # target — MUST carry a read/write/destructive classification. An
+    # UNCLASSIFIED tool is a hard failure — it could be a new write/destructive
+    # op that would silently become uncovered by any forbid AND unofferable to
+    # the authoring UI. Forcing a classification decision here is the gate.
+    # (classify_tool fails closed either way — an unclassified tool is never
+    # grantable — but the spec requires the drift to be REPORTED, not just inert.)
     unclassified = sorted(
         t
         for t in manifest
-        if t.startswith(github_prefix) and fleet_policy.classify_tool(t) is None
+        if t.startswith((github_prefix, asana_prefix))
+        and fleet_policy.classify_tool(t) is None
     )
 
     print(f"gateway: {url}")
@@ -123,9 +130,10 @@ def main() -> int:
     else:
         print("\n✅ every policy-referenced action exists in the manifest")
     if unclassified:
-        print("\nUNCLASSIFIED — GitHub manifest tools with no read/write/destructive class:")
+        print("\nUNCLASSIFIED — manifest tools with no read/write/destructive class:")
         for t in unclassified:
-            print(f"  ✗ {t}  (add to READ_TOOLS / WRITE_TOOLS / DESTRUCTIVE_TOOLS)")
+            print(f"  ✗ {t}  (add to READ_TOOLS / WRITE_TOOLS / DESTRUCTIVE_TOOLS "
+                  "or ASANA_TOOL_CLASS)")
     print(
         f"\nREPO_PARAM_MODE is '{fleet_policy.REPO_PARAM_MODE}' — confirm this "
         "matches the GitHub write tools' input schema (owner+repo vs combined repo)."

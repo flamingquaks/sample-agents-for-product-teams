@@ -213,7 +213,8 @@ def test_grants_by_agent_merges_custom_over_builtins(monkeypatch):
         {"agent_id": "old", "enabled": False, "status": "disabled",
          "builtin": False, "tool_grants": ["GitHubTarget___get_issue"]},
     ])
-    grants = ps._grants_by_agent()
+    grants, complete = ps._grants_by_agent()
+    assert complete is True
     assert grants["triage"] == ["GitHubTarget___get_issue"]
     assert grants["workitems"] == fleet_policy.AGENT_TOOL_GRANTS["workitems"]  # fixed
     assert "old" not in grants  # disabled → no permit
@@ -228,5 +229,43 @@ def test_grants_by_agent_falls_back_on_read_error(monkeypatch):
         raise RuntimeError("table gone")
 
     monkeypatch.setattr(config_store, "list_capabilities", boom)
-    # Degraded read → built-in defaults preserved (agents never lose permits).
-    assert ps._grants_by_agent() == fleet_policy.AGENT_TOOL_GRANTS
+    # Degraded read → built-in defaults preserved (agents never lose permits),
+    # and complete=False so the caller skips the stale-permit deletion pass.
+    grants, complete = ps._grants_by_agent()
+    assert grants == fleet_policy.AGENT_TOOL_GRANTS
+    assert complete is False
+
+
+def test_stale_agent_permit_deleted(monkeypatch):
+    """A sdlc_permit_* policy on the engine whose agent no longer has a grant
+    (disabled/deleted) must be DELETED by the sync — an orphaned permit would
+    keep a torn-down agent's role authorized on the Gateway indefinitely.
+    Fleet forbid policies and foreign policies are never touched."""
+    ps = _load(monkeypatch)
+    import config_store
+
+    monkeypatch.setenv("AWS_ACCOUNT_ID", "111122223333")
+    monkeypatch.setattr(config_store, "list_capabilities", lambda: [
+        {"agent_id": "gone", "enabled": False, "status": "disabled",
+         "builtin": False, "tool_grants": ["GitHubTarget___get_issue"]},
+    ])
+    fake = _FakeClient(
+        existing=[
+            {"name": "sdlc_allowed_repos", "policyId": "pol-1"},
+            {"name": "sdlc_permit_gone", "policyId": "pol-stale"},
+            {"name": "some_foreign_policy", "policyId": "pol-foreign"},
+        ],
+        statuses=["ACTIVE"],
+    )
+    fake.deleted = []
+    def _delete_policy(**kw):
+        fake.deleted.append(kw)
+        return {}
+    fake.delete_policy = _delete_policy
+    monkeypatch.setattr(ps, "_get_client", lambda: fake)
+    ps.sync_fleet_policy()
+    deleted_ids = [d["policyId"] for d in fake.deleted]
+    assert deleted_ids == ["pol-stale"]
+    # Live built-in permits were still upserted.
+    created_names = [c["name"] for c in fake.created]
+    assert "sdlc_permit_workitems" in created_names

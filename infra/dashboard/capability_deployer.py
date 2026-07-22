@@ -506,19 +506,42 @@ def _delete_ecr_repo(agent_id: str) -> None:
         return
 
 
-def _delete_capability_skills(agent_id: str) -> None:
-    """Delete the capability-SCOPED skill packages (skills/<agent_id>/...) from the
-    skills bucket. SHARED skills are left alone — they may back other agents. No-op
-    if the skills feature isn't deployed (no SKILLS_BUCKET)."""
+def _delete_capability_skills(cap: dict) -> None:
+    """Delete the capability-SCOPED skill packages this capability references from
+    the skills bucket. Skills live at ``skills/<scope>/<name>/`` where scope is
+    ``shared`` | ``capability`` (skill_store), so the row's ``skills`` list — not a
+    per-agent prefix — is the source of truth for what this agent owns. SHARED
+    skills are always left alone, and a capability-scoped prefix still referenced
+    by ANOTHER capability row is kept too (deleting it would silently break that
+    agent's startup hash check). No-op if the skills feature isn't deployed (no
+    SKILLS_BUCKET)."""
     bucket = os.environ.get("SKILLS_BUCKET", "")
     if not bucket:
         return
+    agent_id = cap.get("agent_id", "")
+    owned = {
+        s.get("s3_prefix")
+        for s in (cap.get("skills") or [])
+        if s.get("s3_prefix") and s.get("scope") == "capability"
+    }
+    if not owned:
+        return
+    # Keep any prefix another capability still references.
+    for other in config_store.list_capabilities():
+        if other.get("agent_id") == agent_id:
+            continue
+        for s in other.get("skills") or []:
+            owned.discard(s.get("s3_prefix"))
+    if not owned:
+        logger.info("all of %s's capability-scoped skills are shared with other "
+                    "capabilities — leaving them in place", agent_id)
+        return
     s3 = boto3.client("s3")
-    prefix = f"skills/{agent_id}/"
     paginator = s3.get_paginator("list_objects_v2")
     keys: list[dict] = []
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        keys.extend({"Key": o["Key"]} for o in page.get("Contents", []))
+    for prefix in sorted(owned):
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            keys.extend({"Key": o["Key"]} for o in page.get("Contents", []))
     for i in range(0, len(keys), 1000):
         s3.delete_objects(Bucket=bucket, Delete={"Objects": keys[i:i + 1000]})
     if keys:
@@ -548,7 +571,7 @@ def teardown_capability(agent_id: str) -> None:
     _delete_runtime(agent_id)
     _delete_runtime_role(agent_id)
     _delete_ecr_repo(agent_id)
-    _delete_capability_skills(agent_id)
+    _delete_capability_skills(cap)
     # Row last: only remove the record once its resources are gone, so a failure
     # leaves a ``deleting`` row an operator (or a re-invoke) can resume from. The
     # builtin guard above already ran, so delete_capability's own guard won't fire.

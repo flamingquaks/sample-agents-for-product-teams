@@ -171,3 +171,87 @@ def test_zip_upload_sha_matches_agent_recompute(store):
     ))
     s3 = boto3.client("s3", region_name=REGION)
     assert ref["sha256"] == _recompute_agent_side_sha(s3, ref["s3_prefix"])
+
+
+# --- review-finding regressions ------------------------------------------------
+
+
+def test_list_skills_includes_sha256(store):
+    """list_skills MUST return each package's sha256 (finding 3): the authoring UI
+    attaches skills from this listing verbatim, and a reference persisted with an
+    empty hash silently skips the base agent's startup integrity check."""
+    ref = store.upload_skill_md(_skill_md("alpha"))
+    zref = store.upload_skill_zip(_skill_zip("beta", extra_files={"scripts/x.sh": "hi"}))
+    listed = {s["name"]: s for s in store.list_skills()}
+    assert listed["alpha"]["sha256"] == ref["sha256"]
+    assert listed["beta"]["sha256"] == zref["sha256"]
+
+
+def test_list_skills_recomputes_sha_for_legacy_package(store):
+    """A package uploaded before the sha metadata existed (no metadata on its
+    SKILL.md) still lists with a correct, non-empty hash — recomputed from the
+    prefix tree."""
+    s3 = boto3.client("s3", region_name=REGION)
+    s3.put_object(Bucket=BUCKET, Key="skills/shared/legacy/SKILL.md", Body=b"---\nname: legacy\ndescription: d\n---\n")
+    listed = {s["name"]: s for s in store.list_skills()}
+    assert listed["legacy"]["sha256"] == _recompute_agent_side_sha(s3, "skills/shared/legacy/")
+
+
+def test_zip_reupload_clears_stale_objects(store):
+    """Re-uploading a skill with a SMALLER file set must not leave stale objects
+    under the prefix (finding 4) — the agent hashes the full prefix tree at sync
+    time, so leftovers would fail every startup check."""
+    store.upload_skill_zip(_skill_zip(extra_files={"scripts/old.sh": "old", "references/gone.md": "x"}))
+    ref = store.upload_skill_zip(_skill_zip(extra_files={"scripts/new.sh": "new"}))
+    s3 = boto3.client("s3", region_name=REGION)
+    keys = [o["Key"] for o in s3.list_objects_v2(Bucket=BUCKET, Prefix=ref["s3_prefix"]).get("Contents", [])]
+    assert sorted(keys) == [f"{ref['s3_prefix']}SKILL.md", f"{ref['s3_prefix']}scripts/new.sh"]
+    # And the recorded hash matches the agent-side recompute over the clean tree.
+    assert ref["sha256"] == _recompute_agent_side_sha(s3, ref["s3_prefix"])
+
+
+def test_md_reupload_clears_prior_zip_files(store):
+    """A .md re-upload of a name that previously had a .zip package must clear the
+    old scripts/ files too — same stale-tree invariant."""
+    store.upload_skill_zip(_skill_zip(extra_files={"scripts/run.sh": "hi"}))
+    ref = store.upload_skill_md(_skill_md())
+    s3 = boto3.client("s3", region_name=REGION)
+    keys = [o["Key"] for o in s3.list_objects_v2(Bucket=BUCKET, Prefix=ref["s3_prefix"]).get("Contents", [])]
+    assert keys == [f"{ref['s3_prefix']}SKILL.md"]
+    assert ref["sha256"] == _recompute_agent_side_sha(s3, ref["s3_prefix"])
+
+
+def test_zip_with_wrapping_top_level_dir_stored_at_root(store):
+    """A .zip packaged WITH a wrapping directory (my-skill/SKILL.md) must store
+    SKILL.md at the package prefix root (finding 7) — AgentSkills looks for it at
+    the package directory's root, so a nested copy is invisible at runtime."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("my-skill/SKILL.md", _skill_md())
+        zf.writestr("my-skill/scripts/run.sh", "echo hi")
+    ref = store.upload_skill_zip(buf.getvalue())
+    s3 = boto3.client("s3", region_name=REGION)
+    keys = sorted(o["Key"] for o in s3.list_objects_v2(Bucket=BUCKET, Prefix=ref["s3_prefix"]).get("Contents", []))
+    assert keys == [f"{ref['s3_prefix']}SKILL.md", f"{ref['s3_prefix']}scripts/run.sh"]
+    assert ref["sha256"] == _recompute_agent_side_sha(s3, ref["s3_prefix"])
+
+
+def test_zip_with_entries_outside_wrapper_root_rejected(store):
+    """When the package root is a wrapper directory, entries OUTSIDE it are
+    rejected rather than silently stored under a path the runtime never reads."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("my-skill/SKILL.md", _skill_md())
+        zf.writestr("stray.txt", "outside the root")
+    with pytest.raises(store.SkillValidationError, match="outside the package root"):
+        store.upload_skill_zip(buf.getvalue())
+
+
+def test_invalid_scope_rejected_on_upload(store):
+    """Scope is an S3 key segment + a capability-row field — allowlisted (finding
+    8): anything beyond shared|capability is refused for both upload shapes."""
+    for bad in ("shared/nested", "_staging", "SHARED", "", "custom"):
+        with pytest.raises(store.SkillValidationError, match="scope"):
+            store.upload_skill_md(_skill_md(), scope=bad)
+        with pytest.raises(store.SkillValidationError, match="scope"):
+            store.upload_skill_zip(_skill_zip(), scope=bad)

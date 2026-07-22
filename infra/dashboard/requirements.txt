@@ -3,3 +3,7 @@
 # bundled. (The read-only query Lambda doesn't need it, but both share this
 # CodeUri, so one requirements file covers the package.)
 cryptography>=42.0.0
+# skill_store parses SKILL.md YAML frontmatter (spec §6.2) — imported by the
+# admin API's skill routes AND at module top by the isolated skill-unpacker
+# Lambda, so it must be bundled (the Lambda runtime does not provide PyYAML).
+pyyaml>=6.0

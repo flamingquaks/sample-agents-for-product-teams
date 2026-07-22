@@ -69,6 +69,14 @@ class PolicySyncError(Exception):
     config change as complete."""
 
 
+def _approval_gate_on() -> bool:
+    """Whether the second-admin approval gate is on (spec §7.5). Deploy-time
+    parameter (RequireAgentApproval → REQUIRE_AGENT_APPROVAL env); defaults ON —
+    the fail-safe direction. One helper so the onboard and clone paths can never
+    disagree on the parse or the default."""
+    return os.environ.get("REQUIRE_AGENT_APPROVAL", "true").lower() == "true"
+
+
 def _sync_repo_policy() -> None:
     """Regenerate + push the fleet Cedar policies from the current allowed set to
     the Gateway policy engine.
@@ -212,6 +220,46 @@ _TRIGGER_SOURCES = ("github", "asana", "slack")
 # onboard can't smuggle a key that later breaks the runtime's env CSV.
 _ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
+# A "plain pip specifier" (§7.1): a package name, optional extras, optional
+# version constraints and environment markers (PEP 508 allows spaces around
+# each part, e.g. ``requests >= 2.31``) — never a flag, a VCS ref, a direct
+# URL/path, or an embedded control character (a \n inside one "requirement"
+# would emit a second physical line into requirements-extra.txt that pip parses
+# as a standalone global option like --index-url).
+#
+# CONTRACT: this regex + the substring/control-character checks MUST stay
+# byte-identical with agents/_base/gen_requirements.py (the last-line-of-defense
+# re-validation inside the build). If they diverge, a spec can pass onboarding
+# then fail the build (or vice versa). The parity test
+# (tests/test_requirements_parity.py) enforces this.
+_REQ_SPECIFIER_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*"           # package name
+    r" *(\[[A-Za-z0-9,. _-]+\])?"             # optional extras
+    r" *([<>=!~][=]?[^;]*)?"                  # optional version constraint(s)
+    r"(;.*)?$"                                # optional environment marker
+)
+_REQ_FORBIDDEN_SUBSTRINGS = ("://", "@", "git+", "svn+", "hg+", "bzr+")
+
+
+def _valid_requirement_spec(spec: str) -> bool:
+    """Whether ``spec`` is a plain PyPI specifier safe to write into
+    requirements-extra.txt. Same decision procedure as
+    gen_requirements._validate — see the CONTRACT note on _REQ_SPECIFIER_RE."""
+    stripped = spec.strip()
+    lowered = stripped.lower()
+    return bool(
+        stripped
+        and not any(ord(c) < 32 or ord(c) == 127 for c in stripped)
+        and not stripped.startswith(("-", "/", "./", "../"))
+        # Whitespace-then-dash is how pip's PER-REQUIREMENT options attach
+        # ("pkg>=1 --hash=…", "--config-settings=…"): the leading-dash check
+        # above misses them and the version-tail regex would swallow them. No
+        # legitimate specifier/marker contains " -".
+        and not re.search(r"\s-", stripped)
+        and not any(bad in lowered for bad in _REQ_FORBIDDEN_SUBSTRINGS)
+        and _REQ_SPECIFIER_RE.match(stripped)
+    )
+
 
 def _validate_capability_body(body: dict) -> tuple[dict, dict | None]:
     """Validate + normalize an onboard/edit body. Returns ``(fields, None)`` ready
@@ -227,6 +275,16 @@ def _validate_capability_body(body: dict) -> tuple[dict, dict | None]:
             400,
             "body.agent_id must be lowercase, start with a letter, end "
             "alphanumeric, [a-z0-9-], 2-64 chars",
+        )
+
+    # ``plugins`` is RESERVED for the future marketplace-install seam (§6.4):
+    # the schema keeps the name, but the API rejects it until the Claude Code
+    # runtime lands — silently dropping it would let a caller believe a plugin
+    # was installed.
+    if "plugins" in body:
+        return {}, error(
+            400,
+            "body.plugins is reserved for a future runtime and not yet supported (§6.4)",
         )
 
     description = (body.get("description") or "").strip()
@@ -326,29 +384,13 @@ def _validate_capability_body(body: dict) -> tuple[dict, dict | None]:
     requirements = body.get("requirements", [])
     if not isinstance(requirements, list) or any(not isinstance(r, str) for r in requirements):
         return {}, error(400, "body.requirements must be a list of strings")
-    # A "plain specifier" is a package name (optionally with extras/version
-    # constraint) — never a flag, a VCS ref, or a direct URL/path. All of these
-    # would make pip fetch+execute arbitrary code in the build container, so they
-    # are rejected at the boundary (§7.1). pip accepts VCS refs both bare
-    # (``git+https://…``) and via the ``pkg @ git+https://…`` PEP 508 form, and
-    # local installs via ``file://``, ``./``, ``../``, or an absolute path — cover
-    # every shape, case-insensitively.
-    _FORBIDDEN_REQ_PREFIXES = (
-        "-",  # any flag: --index-url, -e, -r, etc.
-        "http://", "https://",  # direct URL download
-        "git+", "svn+", "hg+", "bzr+",  # VCS refs
-        "file://",  # local path URL (e.g. file:///etc/passwd)
-        "./", "../", "/",  # relative/absolute local paths
-    )
     for r in requirements:
-        stripped = r.strip().lower()
-        # Reject VCS/URL refs anywhere, including the PEP 508 ``name @ <url>`` form.
-        after_at = stripped.split("@", 1)[1].strip() if "@" in stripped else ""
-        if stripped.startswith(_FORBIDDEN_REQ_PREFIXES) or after_at.startswith(_FORBIDDEN_REQ_PREFIXES):
+        if r.strip() and not _valid_requirement_spec(r):
             return {}, error(
                 400,
                 f"body.requirements entry {r!r} is not a plain pip specifier "
-                "(no flags, VCS refs, direct URLs, or local paths allowed — §7.1)",
+                "(no flags, VCS refs, direct URLs, local paths, or control "
+                "characters allowed — §7.1)",
             )
 
     # skills — SKILL.md packages the agent loads (spec §6). Each entry references
@@ -356,6 +398,18 @@ def _validate_capability_body(body: dict) -> tuple[dict, dict | None]:
     # deployer syncs exactly these prefixes into the container's SKILLS_DIR. Like
     # requirements, novel skills trip the approval gate (§7.5), so this must reach
     # the persisted row rather than being dropped on the floor.
+    #
+    # Every field is boundary-validated because each one is load-bearing:
+    #   - scope is allowlisted (it's an S3 key segment + the teardown/list axis);
+    #   - name must be a valid skill name (it becomes the container skill dir);
+    #   - s3_prefix must be EXACTLY the canonical skills/<scope>/<name>/ — a
+    #     free-form prefix could point the runtime sync at _staging/ or another
+    #     package's tree;
+    #   - sha256 is REQUIRED (64 hex chars): the base agent verifies the synced
+    #     tree against it at startup, and an empty hash silently disables that
+    #     integrity check (§6.3).
+    import skill_store
+
     skills = body.get("skills", [])
     if not isinstance(skills, list):
         return {}, error(400, "body.skills must be a list of skill references")
@@ -363,13 +417,45 @@ def _validate_capability_body(body: dict) -> tuple[dict, dict | None]:
     for s in skills:
         if not isinstance(s, dict) or not isinstance(s.get("name"), str) or not s.get("name"):
             return {}, error(400, "body.skills entry must be an object with a non-empty 'name'")
-        if not isinstance(s.get("s3_prefix"), str) or not s.get("s3_prefix"):
-            return {}, error(400, f"body.skills entry {s.get('name')!r} must include an 's3_prefix'")
+        name = s["name"]
+        if not skill_store._SKILL_NAME_RE.match(name):
+            return {}, error(400, f"body.skills entry {name!r} is not a valid skill name")
+        scope = str(s.get("scope", "shared"))
+        if scope not in skill_store.VALID_SCOPES:
+            return {}, error(
+                400,
+                f"body.skills entry {name!r} has invalid scope {scope!r} — must be "
+                f"one of {list(skill_store.VALID_SCOPES)}",
+            )
+        expected_prefix = f"skills/{scope}/{name}/"
+        if s.get("s3_prefix") != expected_prefix:
+            return {}, error(
+                400,
+                f"body.skills entry {name!r} must reference its canonical prefix "
+                f"{expected_prefix!r}",
+            )
+        sha = str(s.get("sha256", ""))
+        if not re.fullmatch(r"[0-9a-f]{64}", sha):
+            return {}, error(
+                400,
+                f"body.skills entry {name!r} must include the package's sha256 "
+                "(64 lowercase hex chars) — attach skills from the skills library",
+            )
+        # One skill per NAME per capability, across scopes: the base agent
+        # syncs every package into SKILLS_DIR/<name>, so shared/pb and
+        # capability/pb would overlay into one directory whose merged content
+        # matches neither verified hash.
+        if any(s["name"] == name for s in norm_skills):
+            return {}, error(
+                400,
+                f"body.skills references {name!r} more than once (skill names "
+                "must be unique per agent — they share one skills directory)",
+            )
         norm_skills.append({
-            "name": s["name"],
-            "s3_prefix": s["s3_prefix"],
-            "sha256": str(s.get("sha256", "")),
-            "scope": str(s.get("scope", "shared")),
+            "name": name,
+            "s3_prefix": expected_prefix,
+            "sha256": sha,
+            "scope": scope,
         })
 
     return {
@@ -458,8 +544,18 @@ def _onboard_capability(event: dict, body: dict) -> dict:
 
     existing = config_store.get_capability(agent_id)
     if existing and existing.get("builtin"):
-        # System agent: config is fixed. Preserve the seeded declarative fields;
-        # the only admin lever is enable/disable. (put_capability re-preserves
+        # System agent: config is fixed — the only admin lever is enable/disable
+        # (spec §3.1/§8.2). A submit that carries any OTHER declarative field is
+        # rejected (400) rather than silently ignored, so a caller can't believe
+        # it edited a built-in. The UI's toggle sends exactly {agent_id, enabled}.
+        offered = set(body) - {"agent_id", "enabled"}
+        if offered:
+            return error(
+                400,
+                f"{agent_id} is a built-in system agent; only 'enabled' can be "
+                f"changed (got: {sorted(offered)})",
+            )
+        # Preserve the seeded declarative fields. (put_capability re-preserves
         # builtin/deploy-state itself; we just avoid overwriting config from body.)
         fields = {
             "agent_id": agent_id,
@@ -475,6 +571,29 @@ def _onboard_capability(event: dict, body: dict) -> dict:
             "enabled": fields["enabled"],
         }
 
+    # A sparse body must not CLEAR config it didn't mention: the UI's
+    # Enable/Disable toggle sends exactly {agent_id, enabled}, and
+    # _validate_capability_body defaults every omitted field to an empty value
+    # that put_capability would persist as a deliberate clear — wiping a custom
+    # agent's prompt/deps/grants/skills on a toggle (and, with requirements
+    # emptied, sailing past the approval gate's novelty check). For every
+    # declarative field ABSENT from the body, preserve the existing row's value.
+    if existing:
+        _preserved = {
+            "description": existing.get("description", ""),
+            "aliases": list(existing.get("aliases", [])),
+            "triggers": dict(existing.get("triggers", {})),
+            "limits": dict(existing.get("limits", {})),
+            "env": dict(existing.get("env", {})),
+            "tool_grants": list(existing.get("tool_grants", [])),
+            "system_prompt": existing.get("system_prompt", ""),
+            "requirements": list(existing.get("requirements", [])),
+            "skills": list(existing.get("skills", [])),
+        }
+        for key, prior in _preserved.items():
+            if key not in body:
+                fields[key] = prior
+
     # Disabling de-routes without a rebuild — building a disabled agent is wasted
     # work, and render_registry already drops it. This is "disable = de-route,
     # runtime left running, not torn down" (spec §9).
@@ -484,6 +603,15 @@ def _onboard_capability(event: dict, body: dict) -> dict:
             agent_id, config_store.CAP_DISABLED, detail="disabled by admin (de-routed)"
         )
         _publish_registry_safe()
+        # Disabling must also retract the agent's Gateway tool permit (§3.5) —
+        # de-routing stops NEW dispatches, but the running runtime could still
+        # call tools until its permit is dropped from the policy engine.
+        failure = _sync_after_write(
+            f"policy sync failed after disabling {agent_id}",
+            f"{agent_id} disabled but its tool-permit update failed; retry",
+        )
+        if failure is not None:
+            return failure
         return ok(config_store.get_capability(agent_id))
 
     config_store.put_capability(onboarded_by=auth.caller_sub(event), **fields)
@@ -495,7 +623,7 @@ def _onboard_capability(event: dict, body: dict) -> dict:
     # dep/skill to an already-approved agent re-gates it, but editing a
     # registry-only field (an alias) on an approved agent must NOT re-park it and
     # block the rebuild. Comparing against the approved baseline covers both.
-    gate_on = os.environ.get("REQUIRE_AGENT_APPROVAL", "true").lower() == "true"
+    gate_on = _approval_gate_on()
     is_custom = not (existing and existing.get("builtin"))
     already_approved = bool(existing) and existing.get("review_status") == "approved"
 
@@ -518,9 +646,31 @@ def _onboard_capability(event: dict, body: dict) -> dict:
     if gate_on and is_custom and has_novel:
         config_store.set_review_status(agent_id, "pending_review")
         _publish_registry_safe()
+        # Sync now: a pending_review row's (unapproved, possibly widened)
+        # grants are excluded from the rendered permits (_grants_by_agent), so
+        # this retracts the agent's permit until a second admin approves —
+        # without it the old permit (or, via a later unrelated sync, nothing at
+        # all) would govern a row whose grants were never approved.
+        _sync_after_write(
+            f"policy sync failed after parking {agent_id} for review",
+            f"{agent_id} parked for review but its permit retraction failed",
+        )
         return ok(config_store.get_capability(agent_id))
 
     _publish_registry_safe()
+
+    # Sync the agent's tool permit to the Gateway policy engine (§3.5): a custom
+    # agent's authored tool_grants only take effect when the per-agent permit is
+    # rendered onto the engine, and an edit that NARROWS grants must retract the
+    # old permit rather than waiting for the next unrelated repo/settings change.
+    # Runs before the build starts — a permit for a runtime that isn't up yet is
+    # inert, while a runtime that comes up without its permit can call nothing.
+    failure = _sync_after_write(
+        f"policy sync failed after capability change for {agent_id}",
+        f"{agent_id} saved but its tool-permit update failed; edit it to retry",
+    )
+    if failure is not None:
+        return failure
 
     try:
         image_tag = _start_capability_build(agent_id)
@@ -570,6 +720,14 @@ def _delete_capability(agent_id: str) -> dict:
         agent_id, config_store.CAP_DELETING, detail="teardown requested"
     )
     _publish_registry_safe()
+    # Retract the agent's Gateway tool permit now (§3.5): the deployer teardown
+    # deletes resources, not policies, and a still-running runtime could call
+    # tools until its permit is dropped. Non-fatal in LOG_ONLY (same posture as
+    # every other narrow-direction sync) — deletion proceeds regardless.
+    _sync_after_write(
+        f"policy sync failed while deleting {agent_id}",
+        f"{agent_id} de-routed but its tool-permit retraction failed",
+    )
 
     import boto3
 
@@ -602,6 +760,18 @@ def _approve_capability(event: dict, agent_id: str) -> dict:
     if caller == cap.get("onboarded_by"):
         return error(403, "the approver must be a different admin than the author")
     config_store.set_review_status(agent_id, "approved")
+    # The approved agent's tool permit reaches the Gateway now (§3.5) — its
+    # runtime comes up right after the build, and without the permit it could
+    # call nothing (fail-closed, but broken). On a sync failure the approval is
+    # rolled back to pending_review so the approve can simply be retried (a row
+    # left "approved" would 409 the retry).
+    failure = _sync_after_write(
+        f"policy sync failed after approving {agent_id}",
+        f"{agent_id}'s tool-permit update failed; approval rolled back — retry",
+    )
+    if failure is not None:
+        config_store.set_review_status(agent_id, "pending_review")
+        return failure
     try:
         image_tag = _start_capability_build(agent_id)
     except Exception:  # noqa: BLE001
@@ -631,6 +801,17 @@ def _clone_capability(event: dict, source_id: str, body: dict) -> dict:
         return error(404, f"no such capability: {source_id}")
     if config_store.get_capability(new_id) is not None:
         return error(409, f"agent_id {new_id!r} already exists")
+    # Approval gate (§7.5/§8.2): a NEW row defaults review_status='approved',
+    # but this clone may be copying the source's requirements/skills into it.
+    # Born 'approved', a later edit+enable would compute ZERO novelty against
+    # that copied "baseline" and skip the second-admin gate entirely — even
+    # though no admin ever approved these deps ON THIS agent. So when the gate
+    # is on and the clone carries any deps/skills, the row is born
+    # pending_review (atomically, in the same put — a post-hoc status flip
+    # would leave the vulnerable 'approved' state behind on a crash between the
+    # writes). A dep-free clone stays approved, matching the onboard path for a
+    # new agent without deps.
+    has_deps = bool(source.get("requirements") or source.get("skills"))
     cloned = config_store.put_capability(
         new_id,
         description=source.get("description", ""),
@@ -646,6 +827,7 @@ def _clone_capability(event: dict, source_id: str, body: dict) -> dict:
         status=config_store.CAP_PENDING,
         onboarded_by=auth.caller_sub(event),
         builtin=False,
+        review_status="pending_review" if (_approval_gate_on() and has_deps) else None,
     )
     return ok(cloned)
 
@@ -1127,8 +1309,16 @@ def _route(event: dict) -> dict:
             return ok({"skills": skill_store.list_skills()})
         if method == "POST":
             # Upload: body carries either `content` (raw .md) or `zip_base64`
-            # (base64-encoded .zip). `scope` defaults to "shared".
+            # (base64-encoded .zip). `scope` defaults to "shared" and is
+            # allowlisted HERE (not only in skill_store) because it flows raw
+            # into the S3 key prefix and the capability-row scope field —
+            # defense in depth at the API boundary (§6.1).
             scope = (body.get("scope") or "shared").strip()
+            if scope not in skill_store.VALID_SCOPES:
+                return error(
+                    400,
+                    f"body.scope must be one of {list(skill_store.VALID_SCOPES)}",
+                )
             if body.get("zip_base64"):
                 # A .zip is untrusted artifact ingestion (§6.3): unpack it in the
                 # ISOLATED skill-unpacker Lambda, never here. Stage the raw bytes
@@ -1159,6 +1349,17 @@ def _route(event: dict) -> dict:
             parts = key.split("/", 1)
             scope = parts[0] if len(parts) == 2 else "shared"
             name = parts[-1]
+            # Both halves become raw S3 key segments in the deleted prefix —
+            # shape-check them so a crafted key can't delete outside the
+            # skills/<scope>/<name>/ tree. DELETE deliberately accepts any
+            # path-safe scope (not just VALID_SCOPES): packages uploaded before
+            # the scope allowlist existed may sit under a legacy free-form
+            # scope, and they must stay deletable or they orphan forever in the
+            # versioned bucket. Uploads remain allowlisted.
+            if not skill_store._SKILL_NAME_RE.match(scope):
+                return error(400, f"invalid skill scope {scope!r}")
+            if not skill_store._SKILL_NAME_RE.match(name):
+                return error(400, f"invalid skill name {name!r}")
             deleted = skill_store.delete_skill(scope, name)
             return ok({"name": name, "scope": scope, "deleted": deleted})
 

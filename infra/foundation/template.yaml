@@ -1450,6 +1450,10 @@ Resources:
                   - bedrock-agentcore:UpdatePolicy
                   - bedrock-agentcore:GetPolicy
                   - bedrock-agentcore:ListPolicies
+                  # DeletePolicy: the sync retracts a disabled/deleted agent's
+                  # stale sdlc_permit_* policy (§3.5) — without this the first
+                  # such retraction AccessDenies and every later sync 502s.
+                  - bedrock-agentcore:DeletePolicy
                 Resource:
                   - !GetAtt FleetPolicyEngine.PolicyEngineArn
                   - !Sub ${FleetPolicyEngine.PolicyEngineArn}/*
@@ -1769,6 +1773,18 @@ Resources:
               SSEAlgorithm: aws:kms
       VersioningConfiguration:
         Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          # Staged raw .zip uploads (_staging/) are consumed-or-deleted by the
+          # unpacker on its normal paths; this rule is the backstop for the
+          # "unexpected error" path so an orphaned staged archive (untrusted
+          # bytes) never lingers indefinitely.
+          - Id: expire-staging
+            Status: Enabled
+            Prefix: _staging/
+            ExpirationInDays: 1
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
 
   # Permissions boundary that CAPS every per-agent runtime role the deployer
   # creates. Even a bug in capability_deployer._ensure_runtime_role can't grant a
@@ -1810,13 +1826,20 @@ Resources:
               # kept for the ADR agent's Titan embeddings (bedrock-runtime, not Mantle).
               - bedrock:ApplyGuardrail
               - bedrock:InvokeModel
-              # Read authored skill packages from the skills bucket on startup
-              # (§6.2). The per-role grant scopes this to the one bucket; the
-              # boundary just permits the action class so that grant isn't nulled
-              # by the intersection.
+            Resource: "*"
+          # Read authored skill packages from the skills bucket on startup (§6.2).
+          # Scoped to the ONE skills bucket even in the boundary: the boundary is
+          # the account-wide ceiling for every per-agent runtime role, and an
+          # unscoped s3:GetObject/ListBucket here would let any future per-role
+          # grant (or a deployer bug) reach every bucket in the account.
+          - Sid: SkillsBucketRead
+            Effect: Allow
+            Action:
               - s3:GetObject
               - s3:ListBucket
-            Resource: "*"
+            Resource:
+              - !GetAtt SkillsBucket.Arn
+              - !Sub ${SkillsBucket.Arn}/skills/*
 
   CapabilityBuildRole:
     Type: AWS::IAM::Role
@@ -1906,6 +1929,10 @@ Resources:
           # The fleet config table — read (get-item) so a CUSTOM agent's build can
           # materialize its per-agent requirements from the capability row (§5).
           - { Name: FLEET_CONFIG_TABLE, Value: !Ref FleetConfigTable }
+          # Approval gate (§7.5): gen_requirements.py refuses to materialize a
+          # pending_review row's (unapproved) requirements when this is true —
+          # a build-side backstop to the admin/rebuilder gate.
+          - { Name: REQUIRE_AGENT_APPROVAL, Value: !Ref RequireAgentApproval }
       Source:
         Type: S3
         Location: !Sub ${CapabilitySourceBucket}/source.zip
@@ -2101,6 +2128,8 @@ Resources:
       Policies:
         # The ONLY privilege: read/write objects in the one skills bucket. No
         # config table, no AVP, no build/deploy — the isolation boundary.
+        # ListBucket (bucket ARN) is required by the re-upload prefix clear
+        # (skill_store._clear_prefix does list_objects_v2 before rewriting).
         - Statement:
             - Effect: Allow
               Action:
@@ -2108,6 +2137,9 @@ Resources:
                 - s3:PutObject
                 - s3:DeleteObject
               Resource: !Sub ${SkillsBucket.Arn}/*
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !GetAtt SkillsBucket.Arn
 
   # Weekly security rebuild: re-runs the shared build pipeline for every ACTIVE
   # capability so agent images pick up base-image + dependency security patches.

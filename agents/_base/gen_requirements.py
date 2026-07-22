@@ -20,17 +20,24 @@ get-item JSON document, so nothing here is shell-interpolated.
 """
 
 import json
+import os
 import re
 import sys
 
 # A plain PyPI specifier: a package name, optional extras, optional version
-# constraints and environment markers. Deliberately conservative — anything with
-# a flag, URL, VCS scheme, or path is rejected. Mirrors the intent of the admin
-# API's _FORBIDDEN_REQ_PREFIXES check (admin._validate_capability_body).
+# constraints and environment markers (PEP 508 allows spaces around each part,
+# e.g. ``requests >= 2.31``). Deliberately conservative — anything with a flag,
+# URL, VCS scheme, or path is rejected.
+#
+# CONTRACT: this regex + the forbidden-substring / control-character checks MUST
+# stay byte-identical with admin._valid_requirement_spec
+# (infra/dashboard/admin.py) — the API-boundary validator. If they diverge, a
+# spec can pass onboarding then fail the build (or vice versa). The parity test
+# (infra/dashboard/tests/test_requirements_parity.py) enforces this.
 _SPECIFIER_RE = re.compile(
-    r"^[A-Za-z0-9][A-Za-z0-9._-]*"          # package name
-    r"(\[[A-Za-z0-9,._-]+\])?"               # optional extras
-    r"([<>=!~][=]?[^;]*)?"                    # optional version constraint(s)
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*"           # package name
+    r" *(\[[A-Za-z0-9,. _-]+\])?"             # optional extras
+    r" *([<>=!~][=]?[^;]*)?"                  # optional version constraint(s)
     r"(;.*)?$"                                # optional environment marker
 )
 _FORBIDDEN_SUBSTRINGS = ("://", "@", "git+", "svn+", "hg+", "bzr+")
@@ -51,7 +58,17 @@ def _validate(spec: str) -> str:
     lowered = stripped.lower()
     if (
         not stripped
+        # A control character (\n, \r, \t, …) inside the spec would let one
+        # "requirement" emit a second physical line into requirements-extra.txt
+        # that pip parses as a standalone global option (e.g. --index-url),
+        # defeating the §7.1 allowlist. Rejected before anything else.
+        or any(ord(c) < 32 or ord(c) == 127 for c in stripped)
         or stripped.startswith(("-", "/", "./", "../"))
+        # Whitespace-then-dash is how pip's PER-REQUIREMENT options attach
+        # ("pkg>=1 --hash=…", "--config-settings=…"): the leading-dash check
+        # above misses them and the version-tail regex would swallow them. No
+        # legitimate specifier/marker contains " -".
+        or re.search(r"\s-", stripped)
         or any(bad in lowered for bad in _FORBIDDEN_SUBSTRINGS)
         or not _SPECIFIER_RE.match(stripped)
     ):
@@ -68,6 +85,20 @@ def main() -> None:
     if not raw:
         return  # no row on stdin → empty extras file
     item = (json.loads(raw) or {}).get("Item") or {}
+    # Approval-gate backstop (§7.5, defense in depth): if this row is parked
+    # pending_review while the gate is on, its requirements are UNAPPROVED. The
+    # admin/rebuilder paths already avoid starting a build for such a row, but
+    # this is the last step before pip runs, so refuse here too — a build
+    # triggered by any other path (a future non-API trigger, a manual
+    # StartBuild) still can't pip-install deps that no second admin approved.
+    gate_on = os.environ.get("REQUIRE_AGENT_APPROVAL", "true").lower() == "true"
+    review_status = _unwrap(item.get("review_status", {}))
+    if gate_on and review_status == "pending_review":
+        sys.stderr.write(
+            "gen_requirements: capability is pending_review — refusing to "
+            "materialize unapproved requirements (§7.5)\n"
+        )
+        sys.exit(1)
     reqs = _unwrap(item.get("requirements", {})) or []
     for spec in reqs:
         if isinstance(spec, str):

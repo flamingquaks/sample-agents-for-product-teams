@@ -61,7 +61,7 @@ docs/              Design docs, specs, threat model, roadmap
 ## Conventions
 
 - Agents NEVER close issues, merge PRs, or delete tasks (Cedar-enforced). Work decomposition uses propose → human-approve → execute.
-- Custom tools are structured task prompts, not business logic — they return instructions the LLM orchestrates. System prompts live in `prompts.py` beside the agent code.
+- Custom tools are structured task prompts, not business logic — they return instructions the LLM orchestrates. Built-in agents' system prompts live in `prompts.py` beside the agent code; dashboard-authored custom agents carry theirs in the capability row's `system_prompt` field (read by the generic base agent, `agents/_base/` — see `docs/specs/agent-authoring-spec.md`).
 - The privileged deploy actions (IAM role + runtime + build) live only on event-triggered Lambdas (`capability-deployer`), never on the internet-facing admin API — which holds only `codebuild:StartBuild`.
 
 ## Future (low-effort pivots kept open)

@@ -168,6 +168,37 @@ agents/<name>/
 
 Shared helpers live in `agents/shared/` (currently `assignment.py`, which provides `complete_assignment` / `fail_assignment` wrappers around the DynamoDB write).
 
+### 3.1.1 Built-in vs custom (config-driven) agents
+
+The four repo-resident agents above are **built-ins**: seeded as fixed,
+enable/disable-only capability rows (`builtin: true`) by `deploy_fleet.py`,
+undeletable (409 — disable instead), their config locked. Beyond them, admins
+**author custom agents from the dashboard** (`docs/specs/agent-authoring-spec.md`):
+a custom agent is only a `capability#` row —
+
+- `system_prompt` — the agent's instructions (replaces `prompts.py`);
+- `requirements` — plain pip specifiers, allowlisted at the API and re-validated
+  in the build (spec §7.1); layered onto the base image as
+  `requirements-extra.txt`;
+- `tool_grants` — a **per-tool** allowlist drawn from the fleet tool catalog in
+  `fleet_policy` (`READ_TOOLS` / `WRITE_TOOLS` / `DESTRUCTIVE_TOOLS`, reconciled
+  against the live gateway manifest by `scripts/check_gateway_manifest.py`).
+  Reads grant freely; writes stay bounded by the per-repo write forbid;
+  destructive tools are ungrantable. Grants render into the same Gateway Cedar
+  permits the built-ins use (`policy_sync`) — one enforcement path;
+- `skills` — uploaded `SKILL.md` packages (S3 skills bucket; `.zip`s expanded by
+  the isolated `capability-skill-unpacker` Lambda), synced into the container at
+  startup with a normalized-tree sha256 integrity check.
+
+Custom agents run the **generic base image** (`agents/_base/`: one `agent.py`
+reading `AGENT_ID` / `SYSTEM_PROMPT` / `SKILLS_DIR` + `SKILLS_MANIFEST` from the
+deployer-assembled env) — no code checkin, no per-agent Dockerfile. **Clone**
+copies any agent's declarative config into a new editable custom row. When the
+`RequireAgentApproval` deploy parameter is on (default), a custom agent with
+novel deps/skills parks `pending_review` until a **second admin** approves.
+Deleting a custom agent destroys its runtime, role, image, and
+capability-scoped skills.
+
 ### 3.2 Deployment Pipeline
 
 Agents are onboarded from the dashboard Admin view (the Capabilities panel), not from a per-agent CI workflow. The base platform (foundation stack, shared build pipeline, dashboard) is deployed once with `scripts/deploy_fleet.py`, which also uploads the `agents/` tree as the build source.
@@ -178,7 +209,11 @@ Admin onboards agent_id in the dashboard (Capabilities panel)
       ▼
 Shared CodeBuild: sdlc-agent-builder-${STAGE}  (AGENT_NAME override)
       ├── Ensure ECR repo exists (IMMUTABLE)
-      ├── Build Docker image from agents/${AGENT_NAME}/Dockerfile (context agents/)
+      ├── Built-in  (agents/${AGENT_NAME}/Dockerfile exists):
+      │     build that Dockerfile (context agents/)
+      ├── Custom    (no source dir): build agents/_base/Dockerfile, generating
+      │     requirements-extra.txt from the capability row via
+      │     gen_requirements.py (§7.1 re-validation before pip)
       └── Push image (fresh per-build tag, no :latest)
       │  (build-completion EventBridge event)
       ▼
@@ -292,6 +327,8 @@ Every agent ships with a per-agent policy file at `cedar/<agent>.cedar`, plus `c
 | Adr | Post issue comments, add labels, post PR review comments | All shared forbids; cannot modify ADR files |
 
 The per-agent `cedar/*.cedar` files document the contract; the **enforced** form lives in `infra/dashboard/fleet_policy.py`, evaluated by the **AgentCore Gateway policy engine** in the invocation path. The fleet is **gateway-only** — agents route every tool call through the Gateway, whose Cedar engine evaluates policies default-deny + forbid-wins (per-agent permits keyed on the runtime-role ARN, an unconditional destructive-tool forbid, and a repo-allowlist forbid generated from the admin config). See `docs/aws-deploy.md` § AgentCore Gateway. The engine is rolled out `LOG_ONLY` first, then flipped to `ACTIVE`; until `ACTIVE`, Cedar tool-grant *deny* decisions log rather than block, but the co-repo interceptor and the per-call scoped GitHub credential enforce regardless. The `cedar/*.cedar` files themselves remain advisory (`fleet_policy.py` is authoritative).
+
+`fleet_policy` also carries the **fleet tool catalog** (spec §3.5): every gateway tool classified read/write/destructive (`READ_TOOLS`/`WRITE_TOOLS`/`DESTRUCTIVE_TOOLS` + `ASANA_TOOL_CLASS`, disjointness asserted at import, exhaustiveness against the live manifest checked by `scripts/check_gateway_manifest.py`). **Custom** agents' authored `tool_grants` render through the same per-agent permits as the built-ins' fixed lists (`policy_sync._grants_by_agent`), synced on every capability create/edit/approve/disable/delete — including deleting the stale permit of a removed agent. The read/write split lives in Cedar at the Gateway, not in the runtime.
 
 ### 5.3 Data Security
 

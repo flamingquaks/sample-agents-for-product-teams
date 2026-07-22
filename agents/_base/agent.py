@@ -72,12 +72,25 @@ def _sync_skills_from_s3() -> None:
         expected = entry.get("sha256", "")
         if not name or not prefix:
             continue
+        if not expected:
+            # No recorded hash means the integrity check below can't run — treat
+            # that as a failure, not a pass (§6.3). The admin API requires a
+            # sha256 on every attached skill, so an empty one here indicates a
+            # row written outside that boundary.
+            logger.warning("skill %s: manifest entry has no sha256 — refusing unverifiable package", name)
+            continue
         try:
             objects: list[tuple[str, bytes]] = []
             paginator = s3.get_paginator("list_objects_v2")
             for page in paginator.paginate(Bucket=SKILLS_BUCKET, Prefix=prefix):
                 for obj in page.get("Contents", []):
                     key = obj["Key"]
+                    # Skip a zero-byte "folder marker" object at the prefix
+                    # itself (rel would be "") — the upload-side hash never
+                    # includes it, so hashing it here would make every skill
+                    # fail the check if e.g. the S3 console created one.
+                    if key == prefix:
+                        continue
                     body = s3.get_object(Bucket=SKILLS_BUCKET, Key=key)["Body"].read()
                     objects.append((key, body))
             if not objects:

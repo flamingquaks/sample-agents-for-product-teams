@@ -40,6 +40,25 @@ _SKILL_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 _MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB per file
 _MAX_TOTAL_SIZE = 50 * 1024 * 1024  # 50 MB total
 
+# The only storage scopes a skill may live under (spec §6.1). The scope is a raw
+# S3 key segment (skills/<scope>/<name>/) AND a capability-row field, so it MUST
+# be allowlisted — a free-form scope could nest prefixes ("shared/x"), collide
+# with the _staging/ area, or plant objects the list/teardown paths never see.
+#
+# NOTE: both scopes are GLOBAL namespaces keyed by skill name — "capability"
+# marks a package as owned-by-whichever-capabilities-reference-it (teardown
+# deletes it only when no other row references it), not as per-agent-private.
+# Re-uploading a name replaces the tree for every referencing agent; an agent
+# whose recorded sha256 no longer matches then DROPS the skill at startup
+# (fail-closed, agents/_base/agent.py) rather than loading changed content.
+VALID_SCOPES = ("shared", "capability")
+
+# S3 object-metadata key on each package's root SKILL.md recording the
+# normalized-tree sha256 at upload. list_skills() reads it back so the authoring
+# UI attaches skills WITH their content hash — a skill reference persisted with
+# an empty sha256 would silently skip the base agent's startup integrity check.
+_SHA_METADATA_KEY = "skill-tree-sha256"
+
 _s3 = None
 
 
@@ -52,6 +71,34 @@ def _get_s3():
 
 class SkillValidationError(Exception):
     pass
+
+
+def _validate_scope(scope: str) -> str:
+    """Allowlist the storage scope (see VALID_SCOPES). Raises on anything else —
+    the scope becomes a raw S3 key segment and a capability-row field."""
+    if scope not in VALID_SCOPES:
+        raise SkillValidationError(
+            f"invalid skill scope {scope!r} — must be one of {list(VALID_SCOPES)}"
+        )
+    return scope
+
+
+def _clear_prefix(prefix: str) -> int:
+    """Delete every object under ``prefix``; returns how many were deleted.
+    Used by re-uploads (a package is replaced wholesale — stale leftovers would
+    fail the base agent's full-prefix-tree hash check and silently drop the
+    skill) and by delete_skill. Pages the listing and chunks delete_objects to
+    its 1000-key cap."""
+    paginator = _get_s3().get_paginator("list_objects_v2")
+    keys: list[str] = []
+    for page in paginator.paginate(Bucket=SKILLS_BUCKET, Prefix=prefix):
+        keys.extend(obj["Key"] for obj in page.get("Contents", []))
+    for i in range(0, len(keys), 1000):
+        _get_s3().delete_objects(
+            Bucket=SKILLS_BUCKET,
+            Delete={"Objects": [{"Key": k} for k in keys[i:i + 1000]]},
+        )
+    return len(keys)
 
 
 def normalized_tree_sha256(files: list[tuple[str, bytes]]) -> str:
@@ -95,18 +142,23 @@ def _validate_frontmatter(content: str) -> dict:
 
 def upload_skill_md(content: str, scope: str = "shared") -> dict:
     """Upload a single SKILL.md (raw markdown). Validates frontmatter, writes to
-    S3, returns the skill reference ``{name, s3_prefix, sha256, scope}``."""
+    S3, returns the skill reference ``{name, s3_prefix, sha256, scope}``. A
+    re-upload replaces the whole prefix (a prior .zip upload of the same name may
+    have left scripts/ files that would break the tree hash)."""
+    _validate_scope(scope)
     meta = _validate_frontmatter(content)
     name = meta["name"]
     # Hash the normalized tree (here a single SKILL.md), NOT the raw markdown, so
     # it matches what the base agent recomputes from S3 on sync (§6.3).
     sha = normalized_tree_sha256([("SKILL.md", content.encode())])
     prefix = f"skills/{scope}/{name}/"
+    _clear_prefix(prefix)
     _get_s3().put_object(
         Bucket=SKILLS_BUCKET,
         Key=f"{prefix}SKILL.md",
         Body=content.encode(),
         ContentType="text/markdown",
+        Metadata={_SHA_METADATA_KEY: sha},
     )
     return {"name": name, "s3_prefix": prefix, "sha256": sha, "scope": scope}
 
@@ -139,7 +191,12 @@ def upload_skill_zip(data: bytes, scope: str = "shared") -> dict:
         if total_size > _MAX_TOTAL_SIZE:
             raise SkillValidationError(f"zip total size exceeds limit ({_MAX_TOTAL_SIZE})")
 
-    # Require a top-level SKILL.md.
+    # Require a SKILL.md at the package root. Tools commonly zip a skill WITH a
+    # wrapping directory (``my-skill/SKILL.md``) — accept that shape too, but
+    # then treat that directory as the package root and STRIP it from every
+    # stored path: AgentSkills expects SKILL.md at the package directory's root,
+    # so storing the wrapper one level deep would make the skill invisible at
+    # runtime. A SKILL.md nested deeper than one level is not a package root.
     names = zf.namelist()
     skill_md_path = next(
         (n for n in names if n.rstrip("/") == "SKILL.md" or (n.endswith("/SKILL.md") and n.count("/") == 1)),
@@ -147,30 +204,51 @@ def upload_skill_zip(data: bytes, scope: str = "shared") -> dict:
     )
     if not skill_md_path:
         raise SkillValidationError("zip must contain a top-level SKILL.md")
+    root = skill_md_path[: -len("SKILL.md")]  # "" or "my-skill/"
     skill_md_content = zf.read(skill_md_path).decode("utf-8", errors="replace")
     meta = _validate_frontmatter(skill_md_content)
     name = meta["name"]
 
+    _validate_scope(scope)
     prefix = f"skills/{scope}/{name}/"
 
-    # Write every file to S3 under the prefix, collecting (rel_path, bytes) so the
-    # recorded hash is over the NORMALIZED TREE (§6.3) — the exact set of objects
-    # under the prefix, keyed by their path relative to it. This is what the base
-    # agent recomputes from S3 on sync, so the two agree by construction (a raw
-    # sha256(zip_bytes) would not, since the agent never sees the original zip).
-    written: list[tuple[str, bytes]] = []
+    # Collect every file's root-relative path first — entries OUTSIDE the wrapper
+    # root are rejected (they'd otherwise be stored under a path the runtime
+    # never looks at, or clash with another package's tree).
+    entries: list[tuple[str, bytes]] = []
     for info in zf.infolist():
         if info.is_dir():
             continue
-        rel = os.path.normpath(info.filename)
-        body = zf.read(info.filename)
+        norm = os.path.normpath(info.filename)
+        norm_root = os.path.normpath(root) + os.sep if root else ""
+        if norm_root and not norm.startswith(norm_root):
+            raise SkillValidationError(
+                f"zip entry {info.filename!r} is outside the package root {root!r}"
+            )
+        rel = norm[len(norm_root):] if norm_root else norm
+        if not rel:
+            continue
+        entries.append((rel, zf.read(info.filename)))
+
+    # Replace the prefix WHOLESALE: a re-upload with a smaller file set must not
+    # leave stale objects behind — the base agent hashes the full prefix tree at
+    # sync time, so leftovers would fail every startup check and drop the skill.
+    _clear_prefix(prefix)
+
+    # Write every file to S3 under the prefix, hashing the NORMALIZED TREE (§6.3)
+    # — the exact set of objects under the prefix, keyed by their root-relative
+    # path. This is what the base agent recomputes from S3 on sync, so the two
+    # agree by construction (a raw sha256(zip_bytes) would not, since the agent
+    # never sees the original zip).
+    sha = normalized_tree_sha256(entries)
+    for rel, body in entries:
+        extra = {"Metadata": {_SHA_METADATA_KEY: sha}} if rel == "SKILL.md" else {}
         _get_s3().put_object(
             Bucket=SKILLS_BUCKET,
             Key=f"{prefix}{rel}",
             Body=body,
+            **extra,
         )
-        written.append((rel, body))
-    sha = normalized_tree_sha256(written)
     return {"name": name, "s3_prefix": prefix, "sha256": sha, "scope": scope}
 
 
@@ -186,9 +264,58 @@ def _list_common_prefixes(prefix: str) -> list[str]:
     return prefixes
 
 
+def _prefix_sha256(prefix: str) -> str:
+    """The package's recorded normalized-tree sha256, read back from the root
+    SKILL.md's object metadata (written at upload). Falls back to RECOMPUTING the
+    hash over the prefix tree for packages uploaded before the metadata existed —
+    never returns empty for a real package, because a skill reference persisted
+    with sha256="" would silently skip the base agent's startup integrity check.
+    The recomputed hash is written BACK to the metadata (best-effort) so a legacy
+    package pays the full-tree download once, not on every listing — list_skills
+    sits on the dashboard's polling path."""
+    s3 = _get_s3()
+    root_key = f"{prefix}SKILL.md"
+    try:
+        head = s3.head_object(Bucket=SKILLS_BUCKET, Key=root_key)
+        recorded = (head.get("Metadata") or {}).get(_SHA_METADATA_KEY, "")
+        if recorded:
+            return recorded
+    except Exception:  # noqa: BLE001 — missing root doc; recompute below
+        pass
+    files: list[tuple[str, bytes]] = []
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=SKILLS_BUCKET, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            rel = obj["Key"][len(prefix):]
+            if not rel:
+                continue
+            body = s3.get_object(Bucket=SKILLS_BUCKET, Key=obj["Key"])["Body"].read()
+            files.append((rel, body))
+    if not files:
+        return ""
+    sha = normalized_tree_sha256(files)
+    try:
+        # Self-copy to persist the metadata; a failure just means the next
+        # listing recomputes again (correctness unaffected).
+        s3.copy_object(
+            Bucket=SKILLS_BUCKET,
+            Key=root_key,
+            CopySource={"Bucket": SKILLS_BUCKET, "Key": root_key},
+            Metadata={_SHA_METADATA_KEY: sha},
+            MetadataDirective="REPLACE",
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("could not backfill sha metadata for %s", prefix)
+    return sha
+
+
 def list_skills() -> list[dict]:
     """List all uploaded skill packages (by unique prefix). Returns
-    ``[{name, s3_prefix, scope}]`` — lightweight, no content fetch."""
+    ``[{name, s3_prefix, sha256, scope}]``. The sha256 comes from the root
+    SKILL.md's object metadata (one HEAD per package) — it MUST be present in the
+    listing because the authoring UI attaches skills from it verbatim, and a
+    reference persisted without a hash would disable the base agent's startup
+    integrity verification for that skill."""
     if not SKILLS_BUCKET:
         return []
     # Top-level prefixes are skills/<scope>/ — we need to go one level deeper.
@@ -197,24 +324,16 @@ def list_skills() -> list[dict]:
         scope = scope_prefix.rstrip("/").split("/")[-1]
         for skill_prefix in _list_common_prefixes(scope_prefix):
             name = skill_prefix.rstrip("/").split("/")[-1]
-            skills.append({"name": name, "s3_prefix": skill_prefix, "scope": scope})
+            skills.append({
+                "name": name,
+                "s3_prefix": skill_prefix,
+                "sha256": _prefix_sha256(skill_prefix),
+                "scope": scope,
+            })
     return skills
 
 
 def delete_skill(scope: str, name: str) -> bool:
     """Delete all objects under a skill's prefix. Returns True if anything was
     deleted; False if the prefix was empty/nonexistent."""
-    prefix = f"skills/{scope}/{name}/"
-    paginator = _get_s3().get_paginator("list_objects_v2")
-    keys: list[str] = []
-    for page in paginator.paginate(Bucket=SKILLS_BUCKET, Prefix=prefix):
-        keys.extend(obj["Key"] for obj in page.get("Contents", []))
-    if not keys:
-        return False
-    # delete_objects accepts at most 1000 keys per call — chunk it.
-    for i in range(0, len(keys), 1000):
-        _get_s3().delete_objects(
-            Bucket=SKILLS_BUCKET,
-            Delete={"Objects": [{"Key": k} for k in keys[i:i + 1000]]},
-        )
-    return True
+    return _clear_prefix(f"skills/{scope}/{name}/") > 0

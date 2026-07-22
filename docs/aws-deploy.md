@@ -105,6 +105,17 @@ sync → CloudFront invalidation). Operators are created by an admin (no self
 sign-up) and must be added to the `operators` group; admins (who onboard agents
 and repos in the Admin view) go in the `admins` group. See `dashboard/README.md`.
 
+**Agent authoring (with `DeployDashboard=true`).** The dashboard also carries
+the agent-authoring surface (`docs/specs/agent-authoring-spec.md`): the stack
+additionally creates
+
+| Resource | Logical name | Purpose |
+|---|---|---|
+| S3 bucket | `sdlc-agent-skills-${AWS::AccountId}-${Stage}` | Uploaded `SKILL.md` packages, expanded as `skills/<scope>/<name>/` trees (KMS SSE, versioned, private; `_staging/` uploads expire after 1 day). The generic base agent pulls its referenced packages from here on startup, verifying each normalized-tree sha256 |
+| Lambda | `capability-skill-unpacker-${Stage}` | **Isolated** `.zip` skill expansion (spec §6.3) — the only privilege is object read/write on the skills bucket; the admin API stages the raw zip and invokes this synchronously, never unpacking in-process |
+| CodeBuild project | `sdlc-agent-builder-${Stage}` | The shared build. For a **custom** (config-driven) agent — no `agents/<id>/Dockerfile` — it builds the generic base image (`agents/_base/`), materializing per-agent pip deps from the capability row via `gen_requirements.py` (re-validated before pip; spec §7.1) |
+| IAM managed policy | `sdlc-capability-runtime-boundary-${Stage}` | Permissions boundary capping every per-agent runtime role; its S3 read is scoped to the skills bucket only |
+
 ### 1.2 Per-agent runtime (created by UI onboarding, not SAM, not CI)
 
 Agents are onboarded from the dashboard Admin view (the **Capabilities** panel). Onboarding writes a capability row to `fleet-config-${Stage}` and drives the rest of the lifecycle through the shared build pipeline and the capability deployer — no per-agent script, workflow, or manual command:
@@ -118,7 +129,7 @@ Agents are onboarded from the dashboard Admin view (the **Capabilities** panel).
 
 The flow: the admin API starts one shared build (it holds only `codebuild:StartBuild`); on build completion an EventBridge rule invokes the `capability-deployer` Lambda (the only component holding `iam:CreateRole`/`PassRole` + `create/update-agent-runtime`), which ensures the runtime role, deploys the runtime, waits for READY, marks the capability active, and republishes the registry. A weekly EventBridge schedule invokes the `capability-rebuilder` Lambda, which re-runs the same build for every active capability (security patching); a failed build or deploy never tears down a working runtime.
 
-Four agents ship in `agents/` today: `workitems`, `researcher`, `docwriter`, `adr`. Each becomes per-agent runtime surface once onboarded.
+Four **built-in** agents ship in `agents/` today: `workitems`, `researcher`, `docwriter`, `adr` — seeded as fixed, enable/disable-only capability rows by `scripts/deploy_fleet.py`. Beyond those, admins can **author custom agents from the dashboard** (spec `docs/specs/agent-authoring-spec.md`): a custom agent is a capability row (system prompt + pip requirements + per-tool grants + skills) built on the **generic base image** (`agents/_base/`) — no code checkin, no per-agent Dockerfile. The buildspec discriminates on the presence of `agents/<id>/Dockerfile`: built-ins build their own image; custom agents build the base image with `requirements-extra.txt` generated (and §7.1-re-validated) from the capability row. Deleting a custom agent destroys its runtime, role, image, and capability-scoped skills; built-ins are undeletable (409 — disable instead).
 
 ### 1.3 GitHub triggers — no CI, no OIDC deploy role
 
@@ -188,6 +199,7 @@ Passed to `sam deploy --parameter-overrides`:
 - **`MantleProjectId`** — a pre-existing Bedrock Mantle project id, used only when `DeployMantleProject=false`. Blank (default) leaves agents on the account's default Mantle project. Ignored when `DeployMantleProject=true`.
 - **`AsanaMcpEndpoint`** — Asana MCP server endpoint registered as the direct gateway target (default points at the official server). GitHub has no endpoint parameter: its gateway target is the SCM broker Lambda (`infra/dispatch/scm_broker.py`), not a direct MCP server.
 - **`GitHubAppName`** — display name used when registering the fleet's GitHub App from the admin manifest flow (must be unique across GitHub).
+- **`RequireAgentApproval`** — `true` (default) / `false`. The agent-authoring approval gate (spec §7.5): when on, a custom agent whose pip requirements or skills are **novel** relative to its last-approved baseline lands `pending_review` and does not build until a **second admin** (enforced distinct from the author) approves it in the dashboard. Deliberately a deploy-time parameter, not a runtime toggle — relaxing it requires deploy rights and is an auditable infra change. Built-in enable/disable never needs approval.
 
 Which GitHub repos the fleet acts on is no longer a deploy parameter. The fleet is multi-repo: deploy it once, then an admin onboards repos at runtime in the dashboard's Admin view (stored in the `fleet-config-${Stage}` DynamoDB table). The Dispatch Router reads that allowlist and rejects a GitHub mention from a non-onboarded repo with a `403`. See § AgentCore Gateway below for the tool-call boundary that complements it.
 
@@ -291,7 +303,7 @@ Rough shutdown order:
 2. Delete each onboarded agent's AgentCore Runtime (`bedrock-agentcore-control delete-agent-runtime`).
 3. Delete each agent's IAM runtime role (under path `/sdlc-agents/capabilities/`).
 4. Delete each `sdlc-agents/<agent>` ECR repository (including all images).
-5. Delete the foundation CloudFormation stack (`sam delete`). This removes the Dispatch Router, the webhook Lambdas (GitHub, Asana, and Slack when enabled), API Gateway, the `TriggerPolicyStore` (AVP), DynamoDB tables (`dispatch-assignments`, `fleet-config` — the latter holding the trigger-rule/Slack data rows), S3 buckets (must be empty first — including the build-source and dashboard buckets), SSM registry parameter, the build pipeline + capability deployer/rebuilder, guardrail, and CloudWatch alarms.
+5. Delete the foundation CloudFormation stack (`sam delete`). This removes the Dispatch Router, the webhook Lambdas (GitHub, Asana, and Slack when enabled), API Gateway, the `TriggerPolicyStore` (AVP), DynamoDB tables (`dispatch-assignments`, `fleet-config` — the latter holding the trigger-rule/Slack data rows), S3 buckets (must be empty first — including the build-source, dashboard, and skills buckets), SSM registry parameter, the build pipeline + capability deployer/rebuilder + skill unpacker, guardrail, and CloudWatch alarms.
 6. Delete the SSM parameters (`asana-*`, `github-app-*`, `researcher-tavily-api-key`, and — if Slack was enabled — everything under `/sdlc-agents/${Stage}/slack/*`) and the Secrets Manager `sdlc-agents/github-app/private-key` secret.
 7. If Slack was enabled, delete the Slack app (or its webhook subscriptions) from the Slack side so it stops sending deliveries.
 8. If you enabled the optional Claude Code on Bedrock feature (§1.4), delete its `ClaudeCodeBedrockRole` and the GitHub OIDC provider/trust you created for it. (The fleet itself creates no OIDC provider or CI role to clean up.)

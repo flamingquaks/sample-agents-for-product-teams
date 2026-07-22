@@ -478,6 +478,7 @@ def put_capability(
     status: str | None = None,
     onboarded_by: str = "",
     builtin: bool | None = None,
+    review_status: str | None = None,
 ) -> dict:
     """Create/replace a capability record's DECLARATIVE fields (the parts an admin
     edits). Deploy-state fields — image_tag, runtime_arn, build_id, status_detail —
@@ -537,7 +538,14 @@ def put_capability(
         "system_prompt": system_prompt if system_prompt is not None else existing.get("system_prompt", ""),
         "requirements": list(requirements) if requirements is not None else list(existing.get("requirements", [])),
         "skills": list(skills) if skills is not None else list(existing.get("skills", [])),
-        "review_status": existing.get("review_status", "approved"),
+        # None → preserve (default "approved"); pass explicitly (e.g. clone with
+        # copied deps under the approval gate, spec §7.5) so the row is BORN in
+        # the right state rather than flipped by a second, non-atomic write.
+        "review_status": (
+            review_status
+            if review_status is not None
+            else existing.get("review_status", "approved")
+        ),
         "enabled": bool(enabled),
         "status": status,
         "builtin": bool(builtin),
@@ -734,7 +742,15 @@ def _decimal_default(o):
 # rejects them outright (see admin._validate_capability_body). Kept here so both
 # the API validation and the merge agree on one list.
 RESERVED_ENV_KEYS = frozenset(
-    {"BEDROCK_GUARDRAIL_ID", "BEDROCK_GUARDRAIL_VERSION", "GATEWAY_MCP_URL"}
+    {
+        "BEDROCK_GUARDRAIL_ID",
+        "BEDROCK_GUARDRAIL_VERSION",
+        "GATEWAY_MCP_URL",
+        # Skill delivery (§6.2): where the base agent pulls skill packages from.
+        # Deployer-wired from the stack; an authored env that set it could point
+        # the startup skill sync at an attacker-controlled bucket.
+        "SKILLS_BUCKET",
+    }
 )
 
 
@@ -751,7 +767,12 @@ SKILLS_MOUNT_DIR = "/app/skills"
 # capability's free-form ``env``. AGENT_ID is the identity the Gateway's per-agent
 # Cedar policy keys on, so an authored env that set it could assume another
 # agent's tool grants — these are computed here and rejected at the admin API.
-BASE_AGENT_ENV_KEYS = frozenset({"AGENT_ID", "SYSTEM_PROMPT", "SKILLS_DIR"})
+# SKILLS_MANIFEST is derived from the row's ``skills`` list (name/prefix/sha256);
+# an authored value could point the startup sync at arbitrary prefixes or swap a
+# verified hash.
+BASE_AGENT_ENV_KEYS = frozenset(
+    {"AGENT_ID", "SYSTEM_PROMPT", "SKILLS_DIR", "SKILLS_MANIFEST"}
+)
 
 
 def capability_env_pairs(cap: dict, base_env: dict[str, str]) -> dict[str, str]:

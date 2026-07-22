@@ -461,11 +461,14 @@ class _FakeS3:
         return {}
 
 
-def _install_teardown_fakes(cd, monkeypatch, agentcore, iam, *, cap, ecr=None, s3=None):
+def _install_teardown_fakes(cd, monkeypatch, agentcore, iam, *, cap, ecr=None, s3=None,
+                            other_caps=()):
     monkeypatch.setattr(cd, "_acc", lambda: agentcore)
     monkeypatch.setattr(cd, "_iam_client", lambda: iam)
     store_calls = {"deleted_rows": [], "published": 0}
     monkeypatch.setattr(cd.config_store, "get_capability", lambda a: cap)
+    monkeypatch.setattr(cd.config_store, "list_capabilities",
+                        lambda: [cap, *other_caps])
     monkeypatch.setattr(cd.config_store, "delete_capability",
                         lambda a: store_calls["deleted_rows"].append(a))
     def _pub():
@@ -494,20 +497,48 @@ def test_teardown_destroys_all_resources_then_row(monkeypatch):
     )
     iam = _FakeIam()
     iam.put_role_policy(RoleName="triage-agentcore-runtime", PolicyName="model-access")
+    # The row references one capability-scoped skill (stored at its real
+    # skills/<scope>/<name>/ prefix) and one shared skill that must survive.
     store_calls, ecr, s3 = _install_teardown_fakes(
         cd, monkeypatch, agentcore, iam,
-        cap={"agent_id": "triage", "builtin": False},
-        s3=_FakeS3(objects=["skills/triage/pb/SKILL.md"]),
+        cap={"agent_id": "triage", "builtin": False, "skills": [
+            {"name": "pb", "s3_prefix": "skills/capability/pb/", "scope": "capability"},
+            {"name": "common", "s3_prefix": "skills/shared/common/", "scope": "shared"},
+        ]},
+        s3=_FakeS3(objects=["skills/capability/pb/SKILL.md",
+                            "skills/capability/pb/scripts/run.sh",
+                            "skills/shared/common/SKILL.md"]),
     )
     out = cd.handler({"action": "teardown", "agent_id": "triage"})
     assert out == {"ok": True, "agent_id": "triage", "action": "teardown"}
     assert agentcore.deleted == ["triage-id"]
     assert "triage-agentcore-runtime" in iam.deleted_roles
     assert ("sdlc-agents/triage", True) in ecr.deleted
-    assert s3.deleted == ["skills/triage/pb/SKILL.md"]
+    # Capability-scoped prefix fully deleted; the shared skill untouched.
+    assert sorted(s3.deleted) == ["skills/capability/pb/SKILL.md",
+                                  "skills/capability/pb/scripts/run.sh"]
     # Row removed LAST, and registry republished.
     assert store_calls["deleted_rows"] == ["triage"]
     assert store_calls["published"] == 1
+
+
+def test_teardown_keeps_capability_skill_still_referenced_elsewhere(monkeypatch):
+    """A capability-scoped prefix ANOTHER capability still references must not be
+    deleted — removing it would break that agent's startup hash check."""
+    cd = _fresh()
+    monkeypatch.setenv("SKILLS_BUCKET", "sdlc-agent-skills-123456789012-test")
+    agentcore = _FakeAgentCore(existing={})
+    iam = _FakeIam()
+    shared_ref = {"name": "pb", "s3_prefix": "skills/capability/pb/", "scope": "capability"}
+    store_calls, ecr, s3 = _install_teardown_fakes(
+        cd, monkeypatch, agentcore, iam,
+        cap={"agent_id": "triage", "builtin": False, "skills": [shared_ref]},
+        other_caps=[{"agent_id": "other", "builtin": False, "skills": [shared_ref]}],
+        s3=_FakeS3(objects=["skills/capability/pb/SKILL.md"]),
+    )
+    cd.handler({"action": "teardown", "agent_id": "triage"})
+    assert s3.deleted == []
+    assert store_calls["deleted_rows"] == ["triage"]
 
 
 def test_teardown_refuses_builtin(monkeypatch):

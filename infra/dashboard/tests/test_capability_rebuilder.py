@@ -91,3 +91,22 @@ def test_no_build_project_is_a_noop(monkeypatch):
                         lambda: [{"agent_id": "triage", "status": rb.config_store.CAP_ACTIVE}])
     out = rb.handler({}, None)
     assert out["rebuilt"] == 0
+
+
+def test_pending_review_active_capability_is_skipped(monkeypatch):
+    """An edit that adds a novel dep to an active, approved agent re-parks it
+    pending_review but leaves status=active. The weekly rebuild MUST skip it —
+    rebuilding reads the live row and would pip-install the unapproved dep,
+    bypassing the second-admin gate (§7.5)."""
+    rb = _fresh()
+    caps = [
+        {"agent_id": "triage", "status": rb.config_store.CAP_ACTIVE,
+         "review_status": "approved"},
+        {"agent_id": "sneaky", "status": rb.config_store.CAP_ACTIVE,
+         "review_status": "pending_review"},
+    ]
+    cb = _FakeCodeBuild()
+    _install(rb, monkeypatch, caps, cb)
+    out = rb.handler({"time": "2026-07-26T08:00:00Z"}, None)
+    assert out["rebuilt"] == 1 and out["skipped"] == 1
+    assert [o["AGENT_NAME"] for o in cb.started] == ["triage"]

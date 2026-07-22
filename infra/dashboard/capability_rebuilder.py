@@ -13,6 +13,16 @@ not touch runtimes. A build or runtime-update that fails leaves the capability
 image — a failed security rebuild never takes an agent down. Only ``active``
 capabilities are rebuilt; ones mid-onboard (pending/building) or already failed are
 skipped so the weekly job doesn't disturb an in-flight or broken deploy.
+
+Approval gate (spec §7.5): a capability whose ``review_status`` is
+``pending_review`` is ALSO skipped. An edit that adds a novel dependency/skill to
+an already-active, approved agent re-parks it pending_review but leaves it
+``active`` (its old runtime keeps serving, correctly). The build itself reads the
+LIVE capability row (buildspec → gen_requirements.py), so rebuilding a
+pending_review row would pip-install the unapproved dependency in the build
+container — bypassing the second-admin gate the onboard path enforces. Skipping
+pending_review here closes that path; the rebuild happens after approval, which
+starts its own build.
 """
 
 import logging
@@ -51,6 +61,12 @@ def handler(event=None, context=None):
     for cap in config_store.list_capabilities():
         agent_id = cap.get("agent_id", "")
         if cap.get("status") != config_store.CAP_ACTIVE:
+            skipped += 1
+            continue
+        # Never rebuild an agent parked for second-admin approval: the build
+        # reads the live row and would pip-install its unapproved deps (§7.5).
+        if cap.get("review_status") == "pending_review":
+            logger.info("skipping %s — pending_review (unapproved deps/skills)", agent_id)
             skipped += 1
             continue
         image_tag = f"{tag_base}-{agent_id}"
