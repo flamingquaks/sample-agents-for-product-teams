@@ -539,18 +539,54 @@ def _onboard_capability(event: dict, body: dict) -> dict:
 
 
 def _delete_capability(agent_id: str) -> dict:
-    """Remove a CUSTOM capability row and republish the registry so the router
-    stops resolving it. A built-in (system) agent is undeletable (409) — it's
-    disabled, not removed (spec §3.1). Runtime/role/image teardown for custom
-    agents is a later phase; for now a delete removes the row + de-routes it."""
+    """Destroy a CUSTOM agent (spec §8.2, §10-P3): de-route it immediately, then
+    hand the privileged teardown (runtime + role + image + capability-scoped
+    skills + row) to the deployer Lambda. A built-in (system) agent is undeletable
+    (409) — it's disabled, not removed (spec §3.1).
+
+    The admin API holds NO IAM/runtime/ECR privileges by design, so it does NOT
+    delete resources itself. It flips the row to ``deleting`` (which de-routes it
+    the instant delete is requested — render_registry excludes ``deleting``) and
+    async-invokes the deployer, which owns the guarded teardown. If the deployer
+    function isn't wired (dashboard deployed without it), the row can't be safely
+    torn down, so we surface that rather than orphaning resources."""
     if not config_store.valid_agent_id(agent_id):
         return error(400, "invalid agent_id")
-    try:
-        deleted = config_store.delete_capability(agent_id)
-    except config_store.BuiltinCapabilityError as exc:
-        return error(409, str(exc))
+    cap = config_store.get_capability(agent_id)
+    if cap is None:
+        return error(404, f"no such capability: {agent_id}")
+    if cap.get("builtin"):
+        return error(409, f"{agent_id} is a built-in system agent and cannot be "
+                          "deleted; disable it instead")
+
+    deployer = os.environ.get("CAPABILITY_DEPLOYER_FUNCTION")
+    if not deployer:
+        return error(503, "custom-agent teardown is unavailable (deployer not "
+                          "configured); cannot safely delete")
+
+    # De-route first so a mention stops resolving immediately, even before the
+    # async teardown finishes.
+    config_store.set_capability_status(
+        agent_id, config_store.CAP_DELETING, detail="teardown requested"
+    )
     _publish_registry_safe()
-    return ok({"agent_id": agent_id, "deleted": deleted})
+
+    import boto3
+
+    try:
+        boto3.client("lambda").invoke(
+            FunctionName=deployer,
+            InvocationType="Event",  # async — teardown runs for minutes
+            Payload=json.dumps({"action": "teardown", "agent_id": agent_id}).encode(),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("failed to invoke deployer teardown for %s", agent_id)
+        config_store.set_capability_status(
+            agent_id, config_store.CAP_FAILED, detail="teardown could not be started"
+        )
+        return error(502, f"{agent_id} de-routed but teardown could not be started; "
+                          "retry the delete")
+    return ok({"agent_id": agent_id, "status": "deleting"})
 
 
 def _approve_capability(event: dict, agent_id: str) -> dict:

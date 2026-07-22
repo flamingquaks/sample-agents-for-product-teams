@@ -1365,6 +1365,11 @@ Resources:
           # capability onboard/edit (codebuild:StartBuild only — never runtime/role
           # creation, which is the deployer Lambda's job off the build event).
           CAPABILITY_BUILD_PROJECT: !Ref CapabilityBuildProject
+          # The deployer Lambda the admin async-invokes to TEAR DOWN a custom agent
+          # (runtime/role/image) on delete — the admin holds none of those
+          # privileges itself (§8.2), so it de-routes the row and hands the
+          # privileged teardown to the deployer.
+          CAPABILITY_DEPLOYER_FUNCTION: !Ref CapabilityDeployerFunction
           # AVP authorizes every write (auth.is_admin → Cedar Write action).
           AVP_POLICY_STORE_ID: !GetAtt DashboardPolicyStore.PolicyStoreId
           # Names the per-workspace Slack secret paths recorded on a workspace row.
@@ -1404,6 +1409,14 @@ Resources:
             - Effect: Allow
               Action: codebuild:StartBuild
               Resource: !GetAtt CapabilityBuildProject.Arn
+        # Async-invoke the deployer to TEAR DOWN a custom agent on delete. Scoped
+        # to that ONE function — the admin still can't create/delete roles or
+        # runtimes directly; it can only ask the deployer to run its guarded
+        # teardown (which refuses built-ins and foreign runtimes).
+        - Statement:
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !GetAtt CapabilityDeployerFunction.Arn
         # GitHub App: read app id/slug + read/write the private key + update the
         # id/slug params after the manifest flow creates the App.
         - Statement:
@@ -1991,11 +2004,16 @@ Resources:
             # (logs / dynamodb / ecr / gateway-invoke / model-access), so no
             # iam:AttachRolePolicy is granted — the deployer can't attach an
             # arbitrary managed policy, and the permissions boundary caps the rest.
+            # Delete* are for CUSTOM-agent teardown (§8.2): drop the inline policies
+            # then the role, scoped to the same fixed capabilities path.
             - Sid: ConfigureRuntimeRole
               Effect: Allow
               Action:
                 - iam:PutRolePolicy
                 - iam:GetRole
+                - iam:ListRolePolicies
+                - iam:DeleteRolePolicy
+                - iam:DeleteRole
               Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/sdlc-agents/capabilities/*
             # PassRole so create/update-agent-runtime can hand the runtime role to
             # the AgentCore service — scoped to the same path + service.
@@ -2021,7 +2039,26 @@ Resources:
                 - bedrock-agentcore-control:ListAgentRuntimes
                 - bedrock-agentcore-control:ListTagsForResource
                 - bedrock-agentcore-control:TagResource
+                # DeleteAgentRuntime for custom-agent teardown (§8.2). The deployer
+                # only deletes a runtime it verified carries the fleet tag, so the
+                # account-wide Resource can't be used to delete a foreign runtime.
+                - bedrock-agentcore-control:DeleteAgentRuntime
               Resource: "*"
+            # Custom-agent teardown (§8.2): delete the agent's ECR repo (scoped to
+            # the fleet namespace) and its capability-scoped skill objects.
+            - Sid: TeardownEcr
+              Effect: Allow
+              Action:
+                - ecr:DeleteRepository
+              Resource: !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/sdlc-agents/*
+            - Sid: TeardownSkills
+              Effect: Allow
+              Action:
+                - s3:ListBucket
+                - s3:DeleteObject
+              Resource:
+                - !GetAtt SkillsBucket.Arn
+                - !Sub ${SkillsBucket.Arn}/skills/*
       Events:
         BuildCompleted:
           Type: EventBridgeRule

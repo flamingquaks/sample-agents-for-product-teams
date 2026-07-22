@@ -441,25 +441,67 @@ def test_edit_live_capability_republishes_registry(monkeypatch):
 
 
 @mock_aws
-def test_delete_capability_route():
+def _stub_deployer_invoke(admin, monkeypatch):
+    """Capture the async teardown invoke the delete route fires at the deployer,
+    and point CAPABILITY_DEPLOYER_FUNCTION at it. Returns the captured-calls list."""
+    monkeypatch.setenv("CAPABILITY_DEPLOYER_FUNCTION", "capability-deployer-test")
+    calls: list = []
+
+    class _FakeLambda:
+        def invoke(self, **kw):
+            calls.append(kw)
+            return {"StatusCode": 202}
+
+    import boto3 as _b
+    real_client = _b.client
+
+    def _client(name, *a, **k):
+        if name == "lambda":
+            return _FakeLambda()
+        return real_client(name, *a, **k)
+
+    monkeypatch.setattr(_b, "client", _client)
+    return calls
+
+
+@mock_aws
+def test_delete_capability_route_deroutes_and_invokes_teardown(monkeypatch):
     _make_table()
     admin = _load_admin()
+    cs = _load_store()
+    calls = _stub_deployer_invoke(admin, monkeypatch)
     admin.handler(_event("POST", "/admin/capabilities", body={"agent_id": "triage"}))
     resp = admin.handler(
-        _event(
-            "DELETE",
-            "/admin/capabilities/{agent_id}",
-            path={"agent_id": "triage"},
-        )
+        _event("DELETE", "/admin/capabilities/{agent_id}", path={"agent_id": "triage"})
     )
     assert resp["statusCode"] == 200
-    assert json.loads(resp["body"]) == {"agent_id": "triage", "deleted": True}
-    assert (
-        json.loads(admin.handler(_event("GET", "/admin/capabilities"))["body"])[
-            "capabilities"
-        ]
-        == []
+    assert json.loads(resp["body"]) == {"agent_id": "triage", "status": "deleting"}
+    # De-routed immediately: row flipped to ``deleting`` and excluded from registry,
+    # but NOT yet removed — the deployer owns the row deletion after teardown.
+    row = cs.get_capability("triage")
+    assert row is not None and row["status"] == cs.CAP_DELETING
+    assert cs.render_registry() == {"agents": {}}
+    # Exactly one async teardown invoke at the deployer with the right payload.
+    assert len(calls) == 1
+    assert calls[0]["InvocationType"] == "Event"
+    payload = json.loads(calls[0]["Payload"])
+    assert payload == {"action": "teardown", "agent_id": "triage"}
+
+
+@mock_aws
+def test_delete_capability_unavailable_without_deployer(monkeypatch):
+    """With no deployer wired, a delete must refuse (503) rather than orphan the
+    resources or remove the row."""
+    _make_table()
+    admin = _load_admin()
+    cs = _load_store()
+    monkeypatch.delenv("CAPABILITY_DEPLOYER_FUNCTION", raising=False)
+    admin.handler(_event("POST", "/admin/capabilities", body={"agent_id": "triage"}))
+    resp = admin.handler(
+        _event("DELETE", "/admin/capabilities/{agent_id}", path={"agent_id": "triage"})
     )
+    assert resp["statusCode"] == 503
+    assert cs.get_capability("triage") is not None  # untouched
 
 
 # --- built-in (system) agents + lifecycle (P1) -------------------------------

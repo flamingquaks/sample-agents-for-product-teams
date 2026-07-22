@@ -47,6 +47,7 @@ class _FakeAgentCore:
         self._tags = tags or {}
         self.created = []
         self.updated = []
+        self.deleted = []
 
     def _arn(self, rt_id):
         return f"arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/{rt_id}"
@@ -81,10 +82,17 @@ class _FakeAgentCore:
         seq = self._statuses.get(agentRuntimeId, ["READY"])
         return {"status": seq.pop(0) if len(seq) > 1 else seq[0]}
 
+    def delete_agent_runtime(self, agentRuntimeId):
+        self.deleted.append(agentRuntimeId)
+        return {}
+
 
 class _FakeIam:
     class exceptions:
         class EntityAlreadyExistsException(Exception):
+            pass
+
+        class NoSuchEntityException(Exception):
             pass
 
     def __init__(self, existing_roles=()):
@@ -92,6 +100,10 @@ class _FakeIam:
         self.created = []
         self.put_policies = []
         self.attached = []
+        self.deleted_policies = []
+        self.deleted_roles = []
+        # role_name -> [policy names]; seeded so teardown has something to drop.
+        self._role_policies = {}
 
     def create_role(self, **kw):
         if kw["RoleName"] in self._existing:
@@ -100,9 +112,23 @@ class _FakeIam:
 
     def put_role_policy(self, **kw):
         self.put_policies.append(kw)
+        self._role_policies.setdefault(kw["RoleName"], []).append(kw["PolicyName"])
 
     def attach_role_policy(self, **kw):
         self.attached.append(kw)
+
+    def list_role_policies(self, RoleName):
+        if RoleName not in self._role_policies:
+            raise _FakeIam.exceptions.NoSuchEntityException()
+        return {"PolicyNames": list(self._role_policies[RoleName])}
+
+    def delete_role_policy(self, RoleName, PolicyName):
+        self.deleted_policies.append((RoleName, PolicyName))
+        self._role_policies.get(RoleName, []).remove(PolicyName)
+
+    def delete_role(self, RoleName):
+        self.deleted_roles.append(RoleName)
+        self._role_policies.pop(RoleName, None)
 
 
 def _install_fakes(cd, monkeypatch, agentcore, iam):
@@ -372,7 +398,7 @@ def test_runtime_never_ready_marks_failed_without_teardown(monkeypatch):
     cd.handler(_build_event("triage", "build-4", "SUCCEEDED"))
     # Marked failed, but we never issued a delete — the working runtime stands.
     assert any(s[1] == cd.config_store.CAP_FAILED for s in calls["status"])
-    assert not hasattr(agentcore, "deleted")
+    assert agentcore.deleted == []
     # Not marked active, registry not republished.
     assert not any(s[1] == cd.config_store.CAP_ACTIVE for s in calls["status"])
     assert calls["published"] == 0
@@ -394,3 +420,128 @@ def test_missing_capability_row_is_a_noop(monkeypatch):
 
     cd.deploy_capability("ghost", "build-5")
     assert not agentcore.created and not iam.created and calls["published"] == 0
+
+
+# --- custom-agent teardown (P3, spec §8.2) -----------------------------------
+
+
+class _FakeEcr:
+    class exceptions:
+        class RepositoryNotFoundException(Exception):
+            pass
+
+    def __init__(self, existing=("sdlc-agents/triage",)):
+        self._existing = set(existing)
+        self.deleted = []
+
+    def delete_repository(self, repositoryName, force=False):
+        if repositoryName not in self._existing:
+            raise _FakeEcr.exceptions.RepositoryNotFoundException()
+        self.deleted.append((repositoryName, force))
+        return {}
+
+
+class _FakeS3:
+    def __init__(self, objects=()):
+        # objects: list of keys present in the skills bucket.
+        self._objects = list(objects)
+        self.deleted = []
+
+    def get_paginator(self, _name):
+        objs = [{"Key": k} for k in self._objects]
+
+        class _P:
+            def paginate(self, Bucket, Prefix):
+                return [{"Contents": [o for o in objs if o["Key"].startswith(Prefix)]}]
+
+        return _P()
+
+    def delete_objects(self, Bucket, Delete):
+        self.deleted.extend(o["Key"] for o in Delete["Objects"])
+        return {}
+
+
+def _install_teardown_fakes(cd, monkeypatch, agentcore, iam, *, cap, ecr=None, s3=None):
+    monkeypatch.setattr(cd, "_acc", lambda: agentcore)
+    monkeypatch.setattr(cd, "_iam_client", lambda: iam)
+    store_calls = {"deleted_rows": [], "published": 0}
+    monkeypatch.setattr(cd.config_store, "get_capability", lambda a: cap)
+    monkeypatch.setattr(cd.config_store, "delete_capability",
+                        lambda a: store_calls["deleted_rows"].append(a))
+    def _pub():
+        store_calls["published"] += 1
+    monkeypatch.setattr(cd.config_store, "publish_registry", _pub)
+    ecr = ecr if ecr is not None else _FakeEcr()
+    s3 = s3 if s3 is not None else _FakeS3()
+    real = cd.boto3.client
+    def _client(name, *a, **k):
+        if name == "ecr":
+            return ecr
+        if name == "s3":
+            return s3
+        return real(name, *a, **k)
+    monkeypatch.setattr(cd.boto3, "client", _client)
+    return store_calls, ecr, s3
+
+
+def test_teardown_destroys_all_resources_then_row(monkeypatch):
+    cd = _fresh()
+    monkeypatch.setenv("SKILLS_BUCKET", "sdlc-agent-skills-123456789012-test")
+    fleet_arn = _fleet_arn("triage-id")
+    agentcore = _FakeAgentCore(
+        existing={"triage": "triage-id"},
+        tags={fleet_arn: {"sdlc-fleet": "capability-test"}},
+    )
+    iam = _FakeIam()
+    iam.put_role_policy(RoleName="triage-agentcore-runtime", PolicyName="model-access")
+    store_calls, ecr, s3 = _install_teardown_fakes(
+        cd, monkeypatch, agentcore, iam,
+        cap={"agent_id": "triage", "builtin": False},
+        s3=_FakeS3(objects=["skills/triage/pb/SKILL.md"]),
+    )
+    out = cd.handler({"action": "teardown", "agent_id": "triage"})
+    assert out == {"ok": True, "agent_id": "triage", "action": "teardown"}
+    assert agentcore.deleted == ["triage-id"]
+    assert "triage-agentcore-runtime" in iam.deleted_roles
+    assert ("sdlc-agents/triage", True) in ecr.deleted
+    assert s3.deleted == ["skills/triage/pb/SKILL.md"]
+    # Row removed LAST, and registry republished.
+    assert store_calls["deleted_rows"] == ["triage"]
+    assert store_calls["published"] == 1
+
+
+def test_teardown_refuses_builtin(monkeypatch):
+    cd = _fresh()
+    agentcore = _FakeAgentCore(existing={"workitems": "wi-id"})
+    iam = _FakeIam()
+    store_calls, ecr, s3 = _install_teardown_fakes(
+        cd, monkeypatch, agentcore, iam,
+        cap={"agent_id": "workitems", "builtin": True},
+    )
+    cd.handler({"action": "teardown", "agent_id": "workitems"})
+    # Nothing destroyed, row not removed.
+    assert not agentcore.deleted and not iam.deleted_roles and not ecr.deleted
+    assert store_calls["deleted_rows"] == []
+
+
+def test_teardown_leaves_foreign_runtime_untouched(monkeypatch):
+    """A same-named but non-fleet-tagged runtime must NOT be deleted (same guard
+    as deploy)."""
+    cd = _fresh()
+    foreign_arn = _fleet_arn("foreign-id")
+    agentcore = _FakeAgentCore(existing={"triage": "foreign-id"}, tags={foreign_arn: {}})
+    iam = _FakeIam()
+    store_calls, ecr, s3 = _install_teardown_fakes(
+        cd, monkeypatch, agentcore, iam,
+        cap={"agent_id": "triage", "builtin": False},
+    )
+    cd.handler({"action": "teardown", "agent_id": "triage"})
+    assert agentcore.deleted == []  # foreign runtime left alone
+    # The rest of the teardown still proceeds (role/image/row are fleet-scoped).
+    assert store_calls["deleted_rows"] == ["triage"]
+
+
+def test_teardown_invalid_agent_id_ignored(monkeypatch):
+    cd = _fresh()
+    out = cd.handler({"action": "teardown", "agent_id": "../evil"})
+    assert out["ok"] is False

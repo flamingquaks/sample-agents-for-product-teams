@@ -462,6 +462,104 @@ def deploy_capability(agent_id: str, image_tag: str) -> None:
     logger.info("capability %s active (image %s)", agent_id, image_tag)
 
 
+def _delete_runtime(agent_id: str) -> None:
+    """Delete the agent's AgentCore runtime if it exists AND is fleet-managed.
+    A same-named but foreign (untagged) runtime is left untouched — the same guard
+    _deploy_runtime uses against hijacking applies to teardown. No-op if absent."""
+    existing_id, existing_arn = _find_runtime(agent_id)
+    if not existing_id:
+        return
+    if not _is_fleet_runtime(existing_arn):
+        logger.warning(
+            "runtime %s exists but is not fleet-managed — refusing to delete", agent_id
+        )
+        return
+    logger.info("deleting runtime %s (%s)", agent_id, existing_id)
+    _acc().delete_agent_runtime(agentRuntimeId=existing_id)
+
+
+def _delete_runtime_role(agent_id: str) -> None:
+    """Delete the agent's per-agent runtime role: drop its inline policies (a role
+    with attached inline policies can't be deleted) then the role. Scoped to the
+    fixed capabilities path the deployer is IAM-constrained to. No-op if absent."""
+    iam = _iam_client()
+    role_name = f"{agent_id}-agentcore-runtime"
+    try:
+        policy_names = iam.list_role_policies(RoleName=role_name).get("PolicyNames", [])
+    except iam.exceptions.NoSuchEntityException:
+        return
+    for name in policy_names:
+        iam.delete_role_policy(RoleName=role_name, PolicyName=name)
+    iam.delete_role(RoleName=role_name)
+    logger.info("deleted runtime role %s", role_name)
+
+
+def _delete_ecr_repo(agent_id: str) -> None:
+    """Delete the agent's ECR repo (force — removes all image tags). Scoped to the
+    fleet's sdlc-agents/ namespace. No-op if absent."""
+    ecr = boto3.client("ecr")
+    repo = f"sdlc-agents/{agent_id}"
+    try:
+        ecr.delete_repository(repositoryName=repo, force=True)
+        logger.info("deleted ECR repo %s", repo)
+    except ecr.exceptions.RepositoryNotFoundException:
+        return
+
+
+def _delete_capability_skills(agent_id: str) -> None:
+    """Delete the capability-SCOPED skill packages (skills/<agent_id>/...) from the
+    skills bucket. SHARED skills are left alone — they may back other agents. No-op
+    if the skills feature isn't deployed (no SKILLS_BUCKET)."""
+    bucket = os.environ.get("SKILLS_BUCKET", "")
+    if not bucket:
+        return
+    s3 = boto3.client("s3")
+    prefix = f"skills/{agent_id}/"
+    paginator = s3.get_paginator("list_objects_v2")
+    keys: list[dict] = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        keys.extend({"Key": o["Key"]} for o in page.get("Contents", []))
+    for i in range(0, len(keys), 1000):
+        s3.delete_objects(Bucket=bucket, Delete={"Objects": keys[i:i + 1000]})
+    if keys:
+        logger.info("deleted %d capability-scoped skill objects for %s", len(keys), agent_id)
+
+
+def teardown_capability(agent_id: str) -> None:
+    """Destroy a CUSTOM agent's resources then remove its row (spec §8.2, §10-P3).
+
+    Ordered so a partial failure never orphans the row ahead of its resources:
+    runtime → role → image → capability-scoped skills → row. Each step is
+    idempotent and no-ops when its resource is absent, so a re-invocation after a
+    mid-teardown failure converges. A built-in is refused (defense in depth — the
+    admin API already 409s, and only a custom row is ever flipped to ``deleting``).
+
+    Runs HERE (not on the admin API) because deleting the runtime + IAM role are
+    privileged actions; the admin Lambda holds none of them and only async-invokes
+    this function after de-routing the agent."""
+    cap = config_store.get_capability(agent_id)
+    if cap is None:
+        logger.info("no capability row for %s — nothing to tear down", agent_id)
+        return
+    if cap.get("builtin"):
+        logger.error("refusing to tear down built-in agent %s", agent_id)
+        return
+    logger.info("tearing down custom capability %s", agent_id)
+    _delete_runtime(agent_id)
+    _delete_runtime_role(agent_id)
+    _delete_ecr_repo(agent_id)
+    _delete_capability_skills(agent_id)
+    # Row last: only remove the record once its resources are gone, so a failure
+    # leaves a ``deleting`` row an operator (or a re-invoke) can resume from. The
+    # builtin guard above already ran, so delete_capability's own guard won't fire.
+    config_store.delete_capability(agent_id)
+    try:
+        config_store.publish_registry()
+    except Exception:  # noqa: BLE001
+        logger.exception("torn down %s but registry publish failed; re-publishes on next change", agent_id)
+    logger.info("capability %s fully torn down", agent_id)
+
+
 def _agent_from_build_event(event: dict) -> tuple[str, str, str] | None:
     """Extract (agent_id, image_tag, build_status) from a CodeBuild state-change
     event. AGENT_NAME + IMAGE_TAG are the build's environment override variables
@@ -492,11 +590,24 @@ def _agent_from_build_event(event: dict) -> tuple[str, str, str] | None:
 
 
 def handler(event, context=None):
-    """EventBridge entry point for CodeBuild build-state-change events.
+    """Entry point. Handles two invocation shapes:
 
-    Only SUCCEEDED builds proceed to runtime deployment. A FAILED/STOPPED build
-    marks the capability ``failed`` with the build status and leaves any existing
-    runtime untouched."""
+    1. A DIRECT teardown request (``{"action": "teardown", "agent_id": ...}``),
+       async-invoked by the admin API after it de-routes a custom agent — this is
+       the only privileged path that deletes the runtime/role/image (§8.2). The
+       admin Lambda holds none of those permissions.
+    2. A CodeBuild build-state-change EventBridge event: SUCCEEDED → deploy the
+       runtime; FAILED/STOPPED → mark the capability ``failed``, leaving any
+       existing runtime untouched.
+    """
+    if isinstance(event, dict) and event.get("action") == "teardown":
+        agent_id = event.get("agent_id", "")
+        if not config_store.valid_agent_id(agent_id):
+            logger.warning("teardown request with invalid agent_id %r — ignoring", agent_id)
+            return {"ok": False, "reason": "invalid agent_id"}
+        teardown_capability(agent_id)
+        return {"ok": True, "agent_id": agent_id, "action": "teardown"}
+
     parsed = _agent_from_build_event(event)
     if parsed is None:
         logger.info("build event without a valid AGENT_NAME override — ignoring")

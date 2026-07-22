@@ -108,7 +108,13 @@ CAP_BUILDING = "building"
 CAP_ACTIVE = "active"
 CAP_FAILED = "failed"
 CAP_DISABLED = "disabled"
-CAP_STATUSES = (CAP_PENDING, CAP_BUILDING, CAP_ACTIVE, CAP_FAILED, CAP_DISABLED)
+# "deleting" is a terminal-intent state for a CUSTOM agent whose destroy has been
+# requested: the admin API de-routes it and flips it here, then the deployer tears
+# down the runtime/role/image and removes the row. It's excluded from the registry
+# like "disabled", so a mention stops resolving the instant delete is requested,
+# even before the async teardown finishes.
+CAP_DELETING = "deleting"
+CAP_STATUSES = (CAP_PENDING, CAP_BUILDING, CAP_ACTIVE, CAP_FAILED, CAP_DISABLED, CAP_DELETING)
 
 # agent_id is used unquoted as an ECR repo suffix (sdlc-agents/<id>), a CodeBuild
 # AGENT_NAME override, an agents/<id>/ path, and a Cedar/registry literal. Pin it
@@ -660,7 +666,7 @@ def render_registry() -> dict:
     otherwise resolve a mention to a runtime that isn't up)."""
     agents = {}
     for cap in list_capabilities():
-        if not cap.get("enabled") or cap.get("status") == CAP_DISABLED:
+        if not cap.get("enabled") or cap.get("status") in (CAP_DISABLED, CAP_DELETING):
             continue
         arn = cap.get("runtime_arn")
         if not arn:
