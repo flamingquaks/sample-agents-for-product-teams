@@ -111,7 +111,13 @@ def _stack_outputs(stack: dict | None) -> dict[str, str]:
     return {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
 
 
-def deploy_foundation(runner: Runner, stage: str, region: str, auto_approve: bool) -> None:
+def deploy_foundation(
+    runner: Runner,
+    stage: str,
+    region: str,
+    auto_approve: bool,
+    param_overrides: dict[str, str] | None = None,
+) -> None:
     stack = f"sdlc-agents-{stage}"
     logger.info("== Foundation stack (%s) ==", stack)
     # Preserve the parameter values already on the stack (DeployGateway,
@@ -119,6 +125,27 @@ def deploy_foundation(runner: Runner, stage: str, region: str, auto_approve: boo
     # code/template update, not a silent reconfiguration. For a brand-new stack
     # there are none, and the template defaults apply.
     existing = _stack_params(_describe_stack(region, stack))
+    # Effective parameters, precedence low→high:
+    #   1. Stage (always set from --stage),
+    #   2. the values already on the stack (preserve a redeploy's config),
+    #   3. explicit --param / --full overrides from THIS invocation (so one
+    #      command can stand the whole stack up, or flip a toggle on redeploy).
+    # A NEW stack starts from just Stage, so passing DeployDashboard=true etc.
+    # here is what makes a single first-run deploy the FULL solution rather than
+    # the dashboard/gateway-off template defaults.
+    params: dict[str, str] = {"Stage": stage}
+    params.update(existing)
+    params.update(param_overrides or {})
+    if not existing:
+        logger.info(
+            "new stack %s — deploying with: %s",
+            stack, ", ".join(f"{k}={v}" for k, v in sorted(params.items())),
+        )
+    else:
+        logger.info(
+            "existing stack %s — %d preserved params, %d override(s) this run",
+            stack, len(existing), len(param_overrides or {}),
+        )
     runner.run(["sam", "build"], cwd=FOUNDATION_DIR)
     cmd = [
         "sam", "deploy",
@@ -132,20 +159,13 @@ def deploy_foundation(runner: Runner, stage: str, region: str, auto_approve: boo
     # applies IAM/networking changes to the live stack (never a blind apply).
     # --auto-approve opts into the non-interactive path for unattended runs.
     cmd += ["--no-confirm-changeset"] if auto_approve else ["--confirm-changeset"]
-    if existing:
-        overrides = [f"{k}={v}" for k, v in sorted(existing.items())]
-        cmd += ["--parameter-overrides", *overrides]
-        logger.info("preserving %d existing stack parameters", len(existing))
-    else:
-        # New stack: Stage is the only required-without-default parameter; the
-        # template defaults cover the rest (dashboard/gateway off by default). An
-        # operator turns those on and sets any Asana GIDs afterward.
-        cmd += ["--parameter-overrides", f"Stage={stage}"]
-        logger.warning(
-            "no existing stack %s — deploying with template defaults + Stage=%s; "
-            "enable the dashboard/gateway + set Asana GIDs afterward if needed",
-            stack, stage,
-        )
+    # Use the explicit ParameterKey=/ParameterValue= form so an empty value
+    # (e.g. an unset Asana GID) is passed literally rather than being a parse
+    # error in sam's shorthand ``KEY=VALUE`` splitter.
+    overrides = [
+        f"ParameterKey={k},ParameterValue={v}" for k, v in sorted(params.items())
+    ]
+    cmd += ["--parameter-overrides", *overrides]
     runner.run(cmd, cwd=FOUNDATION_DIR)
 
 
@@ -333,7 +353,51 @@ def main(argv: list[str] | None = None) -> int:
         help="skip the sam changeset confirmation prompt (unattended runs); by "
              "default the foundation changeset is printed and must be confirmed",
     )
+    ap.add_argument(
+        "--param", action="append", default=[], metavar="KEY=VALUE",
+        help="foundation stack parameter override (repeatable), e.g. "
+             "--param DeployDashboard=true --param GatewayPolicyEnforcement=ACTIVE. "
+             "On a new stack these merge with Stage; on a redeploy they override "
+             "the preserved value for that key.",
+    )
+    ap.add_argument(
+        "--full", action="store_true",
+        help="convenience: deploy the FULL solution — dashboard + gateway on "
+             "(GatewayPolicyEnforcement=LOG_ONLY, approval gate on, Mantle "
+             "project on). Equivalent to the matching --param flags; any "
+             "explicit --param wins over these defaults.",
+    )
     args = ap.parse_args(argv)
+
+    # Assemble the foundation parameter overrides for this invocation. --full
+    # sets the full-solution baseline; explicit --param entries override it.
+    param_overrides: dict[str, str] = {}
+    if args.full:
+        param_overrides.update({
+            "DeployDashboard": "true",
+            "DeployGateway": "true",
+            "GatewayPolicyEnforcement": "LOG_ONLY",
+            "DeployMantleProject": "true",
+            "RequireAgentApproval": "true",
+        })
+    for entry in args.param:
+        if "=" not in entry:
+            ap.error(f"--param must be KEY=VALUE (got {entry!r})")
+        key, value = entry.split("=", 1)
+        key = key.strip()
+        if not key:
+            ap.error(f"--param key must be non-empty (got {entry!r})")
+        param_overrides[key] = value
+    # DeployGateway=true requires DeployDashboard=true (template Rule
+    # GatewayRequiresDashboard); catch it here so the deploy fails fast at the
+    # CLI rather than mid-changeset.
+    if param_overrides.get("DeployGateway") == "true" and \
+            param_overrides.get("DeployDashboard") != "true":
+        ap.error(
+            "DeployGateway=true requires DeployDashboard=true (the admin API "
+            "owns the Gateway Cedar policy sync) — pass --param DeployDashboard=true "
+            "or use --full"
+        )
 
     runner = Runner(args.dry_run)
     stack = f"sdlc-agents-{args.stage}"
@@ -343,7 +407,14 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if not args.skip_foundation:
-        deploy_foundation(runner, args.stage, args.region, args.auto_approve)
+        deploy_foundation(
+            runner, args.stage, args.region, args.auto_approve, param_overrides
+        )
+    elif param_overrides:
+        logger.warning(
+            "--param/--full given with --skip-foundation — parameter overrides "
+            "are ignored (the foundation stack is not being deployed this run)"
+        )
 
     # Resolve outputs once the foundation exists (source upload + dashboard need them).
     if args.dry_run:

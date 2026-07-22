@@ -184,3 +184,27 @@ def test_handshake_echoes_hook_secret(monkeypatch):
     assert resp["headers"]["X-Hook-Secret"] == "hs-123"
     assert captured["value"] == "hs-123"
     assert not dispatched
+
+
+def test_unset_bot_gids_dropped_from_bot_users(monkeypatch):
+    """With no bot GIDs configured (the default now that the template defaults
+    them to ""), BOT_USERS must be EMPTY — never a {"" : "workitems"} entry that
+    an unassigned task (assignee_gid == "") would match and wrongly dispatch."""
+    for var in ("WORKITEMS_BOT_GID", "UAT_BOT_GID", "RESEARCHER_BOT_GID", "DOCWRITER_BOT_GID"):
+        monkeypatch.delenv(var, raising=False)
+    sys.modules.pop("asana_webhook", None)
+    import asana_webhook as aw
+    assert aw.BOT_USERS == {}
+    assert "" not in aw.BOT_USERS
+    # An unassigned task resolves to no agent.
+    assert aw.BOT_USERS.get("") is None
+
+
+def test_configured_bot_gid_maps_to_agent(monkeypatch):
+    monkeypatch.setenv("WORKITEMS_BOT_GID", "1201234567890")
+    monkeypatch.delenv("UAT_BOT_GID", raising=False)
+    monkeypatch.delenv("RESEARCHER_BOT_GID", raising=False)
+    monkeypatch.delenv("DOCWRITER_BOT_GID", raising=False)
+    sys.modules.pop("asana_webhook", None)
+    import asana_webhook as aw
+    assert aw.BOT_USERS == {"1201234567890": "workitems"}

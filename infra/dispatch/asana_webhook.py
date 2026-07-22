@@ -69,12 +69,19 @@ _registry = mentions.RegistryCache(REGISTRY_PARAM, lambda: _ssm)
 # to the capability model AND automating the Asana-side setup — tracked as a
 # follow-up; for now they stay explicit and built-in.
 
-# Bot user GIDs in Asana — set via environment variables
+# Bot user GIDs in Asana — set via environment variables. Drop any unset ("")
+# GID: an unconfigured bot must NOT collapse to a "" key, or an UNASSIGNED task
+# (assignee_gid == "") would match it and wrongly dispatch (e.g. every unassigned
+# task → workitems when WORKITEMS_BOT_GID is empty).
 BOT_USERS = {
-    os.environ.get("WORKITEMS_BOT_GID", ""): "workitems",
-    os.environ.get("UAT_BOT_GID", ""): "uat",
-    os.environ.get("RESEARCHER_BOT_GID", ""): "researcher",
-    os.environ.get("DOCWRITER_BOT_GID", ""): "docwriter",
+    gid: agent
+    for gid, agent in {
+        os.environ.get("WORKITEMS_BOT_GID", ""): "workitems",
+        os.environ.get("UAT_BOT_GID", ""): "uat",
+        os.environ.get("RESEARCHER_BOT_GID", ""): "researcher",
+        os.environ.get("DOCWRITER_BOT_GID", ""): "docwriter",
+    }.items()
+    if gid
 }
 
 # Custom field GID for the "Agent" dropdown
@@ -218,7 +225,9 @@ def process_custom_field(event_data: dict, invocation_state: dict):
     # Find the Agent custom field value
     agent_id = None
     for field in task.get("custom_fields", []):
-        if field.get("gid") == AGENT_FIELD_GID:
+        # Skip the whole custom-field path when the Agent field isn't configured
+        # (empty GID) — otherwise a field with a missing/empty gid would match.
+        if AGENT_FIELD_GID and field.get("gid") == AGENT_FIELD_GID:
             enum_value = field.get("enum_value", {})
             if enum_value:
                 field_name = enum_value.get("name", "").lower()

@@ -197,7 +197,14 @@ def is_authorized(
         "parents": [
             {"entityType": _GROUP_TYPE, "entityId": g} for g in sorted(set(groups))
         ],
-        "attributes": {"groups": _set(sorted(set(groups)))},
+        # principalId mirrors the entity id as a STRING so the fixed Cedar
+        # policies can test the agent's allowed/deniedPrincipals (a Set<String>
+        # of grant ids) against it — Cedar STRICT can't compare a String set to
+        # a User entity, so the grant match is String-vs-String on this attr.
+        "attributes": {
+            "principalId": {"string": principal},
+            "groups": _set(sorted(set(groups))),
+        },
     }
     if email:
         principal_entity["attributes"]["email"] = {"string": str(email)}

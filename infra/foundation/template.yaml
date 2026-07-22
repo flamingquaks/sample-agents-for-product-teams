@@ -12,11 +12,18 @@ Parameters:
 
   WorkitemsBotGID:
     Type: String
-    Description: Asana user GID for the Workitems bot account
+    Default: ""
+    Description: >
+      Asana user GID for the Workitems bot account (Asana assignment triggers).
+      Optional — empty when the fleet isn't using Asana assignment triggers, so
+      the stack deploys without an Asana account configured; set it later.
 
   AgentFieldGID:
     Type: String
-    Description: Asana custom field GID for the "Agent" dropdown
+    Default: ""
+    Description: >
+      Asana custom field GID for the "Agent" dropdown (Asana custom-field
+      triggers). Optional — empty is fine when not using custom-field triggers.
 
   DeployMantleProject:
     Type: String
@@ -999,6 +1006,7 @@ Resources:
               "entityTypes": {
                 "Group": {"shape": {"type": "Record", "attributes": {}}},
                 "User": {"memberOfTypes": ["Group"], "shape": {"type": "Record", "attributes": {
+                  "principalId": {"type": "String"},
                   "groups": {"type": "Set", "element": {"type": "String"}},
                   "email": {"type": "String", "required": false}
                 }}},
@@ -1038,7 +1046,7 @@ Resources:
               action == SdlcTrigger::Action::"Trigger",
               resource
             ) when {
-              resource.allowedPrincipals.contains(principal) ||
+              resource.allowedPrincipals.contains(principal.principalId) ||
               principal.groups.containsAny(resource.allowedGroups)
             };
 
@@ -1056,7 +1064,7 @@ Resources:
               action == SdlcTrigger::Action::"Trigger",
               resource
             ) when {
-              resource.deniedPrincipals.contains(principal) ||
+              resource.deniedPrincipals.contains(principal.principalId) ||
               principal.groups.containsAny(resource.deniedGroups)
             };
 

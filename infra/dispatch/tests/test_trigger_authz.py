@@ -155,7 +155,9 @@ def test_call_shape_entities_and_context(monkeypatch):
     ents = {e["identifier"]["entityType"]: e for e in kw["entities"]["entityList"]}
     principal_e = ents["SdlcTrigger::User"]
     agent_e = ents["SdlcTrigger::Agent"]
-    # principal carries its groups (as a set attr + as parents) and email
+    # principal carries its id (String, for the grant-set match), groups (as a
+    # set attr + as parents), and email
+    assert principal_e["attributes"]["principalId"] == {"string": "slack:T0ACME:U0ALICE"}
     assert principal_e["attributes"]["groups"] == {"set": [{"string": "admins"}, {"string": "eng"}]}
     assert principal_e["attributes"]["email"] == {"string": "alice@acme.com"}
     parents = {(p["entityType"], p["entityId"]) for p in principal_e["parents"]}
