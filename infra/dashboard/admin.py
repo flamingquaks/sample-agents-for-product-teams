@@ -650,6 +650,61 @@ def _clone_capability(event: dict, source_id: str, body: dict) -> dict:
     return ok(cloned)
 
 
+def _unpack_skill_zip_isolated(data: bytes, scope: str) -> dict:
+    """Stage a raw skill zip to the skills bucket and hand it to the ISOLATED
+    skill-unpacker Lambda for validated expansion (spec §6.3). The admin API never
+    expands an untrusted zip in-process — that's the whole point of the isolation
+    boundary. Returns the skill ref on success or an error() on validation failure.
+
+    Falls back to nothing: if the unpacker function isn't wired (dashboard without
+    the skills feature), the upload is refused (503) rather than silently unpacking
+    here — the isolation is a security invariant, not an optimization."""
+    import os as _os
+
+    import skill_store
+
+    bucket = skill_store.SKILLS_BUCKET
+    unpacker = _os.environ.get("SKILL_UNPACKER_FUNCTION")
+    if not bucket:
+        return error(503, "skills storage is not configured")
+    if not unpacker:
+        return error(503, "skill zip unpacking is unavailable (unpacker not configured)")
+
+    import boto3
+
+    # A random staging key under an _staging/ prefix (never a skill prefix, so a
+    # half-processed upload can't be mistaken for a real skill by the sync/list).
+    import secrets
+
+    staging_key = f"_staging/{secrets.token_hex(16)}.zip"
+    s3 = boto3.client("s3")
+    try:
+        s3.put_object(Bucket=bucket, Key=staging_key, Body=data)
+    except Exception:  # noqa: BLE001
+        logger.exception("could not stage skill upload")
+        return error(502, "could not stage the upload for validation")
+
+    try:
+        resp = boto3.client("lambda").invoke(
+            FunctionName=unpacker,
+            InvocationType="RequestResponse",  # synchronous — we return its verdict
+            Payload=json.dumps({"staging_key": staging_key, "scope": scope}).encode(),
+        )
+        result = json.loads(resp["Payload"].read() or b"{}")
+    except Exception:  # noqa: BLE001
+        logger.exception("skill unpacker invocation failed")
+        # Best-effort staging cleanup; the unpacker also deletes on its own paths.
+        try:
+            s3.delete_object(Bucket=bucket, Key=staging_key)
+        except Exception:  # noqa: BLE001
+            pass
+        return error(502, "skill validation service failed; retry the upload")
+
+    if result.get("ok"):
+        return ok(result["ref"])
+    return error(400, result.get("error", "skill validation failed"))
+
+
 def _publish_registry_safe() -> None:
     """Publish the rendered registry to SSM. A publish failure is logged but not
     fatal to the config write: the row is already persisted, and the registry
@@ -1074,18 +1129,27 @@ def _route(event: dict) -> dict:
             # Upload: body carries either `content` (raw .md) or `zip_base64`
             # (base64-encoded .zip). `scope` defaults to "shared".
             scope = (body.get("scope") or "shared").strip()
-            try:
-                if body.get("zip_base64"):
-                    import base64
+            if body.get("zip_base64"):
+                # A .zip is untrusted artifact ingestion (§6.3): unpack it in the
+                # ISOLATED skill-unpacker Lambda, never here. Stage the raw bytes
+                # to the skills bucket and hand the unpacker just the key — the
+                # admin Lambda never expands the zip in-process.
+                import base64
+                try:
                     data = base64.b64decode(body["zip_base64"])
-                    ref = skill_store.upload_skill_zip(data, scope=scope)
-                elif body.get("content"):
+                except (ValueError, TypeError):
+                    return error(400, "zip_base64 is not valid base64")
+                return _unpack_skill_zip_isolated(data, scope)
+            elif body.get("content"):
+                # A raw .md carries no archive-expansion risk (no zip-slip/symlink/
+                # bomb surface), so it's validated + stored inline.
+                try:
                     ref = skill_store.upload_skill_md(body["content"], scope=scope)
-                else:
-                    return error(400, "body must include 'content' (markdown) or 'zip_base64'")
-            except skill_store.SkillValidationError as exc:
-                return error(400, str(exc))
-            return ok(ref)
+                except skill_store.SkillValidationError as exc:
+                    return error(400, str(exc))
+                return ok(ref)
+            else:
+                return error(400, "body must include 'content' (markdown) or 'zip_base64'")
 
     if resource in ("/admin/skills/{key}", "/admin/skills/{key+}"):
         key = (path_params.get("key") or path_params.get("key+") or "").strip()

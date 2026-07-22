@@ -1370,6 +1370,10 @@ Resources:
           # privileges itself (§8.2), so it de-routes the row and hands the
           # privileged teardown to the deployer.
           CAPABILITY_DEPLOYER_FUNCTION: !Ref CapabilityDeployerFunction
+          # The isolated Lambda that validates + expands uploaded skill .zips
+          # (§6.3). The admin stages the raw zip and invokes this synchronously;
+          # it never unpacks an untrusted archive in-process.
+          SKILL_UNPACKER_FUNCTION: !Ref CapabilitySkillUnpackerFunction
           # AVP authorizes every write (auth.is_admin → Cedar Write action).
           AVP_POLICY_STORE_ID: !GetAtt DashboardPolicyStore.PolicyStoreId
           # Names the per-workspace Slack secret paths recorded on a workspace row.
@@ -1416,7 +1420,10 @@ Resources:
         - Statement:
             - Effect: Allow
               Action: lambda:InvokeFunction
-              Resource: !GetAtt CapabilityDeployerFunction.Arn
+              Resource:
+                - !GetAtt CapabilityDeployerFunction.Arn
+                # Synchronous invoke of the isolated skill-unpacker on a .zip upload.
+                - !GetAtt CapabilitySkillUnpackerFunction.Arn
         # GitHub App: read app id/slug + read/write the private key + update the
         # id/slug params after the manifest flow creates the App.
         - Statement:
@@ -2070,6 +2077,37 @@ Resources:
                 build-status: [SUCCEEDED, FAILED, STOPPED, FAULT, TIMED_OUT]
                 project-name:
                   - !Sub sdlc-agent-builder-${Stage}
+
+  # Isolated skill-unpacker (spec §6.3): expands admin-uploaded skill .zips in a
+  # function that can ONLY read/write the skills bucket — no config table, no AVP,
+  # no deploy reach. The admin API stages the raw zip and invokes this
+  # synchronously; unpacking an untrusted archive (zip-slip/bomb/symlink) is thus
+  # never done in the admin Lambda's blast radius.
+  CapabilitySkillUnpackerFunction:
+    Type: AWS::Serverless::Function
+    Condition: DashboardEnabled
+    Properties:
+      FunctionName: !Sub capability-skill-unpacker-${Stage}
+      CodeUri: ../dashboard/
+      Handler: skill_unpacker.handler
+      # Bounds a zip-bomb's blast: a modest memory cap + short timeout means an
+      # oversize/adversarial archive is killed rather than run unbounded (the
+      # per-file/total size guards in skill_store are the primary control).
+      MemorySize: 512
+      Timeout: 60
+      Environment:
+        Variables:
+          SKILLS_BUCKET: !Ref SkillsBucket
+      Policies:
+        # The ONLY privilege: read/write objects in the one skills bucket. No
+        # config table, no AVP, no build/deploy — the isolation boundary.
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject
+              Resource: !Sub ${SkillsBucket.Arn}/*
 
   # Weekly security rebuild: re-runs the shared build pipeline for every ACTIVE
   # capability so agent images pick up base-image + dependency security patches.

@@ -7,8 +7,10 @@ immutable containers, so the generic base agent pulls its referenced packages
 from this bucket on startup (verifying the normalized-tree sha256 recorded here) —
 see agents/_base/agent.py::_sync_skills_from_s3.
 
-Security (§6.3): .zip uploads are validated in-process (no separate Lambda for
-now — the admin Lambda's 60-second timeout + 10 MB payload cap bound the blast):
+Security (§6.3): .zip validation/expansion runs in an ISOLATED Lambda
+(skill_unpacker.py), NOT in the admin API Lambda — the admin stages the raw zip
+and invokes the unpacker, which calls upload_skill_zip here inside its own minimal
+(S3-only) blast radius. The guards below are the same regardless of caller:
   - zip-slip (entries escaping root) → rejected
   - symlinks → rejected
   - oversize (per-file 5 MB, total 50 MB) → rejected

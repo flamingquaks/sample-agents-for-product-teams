@@ -6,6 +6,7 @@ declarative-vs-deploy-state split, lifecycle status, and that render_registry
 reproduces exactly the shape router.py consumes — against moto, no AWS.
 """
 
+import io
 import json
 import os
 import sys
@@ -486,6 +487,63 @@ def test_delete_capability_route_deroutes_and_invokes_teardown(monkeypatch):
     assert calls[0]["InvocationType"] == "Event"
     payload = json.loads(calls[0]["Payload"])
     assert payload == {"action": "teardown", "agent_id": "triage"}
+
+
+@mock_aws
+def test_skill_zip_upload_stages_and_invokes_isolated_unpacker(monkeypatch):
+    """A .zip upload must NOT be expanded in the admin Lambda: the route stages the
+    raw bytes to the skills bucket and synchronously invokes the isolated unpacker,
+    returning its verdict (spec §6.3)."""
+    import base64 as _b64
+
+    _make_table()
+    boto3.client("s3", region_name=REGION).create_bucket(
+        Bucket="sdlc-agent-skills-test",
+        CreateBucketConfiguration={"LocationConstraint": REGION},
+    )
+    monkeypatch.setenv("SKILLS_BUCKET", "sdlc-agent-skills-test")
+    monkeypatch.setenv("SKILL_UNPACKER_FUNCTION", "capability-skill-unpacker-test")
+    admin = _load_admin()
+
+    invokes: list = []
+
+    class _FakeLambda:
+        def invoke(self, **kw):
+            invokes.append(kw)
+            ref = {"name": "my-skill", "s3_prefix": "skills/shared/my-skill/",
+                   "sha256": "abc", "scope": "shared"}
+            return {"Payload": io.BytesIO(json.dumps({"ok": True, "ref": ref}).encode())}
+
+    import boto3 as _b
+    real = _b.client
+    monkeypatch.setattr(_b, "client",
+                        lambda n, *a, **k: _FakeLambda() if n == "lambda" else real(n, *a, **k))
+
+    resp = admin.handler(_event("POST", "/admin/skills",
+                                body={"zip_base64": _b64.b64encode(b"PK-fake-zip").decode()}))
+    assert resp["statusCode"] == 200
+    assert json.loads(resp["body"])["name"] == "my-skill"
+    # Invoked synchronously; the raw zip was staged under _staging/ first.
+    assert len(invokes) == 1
+    assert invokes[0]["InvocationType"] == "RequestResponse"
+    payload = json.loads(invokes[0]["Payload"])
+    assert payload["staging_key"].startswith("_staging/")
+    staged = boto3.client("s3", region_name=REGION).get_object(
+        Bucket="sdlc-agent-skills-test", Key=payload["staging_key"])["Body"].read()
+    assert staged == b"PK-fake-zip"
+
+
+@mock_aws
+def test_skill_zip_upload_unavailable_without_unpacker(monkeypatch):
+    """No unpacker wired → refuse (503) rather than expand the zip inline."""
+    _make_table()
+    monkeypatch.setenv("SKILLS_BUCKET", "sdlc-agent-skills-test")
+    monkeypatch.delenv("SKILL_UNPACKER_FUNCTION", raising=False)
+    admin = _load_admin()
+    import base64 as _b64
+    resp = admin.handler(_event("POST", "/admin/skills",
+                                body={"zip_base64": _b64.b64encode(b"x").decode()}))
+    assert resp["statusCode"] == 503
 
 
 @mock_aws
