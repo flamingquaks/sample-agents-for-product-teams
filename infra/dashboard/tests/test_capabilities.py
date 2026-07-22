@@ -701,7 +701,25 @@ def test_onboard_rejects_requirements_with_flags_or_urls(monkeypatch):
     _make_table()
     admin = _load_admin()
     _stub_codebuild(admin, monkeypatch, [])
-    for bad in ["--index-url http://evil.com", "-e git+https://foo", "https://evil.com/pkg.whl"]:
+    bad_reqs = [
+        "--index-url http://evil.com",
+        "-e git+https://foo",
+        "https://evil.com/pkg.whl",
+        # VCS refs — bare and PEP 508 ``name @ url`` form, plus non-git schemes.
+        "git+https://evil.com/pkg.git",
+        "GIT+HTTPS://evil.com/pkg.git",  # case-insensitive
+        "mypkg @ git+https://evil.com/pkg.git",
+        "svn+https://evil.com/pkg",
+        "hg+https://evil.com/pkg",
+        "bzr+https://evil.com/pkg",
+        # Local paths / file URLs.
+        "file:///etc/passwd",
+        "pkg @ file:///etc/passwd",
+        "./local-evil",
+        "../local-evil",
+        "/abs/local-evil",
+    ]
+    for bad in bad_reqs:
         resp = admin.handler(
             _event("POST", "/admin/capabilities", body={
                 "agent_id": "triage",
@@ -710,6 +728,15 @@ def test_onboard_rejects_requirements_with_flags_or_urls(monkeypatch):
         )
         assert resp["statusCode"] == 400, f"should reject: {bad}"
         assert "not a plain pip specifier" in json.loads(resp["body"])["error"].lower()
+    # A genuine PEP 508 specifier with extras + version constraint is still allowed.
+    _stub_codebuild(admin, monkeypatch, [])
+    ok_resp = admin.handler(
+        _event("POST", "/admin/capabilities", body={
+            "agent_id": "triage",
+            "requirements": ["tavily-python[all]>=0.5,<1.0"],
+        })
+    )
+    assert ok_resp["statusCode"] == 200, ok_resp["body"]
 
 
 # --- approval gate (P5, spec §7.5) -------------------------------------------
@@ -804,3 +831,147 @@ def test_self_approve_rejected(monkeypatch):
     )
     assert resp["statusCode"] == 403
     assert "different admin" in json.loads(resp["body"])["error"].lower()
+
+
+# --- approval-gate novelty (regression: editing an approved agent) -----------
+
+
+def _approve(admin, agent_id):
+    """Second-admin approval helper: flips a pending_review row to approved."""
+    return admin.handler(
+        _event("POST", "/admin/capabilities/{agent_id}/approve",
+               path={"agent_id": agent_id}, claims=ADMIN2)
+    )
+
+
+@mock_aws
+def test_edit_approved_agent_alias_does_not_repark_or_block_build(monkeypatch):
+    """Regression: once an agent with deps is approved, editing a registry-only
+    field (an alias) must NOT re-park it as pending_review — it should rebuild.
+    Previously the gate fired on every edit of any agent that HAD requirements."""
+    _make_table()
+    admin = _load_admin()
+    cs = _load_store()
+    builds: list = []
+    monkeypatch.setenv("REQUIRE_AGENT_APPROVAL", "true")
+    _stub_codebuild(admin, monkeypatch, builds)
+    # Onboard with deps → parked, then approved by a second admin.
+    admin.handler(_event("POST", "/admin/capabilities", body={
+        "agent_id": "triage", "requirements": ["tavily-python"], "enabled": True,
+    }))
+    assert cs.get_capability("triage")["review_status"] == "pending_review"
+    assert _approve(admin, "triage")["statusCode"] == 200
+    assert cs.get_capability("triage")["review_status"] == "approved"
+    builds.clear()
+
+    # Edit only an alias — same deps. Must stay approved AND start a build.
+    resp = admin.handler(_event("POST", "/admin/capabilities", body={
+        "agent_id": "triage", "requirements": ["tavily-python"],
+        "aliases": ["tri"], "enabled": True,
+    }))
+    assert resp["statusCode"] == 200, resp["body"]
+    assert cs.get_capability("triage")["review_status"] == "approved"
+    assert len(builds) == 1, "alias edit on an approved agent should rebuild"
+
+
+@mock_aws
+def test_adding_new_dep_to_approved_agent_re_gates(monkeypatch):
+    """A NEW dependency on an already-approved agent is novel supply-chain surface
+    and must re-trigger the approval gate (spec §7.5/§303)."""
+    _make_table()
+    admin = _load_admin()
+    cs = _load_store()
+    builds: list = []
+    monkeypatch.setenv("REQUIRE_AGENT_APPROVAL", "true")
+    _stub_codebuild(admin, monkeypatch, builds)
+    admin.handler(_event("POST", "/admin/capabilities", body={
+        "agent_id": "triage", "requirements": ["tavily-python"], "enabled": True,
+    }))
+    _approve(admin, "triage")
+    builds.clear()
+
+    # Add a brand-new dependency → back to pending_review, no build.
+    resp = admin.handler(_event("POST", "/admin/capabilities", body={
+        "agent_id": "triage", "requirements": ["tavily-python", "requests"],
+        "enabled": True,
+    }))
+    assert resp["statusCode"] == 200, resp["body"]
+    assert cs.get_capability("triage")["review_status"] == "pending_review"
+    assert len(builds) == 0, "a novel dep must not build before re-approval"
+
+
+@mock_aws
+def test_edit_approved_no_dep_agent_does_not_gate(monkeypatch):
+    """An agent onboarded with no deps is approved by default; editing it still
+    must not park it (nothing novel)."""
+    _make_table()
+    admin = _load_admin()
+    cs = _load_store()
+    builds: list = []
+    monkeypatch.setenv("REQUIRE_AGENT_APPROVAL", "true")
+    _stub_codebuild(admin, monkeypatch, builds)
+    admin.handler(_event("POST", "/admin/capabilities", body={
+        "agent_id": "triage", "enabled": True,
+    }))
+    assert cs.get_capability("triage")["review_status"] == "approved"
+    assert len(builds) == 1  # no deps → built straight away
+    builds.clear()
+
+    resp = admin.handler(_event("POST", "/admin/capabilities", body={
+        "agent_id": "triage", "aliases": ["tri"], "enabled": True,
+    }))
+    assert resp["statusCode"] == 200, resp["body"]
+    assert cs.get_capability("triage")["review_status"] == "approved"
+    assert len(builds) == 1
+
+
+# --- skills field is validated + persisted (was dead in the gate) ------------
+
+
+@mock_aws
+def test_onboard_persists_skills_and_gates_on_novel_skill(monkeypatch):
+    _make_table()
+    admin = _load_admin()
+    cs = _load_store()
+    monkeypatch.setenv("REQUIRE_AGENT_APPROVAL", "true")
+    _stub_codebuild(admin, monkeypatch, [])
+    skill = {"name": "triage-playbook", "s3_prefix": "skills/shared/triage-playbook/",
+             "sha256": "abc123", "scope": "shared"}
+    resp = admin.handler(_event("POST", "/admin/capabilities", body={
+        "agent_id": "triage", "skills": [skill], "enabled": True,
+    }))
+    assert resp["statusCode"] == 200, resp["body"]
+    row = cs.get_capability("triage")
+    # Persisted (previously fields.get("skills") was always None → dropped)...
+    assert row["skills"] == [skill]
+    # ...and a novel skill trips the gate just like a novel dep.
+    assert row["review_status"] == "pending_review"
+
+
+@mock_aws
+def test_onboard_rejects_malformed_skills(monkeypatch):
+    _make_table()
+    admin = _load_admin()
+    _stub_codebuild(admin, monkeypatch, [])
+    for bad in ["not-a-list", [{"s3_prefix": "x/"}], [{"name": "ok"}], [42]]:
+        resp = admin.handler(_event("POST", "/admin/capabilities", body={
+            "agent_id": "triage", "skills": bad,
+        }))
+        assert resp["statusCode"] == 400, f"should reject skills={bad!r}"
+
+
+# --- system_prompt clearing (put_capability None-vs-empty) -------------------
+
+
+@mock_aws
+def test_system_prompt_can_be_cleared_and_preserved():
+    _make_table()
+    cs = _load_store()
+    cs.put_capability("triage", system_prompt="You are helpful.")
+    assert cs.get_capability("triage")["system_prompt"] == "You are helpful."
+    # Omitting it (None) preserves the stored prompt...
+    cs.put_capability("triage", description="edit")
+    assert cs.get_capability("triage")["system_prompt"] == "You are helpful."
+    # ...but an explicit empty string clears it (was impossible with `or`).
+    cs.put_capability("triage", system_prompt="")
+    assert cs.get_capability("triage")["system_prompt"] == ""

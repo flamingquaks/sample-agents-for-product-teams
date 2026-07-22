@@ -315,14 +315,51 @@ def _validate_capability_body(body: dict) -> tuple[dict, dict | None]:
     requirements = body.get("requirements", [])
     if not isinstance(requirements, list) or any(not isinstance(r, str) for r in requirements):
         return {}, error(400, "body.requirements must be a list of strings")
+    # A "plain specifier" is a package name (optionally with extras/version
+    # constraint) — never a flag, a VCS ref, or a direct URL/path. All of these
+    # would make pip fetch+execute arbitrary code in the build container, so they
+    # are rejected at the boundary (§7.1). pip accepts VCS refs both bare
+    # (``git+https://…``) and via the ``pkg @ git+https://…`` PEP 508 form, and
+    # local installs via ``file://``, ``./``, ``../``, or an absolute path — cover
+    # every shape, case-insensitively.
+    _FORBIDDEN_REQ_PREFIXES = (
+        "-",  # any flag: --index-url, -e, -r, etc.
+        "http://", "https://",  # direct URL download
+        "git+", "svn+", "hg+", "bzr+",  # VCS refs
+        "file://",  # local path URL (e.g. file:///etc/passwd)
+        "./", "../", "/",  # relative/absolute local paths
+    )
     for r in requirements:
-        stripped = r.strip()
-        if stripped.startswith("-") or stripped.startswith("http://") or stripped.startswith("https://"):
+        stripped = r.strip().lower()
+        # Reject VCS/URL refs anywhere, including the PEP 508 ``name @ <url>`` form.
+        after_at = stripped.split("@", 1)[1].strip() if "@" in stripped else ""
+        if stripped.startswith(_FORBIDDEN_REQ_PREFIXES) or after_at.startswith(_FORBIDDEN_REQ_PREFIXES):
             return {}, error(
                 400,
                 f"body.requirements entry {r!r} is not a plain pip specifier "
-                "(no flags, VCS refs, or direct URLs allowed — §7.1)",
+                "(no flags, VCS refs, direct URLs, or local paths allowed — §7.1)",
             )
+
+    # skills — SKILL.md packages the agent loads (spec §6). Each entry references
+    # an already-uploaded skill by ``{name, s3_prefix, sha256, scope}``; the
+    # deployer syncs exactly these prefixes into the container's SKILLS_DIR. Like
+    # requirements, novel skills trip the approval gate (§7.5), so this must reach
+    # the persisted row rather than being dropped on the floor.
+    skills = body.get("skills", [])
+    if not isinstance(skills, list):
+        return {}, error(400, "body.skills must be a list of skill references")
+    norm_skills: list[dict] = []
+    for s in skills:
+        if not isinstance(s, dict) or not isinstance(s.get("name"), str) or not s.get("name"):
+            return {}, error(400, "body.skills entry must be an object with a non-empty 'name'")
+        if not isinstance(s.get("s3_prefix"), str) or not s.get("s3_prefix"):
+            return {}, error(400, f"body.skills entry {s.get('name')!r} must include an 's3_prefix'")
+        norm_skills.append({
+            "name": s["name"],
+            "s3_prefix": s["s3_prefix"],
+            "sha256": str(s.get("sha256", "")),
+            "scope": str(s.get("scope", "shared")),
+        })
 
     return {
         "agent_id": agent_id,
@@ -334,6 +371,7 @@ def _validate_capability_body(body: dict) -> tuple[dict, dict | None]:
         "tool_grants": norm_grants,
         "system_prompt": system_prompt,
         "requirements": [r.strip() for r in requirements if r.strip()],
+        "skills": norm_skills,
         "enabled": bool(body.get("enabled", True)),
     }, None
 
@@ -422,6 +460,7 @@ def _onboard_capability(event: dict, body: dict) -> dict:
             "tool_grants": list(existing.get("tool_grants", [])),
             "system_prompt": existing.get("system_prompt", ""),
             "requirements": list(existing.get("requirements", [])),
+            "skills": list(existing.get("skills", [])),
             "enabled": fields["enabled"],
         }
 
@@ -438,11 +477,33 @@ def _onboard_capability(event: dict, body: dict) -> dict:
 
     config_store.put_capability(onboarded_by=auth.caller_sub(event), **fields)
 
-    # Approval gate (spec §7.5): if ON and this is a CUSTOM agent with novel
-    # deps/skills, park it as pending_review instead of starting a build.
+    # Approval gate (spec §7.5, §303): if ON and this is a CUSTOM agent whose
+    # deps/skills are NOVEL relative to the last-approved row, park it as
+    # pending_review instead of starting a build. "Novel" — not merely "present" —
+    # is the trigger: a brand-new agent with deps has novel deps, and adding a new
+    # dep/skill to an already-approved agent re-gates it, but editing a
+    # registry-only field (an alias) on an approved agent must NOT re-park it and
+    # block the rebuild. Comparing against the approved baseline covers both.
     gate_on = os.environ.get("REQUIRE_AGENT_APPROVAL", "true").lower() == "true"
     is_custom = not (existing and existing.get("builtin"))
-    has_novel = bool(fields.get("requirements") or fields.get("skills"))
+    already_approved = bool(existing) and existing.get("review_status") == "approved"
+
+    def _skill_key(skills) -> set:
+        # A skill is "the same" if its content (sha256) and identity (scope/name)
+        # are unchanged; a re-upload with new content bumps sha256 and re-gates.
+        return {(s.get("scope"), s.get("name"), s.get("sha256")) for s in (skills or [])}
+
+    if already_approved:
+        # Only deps/skills that weren't in the approved baseline count as novel.
+        prior_reqs = set(existing.get("requirements", []))
+        prior_skills = _skill_key(existing.get("skills"))
+        has_novel = bool(
+            (set(fields.get("requirements") or []) - prior_reqs)
+            or (_skill_key(fields.get("skills")) - prior_skills)
+        )
+    else:
+        # New agent (or one never approved): any dep/skill is novel.
+        has_novel = bool(fields.get("requirements") or fields.get("skills"))
     if gate_on and is_custom and has_novel:
         config_store.set_review_status(agent_id, "pending_review")
         _publish_registry_safe()
@@ -533,6 +594,7 @@ def _clone_capability(event: dict, source_id: str, body: dict) -> dict:
         tool_grants=source.get("tool_grants", []),
         system_prompt=source.get("system_prompt", ""),
         requirements=source.get("requirements", []),
+        skills=source.get("skills", []),
         enabled=False,
         status=config_store.CAP_PENDING,
         onboarded_by=auth.caller_sub(event),

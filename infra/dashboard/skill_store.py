@@ -146,18 +146,28 @@ def upload_skill_zip(data: bytes, scope: str = "shared") -> dict:
     return {"name": name, "s3_prefix": prefix, "sha256": sha, "scope": scope}
 
 
+def _list_common_prefixes(prefix: str) -> list[str]:
+    """Return every immediate sub-prefix of ``prefix`` (Delimiter='/'), paging
+    through the full result set — list_objects_v2 caps a single response at 1000
+    CommonPrefixes, so a bucket with >1000 scopes or >1000 skills in a scope would
+    silently truncate without the paginator."""
+    prefixes: list[str] = []
+    paginator = _get_s3().get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=SKILLS_BUCKET, Prefix=prefix, Delimiter="/"):
+        prefixes.extend(p["Prefix"] for p in page.get("CommonPrefixes", []))
+    return prefixes
+
+
 def list_skills() -> list[dict]:
     """List all uploaded skill packages (by unique prefix). Returns
     ``[{name, s3_prefix, scope}]`` — lightweight, no content fetch."""
     if not SKILLS_BUCKET:
         return []
-    resp = _get_s3().list_objects_v2(Bucket=SKILLS_BUCKET, Prefix="skills/", Delimiter="/")
     # Top-level prefixes are skills/<scope>/ — we need to go one level deeper.
     skills: list[dict] = []
-    for scope_prefix in [p["Prefix"] for p in resp.get("CommonPrefixes", [])]:
+    for scope_prefix in _list_common_prefixes("skills/"):
         scope = scope_prefix.rstrip("/").split("/")[-1]
-        inner = _get_s3().list_objects_v2(Bucket=SKILLS_BUCKET, Prefix=scope_prefix, Delimiter="/")
-        for skill_prefix in [p["Prefix"] for p in inner.get("CommonPrefixes", [])]:
+        for skill_prefix in _list_common_prefixes(scope_prefix):
             name = skill_prefix.rstrip("/").split("/")[-1]
             skills.append({"name": name, "s3_prefix": skill_prefix, "scope": scope})
     return skills
@@ -167,12 +177,16 @@ def delete_skill(scope: str, name: str) -> bool:
     """Delete all objects under a skill's prefix. Returns True if anything was
     deleted; False if the prefix was empty/nonexistent."""
     prefix = f"skills/{scope}/{name}/"
-    resp = _get_s3().list_objects_v2(Bucket=SKILLS_BUCKET, Prefix=prefix)
-    keys = [obj["Key"] for obj in resp.get("Contents", [])]
+    paginator = _get_s3().get_paginator("list_objects_v2")
+    keys: list[str] = []
+    for page in paginator.paginate(Bucket=SKILLS_BUCKET, Prefix=prefix):
+        keys.extend(obj["Key"] for obj in page.get("Contents", []))
     if not keys:
         return False
-    _get_s3().delete_objects(
-        Bucket=SKILLS_BUCKET,
-        Delete={"Objects": [{"Key": k} for k in keys]},
-    )
+    # delete_objects accepts at most 1000 keys per call — chunk it.
+    for i in range(0, len(keys), 1000):
+        _get_s3().delete_objects(
+            Bucket=SKILLS_BUCKET,
+            Delete={"Objects": [{"Key": k} for k in keys[i:i + 1000]]},
+        )
     return True

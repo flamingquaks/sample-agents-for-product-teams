@@ -115,7 +115,8 @@ def invoke(payload, context=None):
                 fail_assignment(assignment_id, error=str(exc))
             return {"statusCode": 500, "body": f"agent error: {exc}"}
 
-    return {"statusCode": 200, "body": output[:5000]}
+    body = output if len(output) <= 5000 else output[:5000] + "\n\n…[output truncated]"
+    return {"statusCode": 200, "body": body}
 
 
 if __name__ == "__main__":

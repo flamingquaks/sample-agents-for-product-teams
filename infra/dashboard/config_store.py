@@ -465,8 +465,9 @@ def put_capability(
     limits: dict | None = None,
     env: dict | None = None,
     tool_grants: list[str] | None = None,
-    system_prompt: str = "",
+    system_prompt: str | None = None,
     requirements: list[str] | None = None,
+    skills: list[dict] | None = None,
     enabled: bool = True,
     status: str | None = None,
     onboarded_by: str = "",
@@ -525,8 +526,11 @@ def put_capability(
         "limits": limits or {},
         "env": env or {},
         "tool_grants": list(tool_grants or []),
-        "system_prompt": system_prompt or existing.get("system_prompt", ""),
+        # None means "not supplied — preserve existing"; "" is a deliberate clear.
+        # (``prompt or existing`` could never store an empty prompt.)
+        "system_prompt": system_prompt if system_prompt is not None else existing.get("system_prompt", ""),
         "requirements": list(requirements) if requirements is not None else list(existing.get("requirements", [])),
+        "skills": list(skills) if skills is not None else list(existing.get("skills", [])),
         "review_status": existing.get("review_status", "approved"),
         "enabled": bool(enabled),
         "status": status,

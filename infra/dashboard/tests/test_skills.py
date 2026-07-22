@@ -110,3 +110,24 @@ def test_list_and_delete_round_trip(store):
     assert store.delete_skill("shared", "alpha") is True
     assert store.delete_skill("shared", "alpha") is False  # already gone
     assert len(store.list_skills()) == 1
+
+
+def test_list_skills_paginates_beyond_1000(store):
+    """list_objects_v2 caps CommonPrefixes at 1000 per response; list_skills must
+    page past that so a bucket with >1000 skills isn't silently truncated."""
+    s3 = boto3.client("s3", region_name=REGION)
+    for i in range(1050):
+        s3.put_object(Bucket=BUCKET, Key=f"skills/shared/skill-{i:04d}/SKILL.md", Body=b"x")
+    skills = store.list_skills()
+    assert len(skills) == 1050
+
+
+def test_delete_skill_paginates_and_chunks_beyond_1000(store):
+    """A skill package with >1000 objects must fully delete: the listing pages and
+    delete_objects is chunked to its 1000-key-per-call limit."""
+    s3 = boto3.client("s3", region_name=REGION)
+    for i in range(1050):
+        s3.put_object(Bucket=BUCKET, Key=f"skills/shared/big/file-{i:04d}.txt", Body=b"x")
+    assert store.delete_skill("shared", "big") is True
+    remaining = s3.list_objects_v2(Bucket=BUCKET, Prefix="skills/shared/big/")
+    assert remaining.get("KeyCount", 0) == 0
