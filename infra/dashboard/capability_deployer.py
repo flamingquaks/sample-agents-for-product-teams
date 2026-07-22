@@ -91,7 +91,10 @@ _REQUIRED_BASE_ENV = ("BEDROCK_GUARDRAIL_ID", "BEDROCK_GUARDRAIL_VERSION", "GATE
 # a missing value degrades gracefully rather than failing the deploy.
 # MANTLE_PROJECT_ID tags model usage to the fleet's shared cost-attribution
 # project; absent, calls just fall back to the account's default project.
-_OPTIONAL_BASE_ENV = ("MANTLE_PROJECT_ID",)
+# SKILLS_BUCKET is where the base agent pulls its skill packages from on startup
+# (§6.2); absent (skills feature not deployed), an agent with no skills is fine
+# and one with skills simply runs prompt-only.
+_OPTIONAL_BASE_ENV = ("MANTLE_PROJECT_ID", "SKILLS_BUCKET")
 
 
 def _base_env() -> tuple[dict[str, str], list[str]]:
@@ -258,6 +261,25 @@ def _ensure_runtime_role(agent_id: str) -> str:
             ],
         },
     }
+    # Skills read (§6.2): the generic base agent pulls its skill packages from the
+    # skills bucket on startup. Read-only, scoped to the one bucket, and only
+    # attached when the skills feature is deployed (SKILLS_BUCKET set). A built-in
+    # agent's role gets it too but never uses it — harmless and keeps one role shape.
+    skills_bucket = os.environ.get("SKILLS_BUCKET", "")
+    if skills_bucket:
+        policies["skills-read"] = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": ["s3:GetObject", "s3:ListBucket"],
+                    "Resource": [
+                        f"arn:aws:s3:::{skills_bucket}",
+                        f"arn:aws:s3:::{skills_bucket}/skills/*",
+                    ],
+                }
+            ],
+        }
     for name, doc in policies.items():
         iam.put_role_policy(
             RoleName=role_name,

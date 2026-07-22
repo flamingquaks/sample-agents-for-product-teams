@@ -268,10 +268,11 @@ in the build and the production agent runtime**. This collides with v2's posture
 7. **Reserved env unchanged.** `RESERVED_ENV_KEYS` (guardrail id/version, gateway
    URL) remain un-overridable; base env wins on merge.
 
-> **ARCC check required before implementing §7:** the package-index allowlist,
-> skill-upload handling, and (later) marketplace fetch touch supply-chain +
-> arbitrary-code domains. Query ARCC guidance on dependency allowlisting and
-> untrusted-artifact ingestion and cite it in the implementation PR.
+> **Security review required before implementing §7:** the package-index
+> allowlist, skill-upload handling, and (later) marketplace fetch touch
+> supply-chain + arbitrary-code domains. These controls are captured in the
+> living threat model (`docs/threat-model.md`) and must be reflected there before
+> the code ships.
 
 ## 8. Schema, API & UI deltas
 
@@ -376,7 +377,7 @@ so a redeploy never knocks a live agent out of the registry.
   `agents/_base/`, generic `agent.py`, build generates `requirements.txt`, clone
   action, and custom-agent **destroy** teardown (row + runtime + role + image).
 - **P4 — Skills:** S3 bucket, upload routes, `.zip` adapter, `AgentSkills`
-  wiring, UI attach. (After the ARCC check on §7.)
+  wiring, UI attach. (After the §7 controls land in the threat model.)
 - **P5 — Approval gate:** `require_agent_approval` setting + `pending_review` +
   approve route/UI. (Can move earlier if desired; independent of P2–P4.)
 - **P6 (deferred):** marketplace fetch on the Claude Code runtime — reuses the P4

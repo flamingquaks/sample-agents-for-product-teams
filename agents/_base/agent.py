@@ -10,6 +10,7 @@ so a future alternative (Codex / Kiro / Claude Code) can be introduced by
 replacing this agent.py without touching the schema, deployer, or UI.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -30,11 +31,86 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message
 AGENT_ID = os.environ.get("AGENT_ID", "custom-agent")
 SYSTEM_PROMPT = os.environ.get("SYSTEM_PROMPT", "You are a helpful assistant.")
 SKILLS_DIR = os.environ.get("SKILLS_DIR", "/app/skills")
+# Skill delivery (§6.2): AgentCore runtimes are immutable, so the deployer can't
+# write into the container. Instead it injects SKILLS_BUCKET + SKILLS_MANIFEST
+# (a JSON list of {name, s3_prefix, sha256}), and we pull each package from S3
+# into SKILLS_DIR here on startup, verifying the content hash.
+SKILLS_BUCKET = os.environ.get("SKILLS_BUCKET", "")
+SKILLS_MANIFEST = os.environ.get("SKILLS_MANIFEST", "")
 
 GATEWAY_MCP_URL = os.environ.get("GATEWAY_MCP_URL")
 if not GATEWAY_MCP_URL:
     logger.critical("GATEWAY_MCP_URL is required — this agent routes ALL tool calls through the Gateway")
     sys.exit(1)
+
+
+def _sync_skills_from_s3() -> None:
+    """Download the manifest's skill packages from S3 into SKILLS_DIR, verifying
+    each package's content hash against the manifest (§6.2/§6.3). Best-effort: any
+    per-skill failure (missing bucket, hash mismatch, S3 error) is logged and the
+    skill skipped so the agent still starts — degraded (prompt-only for that
+    skill) rather than failing to boot. Idempotent across restarts.
+
+    The sha256 is computed over the sorted (key, bytes) of every object under the
+    package prefix — the same normalization skill_store records at upload — so a
+    tampered or partially-synced package is detected and dropped."""
+    if not (SKILLS_BUCKET and SKILLS_MANIFEST):
+        return
+    try:
+        manifest = json.loads(SKILLS_MANIFEST)
+    except (json.JSONDecodeError, TypeError):
+        logger.warning("SKILLS_MANIFEST is not valid JSON; no skills synced")
+        return
+    import boto3
+
+    s3 = boto3.client("s3")
+    dest_root = Path(SKILLS_DIR)
+    dest_root.mkdir(parents=True, exist_ok=True)
+    for entry in manifest:
+        name = entry.get("name", "")
+        prefix = entry.get("s3_prefix", "")
+        expected = entry.get("sha256", "")
+        if not name or not prefix:
+            continue
+        try:
+            objects: list[tuple[str, bytes]] = []
+            paginator = s3.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=SKILLS_BUCKET, Prefix=prefix):
+                for obj in page.get("Contents", []):
+                    key = obj["Key"]
+                    body = s3.get_object(Bucket=SKILLS_BUCKET, Key=key)["Body"].read()
+                    objects.append((key, body))
+            if not objects:
+                logger.warning("skill %s: nothing under s3://%s/%s — skipping", name, SKILLS_BUCKET, prefix)
+                continue
+            # Verify the normalized content hash before writing anything to disk.
+            digest = hashlib.sha256()
+            for key, body in sorted(objects, key=lambda kv: kv[0]):
+                rel = key[len(prefix):]
+                digest.update(rel.encode())
+                digest.update(b"\0")
+                digest.update(body)
+            if expected and digest.hexdigest() != expected:
+                logger.warning("skill %s: sha256 mismatch (expected %s) — skipping", name, expected)
+                continue
+            skill_dir = dest_root / name
+            for key, body in objects:
+                rel = key[len(prefix):]
+                if not rel:
+                    continue
+                target = skill_dir / rel
+                # Defense in depth against a crafted key escaping the skill dir —
+                # the upload adapter already rejects zip-slip, but this is the
+                # write boundary so re-check.
+                resolved = target.resolve()
+                if not str(resolved).startswith(str(skill_dir.resolve()) + os.sep):
+                    logger.warning("skill %s: entry %r escapes skill dir — skipping entry", name, rel)
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(body)
+            logger.info("skill %s synced to %s", name, skill_dir)
+        except Exception:  # noqa: BLE001
+            logger.exception("skill %s: sync failed — skipping", name)
 
 
 def _load_skills_plugin():
@@ -54,6 +130,10 @@ def _load_skills_plugin():
         logger.warning("strands AgentSkills plugin not available; skills will not load")
         return None
 
+
+# Pull skill packages once at import (cold start), before the first invoke. A
+# failure here never blocks boot — _sync_skills_from_s3 swallows per-skill errors.
+_sync_skills_from_s3()
 
 app = BedrockAgentCoreApp()
 

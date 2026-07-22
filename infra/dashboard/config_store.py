@@ -732,10 +732,27 @@ RESERVED_ENV_KEYS = frozenset(
 )
 
 
+# Runtime env the generic base agent (agents/_base/agent.py) reads to identify
+# itself and locate its prompt + skills (spec §4). Derived from the capability
+# row, so the ONE generic image behaves as any authored agent with no per-agent
+# code. Built-in agents ship their own agent.py and ignore these — injecting them
+# is harmless (a built-in doesn't read AGENT_ID/SYSTEM_PROMPT/SKILLS_DIR), and it
+# keeps one env-assembly path for the whole fleet. SKILLS_DIR is fixed to the
+# container path the deployer syncs skill packages into.
+SKILLS_MOUNT_DIR = "/app/skills"
+
+# Env keys the base agent derives from the capability ROW, never from a
+# capability's free-form ``env``. AGENT_ID is the identity the Gateway's per-agent
+# Cedar policy keys on, so an authored env that set it could assume another
+# agent's tool grants — these are computed here and rejected at the admin API.
+BASE_AGENT_ENV_KEYS = frozenset({"AGENT_ID", "SYSTEM_PROMPT", "SKILLS_DIR"})
+
+
 def capability_env_pairs(cap: dict, base_env: dict[str, str]) -> dict[str, str]:
     """The full runtime environment for a capability: the fleet-wide base env
     (guardrail id/version + gateway URL — the hard gates every agent needs) merged
-    with the capability's own ``env`` (e.g. Asana GIDs).
+    with the generic base agent's identity/prompt/skills vars (§4) and the
+    capability's own ``env`` (e.g. Asana GIDs).
 
     The base env ALWAYS wins for RESERVED_ENV_KEYS: even though the admin API
     rejects a capability that sets them, this merge re-enforces it as defense in
@@ -746,9 +763,36 @@ def capability_env_pairs(cap: dict, base_env: dict[str, str]) -> dict[str, str]:
     wants. Kept here so the onboard path and the weekly rebuild share one
     definition of an agent's environment."""
     merged = dict(base_env)
+    # Generic-base-agent identity/prompt/skills (§4). Set BEFORE the capability's
+    # own env loop so an authored env can't shadow them; RESERVED_ENV_KEYS below
+    # still can't be touched either way. SYSTEM_PROMPT defaults to empty (the base
+    # agent supplies a generic fallback) so a built-in with no prompt is fine.
+    merged["AGENT_ID"] = cap.get("agent_id", "")
+    merged["SYSTEM_PROMPT"] = cap.get("system_prompt", "") or ""
+    merged["SKILLS_DIR"] = SKILLS_MOUNT_DIR
+    # Skill delivery (§6.2): AgentCore runtimes are immutable containers, so the
+    # base agent pulls its referenced skill packages from S3 on startup. We inject
+    # the manifest (name/s3_prefix/sha256) as env; the base agent syncs + verifies
+    # each into SKILLS_DIR before wiring AgentSkills. Only emitted when the row has
+    # skills AND SKILLS_BUCKET is in the base env (deployer wires it from the
+    # stack) — otherwise there's nothing to sync and the var stays absent.
+    skills = cap.get("skills") or []
+    if skills and base_env.get("SKILLS_BUCKET"):
+        manifest = [
+            {"name": s.get("name", ""), "s3_prefix": s.get("s3_prefix", ""),
+             "sha256": s.get("sha256", "")}
+            for s in skills
+            if s.get("s3_prefix")
+        ]
+        if manifest:
+            merged["SKILLS_MANIFEST"] = json.dumps(manifest, separators=(",", ":"))
     for k, v in (cap.get("env") or {}).items():
-        if k in RESERVED_ENV_KEYS:
-            continue  # base gate wins — never overridable
+        # RESERVED_ENV_KEYS: base gate wins. BASE_AGENT_ENV_KEYS: derived from the
+        # row, never from free-form env — AGENT_ID especially IS the identity the
+        # Gateway's per-agent Cedar policy keys on, so letting a capability set it
+        # via env would let a custom agent assume another agent's tool grants.
+        if k in RESERVED_ENV_KEYS or k in BASE_AGENT_ENV_KEYS:
+            continue  # derived/gated — never overridable by authored env
         merged[k] = str(v)
     # Re-assert the base gates last in case the loop above was bypassed.
     for k in RESERVED_ENV_KEYS:

@@ -208,6 +208,85 @@ def _fleet_arn(rt_id):
     return f"arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/{rt_id}"
 
 
+def test_runtime_gets_base_agent_identity_env(monkeypatch):
+    """The generic base agent reads AGENT_ID/SYSTEM_PROMPT/SKILLS_DIR from env
+    (§4); the deployer must derive them from the capability row so the ONE base
+    image behaves as the authored agent."""
+    cd = _fresh()
+    agentcore = _FakeAgentCore(statuses={"new-rt-id": ["READY"]})
+    iam = _FakeIam()
+    _install_fakes(cd, monkeypatch, agentcore, iam)
+    monkeypatch.setattr(
+        cd.config_store, "get_capability",
+        lambda a: {"agent_id": a, "system_prompt": "You are triage.", "env": {}},
+    )
+    cd.handler(_build_event("triage", "build-1", "SUCCEEDED"))
+    env = agentcore.created[0]["environmentVariables"]
+    assert env["AGENT_ID"] == "triage"
+    assert env["SYSTEM_PROMPT"] == "You are triage."
+    assert env["SKILLS_DIR"] == cd.config_store.SKILLS_MOUNT_DIR
+
+
+def test_capability_env_cannot_override_agent_id(monkeypatch):
+    """AGENT_ID is the identity the Gateway's Cedar policy keys on. A capability's
+    own env must NOT be able to set it (privilege escalation to another agent's
+    grants) — the derived value wins."""
+    cd = _fresh()
+    agentcore = _FakeAgentCore(statuses={"new-rt-id": ["READY"]})
+    iam = _FakeIam()
+    _install_fakes(cd, monkeypatch, agentcore, iam)
+    monkeypatch.setattr(
+        cd.config_store, "get_capability",
+        lambda a: {"agent_id": a, "env": {"AGENT_ID": "docwriter", "SKILLS_DIR": "/tmp/evil"}},
+    )
+    cd.handler(_build_event("triage", "build-1", "SUCCEEDED"))
+    env = agentcore.created[0]["environmentVariables"]
+    assert env["AGENT_ID"] == "triage"
+    assert env["SKILLS_DIR"] == cd.config_store.SKILLS_MOUNT_DIR
+
+
+def test_skills_manifest_injected_when_bucket_present(monkeypatch):
+    """With SKILLS_BUCKET set and the row carrying skills, the deployer injects a
+    SKILLS_MANIFEST the base agent syncs from on startup (§6.2); the role gets a
+    scoped skills-read grant."""
+    import json as _json
+
+    cd = _fresh()
+    monkeypatch.setenv("SKILLS_BUCKET", "sdlc-agent-skills-123456789012-test")
+    agentcore = _FakeAgentCore(statuses={"new-rt-id": ["READY"]})
+    iam = _FakeIam()
+    _install_fakes(cd, monkeypatch, agentcore, iam)
+    skill = {"name": "playbook", "s3_prefix": "skills/shared/playbook/", "sha256": "abc"}
+    monkeypatch.setattr(
+        cd.config_store, "get_capability",
+        lambda a: {"agent_id": a, "env": {}, "skills": [skill]},
+    )
+    cd.handler(_build_event("triage", "build-1", "SUCCEEDED"))
+    env = agentcore.created[0]["environmentVariables"]
+    manifest = _json.loads(env["SKILLS_MANIFEST"])
+    assert manifest == [{"name": "playbook", "s3_prefix": "skills/shared/playbook/", "sha256": "abc"}]
+    # A scoped skills-read policy was put on the runtime role.
+    assert any(p["PolicyName"] == "skills-read" for p in iam.put_policies)
+
+
+def test_no_skills_manifest_without_bucket(monkeypatch):
+    """No SKILLS_BUCKET (skills feature not deployed) → no manifest, no skills-read
+    grant, even if the row somehow carries skills."""
+    cd = _fresh()
+    monkeypatch.delenv("SKILLS_BUCKET", raising=False)
+    agentcore = _FakeAgentCore(statuses={"new-rt-id": ["READY"]})
+    iam = _FakeIam()
+    _install_fakes(cd, monkeypatch, agentcore, iam)
+    monkeypatch.setattr(
+        cd.config_store, "get_capability",
+        lambda a: {"agent_id": a, "env": {}, "skills": [{"name": "x", "s3_prefix": "skills/shared/x/"}]},
+    )
+    cd.handler(_build_event("triage", "build-1", "SUCCEEDED"))
+    env = agentcore.created[0]["environmentVariables"]
+    assert "SKILLS_MANIFEST" not in env
+    assert not any(p["PolicyName"] == "skills-read" for p in iam.put_policies)
+
+
 def test_new_runtime_is_tagged_as_fleet(monkeypatch):
     cd = _fresh()
     agentcore = _FakeAgentCore(statuses={"new-rt-id": ["READY"]})

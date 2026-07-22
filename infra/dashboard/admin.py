@@ -269,6 +269,17 @@ def _validate_capability_body(body: dict) -> tuple[dict, dict | None]:
                 f"body.env.{k} is a reserved fleet setting and cannot be set per "
                 "capability",
             )
+        # AGENT_ID/SYSTEM_PROMPT/SKILLS_DIR are DERIVED from the capability row by
+        # the deployer (§4), not free-form env. AGENT_ID in particular is the
+        # identity the Gateway's Cedar policy keys on, so accepting it here would
+        # let an agent assume another's tool grants. system_prompt has its own
+        # top-level field. Reject them as env (config_store also drops them on merge).
+        if k in config_store.BASE_AGENT_ENV_KEYS:
+            return {}, error(
+                400,
+                f"body.env.{k} is derived from the capability (set 'system_prompt' "
+                "for the prompt); it cannot be set as free-form env",
+            )
         if not isinstance(v, str):
             return {}, error(400, f"body.env.{k} must be a string")
         # The runtime env is passed to create/update-agent-runtime as a

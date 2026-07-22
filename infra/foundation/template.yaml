@@ -1790,6 +1790,12 @@ Resources:
               # kept for the ADR agent's Titan embeddings (bedrock-runtime, not Mantle).
               - bedrock:ApplyGuardrail
               - bedrock:InvokeModel
+              # Read authored skill packages from the skills bucket on startup
+              # (§6.2). The per-role grant scopes this to the one bucket; the
+              # boundary just permits the action class so that grant isn't nulled
+              # by the intersection.
+              - s3:GetObject
+              - s3:ListBucket
             Resource: "*"
 
   CapabilityBuildRole:
@@ -1821,6 +1827,14 @@ Resources:
                   - s3:GetObject
                   - s3:GetObjectVersion
                 Resource: !Sub ${CapabilitySourceBucket.Arn}/*
+              # Read (get-item only) the capability row so a CUSTOM agent's build
+              # can materialize its per-agent requirements (§5). Read-only — the
+              # build never writes config; it produces an image, and the deployer
+              # owns lifecycle writes.
+              - Sid: CapabilityRowRead
+                Effect: Allow
+                Action: dynamodb:GetItem
+                Resource: !GetAtt FleetConfigTable.Arn
               # ECR push for any sdlc-agents/<agent> repo. GetAuthorizationToken
               # is account-wide (no per-repo scoping possible); the mutating layer
               # actions are scoped to the fleet's own repo namespace.
@@ -1869,6 +1883,9 @@ Resources:
           # a wrong agent.
           - { Name: AGENT_NAME, Value: "" }
           - { Name: IMAGE_TAG, Value: "latest" }
+          # The fleet config table — read (get-item) so a CUSTOM agent's build can
+          # materialize its per-agent requirements from the capability row (§5).
+          - { Name: FLEET_CONFIG_TABLE, Value: !Ref FleetConfigTable }
       Source:
         Type: S3
         Location: !Sub ${CapabilitySourceBucket}/source.zip
@@ -1880,15 +1897,40 @@ Resources:
                 - set -euo pipefail
                 - test -n "$AGENT_NAME" || { echo "AGENT_NAME override is required"; exit 1; }
                 - echo "$AGENT_NAME" | grep -Eq '^[a-z][a-z0-9-]{0,62}[a-z0-9]$' || { echo "invalid AGENT_NAME"; exit 1; }
-                - test -f "agents/$AGENT_NAME/Dockerfile" || { echo "no agents/$AGENT_NAME/Dockerfile in source"; exit 1; }
+                # A BUILT-IN agent ships its own source dir + Dockerfile; a CUSTOM
+                # (config-driven) agent has no source dir and builds on the generic
+                # _base image (spec §4/§5). Presence of the source Dockerfile is the
+                # discriminator — a built-in always has one, a custom never does.
+                - |
+                  if [ -f "agents/$AGENT_NAME/Dockerfile" ]; then
+                    DOCKERFILE="agents/$AGENT_NAME/Dockerfile"
+                    echo "built-in agent: building $DOCKERFILE"
+                  else
+                    DOCKERFILE="agents/_base/Dockerfile"
+                    echo "custom agent: building on generic base $DOCKERFILE"
+                    # Materialize per-agent deps from the capability row. The row is
+                    # authoritative (the weekly rebuild passes only AGENT_NAME), and
+                    # gen_requirements.py re-validates every specifier before it can
+                    # reach pip (§7.1 defense in depth). The file MUST exist (the
+                    # base Dockerfile COPYs it) — empty is fine.
+                    aws dynamodb get-item \
+                      --table-name "$FLEET_CONFIG_TABLE" \
+                      --key "{\"pk\":{\"S\":\"capability#$AGENT_NAME\"}}" \
+                      --output json \
+                      | python3 agents/_base/gen_requirements.py > agents/_base/requirements-extra.txt
+                    echo "generated requirements-extra.txt:"; cat agents/_base/requirements-extra.txt
+                  fi
+                - export DOCKERFILE
                 - REPO="sdlc-agents/$AGENT_NAME"
                 - aws ecr describe-repositories --repository-names "$REPO" >/dev/null 2>&1 || aws ecr create-repository --repository-name "$REPO" --image-scanning-configuration scanOnPush=true --image-tag-mutability IMMUTABLE
                 - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
             build:
               commands:
                 # Build context is agents/ so the shared/ package is included
-                # (matches how the agent images were always built).
-                - docker build -f "agents/$AGENT_NAME/Dockerfile" -t "$ECR_REGISTRY/$REPO:$IMAGE_TAG" agents/
+                # (matches how the agent images were always built). AGENT_ID is a
+                # build arg so the base image can bake a default; the deployer also
+                # injects it as runtime env, which wins.
+                - docker build --build-arg "AGENT_ID=$AGENT_NAME" -f "$DOCKERFILE" -t "$ECR_REGISTRY/$REPO:$IMAGE_TAG" agents/
             post_build:
               commands:
                 - docker push "$ECR_REGISTRY/$REPO:$IMAGE_TAG"
@@ -1914,6 +1956,10 @@ Resources:
           BEDROCK_GUARDRAIL_ID: !Ref PromptInjectionGuardrail
           BEDROCK_GUARDRAIL_VERSION: DRAFT
           GATEWAY_MCP_URL: !If [GatewayEnabled, !GetAtt FleetGateway.GatewayUrl, !Ref "AWS::NoValue"]
+          # Where authored skill packages live; injected onto each runtime (as
+          # SKILLS_BUCKET) so the generic base agent can pull its skills on startup
+          # (§6.2), and used to scope the runtime role's skills-read grant.
+          SKILLS_BUCKET: !Ref SkillsBucket
           # The fleet's shared Mantle cost-attribution project, propagated onto
           # every agent runtime as MANTLE_PROJECT_ID (absent → account default).
           # The CFN-created project's id wins when provisioned here; otherwise a

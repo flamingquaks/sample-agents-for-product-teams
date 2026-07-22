@@ -2,8 +2,10 @@
 
 Handles upload (validation + S3 write), listing, and deletion of `SKILL.md`
 packages — both raw `.md` and `.zip` (the unpack adapter). Storage is S3-backed
-(SKILLS_BUCKET env) so skills persist across deploys and the deployer can sync
-them into agent containers.
+(SKILLS_BUCKET env) so skills persist across deploys. AgentCore runtimes are
+immutable containers, so the generic base agent pulls its referenced packages
+from this bucket on startup (verifying the normalized-tree sha256 recorded here) —
+see agents/_base/agent.py::_sync_skills_from_s3.
 
 Security (§6.3): .zip uploads are validated in-process (no separate Lambda for
 now — the admin Lambda's 60-second timeout + 10 MB payload cap bound the blast):
@@ -50,6 +52,21 @@ class SkillValidationError(Exception):
     pass
 
 
+def normalized_tree_sha256(files: list[tuple[str, bytes]]) -> str:
+    """Content hash over a skill's normalized file tree (§6.3): for each file,
+    sorted by its path RELATIVE to the package root, feed ``rel + \\0 + body``.
+    Independent of upload order and of the (scope/name) prefix, so the same tree
+    hashes identically at upload here and at sync time in the base agent — the two
+    MUST agree or every skill would fail the startup hash check and be dropped.
+    ``files`` is ``[(relative_path, bytes), ...]``."""
+    digest = hashlib.sha256()
+    for rel, body in sorted(files, key=lambda kv: kv[0]):
+        digest.update(rel.encode())
+        digest.update(b"\0")
+        digest.update(body)
+    return digest.hexdigest()
+
+
 def _validate_frontmatter(content: str) -> dict:
     """Parse and validate a SKILL.md's YAML frontmatter. Returns the metadata
     dict; raises SkillValidationError on invalid/missing fields."""
@@ -79,7 +96,9 @@ def upload_skill_md(content: str, scope: str = "shared") -> dict:
     S3, returns the skill reference ``{name, s3_prefix, sha256, scope}``."""
     meta = _validate_frontmatter(content)
     name = meta["name"]
-    sha = hashlib.sha256(content.encode()).hexdigest()[:16]
+    # Hash the normalized tree (here a single SKILL.md), NOT the raw markdown, so
+    # it matches what the base agent recomputes from S3 on sync (§6.3).
+    sha = normalized_tree_sha256([("SKILL.md", content.encode())])
     prefix = f"skills/{scope}/{name}/"
     _get_s3().put_object(
         Bucket=SKILLS_BUCKET,
@@ -130,19 +149,26 @@ def upload_skill_zip(data: bytes, scope: str = "shared") -> dict:
     meta = _validate_frontmatter(skill_md_content)
     name = meta["name"]
 
-    sha = hashlib.sha256(data).hexdigest()[:16]
     prefix = f"skills/{scope}/{name}/"
 
-    # Write every file to S3 under the prefix.
+    # Write every file to S3 under the prefix, collecting (rel_path, bytes) so the
+    # recorded hash is over the NORMALIZED TREE (§6.3) — the exact set of objects
+    # under the prefix, keyed by their path relative to it. This is what the base
+    # agent recomputes from S3 on sync, so the two agree by construction (a raw
+    # sha256(zip_bytes) would not, since the agent never sees the original zip).
+    written: list[tuple[str, bytes]] = []
     for info in zf.infolist():
         if info.is_dir():
             continue
-        key = f"{prefix}{os.path.normpath(info.filename)}"
+        rel = os.path.normpath(info.filename)
+        body = zf.read(info.filename)
         _get_s3().put_object(
             Bucket=SKILLS_BUCKET,
-            Key=key,
-            Body=zf.read(info.filename),
+            Key=f"{prefix}{rel}",
+            Body=body,
         )
+        written.append((rel, body))
+    sha = normalized_tree_sha256(written)
     return {"name": name, "s3_prefix": prefix, "sha256": sha, "scope": scope}
 
 

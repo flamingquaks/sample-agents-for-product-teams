@@ -131,3 +131,43 @@ def test_delete_skill_paginates_and_chunks_beyond_1000(store):
     assert store.delete_skill("shared", "big") is True
     remaining = s3.list_objects_v2(Bucket=BUCKET, Prefix="skills/shared/big/")
     assert remaining.get("KeyCount", 0) == 0
+
+
+def _recompute_agent_side_sha(s3, prefix):
+    """Recompute the normalized-tree sha256 exactly the way the base agent does in
+    _sync_skills_from_s3: read every object under the prefix, key by its path
+    RELATIVE to the prefix, feed rel + \\0 + body sorted by key. If this diverges
+    from what skill_store records at upload, every skill fails the startup hash
+    check and is silently dropped — so this is the load-bearing invariant."""
+    import hashlib
+
+    objects = []
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=BUCKET, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            body = s3.get_object(Bucket=BUCKET, Key=obj["Key"])["Body"].read()
+            objects.append((obj["Key"], body))
+    digest = hashlib.sha256()
+    for key, body in sorted(objects, key=lambda kv: kv[0]):
+        digest.update(key[len(prefix):].encode())
+        digest.update(b"\0")
+        digest.update(body)
+    return digest.hexdigest()
+
+
+def test_md_upload_sha_matches_agent_recompute(store):
+    """The sha256 skill_store records for a .md upload must equal what the base
+    agent recomputes from S3 (else the startup hash check drops the skill)."""
+    ref = store.upload_skill_md(_skill_md())
+    s3 = boto3.client("s3", region_name=REGION)
+    assert ref["sha256"] == _recompute_agent_side_sha(s3, ref["s3_prefix"])
+
+
+def test_zip_upload_sha_matches_agent_recompute(store):
+    """Same invariant for a multi-file .zip package — the recorded hash is over the
+    normalized tree, not the raw zip bytes the agent never sees."""
+    ref = store.upload_skill_zip(_skill_zip(
+        extra_files={"references/guide.md": "# guide\n", "scripts/run.sh": "echo hi\n"}
+    ))
+    s3 = boto3.client("s3", region_name=REGION)
+    assert ref["sha256"] == _recompute_agent_side_sha(s3, ref["s3_prefix"])

@@ -18,6 +18,11 @@ RUN pip install --no-cache-dir -r requirements-extra.txt
 COPY --chown=agent:agent shared/ /app/shared/
 COPY --chown=agent:agent _base/agent.py /app/
 
+# Bake the agent id as a default (the deployer also injects AGENT_ID as runtime
+# env, which wins). Lets the image identify itself even before env is applied.
+ARG AGENT_ID=custom-agent
+ENV AGENT_ID=${AGENT_ID}
+
 # Skills directory — the deployer syncs referenced S3 skill packages here before
 # start (P4). Empty until skills are attached.
 RUN mkdir -p /app/skills && chown agent:agent /app/skills
