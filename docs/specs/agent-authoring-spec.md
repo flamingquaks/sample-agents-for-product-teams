@@ -366,20 +366,27 @@ so a redeploy never knocks a live agent out of the registry.
 
 ## 10. Phasing (once decisions land)
 
-- **P1 — Built-ins + lifecycle:** `builtin` flag, idempotent seeding in
+- **P1 — Built-ins + lifecycle ✅ DONE:** `builtin` flag, idempotent seeding in
   `deploy_fleet.py`, delete-guard (409 for built-ins), enable/disable UI. Small,
-  no runtime change. *(This is the recommended first cut.)*
-- **P2 — Data-driven tool grants + read/write split:** promote the tool catalog
-  (read/write/destructive) in `fleet_policy`, make `AGENT_TOOL_GRANTS` read a
-  capability's `tool_grants`, render both built-in + custom through one policy.
-  UI tool checklist. (Enforcement-layer change; testable against moto/fixtures.)
-- **P3 — Generic base agent + requirements-as-config + clone + custom delete:**
-  `agents/_base/`, generic `agent.py`, build generates `requirements.txt`, clone
-  action, and custom-agent **destroy** teardown (row + runtime + role + image).
-- **P4 — Skills:** S3 bucket, upload routes, `.zip` adapter, `AgentSkills`
-  wiring, UI attach. (After the §7 controls land in the threat model.)
-- **P5 — Approval gate:** `require_agent_approval` setting + `pending_review` +
-  approve route/UI. (Can move earlier if desired; independent of P2–P4.)
+  no runtime change.
+- **P2 — Data-driven tool grants + read/write split ✅ DONE:** tool catalog
+  (read/write/destructive) in `fleet_policy`, `AGENT_TOOL_GRANTS` reads a
+  capability's `tool_grants`, built-in + custom render through one policy,
+  `check_gateway_manifest.py` reconciliation, UI tool checklist grouped by
+  connector.
+- **P3 — Generic base agent + requirements-as-config + clone + custom delete
+  ✅ DONE:** `agents/_base/` generic `agent.py`; the buildspec routes custom
+  agents to the base image and generates `requirements-extra.txt` from the
+  capability row via `gen_requirements.py` (re-validated before pip); clone +
+  edit in the UI; custom-agent **destroy** teardown (row + runtime + role + image
+  + capability-scoped skills) on the deployer, async-invoked by the de-routing
+  admin API.
+- **P4 — Skills ✅ DONE:** S3 bucket, upload routes, `.zip` adapter in an
+  **isolated** `capability-skill-unpacker` Lambda, `AgentSkills` wiring with a
+  startup S3 sync + normalized-tree sha256 verify, UI upload/attach.
+- **P5 — Approval gate ✅ DONE:** `RequireAgentApproval` deploy-time parameter +
+  `pending_review` + second-admin approve route/UI. Novelty is measured against
+  the last-approved baseline.
 - **P6 (deferred):** marketplace fetch on the Claude Code runtime — reuses the P4
   validator + the reserved `plugins` field.
 
