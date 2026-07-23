@@ -88,11 +88,19 @@ def test_missing_origin_rejected():
 
 
 def test_non_tool_call_passes_through():
-    # tools/list, initialize, etc. carry no repo — pass untouched, no injection.
-    ev = {"mcp": {"gatewayRequest": {"headers": {}, "body": json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})}}}
-    body, kind = _out_body(scm_interceptor.handler(ev))
+    # tools/list, initialize, etc. carry no repo — forwarded with the ORIGINAL
+    # body, and the transform carries EXACTLY {headers, body}: extra echoed
+    # fields (path/httpMethod/context) are rejected by the gateway with
+    # "Received invalid response from interceptor".
+    ev = {"mcp": {"gatewayRequest": {"headers": {"a": "b"}, "path": "/mcp", "httpMethod": "POST",
+                                     "body": json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})}}}
+    result = scm_interceptor.handler(ev)
+    body, kind = _out_body(result)
     assert kind == "pass"
     assert body["method"] == "tools/list"
+    tr = result["mcp"]["transformedGatewayRequest"]
+    assert set(tr) == {"headers", "body"}
+    assert tr["headers"] == {"a": "b"}
 
 
 def test_self_repo_always_reachable():

@@ -82,8 +82,27 @@ def _tool_and_args(body: dict) -> tuple[str, dict]:
     return tool, (args if isinstance(args, dict) else {})
 
 
+def _untouched(event: dict) -> dict:
+    """Forward the request unmodified — echo the original headers + body.
+    transformedGatewayRequest accepts EXACTLY {headers, body}: echoing extra
+    fields (path/httpMethod/context) is rejected with "Received invalid
+    response from interceptor", and an empty mcp:{} makes the gateway parse an
+    empty request ("Parse error - Invalid JSON format")."""
+    gw = (event.get("mcp") or {}).get("gatewayRequest") or {}
+    return {
+        "interceptorOutputVersion": "1.0",
+        "mcp": {
+            "transformedGatewayRequest": {
+                "headers": gw.get("headers") or {},
+                "body": gw.get("body") or "{}",
+            }
+        },
+    }
+
+
 def _passthrough(event: dict, body: dict) -> dict:
-    """Return the request unchanged-but-for injected args (the normal path)."""
+    """Forward the request with our modified ``body`` (injected server-truth
+    args). Same exact {headers, body} shape as _untouched."""
     gw = (event.get("mcp") or {}).get("gatewayRequest") or {}
     return {
         "interceptorOutputVersion": "1.0",
@@ -119,6 +138,23 @@ def _reject(body: dict, message: str) -> dict:
 def handler(event, context=None):
     """REQUEST interceptor entry point. Enforces co-repo grouping from the trusted
     origin header, injects server-truth origin/agent, else passes through."""
+    # Shape guard: if the event doesn't carry mcp.gatewayRequest where we expect
+    # it, we can't parse — and we must NOT emit a transformed request with an
+    # empty body (that REPLACES the real request and 500s every gateway call,
+    # including initialize/tools/list). Log the actual top-level shape once so
+    # the mismatch is diagnosable, and pass through untouched.
+    gw = (event.get("mcp") or {}).get("gatewayRequest")
+    if not isinstance(gw, dict) or "body" not in gw:
+        # Can't parse → can't transform. Forward the original request rather
+        # than emitting a broken transform.
+        logger.error(
+            "scm_interceptor: unexpected event shape (keys=%s, mcp keys=%s) — "
+            "forwarding untransformed",
+            sorted(event.keys()),
+            sorted((event.get("mcp") or {}).keys()),
+        )
+        return _untouched(event)
+
     body = _body(event)
     tool, args = _tool_and_args(body)
 
@@ -133,7 +169,7 @@ def handler(event, context=None):
     # primary control. See scm_broker._TOOLS; enforced by
     # test_scm_broker.test_every_tool_requires_owner_and_repo.
     if not tool or "owner" not in args or "repo" not in args:
-        return _passthrough(event, body)
+        return _untouched(event)
 
     headers = _headers(event)
     origin = str(headers.get(ORIGIN_HEADER, "")).strip()
