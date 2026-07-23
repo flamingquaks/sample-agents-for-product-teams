@@ -20,22 +20,23 @@ def _allow(repos):
     return fleet_policy.render_fleet_policies(repos, GW)["sdlc_allowed_repos"]
 
 
-def _destructive(repos=("acme/web",)):
-    return fleet_policy.render_fleet_policies(list(repos), GW)["sdlc_forbid_destructive"]
-
-
 def test_renders_separate_single_statement_policies():
     # AgentCore accepts one Cedar statement per policy, so the fleet forbids are
     # SEPARATE named policies — each exactly one `forbid(`, no packed set.
+    # NO destructive-forbid policy: destructive tools aren't declared in the
+    # GitHubTarget schema, and Cedar validation REJECTS a policy naming a tool
+    # the gateway doesn't expose (the policy would land CREATE_FAILED).
     _reset_pair_mode()
     policies = fleet_policy.render_fleet_policies(["acme/web"], GW)
     assert set(policies) == {
         "sdlc_allowed_repos",
-        "sdlc_forbid_destructive",
         "sdlc_forbid_noncomment_review",
     }
     for stmt in policies.values():
         assert stmt.count("forbid(") == 1
+    # The old destructive-forbid is on the retirement list so the sync removes
+    # any leftover from the engine.
+    assert "sdlc_forbid_destructive" in fleet_policy.RETIRED_FLEET_POLICY_NAMES
 
 
 def test_noncomment_review_forbidden_by_event():
@@ -69,16 +70,20 @@ def test_empty_allowlist_forbids_all_writes():
     assert 'AgentCore::Action::"GitHubTarget___create_issue"' in stmt
 
 
-def test_destructive_tools_unconditionally_forbidden():
+def test_destructive_tools_never_in_allowlist_or_grants():
     _reset_pair_mode()
-    # delete_file (and merge/delete-branch) are in the SEPARATE destructive
-    # forbid (no `unless`), never in the repo-allowlist forbid — so an allowlisted
-    # repo can't lift them.
+    # Destructive tools are enforced STRUCTURALLY: absent from the GitHubTarget
+    # tool schema (uncallable through the gateway) and never grantable. They
+    # must not leak into the repo-allowlist forbid (an allowlisted repo would
+    # lift the forbid there) nor into any built-in agent's grants.
     allow = _allow(["acme/web"])
-    dest = _destructive()
-    assert "delete_file" not in allow
-    assert 'AgentCore::Action::"GitHubTarget___delete_file"' in dest
-    assert "unless" not in dest
+    for tool in fleet_policy.DESTRUCTIVE_TOOLS:
+        assert tool not in allow
+        assert fleet_policy.classify_tool(f"GitHubTarget___{tool}") in (
+            None, fleet_policy.CLASS_DESTRUCTIVE,
+        )
+        for grants in fleet_policy.AGENT_TOOL_GRANTS.values():
+            assert f"GitHubTarget___{tool}" not in grants
 
 
 def test_repo_literals_lowercased():

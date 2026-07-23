@@ -234,19 +234,25 @@ def _allow_condition(allowed_repos: list[str]) -> str:
 
 def render_fleet_policies(allowed_repos: list[str], gateway_arn: str) -> dict[str, str]:
     """Render the fleet forbid policies, keyed by the policy name to sync each
-    under. TWO SEPARATE policies (AgentCore allows one Cedar statement per
-    policy — a two-statement string is rejected with "unexpected token forbid"):
+    under. SEPARATE policies (AgentCore allows one Cedar statement per policy —
+    a two-statement string is rejected with "unexpected token forbid"):
 
       - sdlc_allowed_repos — GitHub write tools (WRITE_TOOLS) forbidden unless the
         call's target repo is in ``allowed_repos``.
-      - sdlc_forbid_destructive — DESTRUCTIVE_TOOLS (delete/merge/…) forbidden for
-        EVERY repo, no exception. Separate so an allowlisted repo never lifts the
-        destructive forbid (delete_file must not be per-repo-liftable — CLAUDE.md
-        "agents NEVER … delete").
       - sdlc_forbid_noncomment_review — COMMENT_ONLY_REVIEW_TOOLS forbidden for
         EVERY repo when the review ``event`` is anything but COMMENT. The
         policy-layer backstop for the broker's forced event=COMMENT, so an
         APPROVE/REQUEST_CHANGES can't slip through even if the broker regresses.
+
+    There is deliberately NO destructive-tools forbid policy: DESTRUCTIVE_TOOLS
+    are not declared in the GitHubTarget tool schema at all (template.yaml's
+    curated InlinePayload; test_scm_broker pins their absence), so they are
+    structurally uncallable through the gateway — and AgentCore validates every
+    Cedar action against the live tool list, REJECTING (CREATE_FAILED) any
+    policy that names a tool the gateway doesn't expose. The enforcement moved
+    into the target schema; DESTRUCTIVE_TOOLS remains the grant-time denylist
+    (classify_tool) so a custom agent can never be granted one if a tool is
+    ever added to the target.
 
     Each statement pins a CONCRETE resource — ``resource == AgentCore::Gateway::``
     — because AgentCore rejects a wildcard/unconstrained resource ("a wildcard
@@ -263,13 +269,6 @@ def render_fleet_policies(allowed_repos: list[str], gateway_arn: str) -> dict[st
         f"  resource == {resource}\n"
         f") unless {{\n  {_allow_condition(allowed_repos)}\n}};"
     )
-    destructive_forbid = (
-        "forbid(\n"
-        "  principal,\n"
-        f"  action in {_actions_block(DESTRUCTIVE_TOOLS)},\n"
-        f"  resource == {resource}\n"
-        ");"
-    )
     # Forbid a review unless its event is COMMENT. ``when { has event && event
     # != "COMMENT" }`` fires only when the caller supplies a non-COMMENT event;
     # a review with no event, or event == "COMMENT", is not caught here (it is
@@ -283,9 +282,15 @@ def render_fleet_policies(allowed_repos: list[str], gateway_arn: str) -> dict[st
     )
     return {
         "sdlc_allowed_repos": allowlist_forbid,
-        "sdlc_forbid_destructive": destructive_forbid,
         "sdlc_forbid_noncomment_review": noncomment_review_forbid,
     }
+
+
+# Fleet policy names that were rendered by PREVIOUS versions and must be removed
+# from the engine when no longer in render_fleet_policies() — a stale (or
+# CREATE_FAILED) leftover otherwise lingers forever. Only names the fleet itself
+# once owned may appear here (never a foreign policy).
+RETIRED_FLEET_POLICY_NAMES = ("sdlc_forbid_destructive",)
 
 
 # --- per-agent permit policies -----------------------------------------------

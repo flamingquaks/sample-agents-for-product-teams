@@ -100,6 +100,17 @@ Parameters:
     Default: "https://mcp.asana.com/v2/mcp"
     Description: Asana MCP server endpoint registered as a gateway target.
 
+  DeployAsanaTarget:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Opt-in flag for the Asana MCP gateway target. Default "false": Asana's
+      MCP endpoint requires OAuth even for tools/list, so without a provisioned
+      AUTHORIZATION_CODE credential provider the DYNAMIC target breaks the
+      gateway's tools/list AND every Cedar policy write. Enable only once the
+      Asana OAuth provider is set up (see AsanaGatewayTarget notes).
+
   GitHubAppName:
     Type: String
     Default: "SDLC Agent Fleet"
@@ -114,6 +125,10 @@ Parameters:
 Conditions:
   DashboardEnabled: !Equals [!Ref DeployDashboard, "true"]
   GatewayEnabled: !Equals [!Ref DeployGateway, "true"]
+  # Asana target needs the gateway AND its own opt-in (OAuth prerequisite).
+  AsanaTargetEnabled: !And
+    - !Condition GatewayEnabled
+    - !Equals [!Ref DeployAsanaTarget, "true"]
   # Provision the shared Mantle project as a CFN resource (opt-in — the resource
   # type must be activated in the account+region first).
   MantleProjectEnabled: !Equals [!Ref DeployMantleProject, "true"]
@@ -1477,6 +1492,25 @@ Resources:
                 Action: bedrock-agentcore:ManageResourceScopedPolicy
                 Resource:
                   - !GetAtt FleetGateway.GatewayArn
+              # ListGatewayTargets: the sync filters agent grants to DEPLOYED
+              # targets (a permit naming an absent target — e.g. AsanaTarget
+              # before its OAuth provider lands — is rejected by Cedar
+              # validation, which would fail the agent's entire permit).
+              # GetGateway: UpdatePolicy/CreatePolicy confirm the resource-scoped
+              # gateway's existence first — without it every policy write fails
+              # AccessDenied ('please make sure you have bedrock-agentcore:GetGateway').
+              # InvokeGateway: Cedar validation then LISTS THE GATEWAY'S LIVE
+              # TOOLS (tools/list as the caller) to check every action id —
+              # without it the policy reaches *_FAILED with 'Insufficient
+              # permissions to call gateway'.
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:ListGatewayTargets
+                  - bedrock-agentcore:GetGateway
+                  - bedrock-agentcore:InvokeGateway
+                Resource:
+                  - !GetAtt FleetGateway.GatewayArn
+                  - !Sub ${FleetGateway.GatewayArn}/*
           - !Ref "AWS::NoValue"
       Events:
         ListRepos:
@@ -2731,9 +2765,18 @@ Resources:
                       Type: string
                   Required: [issue_number, owner, repo]
 
+  # Deployed ONLY when DeployAsanaTarget=true (AsanaTargetEnabled). Asana's MCP
+  # endpoint requires an Authorization header even for tools/list, so a target
+  # without a working OAuth credential provider is worse than none: DYNAMIC
+  # listing breaks the gateway root tools/list (HTTP 500) AND every Cedar
+  # policy create/update ("Make the gateway's targets non-dynamic"), while a
+  # static McpToolSchema is rejected unless the target has an AUTHORIZATION_CODE
+  # credential provider. Until Asana's OAuth provider is provisioned, the
+  # target stays off — GitHub tool policies then sync cleanly. When enabling,
+  # add the OAuth CredentialProviderConfigurations alongside this flag.
   AsanaGatewayTarget:
     Type: AWS::BedrockAgentCore::GatewayTarget
-    Condition: GatewayEnabled
+    Condition: AsanaTargetEnabled
     Properties:
       GatewayIdentifier: !GetAtt FleetGateway.GatewayIdentifier
       Name: AsanaTarget

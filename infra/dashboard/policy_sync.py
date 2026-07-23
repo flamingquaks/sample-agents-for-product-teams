@@ -106,8 +106,13 @@ def _poll_until_ready(client, engine_id: str, policy_id: str) -> str:
 def _upsert_policy(
     client, engine_id: str, name: str, statement: str,
     known_ids: dict[str, str] | None = None,
+    *, poll: bool = True,
 ) -> str:
-    """Create-or-update the named policy with ``statement``, then poll to ready.
+    """Create-or-update the named policy with ``statement``, then poll to ready
+    (skip the poll with ``poll=False`` when the caller batches several upserts
+    and polls them together afterwards — the ACTIVE waits then overlap
+    server-side instead of serializing ~20s per policy, which blew past the
+    Lambda timeout once the fleet had a handful of policies).
     Returns the policy id. Raises PolicySyncError (via _poll_until_ready) or the
     underlying ClientError on failure — callers wrap those. Enforcement mode is
     NOT set here — it lives on the gateway→engine attachment.
@@ -154,7 +159,8 @@ def _upsert_policy(
             definition=definition,
         )
         logger.info("Updated policy %s (%s)", name, policy_id)
-    _poll_until_ready(client, engine_id, policy_id)
+    if poll:
+        _poll_until_ready(client, engine_id, policy_id)
     return policy_id
 
 
@@ -188,17 +194,64 @@ def sync_fleet_policy() -> None:
         # ONE listing pass, reused by every upsert lookup and the stale-permit
         # scan — a per-policy listing would be quadratic in policy count.
         known_ids = _list_policy_ids(client, engine_id)
+        # Upsert everything WITHOUT per-policy polling, then poll the batch at
+        # the end (_poll_batch): each policy's validation (which lists the
+        # gateway's live tools) takes ~20s server-side, and serializing that per
+        # policy exceeded the Lambda timeout at ~3 policies. Batched, the waits
+        # overlap and the whole sync completes in about one validation's time.
+        pending: list[str] = []
         for name, statement in fleet_policy.render_fleet_policies(
             allowed, gateway_arn
         ).items():
-            _upsert_policy(client, engine_id, name, statement, known_ids=known_ids)
-        _sync_agent_permits(client, engine_id, account_id, gateway_arn, known_ids)
+            pending.append(_upsert_policy(
+                client, engine_id, name, statement, known_ids=known_ids, poll=False,
+            ))
+        # Retire fleet policies older versions rendered (e.g. the destructive
+        # forbid, now enforced by the target schema instead). A leftover —
+        # possibly stuck CREATE_FAILED — otherwise lingers on the engine forever.
+        for name in fleet_policy.RETIRED_FLEET_POLICY_NAMES:
+            policy_id = known_ids.pop(name, None)
+            if policy_id:
+                client.delete_policy(policyEngineId=engine_id, policyId=policy_id)
+                logger.info("Deleted retired fleet policy %s (%s)", name, policy_id)
+        pending += _sync_agent_permits(client, engine_id, account_id, gateway_arn, known_ids)
+        _poll_batch(client, engine_id, pending)
     except (ClientError, BotoCoreError) as exc:
         # A Cedar-analysis rejection surfaces here (validation is at create/update
         # time); treat every control-plane error as a sync failure.
         raise PolicySyncError(f"gateway policy write failed: {exc}") from exc
 
     logger.info("Fleet policy set synced (allowed=%s)", allowed)
+
+
+def _poll_batch(client, engine_id: str, policy_ids: list[str]) -> None:
+    """Poll every policy in ``policy_ids`` to a terminal status, in order.
+    Because the writes all landed before the first poll, the server-side
+    validations run concurrently — total wall time is roughly ONE validation,
+    not one per policy. Raises PolicySyncError on the first failure/timeout."""
+    for policy_id in policy_ids:
+        if policy_id:
+            _poll_until_ready(client, engine_id, policy_id)
+
+
+def _available_target_names(client, gateway_arn: str) -> set[str] | None:
+    """The target names currently on the gateway (e.g. {"GitHubTarget"}), or
+    None when the listing fails. AgentCore validates every Cedar action against
+    the gateway's live tool list, so a permit naming a target that isn't
+    deployed (e.g. AsanaTarget while the Asana OAuth provider is pending) is
+    REJECTED outright — grants must be filtered to deployed targets first."""
+    gateway_id = gateway_arn.rsplit("/", 1)[-1]
+    try:
+        names: set[str] = set()
+        paginator = client.get_paginator("list_gateway_targets")
+        for page in paginator.paginate(gatewayIdentifier=gateway_id):
+            for target in page.get("items", []):
+                if target.get("name"):
+                    names.add(target["name"])
+        return names
+    except (ClientError, BotoCoreError):
+        logger.exception("could not list gateway targets; skipping grant filtering")
+        return None
 
 
 def _grants_by_agent() -> tuple[dict[str, list[str]], bool]:
@@ -249,7 +302,7 @@ _AGENT_PERMIT_PREFIX = "sdlc_permit_"
 def _sync_agent_permits(
     client, engine_id: str, account_id: str, gateway_arn: str,
     known_ids: dict[str, str] | None = None,
-) -> None:
+) -> list[str]:
     """Provision one permit policy per agent (default-deny means the fleet does
     nothing without them), and DELETE any stale ``sdlc_permit_*`` policy whose
     agent no longer has a grant (disabled, deleting, deleted, or grants cleared) —
@@ -258,17 +311,43 @@ def _sync_agent_permits(
     policies still apply, but under ENFORCE nothing is permitted until the permits
     land, which is why rollout is LOG_ONLY first.
 
+    Returns the upserted policy ids UNPOLLED — the caller batch-polls them
+    (see sync_fleet_policy) so validations overlap instead of serializing.
+
     Grants are DATA-DRIVEN (`_grants_by_agent`): custom agents' authored
     ``tool_grants`` and the built-ins' fixed lists render through one path."""
     if not account_id:
         logger.info("AWS_ACCOUNT_ID unset — skipping per-agent permits")
-        return
+        return []
     if known_ids is None:
         known_ids = _list_policy_ids(client, engine_id)
     grants, complete = _grants_by_agent()
+    # Drop grants for targets that aren't deployed on the gateway (e.g.
+    # AsanaTarget while its OAuth provider is pending): AgentCore validates
+    # every Cedar action against the live tool list and REJECTS a permit naming
+    # an absent target — one such grant would fail the agent's entire permit,
+    # leaving it with NO tools instead of its remaining (deployed) ones.
+    targets = _available_target_names(client, gateway_arn)
+    if targets is not None:
+        filtered: dict[str, list[str]] = {}
+        for agent, actions in grants.items():
+            kept = [a for a in actions if a.split("___", 1)[0] in targets]
+            dropped = len(actions) - len(kept)
+            if dropped:
+                logger.info(
+                    "agent %s: %d grant(s) reference undeployed targets; "
+                    "omitted from its permit until the target lands",
+                    agent, dropped,
+                )
+            if kept:
+                filtered[agent] = kept
+        grants = filtered
     desired = fleet_policy.agent_permit_policies(account_id, gateway_arn, grants)
+    upserted: list[str] = []
     for name, statement in desired.items():
-        _upsert_policy(client, engine_id, name, statement, known_ids=known_ids)
+        upserted.append(_upsert_policy(
+            client, engine_id, name, statement, known_ids=known_ids, poll=False,
+        ))
     # Retract permits for agents that no longer have one. Only our own
     # namespaced policies are ever considered — the fleet forbids and any
     # foreign policy on the engine are untouched. Skipped entirely on a
@@ -277,9 +356,10 @@ def _sync_agent_permits(
     # running custom agents of tool access.
     if not complete:
         logger.warning("config read degraded — skipping stale-permit deletion this sync")
-        return
+        return upserted
     for name, policy_id in known_ids.items():
         if not name.startswith(_AGENT_PERMIT_PREFIX) or name in desired:
             continue
         client.delete_policy(policyEngineId=engine_id, policyId=policy_id)
         logger.info("Deleted stale agent permit %s (%s)", name, policy_id)
+    return upserted

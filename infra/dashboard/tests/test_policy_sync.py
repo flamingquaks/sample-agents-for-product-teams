@@ -41,20 +41,29 @@ def _load(monkeypatch, *, engine_id=ENGINE, allowed=None):
 
 
 class _FakeClient:
-    """Minimal stand-in for the bedrock-agentcore-control client."""
+    """Minimal stand-in for the bedrock-agentcore-control client. ``targets``
+    is what list_gateway_targets pages out — the sync filters agent grants to
+    deployed target names, so the default exposes both fleet targets (grants
+    pass through untouched)."""
 
-    def __init__(self, *, existing=None, statuses=None):
+    def __init__(self, *, existing=None, statuses=None, targets=("GitHubTarget", "AsanaTarget")):
         self.existing = existing  # policy list returned by list_policies
         self.statuses = list(statuses or ["ACTIVE"])
+        self.targets = [{"name": t, "targetId": f"tid-{t}"} for t in targets]
         self.created = []
         self.updated = []
+        self.deleted = []
 
     def get_paginator(self, name):
-        policies = self.existing or []
+        page = (
+            {"items": self.targets}
+            if name == "list_gateway_targets"
+            else {"policies": self.existing or []}
+        )
 
         class _P:
             def paginate(self, **_):
-                yield {"policies": policies}
+                yield page
 
         return _P()
 
@@ -64,6 +73,10 @@ class _FakeClient:
 
     def update_policy(self, **kwargs):
         self.updated.append(kwargs)
+        return {}
+
+    def delete_policy(self, **kwargs):
+        self.deleted.append(kwargs)
         return {}
 
     def get_policy(self, **_):
@@ -83,12 +96,12 @@ def test_creates_policy_when_absent(monkeypatch):
     fake = _FakeClient(existing=[], statuses=["ACTIVE"])
     monkeypatch.setattr(ps, "_get_client", lambda: fake)
     ps.sync_fleet_policy()
-    # Fleet forbid policies (one Cedar statement each): allowlist + destructive +
-    # non-COMMENT-review backstop.
+    # Fleet forbid policies (one Cedar statement each): allowlist +
+    # non-COMMENT-review backstop. (No destructive forbid — those tools are
+    # absent from the target schema, and Cedar rejects unknown actions.)
     names = [c["name"] for c in fake.created]
     assert names == [
         "sdlc_allowed_repos",
-        "sdlc_forbid_destructive",
         "sdlc_forbid_noncomment_review",
     ]
     # enforcementMode is NOT sent — it lives on the gateway→engine attachment,
@@ -104,7 +117,7 @@ def test_updates_policy_when_present(monkeypatch):
     fake = _FakeClient(
         existing=[
             {"name": "sdlc_allowed_repos", "policyId": "pol-1"},
-            {"name": "sdlc_forbid_destructive", "policyId": "pol-2"},
+            {"name": "sdlc_forbid_destructive", "policyId": "pol-2"},  # retired
             {"name": "sdlc_forbid_noncomment_review", "policyId": "pol-3"},
         ],
         statuses=["ACTIVE"],
@@ -112,10 +125,13 @@ def test_updates_policy_when_present(monkeypatch):
     monkeypatch.setattr(ps, "_get_client", lambda: fake)
     ps.sync_fleet_policy()
     updated_ids = {u["policyId"] for u in fake.updated}
-    assert updated_ids == {"pol-1", "pol-2", "pol-3"}
+    assert updated_ids == {"pol-1", "pol-3"}
     for u in fake.updated:
         assert "enforcementMode" not in u
     assert not fake.created
+    # The retired destructive forbid is removed from the engine (it names tools
+    # the target schema no longer exposes — a leftover would sit CREATE_FAILED).
+    assert [d["policyId"] for d in fake.deleted] == ["pol-2"]
 
 
 def test_raises_on_failed_status(monkeypatch):
@@ -189,7 +205,6 @@ def test_permits_skipped_without_account(monkeypatch):
     ps.sync_fleet_policy()
     assert [c["name"] for c in fake.created] == [
         "sdlc_allowed_repos",
-        "sdlc_forbid_destructive",
         "sdlc_forbid_noncomment_review",
     ]
 
@@ -257,11 +272,6 @@ def test_stale_agent_permit_deleted(monkeypatch):
         ],
         statuses=["ACTIVE"],
     )
-    fake.deleted = []
-    def _delete_policy(**kw):
-        fake.deleted.append(kw)
-        return {}
-    fake.delete_policy = _delete_policy
     monkeypatch.setattr(ps, "_get_client", lambda: fake)
     ps.sync_fleet_policy()
     deleted_ids = [d["policyId"] for d in fake.deleted]
@@ -269,3 +279,22 @@ def test_stale_agent_permit_deleted(monkeypatch):
     # Live built-in permits were still upserted.
     created_names = [c["name"] for c in fake.created]
     assert "sdlc_permit_workitems" in created_names
+
+
+def test_grants_filtered_to_deployed_targets(monkeypatch):
+    """A grant naming a target that isn't on the gateway (AsanaTarget while its
+    OAuth provider is pending) must be OMITTED from the rendered permit — Cedar
+    validation rejects unknown actions, which would fail the agent's whole
+    permit. An agent whose grants ALL reference absent targets gets no permit."""
+    ps = _load(monkeypatch)
+    monkeypatch.setenv("AWS_ACCOUNT_ID", "111122223333")
+    fake = _FakeClient(existing=[], statuses=["ACTIVE"], targets=("GitHubTarget",))
+    monkeypatch.setattr(ps, "_get_client", lambda: fake)
+    ps.sync_fleet_policy()
+    created = {c["name"]: c for c in fake.created}
+    # workitems keeps its GitHub grants but loses the Asana ones.
+    stmt = created["sdlc_permit_workitems"]["definition"]["cedar"]["statement"]
+    assert "GitHubTarget___get_issue" in stmt
+    assert "AsanaTarget" not in stmt
+    # researcher is Asana-only → no permit at all (default-deny).
+    assert "sdlc_permit_researcher" not in created

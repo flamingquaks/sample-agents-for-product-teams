@@ -115,12 +115,16 @@ def _sync_after_write(log_msg: str, error_msg: str) -> dict | None:
     try:
         _sync_repo_policy()
         return None
-    except PolicySyncError:
+    except PolicySyncError as exc:
         if _gateway_enforcing():
             logger.exception(log_msg)
             return error(502, error_msg)
+        # Non-fatal in LOG_ONLY, but keep the CAUSE in the log — a bare
+        # "sync failed" line made the real error (IAM, Cedar validation, …)
+        # undiagnosable without rerunning the sync by hand.
         logger.warning(
-            "%s (gateway not enforcing; will re-sync on next change)", log_msg
+            "%s: %s (gateway not enforcing; will re-sync on next change)",
+            log_msg, exc,
         )
         return None
 
@@ -286,14 +290,14 @@ def _onboard_repos(event: dict, body: dict) -> dict:
             installation_id=installation_id,
             install_verified_at=verified_at,
         )
-    warning = None
     try:
         _sync_repo_policy()
-    except PolicySyncError:
+    except PolicySyncError as exc:
         # ENFORCING: dispatch would widen ahead of a tool-call policy that still
         # denies — roll the batch back to pending and fail. LOG_ONLY (or gateway
-        # not fully wired): the policy blocks nothing, so onboarding succeeds and
-        # the sync retries on the next admin action.
+        # not fully wired): the policy blocks nothing, so onboarding succeeds
+        # (no jargon warning for the admin) and the sync retries on the next
+        # admin action. Keep the CAUSE in the log for diagnosability.
         if _gateway_enforcing():
             logger.exception("policy sync failed for %s; rolling back", repos)
             for repo, _, _ in plan:
@@ -305,13 +309,9 @@ def _onboard_repos(event: dict, body: dict) -> dict:
             )
         logger.warning(
             "policy sync failed for %s but gateway is not enforcing; repos left "
-            "active, policy will re-sync on next change",
-            repos,
+            "active, policy will re-sync on next change: %s",
+            repos, exc,
         )
-        # The sync failure is non-fatal (tool-call policy is not blocking
-        # anything in LOG_ONLY mode). Don't alarm the admin with jargon —
-        # silently onboard and let the policy converge on the next change.
-        pass
     if single:
         return ok(config_store.get_repo(repos[0]))
     return ok({"repos": [config_store.get_repo(r) for r in repos]})
