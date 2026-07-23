@@ -1,10 +1,16 @@
 // Slack connector page: workspaces, channel allow/deny, WHO trigger rules, the
 // channel-onboarding request approval queue, and the access simulator.
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { ApiError } from "../api";
 import { usePolling } from "../hooks";
-import type { ChannelPolicy, ChannelRequest, NotifSub, SlackWorkspace } from "../types";
+import type {
+  CapabilityConfig,
+  ChannelPolicy,
+  ChannelRequest,
+  NotifSub,
+  SlackWorkspace,
+} from "../types";
 import { ActivityPanel } from "./ActivityPanel";
 import { ConnectorLayout } from "./ConnectorLayout";
 import { TriggerRulesPanel } from "./TriggerRulesPanel";
@@ -242,12 +248,14 @@ function RequestsTab({ api, onAuthError }: ConnectorPageProps) {
     isActive: () => false, deps: [api], onError: handleErr,
   });
   const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [approving, setApproving] = useState<ChannelRequest | null>(null);
 
-  const decide = async (id: string, approve: boolean) => {
+  const deny = async (id: string) => {
     setBusy(true);
+    setMsg(null);
     try {
-      if (approve) await api.approveChannelRequest(id);
-      else await api.denyChannelRequest(id);
+      await api.denyChannelRequest(id);
       poll.refresh();
     } catch (e) { handleErr(e); } finally { setBusy(false); }
   };
@@ -257,21 +265,28 @@ function RequestsTab({ api, onAuthError }: ConnectorPageProps) {
     <div>
       <p className="muted">
         Pending channel-onboarding requests filed by users via <code>/sdlc-onboard-channel</code>.
-        Approving allows the channel and grants the requested agents; denying just records the
-        decision.
+        Approving grants specific agents to <b>everyone who triggers from that channel</b> — you
+        pick which agents on approve. This is a WHO-can-use-WHICH-agent grant; it does not by
+        itself scope repositories (agents act on repos per the repo onboarding + co-repo rules,
+        and channel <b>notifications</b> are configured separately in the Notifications tab).
       </p>
+      {msg && <div className="banner ok">{msg}</div>}
       <table>
-        <thead><tr><th>Channel</th><th>Workspace</th><th>Requested by</th><th>Agents</th><th /></tr></thead>
+        <thead><tr><th>Channel</th><th>Workspace</th><th>Requested by</th><th>Requested agents</th><th /></tr></thead>
         <tbody>
           {requests.map((r) => (
             <tr key={r.request_id}>
               <td>{r.channel_name || <code>{r.channel_id}</code>}</td>
               <td><code>{r.team_id}</code></td>
               <td><code>{r.requested_by}</code></td>
-              <td>{r.requested_agents.length ? r.requested_agents.join(", ") : "any"}</td>
               <td>
-                <button className="primary" disabled={busy} onClick={() => void decide(r.request_id, true)}>Approve</button>{" "}
-                <button disabled={busy} onClick={() => void decide(r.request_id, false)}>Deny</button>
+                {r.requested_agents.length
+                  ? r.requested_agents.join(", ")
+                  : <span className="muted">any (you'll choose on approve)</span>}
+              </td>
+              <td>
+                <button className="primary" disabled={busy} onClick={() => { setMsg(null); setApproving(r); }}>Approve…</button>{" "}
+                <button disabled={busy} onClick={() => void deny(r.request_id)}>Deny</button>
               </td>
             </tr>
           ))}
@@ -280,6 +295,131 @@ function RequestsTab({ api, onAuthError }: ConnectorPageProps) {
           )}
         </tbody>
       </table>
+
+      {approving && (
+        <ApproveChannelDialog
+          api={api}
+          request={approving}
+          onClose={() => setApproving(null)}
+          onDone={(channel, agents) => {
+            setApproving(null);
+            setMsg(`Approved ${channel} for: ${agents.join(", ")}.`);
+            poll.refresh();
+          }}
+          onAuthError={onAuthError}
+        />
+      )}
+    </div>
+  );
+}
+
+// Approve dialog — the backend REQUIRES a concrete (non-wildcard) agent scope,
+// so a bare "Approve" of an "any" request 400s. This dialog makes the admin pick
+// exactly which fleet agents the channel gets, defaulting to the ones the user
+// asked for (minus any wildcard). It loads the live capability list so the admin
+// picks from real agents, not free text.
+function ApproveChannelDialog({
+  api, request, onClose, onDone, onAuthError,
+}: {
+  api: ConnectorPageProps["api"];
+  request: ChannelRequest;
+  onClose: () => void;
+  onDone: (channel: string, agents: string[]) => void;
+  onAuthError: () => void;
+}) {
+  const handleErr = useErr(onAuthError);
+  const caps = usePolling<{ capabilities: CapabilityConfig[] }>(() => api.listCapabilities(), {
+    isActive: () => false, deps: [api], onError: handleErr,
+  });
+  const [selected, setSelected] = useState<Set<string>>(
+    () => new Set(request.requested_agents.filter((a) => a && a !== "*")),
+  );
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape" && !busy) onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [busy, onClose]);
+
+  // Only enabled agents are meaningfully grantable; show them first.
+  const agents = useMemo(() => {
+    const list = caps.data?.capabilities ?? [];
+    return [...list].sort((a, b) =>
+      Number(b.enabled ?? false) - Number(a.enabled ?? false) ||
+      a.agent_id.localeCompare(b.agent_id));
+  }, [caps.data]);
+
+  const toggle = (id: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+    if (err) setErr(null);
+  };
+
+  const channel = request.channel_name || request.channel_id;
+  const submit = async () => {
+    const chosen = [...selected];
+    if (chosen.length === 0) {
+      setErr("Pick at least one agent — a channel grant must name concrete agents.");
+      return;
+    }
+    setBusy(true);
+    setErr(null);
+    try {
+      await api.approveChannelRequest(request.request_id, chosen);
+      onDone(channel, chosen);
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : (e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="modal-overlay" onClick={() => { if (!busy) onClose(); }}>
+      <div className="modal" role="dialog" aria-modal="true" aria-labelledby="approve-title"
+           onClick={(e) => e.stopPropagation()}>
+        <h3 id="approve-title">Approve #{channel}</h3>
+        <p className="muted">
+          Choose which agents anyone in <b>#{channel}</b> may trigger. This creates a permit for
+          each — the channel is allowed and the grants take effect immediately.
+        </p>
+
+        {caps.data === null && !caps.error && <p className="muted">Loading agents…</p>}
+        {caps.error && <div className="banner error">Could not load agents: {caps.error}</div>}
+
+        <div className="repo-picker" role="listbox" aria-multiselectable="true">
+          {agents.map((c) => (
+            <label key={c.agent_id} className="field-inline" style={{ display: "block" }}>
+              <input
+                type="checkbox"
+                checked={selected.has(c.agent_id)}
+                disabled={busy}
+                onChange={() => toggle(c.agent_id)}
+              />{" "}
+              <code>{c.agent_id}</code>
+              {c.description && <span className="muted"> — {c.description}</span>}
+              {!c.enabled && <span className="muted"> · disabled</span>}
+            </label>
+          ))}
+          {agents.length === 0 && caps.data !== null && (
+            <p className="muted">No agents onboarded yet — onboard an agent first.</p>
+          )}
+        </div>
+
+        {err && <div className="banner error" role="alert">{err}</div>}
+
+        <div className="modal-actions">
+          <button disabled={busy} onClick={onClose}>Cancel</button>
+          <button className="primary" disabled={busy || selected.size === 0} onClick={() => void submit()}>
+            {busy ? "Approving…" : `Approve for ${selected.size || ""} ${selected.size === 1 ? "agent" : "agents"}`}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
