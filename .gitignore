@@ -44,3 +44,4 @@ samconfig.toml
 
 # REPL state (agent local dev)
 repl_state/
+.venv*/
