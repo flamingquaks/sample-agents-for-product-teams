@@ -2008,9 +2008,14 @@ Resources:
       TimeoutInMinutes: 30
       Artifacts: { Type: NO_ARTIFACTS }
       Environment:
-        Type: LINUX_CONTAINER
+        # ARM: AgentCore Runtime only accepts arm64/aarch64 container images
+        # (CreateAgentRuntime ValidationException "Supported platforms: [arm64]"
+        # otherwise). Build NATIVELY on an ARM CodeBuild host so a plain
+        # `docker build` yields an arm64 image — the python:3.12-slim base is
+        # multi-arch, so no Dockerfile/buildx/QEMU change is needed.
+        Type: ARM_CONTAINER
         ComputeType: BUILD_GENERAL1_SMALL
-        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        Image: aws/codebuild/amazonlinux-aarch64-standard:3.0
         PrivilegedMode: true
         EnvironmentVariables:
           - { Name: AWS_ACCOUNT_ID, Value: !Ref AWS::AccountId }
