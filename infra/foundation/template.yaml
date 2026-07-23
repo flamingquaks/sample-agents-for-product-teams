@@ -2159,19 +2159,38 @@ Resources:
             # ARN); Create tags the runtime as fleet-managed and the deployer
             # refuses to Update any same-named runtime lacking that tag, so the
             # broad Resource can't be used to hijack a foreign runtime.
+            # NOTE: the IAM service prefix is ``bedrock-agentcore`` — the same
+            # one the gateway/policy actions use. ``bedrock-agentcore-control``
+            # is only the SDK/CLI client name, NOT an IAM prefix; actions under
+            # it never match and the deployer AccessDenies on its first
+            # ListAgentRuntimes call.
             - Sid: AgentCoreRuntime
               Effect: Allow
               Action:
-                - bedrock-agentcore-control:CreateAgentRuntime
-                - bedrock-agentcore-control:UpdateAgentRuntime
-                - bedrock-agentcore-control:GetAgentRuntime
-                - bedrock-agentcore-control:ListAgentRuntimes
-                - bedrock-agentcore-control:ListTagsForResource
-                - bedrock-agentcore-control:TagResource
+                - bedrock-agentcore:CreateAgentRuntime
+                - bedrock-agentcore:UpdateAgentRuntime
+                - bedrock-agentcore:GetAgentRuntime
+                - bedrock-agentcore:ListAgentRuntimes
+                - bedrock-agentcore:ListTagsForResource
+                - bedrock-agentcore:TagResource
+                # CreateAgentRuntime implicitly provisions the runtime's DEFAULT
+                # endpoint and workload identity — the service authorizes those
+                # as their own actions, so Create/Update/Delete of a runtime
+                # needs the companion endpoint + workload-identity permissions
+                # or it AccessDenies mid-provision.
+                - bedrock-agentcore:CreateAgentRuntimeEndpoint
+                - bedrock-agentcore:GetAgentRuntimeEndpoint
+                - bedrock-agentcore:ListAgentRuntimeEndpoints
+                - bedrock-agentcore:UpdateAgentRuntimeEndpoint
+                - bedrock-agentcore:DeleteAgentRuntimeEndpoint
+                - bedrock-agentcore:CreateWorkloadIdentity
+                - bedrock-agentcore:GetWorkloadIdentity
+                - bedrock-agentcore:UpdateWorkloadIdentity
+                - bedrock-agentcore:DeleteWorkloadIdentity
                 # DeleteAgentRuntime for custom-agent teardown (§8.2). The deployer
                 # only deletes a runtime it verified carries the fleet tag, so the
                 # account-wide Resource can't be used to delete a foreign runtime.
-                - bedrock-agentcore-control:DeleteAgentRuntime
+                - bedrock-agentcore:DeleteAgentRuntime
               Resource: "*"
             # Custom-agent teardown (§8.2): delete the agent's ECR repo (scoped to
             # the fleet namespace) and its capability-scoped skill objects.
