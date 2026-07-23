@@ -86,7 +86,9 @@ export function TriggerRulesPanel({
           <option value="user">user</option>
           <option value="group">group</option>
         </select>
-        <input placeholder="subject id (slack:T…:U… or group name)" value={subjectId}
+        <input placeholder={subjectType === "user"
+                 ? "user (email preferred, or slack:T…:U…)"
+                 : "group name or channel:T…:C…"} value={subjectId}
                disabled={busy} onChange={(e) => setSubjectId(e.target.value)} />
         <input placeholder="agent (blank = any)" value={agentId}
                disabled={busy} onChange={(e) => setAgentId(e.target.value)} />
@@ -107,15 +109,29 @@ export function TriggerRulesPanel({
           <tr><th>Effect</th><th>Subject</th><th>Agent</th><th>Workspace</th><th /></tr>
         </thead>
         <tbody>
-          {rules.map((r) => (
-            <tr key={r.rule_id}>
-              <td><span className={`pill ${r.effect === "permit" ? "ok" : "err"}`}>{r.effect}</span></td>
-              <td><code>{r.subject_id}</code> <span className="muted">({r.subject_type})</span></td>
-              <td>{r.agent_id}</td>
-              <td>{r.workspace}</td>
-              <td><button disabled={busy} onClick={() => void remove(r.rule_id)}>Remove</button></td>
-            </tr>
-          ))}
+          {rules.map((r) => {
+            const label = r.subject_label && r.subject_label !== r.subject_id ? r.subject_label : null;
+            const ws = r.workspace === "*" ? "any" : (r.workspace_label || r.workspace);
+            return (
+              <tr key={r.rule_id}>
+                <td><span className={`pill ${r.effect === "permit" ? "ok" : "err"}`}>{r.effect}</span></td>
+                <td>
+                  {label ? (
+                    <>
+                      <span>{label}</span>{" "}
+                      <span className="muted">({r.subject_type})</span>
+                      <div className="muted" style={{ fontSize: 12 }}><code>{r.subject_id}</code></div>
+                    </>
+                  ) : (
+                    <><code>{r.subject_id}</code> <span className="muted">({r.subject_type})</span></>
+                  )}
+                </td>
+                <td>{r.agent_id === "*" ? <span className="muted">any</span> : r.agent_id}</td>
+                <td>{ws === "any" ? <span className="muted">any</span> : ws}</td>
+                <td><button disabled={busy} onClick={() => void remove(r.rule_id)}>Remove</button></td>
+              </tr>
+            );
+          })}
           {rules.length === 0 && !poll.loading && (
             <tr><td colSpan={5} className="muted">No rules yet.</td></tr>
           )}

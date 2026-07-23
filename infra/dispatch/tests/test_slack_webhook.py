@@ -92,6 +92,14 @@ def _fresh(monkeypatch, *, secret=SECRET, ws_enabled=True, channel_repos=None):
         lambda team, chan, text, thread_ts=None: state["posted"].append(
             {"team": team, "channel": chan, "text": text}) or True,
     )
+    # users.info profile lookup: default to an empty profile (no verified name /
+    # email captured) so a test that doesn't care about it sees the bare context.
+    # Tests exercising capture override state["profile"].
+    state["profile"] = {"display_name": "", "email": ""}
+    monkeypatch.setattr(
+        sw.reply, "slack_user_profile",
+        lambda team, user: dict(state["profile"]),
+    )
     return sw, state
 
 
@@ -192,6 +200,37 @@ def test_app_mention_dispatches(monkeypatch):
     assert d["context"] == {"workspace": TEAM, "channel_id": "C0ENG",
                             "thread_ts": "111.2", "message_ts": "111.2",
                             "principal_groups": ["channel:T0ACME12:C0ENG"]}
+
+
+def test_app_mention_captures_verified_profile(monkeypatch):
+    """When users.info resolves a name + email, the dispatch context carries the
+    verified sender_name + requester_email (with requester_email_verified) so the
+    router's identity map stores a friendly name and joins on email (§16.5)."""
+    sw, state = _fresh(monkeypatch)
+    state["profile"] = {"display_name": "Alice Anderson", "email": "alice@example.com"}
+    ev = _events_event({"type": "event_callback", "team_id": TEAM, "event_id": "ep1",
+                        "event": {"type": "app_mention", "text": "<@U0BOT> @workitems go",
+                                  "user": "U0ALICE", "channel": "C0ENG", "ts": "1.1"}})
+    sw.handler(ev)
+    ctx = state["dispatched"][0]["context"]
+    assert ctx["sender_name"] == "Alice Anderson"
+    assert ctx["requester_email"] == "alice@example.com"
+    assert ctx["requester_email_verified"] is True
+
+
+def test_app_mention_partial_profile_omits_missing_keys(monkeypatch):
+    """A name but no email: the name is captured, but no unverified email leaks
+    into the context (email stays absent, verified flag not set)."""
+    sw, state = _fresh(monkeypatch)
+    state["profile"] = {"display_name": "Bob", "email": ""}
+    ev = _events_event({"type": "event_callback", "team_id": TEAM, "event_id": "ep2",
+                        "event": {"type": "app_mention", "text": "<@U0BOT> @workitems go",
+                                  "user": "U0BOB", "channel": "C0ENG", "ts": "1.1"}})
+    sw.handler(ev)
+    ctx = state["dispatched"][0]["context"]
+    assert ctx["sender_name"] == "Bob"
+    assert "requester_email" not in ctx
+    assert "requester_email_verified" not in ctx
 
 
 def test_app_mention_alias_resolves(monkeypatch):

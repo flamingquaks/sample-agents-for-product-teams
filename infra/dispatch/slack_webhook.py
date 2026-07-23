@@ -157,6 +157,26 @@ def _principal(team_id: str, user_id: str) -> str:
     return f"slack:{team_id}:{user_id}"
 
 
+def _sender_identity_context(team_id: str, user_id: str) -> dict:
+    """Context keys that name the human behind a dispatch, resolved from Slack's
+    authenticated directory (``users.info``). The verified display name + email
+    let the router's identity map store a friendly name and use email as the
+    golden join id across sources (§16.5). ``requester_email_verified`` is set
+    because the source IS the platform directory (T-42) — never a user-editable
+    field. Best-effort: an empty profile just omits the keys, and the router
+    falls back to the raw handle. Only fetched when we have a user to look up."""
+    if not user_id:
+        return {}
+    profile = reply.slack_user_profile(team_id, user_id)
+    ctx: dict = {}
+    if profile.get("display_name"):
+        ctx["sender_name"] = profile["display_name"]
+    if profile.get("email"):
+        ctx["requester_email"] = profile["email"]
+        ctx["requester_email_verified"] = True
+    return ctx
+
+
 def _principal_groups(team_id: str, channel_id: str) -> list[str]:
     """Implicit groups the sender belongs to for authz. The channel itself is a
     group (``channel:<team>:<channel>``) so a channel-scoped grant — the one an
@@ -221,6 +241,7 @@ def _process_app_mention(event_data: dict, team_id: str) -> None:
         "thread_ts": event_data.get("thread_ts") or event_data.get("ts"),
         "message_ts": event_data.get("ts"),
         "principal_groups": _principal_groups(team_id, channel_id),
+        **_sender_identity_context(team_id, user_id),
     }
     _dispatch(agent_id, instruction, _principal(team_id, user_id), context, "comment_mention")
 
@@ -328,6 +349,7 @@ def _handle_slash_command(form: dict, team_id: str) -> dict:
         "thread_ts": None,
         "message_ts": None,
         "principal_groups": _principal_groups(team_id, channel_id),
+        **_sender_identity_context(team_id, user_id),
     }
     _dispatch(
         agent_id,
@@ -413,6 +435,7 @@ def _submit_message_agent(payload: dict, view: dict) -> dict:
         "repo": repos[0] if repos else "",
         "repos": repos,
         "principal_groups": _principal_groups(team_id, channel_id),
+        **_sender_identity_context(team_id, user_id),
     }
     _dispatch(
         parsed["agent_id"], instruction, _principal(team_id, user_id),

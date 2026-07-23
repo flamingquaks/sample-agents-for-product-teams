@@ -388,3 +388,121 @@ def test_operator_cannot_approve_request():
     resp = admin.handler(_event("POST", "/admin/channel-requests/{request_id}/approve",
                                 claims=OPERATOR, path={"request_id": "x"}))
     assert resp["statusCode"] == 403
+
+
+# --- friendly label decoration (no raw ids surfaced) -------------------------
+
+
+@mock_aws
+def test_trigger_rules_decorated_with_friendly_labels():
+    """A listed rule carries a subject_label (person name / #channel / group name)
+    and a workspace_label, so the UI never has to show the raw Slack ids."""
+    _make_table()
+    admin = _load_admin()
+    import config_store
+
+    # A workspace with a human name, a named channel, an identity, and a group.
+    admin.handler(_event("POST", "/admin/slack/workspaces",
+                         body={"team_id": TEAM, "team_name": "Acme Corp"}))
+    config_store.put_channel_policy(
+        TEAM, "C0ENG111", mode="allow", channel_name="engineering")
+    config_store.put_identity(
+        email="alice@example.com", display_name="Alice Anderson",
+        handles={"slack": {TEAM: "U0ALICE"}}, status="active")
+    config_store.put_perm_group("edtech-eng", name="EdTech Engineering")
+
+    # user rule (matched by slack handle), channel-group rule, perm-group rule.
+    for body in (
+        {"subject_type": "user", "subject_id": "slack:T0ACME12:U0ALICE"},
+        {"subject_type": "group", "subject_id": f"channel:{TEAM}:C0ENG111"},
+        {"subject_type": "group", "subject_id": "edtech-eng"},
+    ):
+        admin.handler(_event("POST", "/admin/trigger-rules",
+                             body={"connector": "slack", "agent_id": "workitems",
+                                   "workspace": TEAM, "effect": "permit", **body}))
+
+    rules = _body(admin.handler(_event("GET", "/admin/trigger-rules",
+                                       query={"connector": "slack"})))["rules"]
+    by_subject = {r["subject_id"]: r for r in rules}
+    assert by_subject["slack:T0ACME12:U0ALICE"]["subject_label"] == "Alice Anderson"
+    assert by_subject[f"channel:{TEAM}:C0ENG111"]["subject_label"] == "#engineering"
+    assert by_subject["edtech-eng"]["subject_label"] == "EdTech Engineering"
+    assert all(r["workspace_label"] == "Acme Corp" for r in rules)
+
+
+@mock_aws
+def test_trigger_rule_subject_label_falls_back_to_raw_id():
+    """An unknown subject (no matching identity/channel/group) keeps the raw id as
+    its label — a not-yet-enriched row still renders, never blank."""
+    _make_table()
+    admin = _load_admin()
+    admin.handler(_event("POST", "/admin/trigger-rules",
+                         body={"connector": "slack", "subject_type": "user",
+                               "subject_id": "slack:T0ACME12:U0GHOST",
+                               "agent_id": "workitems", "workspace": TEAM,
+                               "effect": "permit"}))
+    rules = _body(admin.handler(_event("GET", "/admin/trigger-rules",
+                                       query={"connector": "slack"})))["rules"]
+    assert rules[0]["subject_label"] == "slack:T0ACME12:U0GHOST"
+
+
+@mock_aws
+def test_person_label_prefers_display_name_then_email():
+    """display_name wins; email is the fallback (the user's stated rule)."""
+    _make_table()
+    admin = _load_admin()
+    import config_store
+
+    config_store.put_identity(
+        email="bob@example.com", handles={"slack": {TEAM: "U0BOB"}}, status="active")
+    admin.handler(_event("POST", "/admin/trigger-rules",
+                         body={"connector": "slack", "subject_type": "user",
+                               "subject_id": "slack:T0ACME12:U0BOB",
+                               "agent_id": "workitems", "workspace": TEAM,
+                               "effect": "permit"}))
+    rules = _body(admin.handler(_event("GET", "/admin/trigger-rules",
+                                       query={"connector": "slack"})))["rules"]
+    assert rules[0]["subject_label"] == "bob@example.com"
+
+
+@mock_aws
+def test_channel_requests_decorated_with_labels():
+    """The approval queue shows the requester's name + a #channel + workspace
+    name, not the raw slack:T:U principal."""
+    _make_table()
+    admin = _load_admin()
+    import config_store
+
+    admin.handler(_event("POST", "/admin/slack/workspaces",
+                         body={"team_id": TEAM, "team_name": "Acme Corp"}))
+    config_store.put_identity(
+        display_name="Carol Cortez", handles={"slack": {TEAM: "U0CAROL"}}, status="active")
+    config_store.put_channel_request(
+        team_id=TEAM, channel_id="C0ENG111",
+        requested_by=f"slack:{TEAM}:U0CAROL", requested_agents=["workitems"])
+
+    reqs = _body(admin.handler(_event("GET", "/admin/channel-requests",
+                                      query={"status": "pending"})))["requests"]
+    assert reqs[0]["requested_by_label"] == "Carol Cortez"
+    assert reqs[0]["workspace_label"] == "Acme Corp"
+    # channel_name was unset → the #channel fallback label is provided
+    assert reqs[0]["channel_label"] == "C0ENG111"  # no channel policy row yet
+
+
+@mock_aws
+def test_notif_subs_decorated_with_channel_and_workspace_labels():
+    _make_table()
+    admin = _load_admin()
+    import config_store
+
+    admin.handler(_event("POST", "/admin/slack/workspaces",
+                         body={"team_id": TEAM, "team_name": "Acme Corp"}))
+    config_store.put_channel_policy(
+        TEAM, "C0ENG111", mode="allow", channel_name="engineering")
+    config_store.put_notif_sub(
+        team_id=TEAM, channel_id="C0ENG111", repos=[], tiers={},
+        min_severity="informative")
+
+    subs = _body(admin.handler(_event("GET", "/admin/notif-subs")))["subscriptions"]
+    assert subs[0]["channel_label"] == "#engineering"
+    assert subs[0]["workspace_label"] == "Acme Corp"

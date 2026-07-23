@@ -1015,6 +1015,13 @@ def list_channels(team_id: str) -> list[dict]:
     return rows
 
 
+def list_all_channels() -> list[dict]:
+    """Every workspace's channel-policy rows (not scoped to one team). Used by the
+    admin API's label directory to resolve ``channel:<team>:<chan>`` subjects to
+    ``#channel-name`` across all workspaces in a single Query."""
+    return _query_kind("slack_channel")
+
+
 def put_channel_policy(
     team_id: str,
     channel_id: str,

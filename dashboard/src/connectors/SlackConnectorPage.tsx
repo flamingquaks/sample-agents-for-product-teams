@@ -276,9 +276,13 @@ function RequestsTab({ api, onAuthError }: ConnectorPageProps) {
         <tbody>
           {requests.map((r) => (
             <tr key={r.request_id}>
-              <td>{r.channel_name || <code>{r.channel_id}</code>}</td>
-              <td><code>{r.team_id}</code></td>
-              <td><code>{r.requested_by}</code></td>
+              <td>{r.channel_name || r.channel_label || <code>{r.channel_id}</code>}</td>
+              <td>{r.workspace_label || <code>{r.team_id}</code>}</td>
+              <td>
+                {r.requested_by_label && r.requested_by_label !== r.requested_by
+                  ? r.requested_by_label
+                  : <code>{r.requested_by}</code>}
+              </td>
               <td>
                 {r.requested_agents.length
                   ? r.requested_agents.join(", ")
@@ -514,8 +518,8 @@ function NotificationsTab({ api, onAuthError }: ConnectorPageProps) {
         <tbody>
           {subs.map((s) => (
             <tr key={`${s.team_id}#${s.channel_id}`}>
-              <td><code>{s.channel_id}</code></td>
-              <td><code>{s.team_id}</code></td>
+              <td>{s.channel_label && s.channel_label !== s.channel_id ? s.channel_label : <code>{s.channel_id}</code>}</td>
+              <td>{s.workspace_label || <code>{s.team_id}</code>}</td>
               <td>{s.repos.length ? s.repos.join(", ") : "—"}</td>
               <td>{tierSummary(s)}</td>
               <td>

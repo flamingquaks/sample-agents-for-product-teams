@@ -105,7 +105,12 @@ export function UsersPanel({
               {pending.map((req) => (
                 <tr key={req.request_id}>
                   <td>{req.source}</td>
-                  <td>{req.proposed_email || req.display_name || req.identity_id}</td>
+                  <td>
+                    {req.display_name || req.proposed_email || req.identity_id}
+                    {req.display_name && req.proposed_email && (
+                      <div className="muted" style={{ fontSize: 12 }}>{req.proposed_email}</div>
+                    )}
+                  </td>
                   <td>
                     <select
                       multiple
@@ -151,6 +156,7 @@ export function UsersPanel({
           <table>
             <thead>
               <tr>
+                <th>Name</th>
                 <th>Email</th>
                 <th>Handles</th>
                 <th>Groups</th>
@@ -160,6 +166,7 @@ export function UsersPanel({
             <tbody>
               {allIdentities.map((id) => (
                 <tr key={id.identity_id}>
+                  <td>{id.display_name || "—"}</td>
                   <td>{id.email || "—"}</td>
                   <td className="handles">{handleKeys(id)}</td>
                   <td>{id.groups.join(", ") || "—"}</td>

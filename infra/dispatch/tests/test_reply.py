@@ -141,3 +141,49 @@ def test_post_slack_message_missing_args():
 def test_slack_bot_token_param_layout(monkeypatch):
     monkeypatch.setenv("STAGE", "gamma")
     assert reply.slack_bot_token_param("T0ACME12") == "/sdlc-agents/gamma/slack/T0ACME12/bot-token"
+
+
+def test_slack_user_profile_prefers_display_name(monkeypatch):
+    monkeypatch.setenv("STAGE", "test")
+    resp = _mock_response()
+    resp.json = lambda: {"ok": True, "user": {"real_name": "Alice A.",
+                         "profile": {"display_name": "alice", "real_name": "Alice A.",
+                                     "email": "alice@example.com"}}}
+    with patch.object(reply.requests, "get", return_value=resp) as mock_get:
+        out = reply.slack_user_profile("T0ACME12", "U0ALICE")
+    assert out == {"display_name": "alice", "email": "alice@example.com"}
+    kw = mock_get.call_args.kwargs
+    assert kw["params"] == {"user": "U0ALICE"}
+    assert kw["headers"]["Authorization"] == "Bearer fake-token"
+
+
+def test_slack_user_profile_falls_back_to_real_name(monkeypatch):
+    # A user who never set a display_name: real_name is the label.
+    monkeypatch.setenv("STAGE", "test")
+    resp = _mock_response()
+    resp.json = lambda: {"ok": True, "user": {"profile": {"display_name": "",
+                         "real_name": "Bob Barker", "email": ""}}}
+    with patch.object(reply.requests, "get", return_value=resp):
+        out = reply.slack_user_profile("T0ACME12", "U0BOB")
+    assert out == {"display_name": "Bob Barker", "email": ""}
+
+
+def test_slack_user_profile_logical_error_returns_empty(monkeypatch):
+    monkeypatch.setenv("STAGE", "test")
+    resp = _mock_response()
+    resp.json = lambda: {"ok": False, "error": "user_not_found"}
+    with patch.object(reply.requests, "get", return_value=resp):
+        assert reply.slack_user_profile("T0ACME12", "U0GHOST") == {"display_name": "", "email": ""}
+
+
+def test_slack_user_profile_missing_args():
+    assert reply.slack_user_profile("", "U0ALICE") == {"display_name": "", "email": ""}
+    assert reply.slack_user_profile("T0ACME12", "") == {"display_name": "", "email": ""}
+
+
+def test_slack_user_profile_swallows_http_error(monkeypatch):
+    import requests
+
+    monkeypatch.setenv("STAGE", "test")
+    with patch.object(reply.requests, "get", side_effect=requests.RequestException("boom")):
+        assert reply.slack_user_profile("T0ACME12", "U0ALICE") == {"display_name": "", "email": ""}

@@ -203,8 +203,12 @@ export interface TriggerRule {
   connector: "slack" | "asana" | "github";
   subject_type: "user" | "group";
   subject_id: string;
+  /** Human label for subject_id (person name / #channel / group name), server-resolved. */
+  subject_label?: string;
   agent_id: string;
   workspace: string;
+  /** Human workspace name for a concrete (non-"*") workspace, server-resolved. */
+  workspace_label?: string;
   effect: "permit" | "forbid";
   created_by?: string;
   created_at?: number;
@@ -216,7 +220,13 @@ export interface ChannelRequest {
   team_id: string;
   channel_id: string;
   channel_name?: string;
+  /** #channel-name fallback when channel_name is unset, server-resolved. */
+  channel_label?: string;
   requested_by: string;
+  /** Human name for requested_by (display name / email), server-resolved. */
+  requested_by_label?: string;
+  /** Human workspace name, server-resolved. */
+  workspace_label?: string;
   requested_agents: string[];
   /** Repos the requester asked to work on from this channel (spec §19). */
   requested_repos?: string[];
@@ -280,6 +290,10 @@ export interface PermGroup {
 export interface NotifSub {
   team_id: string;
   channel_id: string;
+  /** #channel-name, server-resolved (falls back to the raw id). */
+  channel_label?: string;
+  /** Human workspace name, server-resolved. */
+  workspace_label?: string;
   repos: string[];
   tiers: { actionable?: string[]; informative?: string[]; error?: string[] };
   min_severity: "informative" | "actionable" | "error";

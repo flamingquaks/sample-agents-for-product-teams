@@ -150,6 +150,54 @@ def post_slack_message_ts(
         return False, None
 
 
+def slack_user_profile(team_id: str, user_id: str) -> dict:
+    """Fetch a Slack user's profile via ``users.info`` — the workspace's
+    AUTHENTICATED directory, so the display name + email it returns are verified
+    (identity.py §16.5 / T-42: only such a source may seed the golden-join email).
+
+    Returns ``{"display_name": ..., "email": ...}`` with whatever was resolvable;
+    empty strings on any miss. Best-effort like the other Slack calls: a failed
+    lookup must not block dispatch (the caller degrades to the raw handle). Slack
+    returns HTTP 200 even on a logical error (``{"ok": false}``), so we check
+    ``ok``. Requires the ``users:read`` + ``users:read.email`` scopes the app
+    manifest already requests."""
+    if not team_id or not user_id:
+        return {"display_name": "", "email": ""}
+    token = _get_secret(slack_bot_token_param(team_id))
+    if not token:
+        return {"display_name": "", "email": ""}
+    try:
+        response = requests.get(
+            f"{SLACK_API}/users.info",
+            params={"user": user_id},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not data.get("ok"):
+            logger.error(
+                "Slack users.info rejected for %s/%s: %s",
+                team_id,
+                user_id,
+                data.get("error", "unknown"),
+            )
+            return {"display_name": "", "email": ""}
+        profile = (data.get("user") or {}).get("profile") or {}
+        # Prefer the user's chosen display name, then their real name; Slack
+        # leaves display_name blank when the user never set one.
+        display_name = (
+            profile.get("display_name")
+            or profile.get("real_name")
+            or (data.get("user") or {}).get("real_name")
+            or ""
+        ).strip()
+        return {"display_name": display_name, "email": (profile.get("email") or "").strip()}
+    except (requests.RequestException, ValueError) as exc:
+        logger.error("Failed to fetch Slack profile for %s/%s: %s", team_id, user_id, exc)
+        return {"display_name": "", "email": ""}
+
+
 def _github_token(repo: str) -> Optional[str]:
     """The GitHub bearer token for posting to ``repo``: a per-owner GitHub App
     installation token (bounded to that owner's installed repos — threat-model

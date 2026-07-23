@@ -1251,6 +1251,114 @@ def _channel_granted_repos(team_id: str, channel_id: str) -> set[str]:
     return {r["repo"] for r in config_store.list_repos() if r.get("enabled")}
 
 
+class _LabelDirectory:
+    """Turns the raw ids that trigger rules / channel rows / requests store into
+    the human labels the dashboard shows — so an admin never sees a bare Slack
+    ``T…:U…`` or ``C…`` id. Built once per request from a bounded set of Queries
+    (identities, all channels, workspaces, groups) and reused across every row
+    being decorated, so decorating N rows is a handful of reads, not N×4.
+
+    The label vocabulary, all with a graceful fallback to the raw id so a
+    not-yet-enriched row still renders something meaningful:
+
+      - person   ``slack:T:U`` / ``github:login`` / ``asana:gid`` / email
+                 → the identity's ``display_name``, else its ``email``, else the
+                   raw handle (display_name is the verified Slack name we now
+                   capture; email is the golden fallback — the user's stated rule)
+      - channel  ``channel:T:C`` (a group subject) → ``#channel-name``
+      - group    a permission-group id → the group's human ``name``
+      - workspace ``T…`` team id → the workspace ``team_name``
+    """
+
+    def __init__(self) -> None:
+        self._people: dict[str, str] = {}  # handle_key OR email(casefold) -> label
+        self._channels: dict[str, str] = {}  # "channel:T:C" -> "#name"
+        self._workspaces: dict[str, str] = {}  # team_id -> team_name
+        self._groups: dict[str, str] = {}  # group_id -> name
+        self._built = False
+
+    def _build(self) -> None:
+        if self._built:
+            return
+        self._built = True
+        for ident in config_store.list_identities():
+            label = (ident.get("display_name") or "").strip() or (ident.get("email") or "").strip()
+            if not label:
+                continue
+            for hk in ident.get("handle_keys") or []:
+                self._people.setdefault(hk, label)
+            email = (ident.get("email") or "").strip().casefold()
+            if email:
+                self._people.setdefault(email, label)
+        for ch in config_store.list_all_channels():
+            name = (ch.get("channel_name") or "").strip()
+            if name:
+                key = f"channel:{ch.get('team_id', '')}:{ch.get('channel_id', '')}"
+                self._channels[key] = name if name.startswith("#") else f"#{name}"
+        for ws in config_store.list_slack_workspaces():
+            name = (ws.get("team_name") or "").strip()
+            if name:
+                self._workspaces[ws.get("team_id", "")] = name
+        for g in config_store.list_perm_groups():
+            name = (g.get("name") or "").strip()
+            if name:
+                self._groups[g.get("group_id", "")] = name
+
+    def person(self, principal: str) -> str:
+        """Friendly name for a user subject/principal, else the raw id."""
+        self._build()
+        key = (principal or "").strip()
+        if not key:
+            return key
+        return self._people.get(key) or self._people.get(key.casefold()) or key
+
+    def channel(self, subject: str) -> str:
+        """``#channel-name`` for a ``channel:T:C`` group subject, else the raw id."""
+        self._build()
+        return self._channels.get((subject or "").strip(), subject)
+
+    def group(self, group_id: str) -> str:
+        self._build()
+        return self._groups.get((group_id or "").strip(), group_id)
+
+    def workspace(self, team_id: str) -> str:
+        self._build()
+        return self._workspaces.get((team_id or "").strip(), team_id)
+
+    def channel_id(self, team_id: str, channel_id: str) -> str:
+        """``#name`` for a (team, channel) pair, else the raw channel id."""
+        self._build()
+        return self._channels.get(f"channel:{team_id}:{channel_id}", channel_id)
+
+    def subject(self, subject_type: str, subject_id: str) -> str:
+        """The label for a trigger-rule subject, dispatching on its type. A
+        ``group`` subject is either a channel group (``channel:T:C``) or a named
+        permission group; a ``user`` subject is a person principal."""
+        if subject_type == config_store.RULE_SUBJECT_GROUP:
+            if (subject_id or "").startswith("channel:"):
+                return self.channel(subject_id)
+            return self.group(subject_id)
+        return self.person(subject_id)
+
+
+def _decorate_trigger_rules(rules: list[dict], directory: _LabelDirectory) -> list[dict]:
+    """Attach a ``subject_label`` (and, for a Slack rule, ``workspace_label``) to
+    each rule so the UI can show ``#channel-name`` / a person's name / a group
+    name instead of a raw id. Non-destructive: the raw ids stay on the row (the
+    UI keeps them as secondary text / for edits)."""
+    out = []
+    for r in rules:
+        row = dict(r)
+        row["subject_label"] = directory.subject(
+            r.get("subject_type", ""), r.get("subject_id", "")
+        )
+        ws = r.get("workspace", "")
+        if ws and ws != "*":
+            row["workspace_label"] = directory.workspace(ws)
+        out.append(row)
+    return out
+
+
 def _route(event: dict) -> dict:
     resource = event.get("resource", "")
     method = event.get("httpMethod", "")
@@ -1645,7 +1753,8 @@ def _route(event: dict) -> dict:
     if resource == "/admin/trigger-rules":
         if method == "GET":
             connector = (event.get("queryStringParameters") or {}).get("connector")
-            return ok({"rules": config_store.list_trigger_rules(connector)})
+            rules = config_store.list_trigger_rules(connector)
+            return ok({"rules": _decorate_trigger_rules(rules, _LabelDirectory())})
         if method == "POST":
             try:
                 rec = config_store.put_trigger_rule(
@@ -1674,7 +1783,19 @@ def _route(event: dict) -> dict:
     if resource == "/admin/channel-requests":
         if method == "GET":
             status = (event.get("queryStringParameters") or {}).get("status")
-            return ok({"requests": config_store.list_channel_requests(status)})
+            requests_ = config_store.list_channel_requests(status)
+            directory = _LabelDirectory()
+            decorated = []
+            for req in requests_:
+                row = dict(req)
+                row["requested_by_label"] = directory.person(req.get("requested_by", ""))
+                row["workspace_label"] = directory.workspace(req.get("team_id", ""))
+                if not (req.get("channel_name") or "").strip():
+                    row["channel_label"] = directory.channel_id(
+                        req.get("team_id", ""), req.get("channel_id", "")
+                    )
+                decorated.append(row)
+            return ok({"requests": decorated})
 
     if resource in ("/admin/channel-requests/{request_id}/approve",
                     "/admin/channel-requests/{request_id}/deny"):
@@ -1778,7 +1899,17 @@ def _route(event: dict) -> dict:
     if resource == "/admin/notif-subs":
         if method == "GET":
             team_id = (event.get("queryStringParameters") or {}).get("team_id")
-            return ok({"subscriptions": config_store.list_notif_subs(team_id)})
+            subs = config_store.list_notif_subs(team_id)
+            directory = _LabelDirectory()
+            decorated = []
+            for s in subs:
+                row = dict(s)
+                row["channel_label"] = directory.channel_id(
+                    s.get("team_id", ""), s.get("channel_id", "")
+                )
+                row["workspace_label"] = directory.workspace(s.get("team_id", ""))
+                decorated.append(row)
+            return ok({"subscriptions": decorated})
         if method == "POST":
             team_id = (body.get("team_id") or "").strip()
             channel_id = (body.get("channel_id") or "").strip()
