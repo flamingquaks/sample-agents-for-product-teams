@@ -317,7 +317,9 @@ function RequestsTab({ api, onAuthError }: ConnectorPageProps) {
 // so a bare "Approve" of an "any" request 400s. This dialog makes the admin pick
 // exactly which fleet agents the channel gets, defaulting to the ones the user
 // asked for (minus any wildcard). It loads the live capability list so the admin
-// picks from real agents, not free text.
+// picks from real agents, not free text. It ALSO scopes the channel's approved
+// direct-work repos (spec §19) — the set a /sdlc-message-agent dispatch from the
+// channel may name; grouped siblings stay reachable via co-repo mechanics only.
 function ApproveChannelDialog({
   api, request, onClose, onDone, onAuthError,
 }: {
@@ -331,8 +333,14 @@ function ApproveChannelDialog({
   const caps = usePolling<{ capabilities: CapabilityConfig[] }>(() => api.listCapabilities(), {
     isActive: () => false, deps: [api], onError: handleErr,
   });
+  const repoPoll = usePolling<{ repos: { repo: string }[] }>(() => api.listRepos(), {
+    isActive: () => false, deps: [api], onError: handleErr,
+  });
   const [selected, setSelected] = useState<Set<string>>(
     () => new Set(request.requested_agents.filter((a) => a && a !== "*")),
+  );
+  const [selectedRepos, setSelectedRepos] = useState<Set<string>>(
+    () => new Set(request.requested_repos ?? []),
   );
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -360,6 +368,15 @@ function ApproveChannelDialog({
     if (err) setErr(null);
   };
 
+  const toggleRepo = (repo: string) => {
+    setSelectedRepos((prev) => {
+      const next = new Set(prev);
+      if (next.has(repo)) next.delete(repo); else next.add(repo);
+      return next;
+    });
+  };
+
+  const fleetRepos = repoPoll.data?.repos ?? [];
   const channel = request.channel_name || request.channel_id;
   const submit = async () => {
     const chosen = [...selected];
@@ -370,7 +387,7 @@ function ApproveChannelDialog({
     setBusy(true);
     setErr(null);
     try {
-      await api.approveChannelRequest(request.request_id, chosen);
+      await api.approveChannelRequest(request.request_id, chosen, [...selectedRepos]);
       onDone(channel, chosen);
     } catch (e) {
       setErr(e instanceof ApiError ? e.message : (e as Error).message);
@@ -408,6 +425,32 @@ function ApproveChannelDialog({
           ))}
           {agents.length === 0 && caps.data !== null && (
             <p className="muted">No agents onboarded yet — onboard an agent first.</p>
+          )}
+        </div>
+
+        <p className="muted" style={{ marginTop: 12, marginBottom: 4 }}>
+          <b>Repositories this channel may work on</b> — what <code>/sdlc-message-agent</code>{" "}
+          from #{channel} can target. Repos grouped with an approved repo are reachable by the
+          agent while working an approved repo, but can't be targeted directly unless approved
+          here. Leave empty for agent-only (no-repo) work.
+        </p>
+        <div className="repo-picker" role="listbox" aria-multiselectable="true">
+          {fleetRepos.map((r) => (
+            <label key={r.repo} className="field-inline" style={{ display: "block" }}>
+              <input
+                type="checkbox"
+                checked={selectedRepos.has(r.repo)}
+                disabled={busy}
+                onChange={() => toggleRepo(r.repo)}
+              />{" "}
+              <code>{r.repo}</code>
+              {(request.requested_repos ?? []).includes(r.repo) && (
+                <span className="muted"> · requested</span>
+              )}
+            </label>
+          ))}
+          {fleetRepos.length === 0 && repoPoll.data !== null && (
+            <p className="muted">No repositories onboarded to the fleet yet.</p>
           )}
         </div>
 

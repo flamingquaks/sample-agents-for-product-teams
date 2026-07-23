@@ -33,12 +33,13 @@ def _sign(body: str, secret=SECRET, ts=None):
     return {"x-slack-request-timestamp": ts, "x-slack-signature": sig}
 
 
-def _fresh(monkeypatch, *, secret=SECRET, ws_enabled=True):
-    for m in ("slack_webhook", "trigger_grants", "mentions", "reply"):
+def _fresh(monkeypatch, *, secret=SECRET, ws_enabled=True, channel_repos=None):
+    for m in ("slack_webhook", "trigger_grants", "mentions", "reply", "slack_modals", "slack_notify"):
         sys.modules.pop(m, None)
     import slack_webhook as sw
 
-    state = {"dispatched": [], "requests": [], "seen": set()}
+    state = {"dispatched": [], "requests": [], "seen": set(),
+             "modals": [], "posted": []}
 
     class _ParamNotFound(Exception):
         pass
@@ -75,7 +76,41 @@ def _fresh(monkeypatch, *, secret=SECRET, ws_enabled=True):
     # a delivery that fails mid-process is never marked and Slack's retry runs.
     monkeypatch.setattr(sw, "_already_seen", lambda eid: bool(eid) and eid in state["seen"])
     monkeypatch.setattr(sw, "_mark_seen", lambda eid: eid and state["seen"].add(eid))
+    # Modal plumbing: capture views.open + visible confirmations; channel repo
+    # grants come from the fixture arg.
+    monkeypatch.setattr(
+        sw.slack_notify, "open_modal",
+        lambda **kw: state["modals"].append(kw) or True,
+    )
+    monkeypatch.setattr(sw.slack_notify, "onboarded_repos", lambda: ["acme/web", "acme/api"])
+    monkeypatch.setattr(
+        sw.trigger_grants, "channel_repos",
+        lambda t, c: list(channel_repos or []),
+    )
+    monkeypatch.setattr(
+        sw.reply, "post_slack_message",
+        lambda team, chan, text, thread_ts=None: state["posted"].append(
+            {"team": team, "channel": chan, "text": text}) or True,
+    )
     return sw, state
+
+
+def _interaction_event(payload, *, secret=SECRET, ts=None):
+    body = urlencode({"payload": json.dumps(payload)})
+    return {"resource": "/slack/interactions", "headers": _sign(body, secret, ts), "body": body}
+
+
+def _view_submission(callback_id, private_metadata, values, user="U0ALICE"):
+    return {
+        "type": "view_submission",
+        "team": {"id": TEAM},
+        "user": {"id": user},
+        "view": {
+            "callback_id": callback_id,
+            "private_metadata": json.dumps(private_metadata),
+            "state": {"values": values},
+        },
+    }
 
 
 def _events_event(body_obj, *, secret=SECRET, ts=None):
@@ -252,13 +287,108 @@ def test_onboard_channel_files_request(monkeypatch):
     assert req["requested_agents"] == ["workitems", "researcher"]
 
 
-def test_onboard_channel_no_scope_means_any(monkeypatch):
+def test_onboard_channel_without_text_opens_modal(monkeypatch):
+    # Bare /sdlc-onboard-channel is now interactive: it opens the agent+repo
+    # picker modal instead of filing an unscoped request.
     sw, state = _fresh(monkeypatch)
     ev = _command_event({"command": "/sdlc-onboard-channel", "text": "",
                          "team_id": TEAM, "user_id": "U1", "channel_id": "C0ENG",
-                         "channel_name": "eng"})
-    sw.handler(ev)
-    assert state["requests"][0]["requested_agents"] == []
+                         "channel_name": "eng", "trigger_id": "trig.1"})
+    resp = sw.handler(ev)
+    assert resp["statusCode"] == 200
+    assert state["requests"] == []  # nothing filed yet — the modal submit files
+    assert len(state["modals"]) == 1
+    view = state["modals"][0]["view"]
+    assert view["callback_id"] == "sdlc_onboard_channel"
+    meta = json.loads(view["private_metadata"])
+    assert meta["channel_id"] == "C0ENG"
+    assert meta["repos"] == ["acme/web", "acme/api"]
+    assert meta["agents"] == ["workitems"]  # from the registry
+
+
+def test_onboard_modal_submit_files_request_and_posts(monkeypatch):
+    sw, state = _fresh(monkeypatch)
+    import slack_modals
+
+    meta = {"team_id": TEAM, "channel_id": "C0ENG", "channel_name": "eng",
+            "agents": ["workitems", "researcher"], "repos": ["acme/web", "acme/api"]}
+    values = {
+        "agents": {"selected": {"selected_options": [{"value": "0"}]}},
+        "repos": {"selected": {"selected_options": [{"value": "1"}]}},
+    }
+    ev = _interaction_event(
+        _view_submission(slack_modals.ONBOARD_VIEW_CALLBACK, meta, values))
+    resp = sw.handler(ev)
+    assert resp["statusCode"] == 200
+    assert len(state["requests"]) == 1
+    req = state["requests"][0]
+    assert req["requested_agents"] == ["workitems"]
+    assert req["requested_repos"] == ["acme/api"]
+    assert req["requested_by"] == "slack:T0ACME12:U0ALICE"
+    # Visible in-channel confirmation posted.
+    assert state["posted"] and state["posted"][0]["channel"] == "C0ENG"
+
+
+def test_message_agent_command_opens_modal_with_channel_repos(monkeypatch):
+    sw, state = _fresh(monkeypatch, channel_repos=["acme/web"])
+    ev = _command_event({"command": "/sdlc-message-agent", "text": "",
+                         "team_id": TEAM, "user_id": "U1", "channel_id": "C0ENG",
+                         "channel_name": "eng", "trigger_id": "trig.2"})
+    resp = sw.handler(ev)
+    assert resp["statusCode"] == 200
+    view = state["modals"][0]["view"]
+    assert view["callback_id"] == "sdlc_message_agent"
+    meta = json.loads(view["private_metadata"])
+    # Only the CHANNEL'S approved repos are offered, not the whole fleet.
+    assert meta["repos"] == ["acme/web"]
+
+
+def test_message_agent_submit_dispatches_and_posts_visibly(monkeypatch):
+    sw, state = _fresh(monkeypatch, channel_repos=["acme/web"])
+    import slack_modals
+
+    meta = {"team_id": TEAM, "channel_id": "C0ENG", "channel_name": "eng",
+            "agents": ["workitems"], "repos": ["acme/web"]}
+    values = {
+        "agent": {"selected": {"selected_option": {"value": "0"}}},
+        "repos": {"selected": {"selected_options": [{"value": "0"}]}},
+        "message": {"text": {"value": "Plan the sprint"}},
+    }
+    ev = _interaction_event(
+        _view_submission(slack_modals.MESSAGE_VIEW_CALLBACK, meta, values))
+    resp = sw.handler(ev)
+    assert resp["statusCode"] == 200
+    assert len(state["dispatched"]) == 1
+    d = state["dispatched"][0]
+    assert d["agent_id"] == "workitems"
+    assert d["sender"] == "slack:T0ACME12:U0ALICE"
+    # The first selected repo anchors the dispatch origin for co-repo mechanics.
+    assert d["context"]["repo"] == "acme/web"
+    assert d["context"]["repos"] == ["acme/web"]
+    assert "Plan the sprint" in d["instruction"]
+    # Visible in-channel confirmation.
+    assert state["posted"] and "workitems" in state["posted"][0]["text"]
+
+
+def test_message_agent_submit_rejects_revoked_repo(monkeypatch):
+    # The grant may be revoked between modal open and submit — the submit
+    # re-checks the LIVE channel grant and keeps the modal open with an error.
+    sw, state = _fresh(monkeypatch, channel_repos=[])  # revoked by submit time
+    import slack_modals
+
+    meta = {"team_id": TEAM, "channel_id": "C0ENG", "channel_name": "eng",
+            "agents": ["workitems"], "repos": ["acme/web"]}
+    values = {
+        "agent": {"selected": {"selected_option": {"value": "0"}}},
+        "repos": {"selected": {"selected_options": [{"value": "0"}]}},
+        "message": {"text": {"value": "Plan"}},
+    }
+    ev = _interaction_event(
+        _view_submission(slack_modals.MESSAGE_VIEW_CALLBACK, meta, values))
+    resp = sw.handler(ev)
+    body = json.loads(resp["body"])
+    assert body["response_action"] == "errors"
+    assert state["dispatched"] == []
 
 
 def test_slash_command_unknown_agent_ephemeral(monkeypatch):

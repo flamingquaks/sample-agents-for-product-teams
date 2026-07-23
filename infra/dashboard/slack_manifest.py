@@ -11,9 +11,10 @@ token is still an out-of-band operator step (the admin Lambda does not hold
 """
 
 # Slash commands + notify command names must match the receiver's defaults
-# (slack_webhook.ONBOARD_COMMAND / NOTIFY_COMMAND).
+# (slack_webhook.ONBOARD_COMMAND / NOTIFY_COMMAND / MESSAGE_COMMAND).
 ONBOARD_COMMAND = "sdlc-onboard-channel"
 NOTIFY_COMMAND = "sdlc-notify"
+MESSAGE_COMMAND = "sdlc-message-agent"
 
 
 def build_manifest(webhook_base: str, app_name: str = "SDLC Agent Fleet") -> dict:
@@ -33,7 +34,7 @@ def build_manifest(webhook_base: str, app_name: str = "SDLC Agent Fleet") -> dic
                     "command": f"/{ONBOARD_COMMAND}",
                     "url": f"{base}/slack/commands",
                     "description": "Request this channel be onboarded for fleet agents",
-                    "usage_hint": "[agent ...]",
+                    "usage_hint": "",
                     "should_escape": False,
                 },
                 {
@@ -44,10 +45,10 @@ def build_manifest(webhook_base: str, app_name: str = "SDLC Agent Fleet") -> dic
                     "should_escape": False,
                 },
                 {
-                    "command": "/fleet",
+                    "command": f"/{MESSAGE_COMMAND}",
                     "url": f"{base}/slack/commands",
-                    "description": "Dispatch a fleet agent",
-                    "usage_hint": "@agent your instruction",
+                    "description": "Message a fleet agent (guided form)",
+                    "usage_hint": "",
                     "should_escape": False,
                 },
             ],

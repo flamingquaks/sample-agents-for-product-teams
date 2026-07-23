@@ -39,6 +39,7 @@ import boto3
 
 import mentions
 import reply
+import slack_modals
 import slack_notify
 import trigger_grants
 
@@ -48,11 +49,14 @@ logger.setLevel(logging.INFO)
 DISPATCH_FUNCTION = os.environ.get("DISPATCH_FUNCTION", "dispatch-router")
 REGISTRY_PARAM = os.environ.get("REGISTRY_PARAM", "/dispatch/agents")
 STAGE = os.environ.get("STAGE", "dev")
-# Slash command that files a channel-onboarding REQUEST (leading slash stripped
-# by Slack; we match on the bare name).
+# Slash command that opens the channel-onboarding request modal (leading slash
+# stripped by Slack; we match on the bare name).
 ONBOARD_COMMAND = os.environ.get("SLACK_ONBOARD_COMMAND", "sdlc-onboard-channel")
 # Slash command that opens the interactive notification-config modal (spec §18).
 NOTIFY_COMMAND = os.environ.get("SLACK_NOTIFY_COMMAND", "sdlc-notify")
+# Slash command that opens the message-an-agent modal (spec §19) — replaces the
+# "/fleet @agent …" form, whose @ collided with Slack's user tagging.
+MESSAGE_COMMAND = os.environ.get("SLACK_MESSAGE_COMMAND", "sdlc-message-agent")
 # How long to remember an event_id for de-duplication.
 _DEDUP_TTL_SECONDS = 24 * 60 * 60
 
@@ -234,26 +238,68 @@ def _ack(text: str = "") -> dict:
     return {"statusCode": 200, "body": text}
 
 
+def _registry_agent_ids() -> list[str]:
+    """The routable agent ids from the live registry (for modal dropdowns)."""
+    return sorted((_registry.load() or {}).get("agents", {}).keys())
+
+
 def _handle_slash_command(form: dict, team_id: str) -> dict:
-    """Route a slash command. ``/sdlc-onboard-channel`` files a request; any other
-    configured command carries an @mention we dispatch. Returns the HTTP response
-    (ephemeral so only the invoking user sees it)."""
+    """Route a slash command. Every command opens an interactive modal
+    (``views.open`` on the ~3s trigger_id):
+
+      - ``/sdlc-onboard-channel`` — agent + repo pickers → files a pending
+        channel_request an admin approves in the dashboard.
+      - ``/sdlc-message-agent``  — agent dropdown + the channel's APPROVED
+        repos + a message → dispatches, then posts a visible in-channel
+        confirmation. Replaces ``/fleet @agent …`` (@ collided with user tags).
+      - ``/sdlc-notify``         — the notification-config modal (spec §18).
+
+    Legacy ``/fleet @agent …`` text dispatch still works when invoked WITH text
+    (back-compat during migration), but its empty invocation now points at the
+    new command."""
     command = (form.get("command", [""])[0] or "").lstrip("/")
     text = form.get("text", [""])[0] or ""
     user_id = form.get("user_id", [""])[0] or ""
     channel_id = form.get("channel_id", [""])[0] or ""
     channel_name = form.get("channel_name", [""])[0] or ""
+    trigger_id = form.get("trigger_id", [""])[0] or ""
 
     if command == ONBOARD_COMMAND:
-        msg = _record_channel_request(team_id, channel_id, channel_name, user_id, text)
-        return _ephemeral(msg)
+        # Back-compat: explicit text args still file directly (scripts/docs).
+        if text.strip():
+            msg = _record_channel_request(team_id, channel_id, channel_name, user_id, text)
+            return _ephemeral(msg)
+        view = slack_modals.build_onboard_modal(
+            team_id=team_id,
+            channel_id=channel_id,
+            channel_name=channel_name,
+            agents=_registry_agent_ids(),
+            repos=slack_notify.onboarded_repos(),
+        )
+        if not slack_notify.open_modal(team_id=team_id, trigger_id=trigger_id, view=view):
+            return _ephemeral("Couldn't open the onboarding form — please try again.")
+        return _ack()
+
+    if command == MESSAGE_COMMAND:
+        agents = _registry_agent_ids()
+        if not agents:
+            return _ephemeral("No agents are live yet — ask an admin to enable one.")
+        view = slack_modals.build_message_modal(
+            team_id=team_id,
+            channel_id=channel_id,
+            channel_name=channel_name,
+            agents=agents,
+            channel_repos=trigger_grants.channel_repos(team_id, channel_id),
+        )
+        if not slack_notify.open_modal(team_id=team_id, trigger_id=trigger_id, view=view):
+            return _ephemeral("Couldn't open the message form — please try again.")
+        return _ack()
 
     if command == NOTIFY_COMMAND:
         # Open the interactive notification-config modal. The slash-command
         # payload carries a trigger_id (valid ~3s); views.open must use it
         # promptly, so we open here and return an empty 200 (Slack shows the
         # modal, no ephemeral text needed).
-        trigger_id = form.get("trigger_id", [""])[0] or ""
         view = slack_notify.build_notify_modal(
             team_id=team_id,
             channel_id=channel_id,
@@ -264,12 +310,16 @@ def _handle_slash_command(form: dict, team_id: str) -> dict:
             return _ephemeral("Couldn't open the notification settings — please try again.")
         return _ack()
 
-    # A mention-style command: resolve the agent from the text.
+    # Legacy mention-style command (/fleet @agent …) — kept for back-compat.
+    if not text.strip():
+        return _ephemeral(
+            f"Use `/{MESSAGE_COMMAND}` to message an agent with a guided form."
+        )
     resolved = _registry.resolve_mention(text if text.startswith("@") else f"@{text}")
     if not resolved:
         return _ephemeral(
-            f"No known agent in `/{command} {text}`. Mention an agent, e.g. "
-            f"`/{command} @workitems break this up`."
+            f"No known agent in `/{command} {text}`. Try `/{MESSAGE_COMMAND}` "
+            "for a guided form."
         )
     agent_id, instruction = resolved
     context = {
@@ -292,11 +342,98 @@ def _handle_slash_command(form: dict, team_id: str) -> dict:
 # --- interactivity (Block Kit / modal submits) -------------------------------
 
 
+def _view_errors(errors: dict) -> dict:
+    """A view_submission response that keeps the modal open with field errors."""
+    return {"statusCode": 200, "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"response_action": "errors", "errors": errors})}
+
+
+def _submit_onboard_request(payload: dict, view: dict) -> dict:
+    """Persist the channel-onboarding request from the modal submit."""
+    parsed = slack_modals.parse_onboard_submission(view)
+    user_id = (payload.get("user") or {}).get("id") or ""
+    try:
+        trigger_grants.put_channel_request(
+            team_id=parsed["team_id"],
+            channel_id=parsed["channel_id"],
+            channel_name=parsed["channel_name"],
+            requested_by=_principal(parsed["team_id"], user_id),
+            requested_agents=parsed["requested_agents"],
+            requested_repos=parsed["requested_repos"],
+        )
+    except ValueError as exc:
+        logger.warning("channel request rejected: %s", exc)
+        return _view_errors({"agents": f"Couldn't file the request: {exc}"})
+    # Visible confirmation so the channel knows a request is in flight.
+    scope = ", ".join(parsed["requested_agents"]) or "any agent"
+    repos = ", ".join(parsed["requested_repos"]) or "no repos yet"
+    reply.post_slack_message(
+        parsed["team_id"], parsed["channel_id"],
+        f"📨 <@{user_id}> requested fleet onboarding for this channel "
+        f"(agents: {scope} · repos: {repos}). An admin will review it.",
+    )
+    return _ack()  # close the modal
+
+
+def _submit_message_agent(payload: dict, view: dict) -> dict:
+    """Dispatch the message-agent modal submit, then post a VISIBLE in-channel
+    confirmation (the whole point of the guided form — the channel sees work
+    was kicked off, unlike the old ephemeral-only /fleet)."""
+    parsed = slack_modals.parse_message_submission(view)
+    team_id, channel_id = parsed["team_id"], parsed["channel_id"]
+    user_id = (payload.get("user") or {}).get("id") or ""
+    if not parsed["agent_id"]:
+        return _view_errors({"agent": "Pick an agent."})
+    if not parsed["message"]:
+        return _view_errors({"message": "Enter a message for the agent."})
+
+    # Re-verify the repo scope against the LIVE channel grant. The modal only
+    # OFFERED approved repos, but the grant may have been revoked between open
+    # and submit — enforce at the trust boundary, not just the UI.
+    approved = set(trigger_grants.channel_repos(team_id, channel_id))
+    stale = [r for r in parsed["repos"] if r not in approved]
+    if stale:
+        return _view_errors({
+            "repos": f"No longer approved for this channel: {', '.join(stale)}. "
+            "Re-open the form to refresh.",
+        })
+
+    repos = parsed["repos"]
+    instruction = parsed["message"]
+    if repos:
+        instruction += "\n\nWork against these repositories (approved for this channel): " + ", ".join(repos)
+    context = {
+        "workspace": team_id,
+        "channel_id": channel_id,
+        "thread_ts": None,
+        "message_ts": None,
+        # The FIRST selected repo becomes the dispatch origin — the anchor the
+        # gateway's co-repo grouping enforces reach from (siblings grouped with
+        # it are reachable; unrelated repos are not).
+        "repo": repos[0] if repos else "",
+        "repos": repos,
+        "principal_groups": _principal_groups(team_id, channel_id),
+    }
+    _dispatch(
+        parsed["agent_id"], instruction, _principal(team_id, user_id),
+        context, "slash_command",
+    )
+    # Visible (non-ephemeral) confirmation in the channel.
+    scope = f" · repos: {', '.join(repos)}" if repos else ""
+    preview = parsed["message"][:200] + ("…" if len(parsed["message"]) > 200 else "")
+    reply.post_slack_message(
+        team_id, channel_id,
+        f"🤖 <@{user_id}> sent a message to *{parsed['agent_id']}*{scope}:\n> {preview}",
+    )
+    return _ack()  # close the modal
+
+
 def _handle_interaction(form: dict) -> dict:
     """Route a Slack interactivity payload. Slack sends a single ``payload`` form
-    field holding url-encoded JSON. We handle the /sdlc-notify modal submit
-    (``view_submission`` with our callback_id) and save the subscription; a
-    view_submission must return 200 with an empty body to close the modal."""
+    field holding url-encoded JSON. We handle our three modal submits
+    (``view_submission`` with our callback_ids); a view_submission must return
+    200 with an empty body to close the modal (or response_action:errors to keep
+    it open with field errors)."""
     raw = form.get("payload", [""])[0] or ""
     try:
         payload = json.loads(raw)
@@ -305,18 +442,20 @@ def _handle_interaction(form: dict) -> dict:
     if payload.get("type") != "view_submission":
         return _ack()  # button clicks etc. — no-op for now
     view = payload.get("view", {}) or {}
-    if view.get("callback_id") != slack_notify.NOTIFY_VIEW_CALLBACK:
-        return _ack()
-    # Re-check the workspace is still onboarded before persisting.
+    callback = view.get("callback_id")
+    # Re-check the workspace is still onboarded before acting on any submit.
     team_id = (payload.get("team") or {}).get("id") or ""
     if not trigger_grants.is_workspace_enabled(team_id):
-        return {"statusCode": 200, "body": json.dumps({
-            "response_action": "errors",
-            "errors": {"repos": "This workspace isn't onboarded for the fleet."},
-        })}
-    config = slack_notify.parse_view_submission(view)
-    slack_notify.save_subscription(config)
-    return _ack()  # empty 200 closes the modal
+        return _view_errors({"agents": "This workspace isn't onboarded for the fleet."})
+    if callback == slack_modals.ONBOARD_VIEW_CALLBACK:
+        return _submit_onboard_request(payload, view)
+    if callback == slack_modals.MESSAGE_VIEW_CALLBACK:
+        return _submit_message_agent(payload, view)
+    if callback == slack_notify.NOTIFY_VIEW_CALLBACK:
+        config = slack_notify.parse_view_submission(view)
+        slack_notify.save_subscription(config)
+        return _ack()  # empty 200 closes the modal
+    return _ack()
 
 
 # --- Lambda handler ----------------------------------------------------------

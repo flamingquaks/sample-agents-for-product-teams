@@ -384,9 +384,13 @@ export class DashboardApi {
   approveChannelRequest(
     requestId: string,
     approvedAgents?: string[],
-  ): Promise<{ request: ChannelRequest; created_rules: string[] }> {
+    approvedRepos?: string[],
+  ): Promise<{ request: ChannelRequest; created_rules: string[]; approved_repos?: string[] }> {
+    const body: Record<string, unknown> = {};
+    if (approvedAgents) body.approved_agents = approvedAgents;
+    if (approvedRepos) body.approved_repos = approvedRepos;
     return this.request("POST", `/admin/channel-requests/${encodeURIComponent(requestId)}/approve`, {
-      body: approvedAgents ? { approved_agents: approvedAgents } : {},
+      body,
     });
   }
 

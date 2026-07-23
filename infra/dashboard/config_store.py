@@ -1023,9 +1023,19 @@ def put_channel_policy(
     channel_name: str = "",
     note: str = "",
     created_by: str = "",
+    repos: list[str] | None = None,
 ) -> dict:
     """Create/replace a channel allow|deny row. Raises ValueError on a malformed
-    team/channel id (both flow into Cedar literals) or an invalid mode."""
+    team/channel id (both flow into Cedar literals) or an invalid mode.
+
+    ``repos`` is the channel's approved DIRECT-WORK repo scope (spec §19): the
+    onboarded repos a Slack dispatch from this channel may name as its target.
+    Stored on the allow row (the channel axis' single source of truth) and read
+    by the receiver via trigger_grants.channel_repos. Grouped siblings of an
+    approved repo stay reachable through the agent's co-repo mechanics, but are
+    not directly selectable from the channel unless approved here. Each entry
+    must be an onboarded repo — validated by the caller (admin.py bounds it to
+    list_repos), shape-checked here."""
     if not valid_slack_team(team_id):
         raise ValueError(f"invalid Slack team id {team_id!r}")
     if not valid_slack_channel(channel_id):
@@ -1034,6 +1044,7 @@ def put_channel_policy(
         )
     if mode not in CHANNEL_MODES:
         raise ValueError(f"invalid channel mode {mode!r}")
+    normalized_repos = sorted({_normalize_repo(r) for r in (repos or []) if r and r.strip()})
     item = {
         "pk": _slack_chan_pk(team_id, channel_id),
         "kind": "slack_channel",
@@ -1042,6 +1053,7 @@ def put_channel_policy(
         "channel_name": channel_name,
         "mode": mode,
         "note": note,
+        "repos": normalized_repos,
         "created_by": created_by,
         "created_at": int(time.time()),
     }

@@ -110,7 +110,9 @@ def test_slack_manifest_route(monkeypatch):
     assert m["settings"]["interactivity"]["request_url"] == "https://wh.example.com/test/slack/interactions"
     assert m["settings"]["event_subscriptions"]["request_url"] == "https://wh.example.com/test/slack/events"
     cmds = {c["command"] for c in m["features"]["slash_commands"]}
-    assert cmds == {"/sdlc-onboard-channel", "/sdlc-notify", "/fleet"}
+    # /fleet retired — /sdlc-message-agent (guided modal) replaces it: its
+    # "@agent" arg collided with Slack's user tagging.
+    assert cmds == {"/sdlc-onboard-channel", "/sdlc-notify", "/sdlc-message-agent"}
     assert "users:read.email" in m["oauth_config"]["scopes"]["bot"]
 
 

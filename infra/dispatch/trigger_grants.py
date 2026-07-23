@@ -176,6 +176,7 @@ def put_channel_request(
     channel_name: str = "",
     requested_by: str,
     requested_agents=None,
+    requested_repos=None,
 ) -> None:
     """Write a pending channel-onboarding request from the Slack receiver.
 
@@ -197,6 +198,13 @@ def put_channel_request(
     for a in agents:
         if not re.match(r"^[a-z][a-z0-9-]{0,62}[a-z0-9]$", a):
             raise ValueError(f"invalid requested agent id {a!r}")
+    # Requested repos (owner/repo) — same shape check the admin API applies;
+    # these flow into the admin's approval UI and, once approved, into the
+    # channel's repo grant, so a malformed value is rejected at the boundary.
+    repos = [r.strip().casefold() for r in (requested_repos or []) if r and r.strip()]
+    for r in repos:
+        if not re.match(r"^[a-z0-9._-]+/[a-z0-9._-]+$", r):
+            raise ValueError(f"invalid requested repo {r!r}")
     request_id = str(uuid.uuid4())
     _get_table().put_item(
         Item={
@@ -208,6 +216,7 @@ def put_channel_request(
             "channel_name": channel_name,
             "requested_by": requested_by.strip(),
             "requested_agents": agents,
+            "requested_repos": repos,
             "note": "",
             "status": "pending",
             "created_at": int(time.time()),
@@ -215,6 +224,21 @@ def put_channel_request(
             "decided_at": None,
         }
     )
+
+
+def channel_repos(workspace: str, channel_id: str) -> list[str]:
+    """The repos APPROVED for this channel — the set an admin granted when
+    approving the channel's onboarding request (stored on the channel allow
+    row). This is the channel's direct-work scope: a Slack-triggered dispatch
+    may only NAME these repos as its work target. Repos grouped with an
+    approved repo (co_repo_mode) remain reachable BY THE AGENT when working an
+    approved repo — the gateway/broker's co-repo grouping handles that — but
+    they are not directly selectable from the channel unless approved here.
+    Empty when the channel has no grant (or none recorded)."""
+    row = _snapshot()["channels"].get((workspace, channel_id))
+    if not row:
+        return []
+    return sorted({r for r in (row.get("repos") or []) if r})
 
 
 def channel_allowed(workspace: str, channel_id: str) -> bool:

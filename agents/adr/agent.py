@@ -87,7 +87,11 @@ def invoke(payload, context=None):
 
     # The repo to act on comes from the dispatch (multi-repo fleet), not a baked
     # env var. Adr is GitHub-only, so the dispatch always carries the repo.
-    dispatch_repo = source_context.get("repo") if source == "github" else None
+    # The origin repo anchors co-repo enforcement for ANY source that names a
+    # repo: GitHub mentions carry the repo they came from; a Slack
+    # /sdlc-message-agent dispatch carries the first channel-approved repo the
+    # user selected. No repo (e.g. Asana) => no GitHub work possible.
+    dispatch_repo = source_context.get("repo") or None
     system_prompt = (
         SYSTEM_PROMPT.format(project_context=build_project_context(dispatch_repo))
         + dispatch_context_block

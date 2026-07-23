@@ -284,19 +284,44 @@ def check_authorization(
 
 
 def check_repo_allowed(source: str, source_context: dict) -> bool:
-    """For a GitHub dispatch, confirm its repo is onboarded (and, when the fleet
-    is restricted, multi-repo eligible) per the runtime fleet config.
+    """Confirm a repo-carrying dispatch targets repos the fleet (and, for Slack,
+    the CHANNEL) has approved.
 
-    Only GitHub carries a repo, so other sources always pass. The allowlist is
-    read from the fleet-config table through a short-TTL cache, so an admin
-    onboarding/removing a repo takes effect fleet-wide within the cache window.
-    Fails closed: a GitHub dispatch whose repo is empty or not-yet-allowed is
-    rejected rather than let through.
+    - GitHub: the origin repo must be onboarded (and, when the fleet is
+      restricted, multi-repo eligible) per the runtime fleet config.
+    - Slack: a dispatch that names repos (``/sdlc-message-agent``) may only name
+      repos APPROVED FOR ITS CHANNEL (spec §19) — the admin grants that set when
+      approving the channel. The modal only offers approved repos and the webhook
+      re-checks on submit; this is the fail-closed backstop at the router (the
+      single choke point every trigger passes). Grouped siblings of an approved
+      repo remain reachable by the AGENT via co-repo mechanics — but can't be
+      named as the dispatch target from the channel. A Slack dispatch with no
+      repos passes (agent-only / Asana work).
+    - Other sources carry no repo and always pass.
+
+    The allowlist is read from the fleet-config table through a short-TTL cache,
+    so an admin change takes effect fleet-wide within the cache window. Fails
+    closed: an empty/not-yet-allowed repo is rejected rather than let through.
     """
-    if source != "github":
-        return True
-    repo = str(source_context.get("repo", "")).strip()
-    return fleet_config.is_repo_allowed(repo)
+    if source == "github":
+        repo = str(source_context.get("repo", "")).strip()
+        return fleet_config.is_repo_allowed(repo)
+    if source == "slack":
+        repos = [str(r).strip().casefold() for r in (source_context.get("repos") or []) if r]
+        single = str(source_context.get("repo", "")).strip().casefold()
+        if single and single not in repos:
+            repos.append(single)
+        if not repos:
+            return True  # agent-only work — no repo named
+        import trigger_grants
+
+        workspace = str(source_context.get("workspace", "")).strip()
+        channel = str(source_context.get("channel_id", "")).strip()
+        approved = {r.casefold() for r in trigger_grants.channel_repos(workspace, channel)}
+        return all(
+            r in approved and fleet_config.is_repo_allowed(r) for r in repos
+        )
+    return True
 
 
 # --- Concurrency -------------------------------------------------------------

@@ -44,6 +44,7 @@ import sys
 ONBOARD_COMMAND = "sdlc-onboard-channel"
 # The slash command that opens the interactive notification-config modal
 # (matches the receiver's NOTIFY_COMMAND default).
+MESSAGE_COMMAND = "sdlc-message-agent"
 NOTIFY_COMMAND = "sdlc-notify"
 
 
@@ -65,7 +66,7 @@ def build_manifest(webhook_base: str, app_name: str = "SDLC Agent Fleet") -> dic
                     "command": f"/{ONBOARD_COMMAND}",
                     "url": f"{base}/slack/commands",
                     "description": "Request this channel be onboarded for fleet agents",
-                    "usage_hint": "[agent ...]",
+                    "usage_hint": "",
                     "should_escape": False,
                 },
                 {
@@ -76,10 +77,10 @@ def build_manifest(webhook_base: str, app_name: str = "SDLC Agent Fleet") -> dic
                     "should_escape": False,
                 },
                 {
-                    "command": "/fleet",
+                    "command": f"/{MESSAGE_COMMAND}",
                     "url": f"{base}/slack/commands",
-                    "description": "Dispatch a fleet agent",
-                    "usage_hint": "@agent your instruction",
+                    "description": "Message a fleet agent (guided form)",
+                    "usage_hint": "",
                     "should_escape": False,
                 },
             ],

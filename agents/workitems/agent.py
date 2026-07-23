@@ -127,7 +127,11 @@ def invoke(payload, context=None):
     # then defers to the Current Dispatch block. Resolved before the MCP client
     # (and before the model) so it can be stamped as the trusted dispatch origin
     # the gateway interceptor/broker use to scope GitHub access to this owner.
-    dispatch_repo = source_context.get("repo") if source == "github" else None
+    # The origin repo anchors co-repo enforcement for ANY source that names a
+    # repo: GitHub mentions carry the repo they came from; a Slack
+    # /sdlc-message-agent dispatch carries the first channel-approved repo the
+    # user selected. No repo (e.g. Asana) => no GitHub work possible.
+    dispatch_repo = source_context.get("repo") or None
 
     # MCP connectivity: one gateway client (SigV4, Cedar-enforced) — the fleet is
     # gateway-only, so ALL tool calls route through the AgentCore Gateway (policy

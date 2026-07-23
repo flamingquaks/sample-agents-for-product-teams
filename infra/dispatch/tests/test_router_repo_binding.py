@@ -238,3 +238,61 @@ def test_cache_refreshes_after_ttl(modules):
     later = fc.time.time() + fc._CACHE_TTL_SECONDS + 1
     with patch.object(fc.time, "time", return_value=later):
         assert router.check_repo_allowed("github", {"repo": "acme/web"}) is True
+
+
+# --- Slack channel→repo scope (spec §19) ---------------------------------------
+
+
+def _put_channel(team, channel, repos, mode="allow"):
+    item = {
+        "pk": f"slack_chan#{team}#{channel}",
+        "kind": "slack_channel",
+        "team_id": team,
+        "channel_id": channel,
+        "mode": mode,
+        "repos": repos,
+    }
+    boto3.resource("dynamodb", region_name=REGION).Table(TABLE).put_item(Item=item)
+
+
+def test_slack_dispatch_repo_must_be_channel_approved(modules):
+    router, _ = modules
+    import trigger_grants
+
+    trigger_grants.reset_cache()
+    _put_repo("acme/web")
+    _put_repo("acme/api")
+    _put_channel("T0ACME12", "C0ENG", ["acme/web"])
+    ctx = {"workspace": "T0ACME12", "channel_id": "C0ENG"}
+    # Approved repo → allowed.
+    assert router.check_repo_allowed("slack", {**ctx, "repos": ["acme/web"]}) is True
+    # Onboarded-but-not-channel-approved repo → rejected (grouped siblings are
+    # only reachable via the agent's co-repo mechanics, never directly named).
+    assert router.check_repo_allowed("slack", {**ctx, "repos": ["acme/api"]}) is False
+    # Mixed batch fails closed on the unapproved one.
+    assert router.check_repo_allowed("slack", {**ctx, "repos": ["acme/web", "acme/api"]}) is False
+    trigger_grants.reset_cache()
+
+
+def test_slack_dispatch_without_repos_passes(modules):
+    router, _ = modules
+    import trigger_grants
+
+    trigger_grants.reset_cache()
+    # Agent-only work (no repo named) — the channel gate + trigger authz still
+    # apply upstream; there's no repo axis to enforce.
+    assert router.check_repo_allowed("slack", {"workspace": "T0ACME12", "channel_id": "C0X"}) is True
+    trigger_grants.reset_cache()
+
+
+def test_slack_channel_approved_but_repo_off_fleet_rejected(modules):
+    router, _ = modules
+    import trigger_grants
+
+    trigger_grants.reset_cache()
+    # Channel grant lingers but the repo was REMOVED from the fleet — the
+    # fleet-level allowlist still wins (both must hold).
+    _put_channel("T0ACME12", "C0ENG", ["acme/gone"])
+    ctx = {"workspace": "T0ACME12", "channel_id": "C0ENG"}
+    assert router.check_repo_allowed("slack", {**ctx, "repos": ["acme/gone"]}) is False
+    trigger_grants.reset_cache()

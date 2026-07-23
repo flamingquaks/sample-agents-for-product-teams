@@ -218,6 +218,8 @@ export interface ChannelRequest {
   channel_name?: string;
   requested_by: string;
   requested_agents: string[];
+  /** Repos the requester asked to work on from this channel (spec §19). */
+  requested_repos?: string[];
   status: "pending" | "approved" | "denied";
   created_at?: number;
   decided_by?: string;

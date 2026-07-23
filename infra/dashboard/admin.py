@@ -1141,6 +1141,16 @@ def _decide_channel_request(event: dict, request_id: str, approve: bool, body: d
     # silently coerce it to a wildcard (that would grant every fleet agent to
     # everyone in the channel) nor to nothing (a channel-allow with no WHO grant
     # that still default-denies). The admin must name the agents.
+    # Repo scope (spec §19): the channel's approved direct-work repos. Prefer an
+    # explicit approval override, else what the user requested. BOUNDED to the
+    # fleet's onboarded repos — approving a channel can never widen the fleet.
+    # Empty is fine (a channel may be agent-only, e.g. Asana work).
+    repos = body.get("approved_repos")
+    if repos is None:
+        repos = req.get("requested_repos", [])
+    onboarded = {r["repo"] for r in config_store.list_repos()}
+    repos = sorted({str(r).strip().casefold() for r in repos if r} & onboarded)
+
     agents = body.get("approved_agents")
     if agents is None:
         agents = req.get("requested_agents", [])
@@ -1151,13 +1161,15 @@ def _decide_channel_request(event: dict, request_id: str, approve: bool, body: d
             "approve requires a concrete agent scope: pass body.approved_agents "
             "(the request did not name specific agents)",
         )
-    # 1) allow the channel (the WHERE axis) so triggers there pass the channel gate.
+    # 1) allow the channel (the WHERE axis) so triggers there pass the channel
+    # gate, carrying the approved direct-work repo scope (§19).
     config_store.put_channel_policy(
         team_id, channel_id,
         mode=config_store.CHANNEL_MODE_ALLOW,
         channel_name=req.get("channel_name", ""),
         note=f"approved from request {request_id}",
         created_by=caller,
+        repos=repos,
     )
     # 2) one permit rule per approved agent, keyed on the channel group (the
     # receiver stamps `channel:<team>:<chan>` into principal_groups, so this
@@ -1179,7 +1191,8 @@ def _decide_channel_request(event: dict, request_id: str, approve: bool, body: d
     rec = config_store.resolve_channel_request(
         request_id, status=config_store.CHAN_REQ_APPROVED, decided_by=caller
     )
-    return ok({"request": rec, "channel_allowed": True, "created_rules": created})
+    return ok({"request": rec, "channel_allowed": True, "created_rules": created,
+               "approved_repos": repos})
 
 
 def _decide_user_request(event: dict, request_id: str, approve: bool, body: dict) -> dict:
