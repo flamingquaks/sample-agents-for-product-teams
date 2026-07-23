@@ -13,7 +13,6 @@ export function AsanaConnectorPage({ api, onAuthError }: ConnectorPageProps) {
   return (
     <ConnectorLayout
       label="Asana"
-      onBack={() => (window.location.hash = "#/admin/connectors")}
       tabs={[
         {
           key: "connection",

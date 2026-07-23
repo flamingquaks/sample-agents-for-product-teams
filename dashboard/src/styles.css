@@ -14,6 +14,10 @@
   --unknown: #6e7681;
   --radius: 8px;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+
+  /* Layout dimensions */
+  --sidebar-width: 240px;
+  --topbar-height: 52px;
 }
 
 * {
@@ -37,32 +41,263 @@ a:hover {
   text-decoration: underline;
 }
 
-.app-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 14px 24px;
-  border-bottom: 1px solid var(--border);
-  background: var(--surface);
-}
-.app-header h1 {
-  font-size: 16px;
-  margin: 0;
-  font-weight: 600;
-}
-.app-header .who {
-  color: var(--text-dim);
-  font-size: 13px;
-  display: flex;
-  gap: 12px;
-  align-items: center;
+/* ==========================================================================
+   App Shell: Sidebar + Top Bar + Content
+   ========================================================================== */
+
+.app-shell {
+  display: grid;
+  grid-template-columns: var(--sidebar-width) 1fr;
+  min-height: 100vh;
 }
 
-.content {
-  padding: 20px 24px;
-  max-width: 1200px;
-  margin: 0 auto;
+/* -- Sidebar -- */
+.sidebar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  width: var(--sidebar-width);
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  z-index: 50;
+  overflow-y: auto;
 }
+
+.sidebar-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 16px 18px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  color: var(--text);
+  font-weight: 600;
+  font-size: 15px;
+}
+.sidebar-brand:hover {
+  color: var(--accent);
+}
+.sidebar-brand svg {
+  flex-shrink: 0;
+}
+
+.sidebar-nav {
+  flex: 1;
+  padding: 8px 0;
+}
+
+.nav-section-header {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+  padding: 16px 18px 4px;
+  margin-top: 4px;
+}
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 18px;
+  border: none;
+  border-left: 3px solid transparent;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  text-align: left;
+  border-radius: 0;
+  transition: background 0.1s, color 0.1s, border-color 0.1s;
+}
+.nav-item:hover {
+  background: var(--surface-2);
+  color: var(--text);
+  border-color: transparent;
+}
+.nav-item.active {
+  background: rgba(91, 157, 255, 0.08);
+  color: var(--accent);
+  border-left-color: var(--accent);
+  font-weight: 600;
+}
+
+.nav-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+}
+.nav-icon svg {
+  width: 18px;
+  height: 18px;
+}
+
+.nav-label {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nav-lock {
+  opacity: 0.4;
+  flex-shrink: 0;
+}
+
+/* -- Main area (right of sidebar) -- */
+.main-area {
+  grid-column: 2;
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+/* -- Top bar -- */
+.top-bar {
+  display: flex;
+  align-items: center;
+  height: var(--topbar-height);
+  padding: 0 24px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  position: sticky;
+  top: 0;
+  z-index: 40;
+}
+.top-bar-spacer {
+  flex: 1;
+}
+.top-bar-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+.top-bar-email {
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.top-bar-signout {
+  font-size: 12px;
+  padding: 4px 10px;
+}
+.role-badge {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: rgba(91, 157, 255, 0.12);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.mobile-menu-btn {
+  display: none;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  padding: 4px;
+}
+
+/* -- Page content area -- */
+.page-content {
+  flex: 1;
+  padding: 24px 28px;
+  max-width: 1200px;
+  width: 100%;
+}
+
+/* -- Page headers -- */
+.page {
+  /* Page wrapper for section pages */
+}
+.page-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 20px;
+}
+.page-header h1 {
+  font-size: 22px;
+  font-weight: 600;
+  margin: 0;
+}
+.page-desc {
+  color: var(--text-dim);
+  margin: 4px 0 0;
+  font-size: 13px;
+}
+
+/* -- Sidebar overlay for mobile -- */
+.sidebar-overlay {
+  display: none;
+}
+
+/* ==========================================================================
+   Responsive: collapse sidebar on mobile (<768px)
+   ========================================================================== */
+
+@media (max-width: 767px) {
+  .app-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    transform: translateX(-100%);
+    transition: transform 0.2s ease;
+    box-shadow: none;
+  }
+  .sidebar.open {
+    transform: translateX(0);
+    box-shadow: 4px 0 24px rgba(0, 0, 0, 0.5);
+  }
+
+  .sidebar-overlay {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    z-index: 45;
+  }
+
+  .main-area {
+    grid-column: 1;
+  }
+
+  .mobile-menu-btn {
+    display: flex;
+    margin-right: 12px;
+  }
+
+  .page-content {
+    padding: 16px;
+  }
+}
+
+/* Wider than sidebar collapse but narrow enough to shrink sidebar labels */
+@media (min-width: 768px) and (max-width: 1023px) {
+  :root {
+    --sidebar-width: 200px;
+  }
+}
+
+/* ==========================================================================
+   Buttons
+   ========================================================================== */
 
 button {
   font: inherit;
@@ -83,7 +318,10 @@ button.primary {
   font-weight: 600;
 }
 
-/* Stat tiles */
+/* ==========================================================================
+   Stat tiles
+   ========================================================================== */
+
 .tiles {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
@@ -108,13 +346,19 @@ button.primary {
   margin-top: 4px;
 }
 
-/* Table row action buttons (e.g. Enable/Disable/Delete) */
+/* ==========================================================================
+   Table row action buttons
+   ========================================================================== */
+
 .row-actions {
   display: flex;
   gap: 8px;
 }
 
-/* Filters */
+/* ==========================================================================
+   Filters
+   ========================================================================== */
+
 .filters {
   display: flex;
   gap: 10px;
@@ -131,7 +375,10 @@ button.primary {
   padding: 6px 10px;
 }
 
-/* Table */
+/* ==========================================================================
+   Table
+   ========================================================================== */
+
 table {
   width: 100%;
   border-collapse: collapse;
@@ -164,7 +411,10 @@ td.mono,
   font-size: 12px;
 }
 
-/* Status pill */
+/* ==========================================================================
+   Status pill
+   ========================================================================== */
+
 .pill {
   display: inline-block;
   padding: 2px 8px;
@@ -194,14 +444,20 @@ td.mono,
   border-color: var(--active);
 }
 
-/* Separates the repos section from the capabilities section in the admin view */
+/* ==========================================================================
+   Section divider
+   ========================================================================== */
+
 .section-divider {
   border: none;
   border-top: 1px solid var(--border, #2a2a2a);
   margin: 32px 0;
 }
 
-/* Trace-ref chips */
+/* ==========================================================================
+   Trace-ref chips
+   ========================================================================== */
+
 .chips {
   display: flex;
   flex-wrap: wrap;
@@ -220,6 +476,10 @@ td.mono,
   color: var(--text);
   font-weight: 600;
 }
+
+/* ==========================================================================
+   Utility classes
+   ========================================================================== */
 
 .muted {
   color: var(--text-dim);
@@ -255,7 +515,10 @@ td.mono,
   margin-top: 12px;
 }
 
-/* Run detail */
+/* ==========================================================================
+   Run detail
+   ========================================================================== */
+
 .detail-grid {
   display: grid;
   grid-template-columns: max-content 1fr;
@@ -287,7 +550,10 @@ h3 {
   margin: 20px 0 4px;
 }
 
-/* Admin: a bordered config panel (GitHub App setup). */
+/* ==========================================================================
+   Panel (bordered config section)
+   ========================================================================== */
+
 .panel {
   background: var(--surface);
   border: 1px solid var(--border);
@@ -298,7 +564,6 @@ h3 {
 .panel h3 {
   margin-top: 0;
 }
-/* An anchor styled as a button (install deep-links). */
 .button-link {
   display: inline-block;
   background: var(--accent);
@@ -314,7 +579,10 @@ h3 {
   filter: brightness(1.05);
 }
 
-/* Admin: header row with a right-aligned primary action. */
+/* ==========================================================================
+   Section head (header row with right-aligned action)
+   ========================================================================== */
+
 .section-head {
   display: flex;
   align-items: flex-start;
@@ -325,7 +593,10 @@ h3 {
   margin-top: 0;
 }
 
-/* Modal dialog (admin onboarding) */
+/* ==========================================================================
+   Modal dialog
+   ========================================================================== */
+
 .modal-overlay {
   position: fixed;
   inset: 0;
@@ -382,8 +653,6 @@ h3 {
   display: block;
   margin: 14px 0;
 }
-/* Repo picker inside the onboarding modal — same scrolling-checklist shape as
-   .tool-grid, but rows are denser (one repo per line, no grouping). */
 .repo-picker {
   max-height: 260px;
   overflow-y: auto;
@@ -395,7 +664,6 @@ h3 {
 .repo-picker .field-inline {
   margin: 4px 0;
 }
-/* Tool-grant / skill checklist inside the authoring modal. */
 .tool-grid {
   max-height: 220px;
   overflow-y: auto;
@@ -446,7 +714,10 @@ h3 {
   margin-top: 18px;
 }
 
-/* --- Connectors section --- */
+/* ==========================================================================
+   Connectors: card grid (legacy — kept for possible reuse)
+   ========================================================================== */
+
 .card-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
@@ -467,6 +738,11 @@ h3 {
 .connector-card h3 {
   margin: 0 0 6px;
 }
+
+/* ==========================================================================
+   Tab strip (connector sub-pages)
+   ========================================================================== */
+
 .tab-strip {
   display: flex;
   gap: 4px;
@@ -486,4 +762,35 @@ h3 {
 }
 .tab-panel {
   min-height: 120px;
+}
+
+/* ==========================================================================
+   Settings page
+   ========================================================================== */
+
+.settings-section {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px 20px;
+  margin-bottom: 16px;
+}
+.settings-section h3 {
+  margin-top: 0;
+  margin-bottom: 12px;
+  font-size: 14px;
+  font-weight: 600;
+}
+.settings-row {
+  padding: 4px 0;
+}
+.settings-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+.settings-toggle-label {
+  font-size: 13px;
+  font-weight: 500;
 }

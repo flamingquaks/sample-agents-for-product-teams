@@ -12,7 +12,6 @@ export function GitHubConnectorPage({ api, onAuthError }: ConnectorPageProps) {
   return (
     <ConnectorLayout
       label="GitHub"
-      onBack={() => (window.location.hash = "#/admin/connectors")}
       tabs={[
         {
           key: "connection",

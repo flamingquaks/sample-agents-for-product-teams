@@ -1,5 +1,6 @@
-// Shared chrome for a connector sub-page: a back link, the connector title, and
-// a tab strip. Each page renders its own tab content via the render-prop.
+// Shared chrome for a connector sub-page: the connector title and a tab strip.
+// Each page renders its own tab content via the render-prop. Navigation is
+// handled by the sidebar — no back button needed.
 
 import { useState } from "react";
 
@@ -10,26 +11,17 @@ export interface Tab {
 }
 
 export function ConnectorLayout({
-  label,
   tabs,
-  onBack,
 }: {
-  label: string;
+  label?: string;
   tabs: Tab[];
-  onBack: () => void;
+  /** @deprecated No longer used — sidebar handles navigation. Kept for compat. */
+  onBack?: () => void;
 }) {
   const [active, setActive] = useState(tabs[0]?.key);
   const current = tabs.find((t) => t.key === active) ?? tabs[0];
   return (
     <div>
-      <div className="section-head">
-        <div>
-          <button className="button-link" onClick={onBack}>
-            ← Connectors
-          </button>
-          <h2>{label}</h2>
-        </div>
-      </div>
       <div className="tab-strip" role="tablist">
         {tabs.map((t) => (
           <button

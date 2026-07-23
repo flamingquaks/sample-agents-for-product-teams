@@ -20,7 +20,6 @@ export function SlackConnectorPage({ api, onAuthError }: ConnectorPageProps) {
   return (
     <ConnectorLayout
       label="Slack"
-      onBack={() => (window.location.hash = "#/admin/connectors")}
       tabs={[
         { key: "workspaces", label: "Workspaces", render: () => <WorkspacesTab api={api} onAuthError={onAuthError} /> },
         { key: "channels", label: "Channels", render: () => <ChannelsTab api={api} onAuthError={onAuthError} /> },
