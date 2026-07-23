@@ -1530,16 +1530,19 @@ Resources:
             Path: /admin/capabilities/{agent_id}
             Method: DELETE
             RestApiId: !Ref DashboardApi
+        # Plain {agent_id} (not greedy {agent_id+}): agent ids never contain a
+        # slash, a greedy variable can't have child resources (/clone), and API
+        # Gateway forbids {agent_id} and {agent_id+} as siblings.
         CloneCapability:
           Type: Api
           Properties:
-            Path: /admin/capabilities/{agent_id+}/clone
+            Path: /admin/capabilities/{agent_id}/clone
             Method: POST
             RestApiId: !Ref DashboardApi
         ApproveCapability:
           Type: Api
           Properties:
-            Path: /admin/capabilities/{agent_id+}/approve
+            Path: /admin/capabilities/{agent_id}/approve
             Method: POST
             RestApiId: !Ref DashboardApi
         ToolCatalog:
