@@ -4,6 +4,7 @@
 
 import { useCallback } from "react";
 import { ApiError, type DashboardApi } from "../api";
+import { isActive } from "../format";
 import { usePolling } from "../hooks";
 import type { RunsPage } from "../types";
 
@@ -22,9 +23,9 @@ export function ActivityPanel({
     },
     [onAuthError],
   );
-  // Active while any recent run is still dispatched — poll faster then.
+  // Active while any recent run is still in flight — poll faster then.
   const poll = usePolling<RunsPage>(() => api.listRuns({ source, limit: 25 }), {
-    isActive: (d) => (d?.runs ?? []).some((r) => r.status === "dispatched"),
+    isActive: (d) => (d?.runs ?? []).some((r) => isActive(r.status)),
     deps: [api, source],
     onError: handleErr,
   });

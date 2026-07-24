@@ -189,12 +189,18 @@ def sweep_stale_dispatches(now: float | None = None) -> int:
     """dispatched older than DISPATCH_TIMEOUT_HOURS → failed (dead runtime).
 
     Frees the concurrency slot and tells the requester via the notifier's
-    run_failed path instead of silence until the row's TTL."""
+    run_failed path instead of silence until the row's TTL.
+
+    Age is measured from the run's LAST (re)start: ``resumed_at`` when the row
+    was resumed after a pause (mark_resumed writes it), else ``created_at``.
+    Keying on created_at alone would sweep an actively-running resumed
+    assignment to ``failed`` whenever the human's reply arrived more than the
+    window after the original dispatch — a legal pause can last 48h."""
     current = time.time() if now is None else now
     cutoff = current - DISPATCH_TIMEOUT_HOURS * 3600
     failed = 0
     for row in _scan_status("dispatched"):
-        started = row.get("created_at") or 0
+        started = row.get("resumed_at") or row.get("created_at") or 0
         if float(started) > cutoff:
             continue
         assignment_id = str(row["assignment_id"])

@@ -251,7 +251,10 @@ def stats() -> dict:
     agent, and source, plus an active-now count."""
     items, truncated = _scan_all_runs(_AGG_SCAN_CAP)
 
-    active_statuses = {"dispatched"}
+    # In-flight statuses: a resuming run (durable pause being picked back up)
+    # is live work exactly like a dispatched one. awaiting_input is NOT active
+    # — it can sit for days waiting on a human.
+    active_statuses = {"dispatched", "resuming"}
     by_status: dict[str, int] = {}
     by_agent: dict[str, int] = {}
     by_source: dict[str, int] = {}

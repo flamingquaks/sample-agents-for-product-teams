@@ -85,6 +85,17 @@ def router(monkeypatch):
     # Trigger authz (Cedar/AVP) is exercised in test_trigger_authz; the resume
     # path re-checks the replier, so default to permitted here.
     monkeypatch.setattr(router_mod, "authorize_trigger", lambda *a, **k: (True, ""))
+    # Identity resolution (spec §16) is exercised in test_identity; default to
+    # an active identity so resume tests focus on the resume mechanics.
+    import identity as identity_mod
+
+    monkeypatch.setattr(
+        router_mod, "resolve_dispatch_identity",
+        lambda *a, **k: identity_mod.Identity(
+            identity_id="id-1", email="a@b.c", status="active"
+        ),
+    )
+    monkeypatch.setattr(router_mod, "check_concurrency", lambda *a, **k: True)
     return router_mod
 
 
@@ -123,6 +134,64 @@ def test_resume_invokes_runtime_with_saved_state(router):
     assert payload["resume"]["workspace_snapshot"][0]["sha"] == "abc"
     # The lock flipped the row to resuming.
     assert router.assignments_table.rows["a-1"]["status"] == "resuming"
+
+
+def test_resume_enriches_identity_groups_into_authz_context(router, monkeypatch):
+    """Regression: a group-granted user's reply must carry their identity-map
+    groups into trigger authz, exactly like the original dispatch."""
+    import identity as identity_mod
+
+    router.assignments_table.rows["a-1"] = _paused_row()
+    monkeypatch.setattr(
+        router, "resolve_dispatch_identity",
+        lambda *a, **k: identity_mod.Identity(
+            identity_id="id-9", email="grp@acme.com", status="active",
+            groups=["team-platform"],
+        ),
+    )
+    seen_context = {}
+
+    def capture_authz(agent_config, sender, source, source_context):
+        seen_context.update(source_context or {})
+        return True, ""
+
+    monkeypatch.setattr(router, "authorize_trigger", capture_authz)
+    with patch("guardrail.check_prompt") as gp:
+        gp.return_value = MagicMock(outcome="passed", reason="")
+        resp = router.handler(_resume_event(), None)
+    assert resp["statusCode"] == 200
+    assert "team-platform" in seen_context.get("principal_groups", [])
+    assert seen_context.get("requester_email") == "grp@acme.com"
+
+
+def test_resume_rejects_pending_identity(router, monkeypatch):
+    """A not-onboarded user can't resume work they couldn't dispatch."""
+    import identity as identity_mod
+
+    router.assignments_table.rows["a-1"] = _paused_row()
+    monkeypatch.setattr(
+        router, "resolve_dispatch_identity",
+        lambda *a, **k: identity_mod.Identity(identity_id="id-p", status="pending"),
+    )
+    with patch("guardrail.check_prompt") as gp:
+        gp.return_value = MagicMock(outcome="passed", reason="")
+        resp = router.handler(_resume_event(), None)
+    assert resp["statusCode"] == 403
+    router.agentcore.invoke_agent_runtime.assert_not_called()
+    assert router.assignments_table.rows["a-1"]["status"] == "awaiting_input"
+
+
+def test_resume_deferred_when_agent_at_capacity(router, monkeypatch):
+    """A resume consumes a runtime slot — at capacity it defers (429) and the
+    row stays awaiting_input so the user can simply reply again."""
+    router.assignments_table.rows["a-1"] = _paused_row()
+    monkeypatch.setattr(router, "check_concurrency", lambda *a, **k: False)
+    with patch("guardrail.check_prompt") as gp:
+        gp.return_value = MagicMock(outcome="passed", reason="")
+        resp = router.handler(_resume_event(), None)
+    assert resp["statusCode"] == 429
+    router.agentcore.invoke_agent_runtime.assert_not_called()
+    assert router.assignments_table.rows["a-1"]["status"] == "awaiting_input"
 
 
 def test_resume_requires_authorized_replier(router, monkeypatch):
@@ -245,6 +314,50 @@ def test_followup_dispatch_records_parent_link(dispatch_ready):
     assert resp["statusCode"] == 200
     rows = [p for p in router.assignments_table.puts if p.get("kind") is None and p.get("agent_id")]
     assert rows and rows[0].get("parent_assignment_id") == "a-prior"
+
+
+def test_binding_not_overwritten_while_bound_assignment_paused(dispatch_ready):
+    """Regression: a new dispatch in the same thread must NOT steal the resume
+    anchor from a paused assignment — its reply would route to the wrong run."""
+    router = dispatch_ready
+    router.assignments_table.rows["thread_binding#T1#C1#111.222"] = {
+        "assignment_id": "thread_binding#T1#C1#111.222",
+        "kind": "thread_binding",
+        "bound_assignment_id": "a-paused",
+        "agent_id": "docwriter",
+    }
+    router.assignments_table.rows["a-paused"] = {
+        "assignment_id": "a-paused",
+        "agent_id": "docwriter",
+        "status": "awaiting_input",
+    }
+    with patch("guardrail.check_prompt") as gp, patch.object(router, "invoke_agent"):
+        gp.return_value = MagicMock(outcome="passed", reason="")
+        resp = router.handler(_slack_dispatch_event(), None)
+    assert resp["statusCode"] == 200
+    binding = router.assignments_table.rows["thread_binding#T1#C1#111.222"]
+    assert binding["bound_assignment_id"] == "a-paused"
+
+
+def test_binding_rebinds_over_completed_assignment(dispatch_ready):
+    router = dispatch_ready
+    router.assignments_table.rows["thread_binding#T1#C1#111.222"] = {
+        "assignment_id": "thread_binding#T1#C1#111.222",
+        "kind": "thread_binding",
+        "bound_assignment_id": "a-done",
+        "agent_id": "docwriter",
+    }
+    router.assignments_table.rows["a-done"] = {
+        "assignment_id": "a-done",
+        "agent_id": "docwriter",
+        "status": "completed",
+    }
+    with patch("guardrail.check_prompt") as gp, patch.object(router, "invoke_agent"):
+        gp.return_value = MagicMock(outcome="passed", reason="")
+        resp = router.handler(_slack_dispatch_event(), None)
+    assert resp["statusCode"] == 200
+    binding = router.assignments_table.rows["thread_binding#T1#C1#111.222"]
+    assert binding["bound_assignment_id"] != "a-done"
 
 
 def test_github_dispatch_writes_no_binding(dispatch_ready):

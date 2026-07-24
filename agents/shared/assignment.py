@@ -270,9 +270,26 @@ def _update_with_usage(
             UpdateExpression=add_expr,
             ExpressionAttributeValues=add_values,
         )
-    except ClientError:
+    except ClientError as exc:
+        # The SET fallback exists ONLY for legacy rows whose token_usage was
+        # created as an explicit NULL (pre-accumulation router) — ADD rejects
+        # a NULL-typed attribute with a ValidationException, and overwriting a
+        # NULL loses nothing. Any OTHER ClientError (throttle, access denied)
+        # must NOT fall back: a SET there would replace the accumulated
+        # multi-segment total with just this segment — the exact overwrite the
+        # ADD design prevents. Those are logged and dropped (usage capture is
+        # best-effort; a lost segment is better than corrupted totals).
+        code = (exc.response.get("Error") or {}).get("Code", "")
+        if code != "ValidationException":
+            logger.warning(
+                "usage ADD failed for %s (%s); segment dropped rather than "
+                "risk overwriting accumulated totals",
+                assignment_id,
+                code or "unknown error",
+            )
+            return
         logger.warning(
-            "usage ADD failed for %s (legacy NULL fields?); falling back to SET",
+            "usage ADD failed for %s (legacy NULL fields); falling back to SET",
             assignment_id,
         )
         try:

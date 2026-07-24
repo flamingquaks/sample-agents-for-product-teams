@@ -84,6 +84,69 @@ def test_clone_mints_read_token_only(wsenv):
     assert all(not m["write"] for m in wsenv)
 
 
+def test_second_push_in_same_session_succeeds(wsenv, remote):
+    """Regression: shallow clones are single-branch (no origin/wip remote-
+    tracking ref), so a bare --force-with-lease rejects EVERY push after the
+    branch exists. The explicit tracked-sha lease must allow consecutive
+    checkpoints."""
+    ws.clone_repo("acme/web")
+    repo_dir = ws._state.cloned["acme/web"]
+    (repo_dir / "one.txt").write_text("1\n")
+    assert "ERROR" not in ws.commit_and_push("acme/web", "checkpoint 1")
+    (repo_dir / "two.txt").write_text("2\n")
+    out = ws.commit_and_push("acme/web", "checkpoint 2")
+    assert "ERROR" not in out
+    remote_sha = subprocess.run(
+        ["git", "rev-parse", "wip/a-123"], cwd=str(remote),
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert remote_sha == ws._head_sha(repo_dir)
+
+
+def test_push_after_resume_reclone_succeeds(wsenv):
+    """Regression: a re-clone (resume) has no remote-tracking ref either — the
+    push after restore must succeed via the seeded lease base."""
+    ws.clone_repo("acme/web")
+    repo_dir = ws._state.cloned["acme/web"]
+    (repo_dir / "pre.txt").write_text("pre\n")
+    snapshot = ws.push_all_clean()
+    import shutil as _shutil
+
+    _shutil.rmtree(ws.workspace_root())
+    ws.configure(assignment_id="a-123", agent_id="docwriter", origin="acme/web")
+    ws.restore(snapshot)
+    new_dir = ws._state.cloned["acme/web"]
+    (new_dir / "post.txt").write_text("post\n")
+    out = ws.commit_and_push("acme/web", "after resume")
+    assert "ERROR" not in out
+
+
+def test_push_lease_lost_to_foreign_push_fails_loud(wsenv, remote, tmp_path):
+    """The explicit lease must retain force-with-lease's safety property: a
+    push that would clobber a commit someone else landed is rejected."""
+    ws.clone_repo("acme/web")
+    repo_dir = ws._state.cloned["acme/web"]
+    (repo_dir / "mine.txt").write_text("mine\n")
+    ws.commit_and_push("acme/web", "mine")
+    # A foreign writer advances the remote wip branch behind our back.
+    foreign = tmp_path / "foreign"
+    subprocess.run(["git", "clone", "-q", str(remote), str(foreign)], check=True)
+    _git(["config", "user.email", "f@f"], foreign)
+    _git(["config", "user.name", "f"], foreign)
+    subprocess.run(
+        ["git", "fetch", "-q", "origin", "wip/a-123:wip/a-123"], cwd=str(foreign), check=True
+    )
+    subprocess.run(["git", "checkout", "-q", "wip/a-123"], cwd=str(foreign), check=True)
+    (foreign / "theirs.txt").write_text("theirs\n")
+    _git(["add", "-A"], foreign)
+    _git(["commit", "-qm", "theirs"], foreign)
+    subprocess.run(["git", "push", "-q", "origin", "wip/a-123"], cwd=str(foreign), check=True)
+    # Our next push leases against our (now stale) tracked sha and must fail.
+    (repo_dir / "more.txt").write_text("more\n")
+    out = ws.commit_and_push("acme/web", "more")
+    assert "ERROR" in out
+
+
 def test_commit_and_push_lands_and_verifies(wsenv, remote):
     ws.clone_repo("acme/web")
     repo_dir = ws._state.cloned["acme/web"]

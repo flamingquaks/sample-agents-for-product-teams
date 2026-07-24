@@ -194,7 +194,8 @@ def test_durable_kit_full(monkeypatch):
 
     monkeypatch.setattr(ws, "enabled", lambda: True)
     session, tools, hooks, prompt = durable.durable_kit(
-        "a-1", agent_id="docwriter", origin="acme/web", source="slack"
+        "a-1", agent_id="docwriter", origin="acme/web", source="slack",
+        source_context={"workspace": "T1", "channel_id": "C1", "thread_ts": "1.2"},
     )
     assert session is not None
     tool_names = {getattr(t, "tool_name", getattr(t, "__name__", "")) for t in tools}
@@ -222,11 +223,38 @@ def test_durable_kit_repo_incapable_agent(monkeypatch):
 
     monkeypatch.setattr(ws, "enabled", lambda: True)
     _session, tools, _hooks, _prompt = durable.durable_kit(
-        "a-1", agent_id="workitems", origin="", repo_capable=False, source="slack"
+        "a-1", agent_id="workitems", origin="", repo_capable=False, source="slack",
+        source_context={"workspace": "T1", "channel_id": "C1", "thread_ts": "1.2"},
     )
     tool_names = {getattr(t, "tool_name", getattr(t, "__name__", "")) for t in tools}
     assert "clone_repo" not in tool_names
     assert "ask_user" in tool_names
+
+
+def test_durable_kit_no_ask_user_for_threadless_slack_dispatch(monkeypatch):
+    """Regression: a Slack dispatch WITHOUT a thread (legacy /fleet slash
+    command sends thread_ts=None) gets no thread binding — a pause there would
+    be unresumable, so ask_user must not be offered."""
+    monkeypatch.setenv("SESSION_BUCKET", "bkt")
+    monkeypatch.setenv("WORKSPACE_TOKEN_FUNCTION", "fn")
+
+    class FakeSM:
+        def __init__(self, **kwargs):
+            pass
+
+    import strands.session.s3_session_manager as sm_mod
+
+    monkeypatch.setattr(sm_mod, "S3SessionManager", FakeSM)
+    import shared.tools.workspace as ws
+
+    monkeypatch.setattr(ws, "enabled", lambda: True)
+    _session, tools, hooks, _prompt = durable.durable_kit(
+        "a-1", agent_id="docwriter", origin="acme/web", source="slack",
+        source_context={"workspace": "T1", "channel_id": "C1", "thread_ts": None},
+    )
+    tool_names = {getattr(t, "tool_name", getattr(t, "__name__", "")) for t in tools}
+    assert "ask_user" not in tool_names
+    assert hooks == []
 
 
 def test_durable_kit_no_ask_user_without_resume_trigger(monkeypatch):
@@ -303,3 +331,46 @@ def test_hook_returns_answer_on_resume():
     event = FakeEvent()
     hook._on_tool_call(event)
     assert event.cancel_tool == "The user replied: yes, go ahead"
+
+
+def test_after_hook_rewrites_answer_to_success_status():
+    """Regression: strands packages a cancel_tool result as status 'error' —
+    the model would read the human's answer as a FAILED ask_user call. The
+    after-hook must flip our answer-carrying result to success."""
+    hook = durable.AskUserInterruptHook()
+
+    class FakeAfterEvent:
+        tool_use = {"name": "ask_user", "input": {"question": "Deploy?"}}
+        cancel_message = "The user replied: yes, go ahead"
+        result = {
+            "toolUseId": "t-1",
+            "status": "error",
+            "content": [{"text": "The user replied: yes, go ahead"}],
+        }
+
+    event = FakeAfterEvent()
+    hook._on_after_tool_call(event)
+    assert event.result["status"] == "success"
+    assert event.result["content"][0]["text"] == "The user replied: yes, go ahead"
+
+
+def test_after_hook_leaves_genuine_cancels_and_other_tools_alone():
+    hook = durable.AskUserInterruptHook()
+
+    class OtherTool:
+        tool_use = {"name": "get_issue", "input": {}}
+        cancel_message = "The user replied: n/a"
+        result = {"toolUseId": "t-2", "status": "error", "content": []}
+
+    other = OtherTool()
+    hook._on_after_tool_call(other)
+    assert other.result["status"] == "error"
+
+    class RealCancel:
+        tool_use = {"name": "ask_user", "input": {}}
+        cancel_message = "cancelled by operator"
+        result = {"toolUseId": "t-3", "status": "error", "content": []}
+
+    real = RealCancel()
+    hook._on_after_tool_call(real)
+    assert real.result["status"] == "error"

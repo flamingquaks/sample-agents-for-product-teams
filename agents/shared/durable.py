@@ -29,17 +29,17 @@ import os
 import time
 
 from strands import tool
-from strands.hooks import BeforeToolCallEvent, HookProvider
+from strands.hooks import AfterToolCallEvent, BeforeToolCallEvent, HookProvider
 
 logger = logging.getLogger(__name__)
 
 ASK_USER_TOOL_NAME = "ask_user"
 INTERRUPT_NAME = "ask_user"
 
-# Assignment statuses this module owns (see docs/specs/durable-repo-work-and-
-# resume-spec.md "Thread ↔ assignment binding" lifecycle).
+# The pause status this module writes (see docs/specs/durable-repo-work-and-
+# resume-spec.md "Thread ↔ assignment binding" for the full lifecycle; the
+# other states — resuming/timed_out — are written by the router and sweeper).
 STATUS_AWAITING_INPUT = "awaiting_input"
-STATUS_RESUMING = "resuming"
 
 
 def session_manager(assignment_id: str):
@@ -84,26 +84,48 @@ def ask_user(question: str) -> str:
     )
 
 
+# Marker prefix on the cancel message so the after-hook can recognize OUR
+# resume-delivery cancel (vs. any other cancelled tool) and rewrite its status.
+_ANSWER_PREFIX = "The user replied: "
+
+
 class AskUserInterruptHook(HookProvider):
     """Raises a Strands interrupt when the model calls ``ask_user`` (D5).
 
     ``event.interrupt`` raises ``InterruptException`` internally on first call;
-    on resume (the interruptResponse invocation) it RETURNS the human's answer,
-    which we hand to the model as the tool's result via ``cancel_tool`` — the
-    tool body itself never runs.
+    on resume (the interruptResponse invocation) it RETURNS the human's answer.
+    Delivery of that answer needs BOTH hooks:
+
+    - BeforeToolCallEvent sets ``cancel_tool`` so the tool body never runs and
+      the answer becomes the tool result's text — but strands packages every
+      cancel as ``status: "error"``, which the model reads as a FAILED tool
+      call (it may re-ask the answered question or fall back to guessing).
+    - AfterToolCallEvent therefore rewrites our answer-carrying cancel result
+      to ``status: "success"`` (``result`` is one of the event's writable
+      fields), so the model sees a normal, successful ``ask_user`` return.
     """
 
     def register_hooks(self, registry, **kwargs) -> None:
         registry.add_callback(BeforeToolCallEvent, self._on_tool_call)
+        registry.add_callback(AfterToolCallEvent, self._on_after_tool_call)
 
     def _on_tool_call(self, event: BeforeToolCallEvent) -> None:
         if event.tool_use.get("name") != ASK_USER_TOOL_NAME:
             return
         question = str((event.tool_use.get("input") or {}).get("question", ""))
         answer = event.interrupt(INTERRUPT_NAME, reason=question)
-        # Resumed: surface the human's reply as the tool result. cancel_tool
-        # with a string skips execution and returns the string to the model.
-        event.cancel_tool = f"The user replied: {answer}"
+        # Resumed: surface the human's reply as the tool result (text only —
+        # the after-hook below fixes the status).
+        event.cancel_tool = f"{_ANSWER_PREFIX}{answer}"
+
+    def _on_after_tool_call(self, event: AfterToolCallEvent) -> None:
+        if event.tool_use.get("name") != ASK_USER_TOOL_NAME:
+            return
+        if not (event.cancel_message or "").startswith(_ANSWER_PREFIX):
+            return  # a genuine cancel of ask_user, not our answer delivery
+        result = dict(event.result or {})
+        result["status"] = "success"
+        event.result = result
 
 
 def pending_ask(result):
@@ -160,20 +182,42 @@ def record_pause(
 
 def mark_resumed(assignment_id: str) -> None:
     """Flip a resuming assignment back to in-flight and clear the pause fields.
-    Best-effort — the resume itself already holds the ``resuming`` lock."""
+
+    Two load-bearing details:
+    - ``resumed_at`` is written so the durable sweeper's stale-dispatch sweep
+      ages this run from the RESUME, not the original ``created_at`` — without
+      it, a run resumed hours after creation would be swept to ``failed``
+      mid-execution.
+    - The write is RETRIED (not fire-and-forget): if it never lands, the row
+      stays ``resuming`` and the sweeper's stuck-resume revert would re-open
+      the pause while this agent is still running — inviting a second,
+      concurrent resume of the same interrupt. After retries exhaust we log
+      loudly; the run itself proceeds (a duplicate status is recoverable, a
+      dead run is not).
+    """
     from shared.assignment import _get_table
 
-    try:
-        _get_table().update_item(
-            Key={"assignment_id": assignment_id},
-            UpdateExpression=(
-                "SET #s = :s REMOVE interrupt_id, pending_question, paused_at"
-            ),
-            ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues={":s": "dispatched"},
-        )
-    except Exception:
-        logger.exception("could not mark %s resumed", assignment_id)
+    for attempt in range(3):
+        try:
+            _get_table().update_item(
+                Key={"assignment_id": assignment_id},
+                UpdateExpression=(
+                    "SET #s = :s, resumed_at = :now "
+                    "REMOVE interrupt_id, pending_question, paused_at"
+                ),
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={":s": "dispatched", ":now": int(time.time())},
+            )
+            return
+        except Exception:
+            if attempt == 2:
+                logger.exception(
+                    "could not mark %s resumed after retries — row remains "
+                    "'resuming' and the sweeper may re-open the pause",
+                    assignment_id,
+                )
+            else:
+                time.sleep(0.5 * (attempt + 1))
 
 
 def durable_kit(
@@ -183,6 +227,7 @@ def durable_kit(
     origin: str,
     repo_capable: bool = True,
     source: str = "",
+    source_context: dict | None = None,
 ):
     """One-call wiring for an agent entrypoint. Returns
     ``(session_manager, extra_tools, hooks, prompt_suffix)``:
@@ -191,11 +236,7 @@ def durable_kit(
     - the durable-workspace tools (when ``repo_capable`` and the runtime has
       git + the token vendor),
     - the ``ask_user`` tool + its interrupt hook — offered ONLY when a resume
-      trigger actually exists: the session must be durable (a pause without
-      conversation durability would lose the run) AND the dispatch must be
-      Slack-originated (the in-thread reply is the only resume trigger today,
-      D6 — a GitHub/Asana run that paused would be stranded until the
-      timeout sweep, which reads as a hang to the requester),
+      trigger actually exists (see ``_resumable``),
     - the system-prompt addendum describing what was wired.
 
     Also binds the workspace to this dispatch (assignment/agent/origin) so the
@@ -220,7 +261,7 @@ def durable_kit(
             "single file read, keep using the get_file_contents tool.\n"
         )
     session = session_manager(assignment_id)
-    if session is not None and source == "slack":
+    if session is not None and _resumable(source, source_context):
         tools.append(ask_user)
         hooks.append(AskUserInterruptHook())
         prompt += (
@@ -230,6 +271,26 @@ def durable_kit(
             "clearly in your answer.\n"
         )
     return session, tools, hooks, prompt
+
+
+def _resumable(source: str, source_context: dict | None) -> bool:
+    """Whether a pause on THIS dispatch could actually be resumed.
+
+    The resume trigger is an in-thread ``@sdlc-agents`` reply resolved via the
+    ``thread_binding#`` row — which the router only writes when the dispatch
+    carries a Slack thread (workspace + channel + thread_ts). A durable
+    session alone is not enough: a Slack dispatch WITHOUT a thread (the legacy
+    ``/fleet`` slash command sends thread_ts=None) has no binding, so its
+    pause would strand as an apparent hang until the timeout sweep — same for
+    GitHub/Asana dispatches. The predicate is therefore the presence of the
+    binding's ingredients, not the source name alone.
+    """
+    if source != "slack":
+        return False
+    ctx = source_context or {}
+    return bool(
+        ctx.get("workspace") and ctx.get("channel_id") and ctx.get("thread_ts")
+    )
 
 
 def handle_agent_result(result, assignment_id: str, *, workspace=None):

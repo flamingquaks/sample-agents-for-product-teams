@@ -387,8 +387,13 @@ def _process_app_mention(event_data: dict, team_id: str) -> None:
             return
         if status == "completed":
             # D8: new linked assignment on the same thread — the binding names
-            # the agent, so the reply needn't; fresh work, prior linked.
-            resolved = _resolve_agent_from_text(text) or (
+            # the agent, so the reply needn't. Switching agents requires the
+            # EXPLICIT @agent form: the bare-first-word resolution the top-level
+            # mention path uses would hijack natural replies here, because
+            # aliases are common English words ('docs are outdated…' would
+            # silently reroute a workitems thread to docwriter with the first
+            # word swallowed).
+            resolved = _registry.resolve_mention(text) or (
                 str(binding.get("agent_id", "")), text
             )
             agent_id, instruction = resolved

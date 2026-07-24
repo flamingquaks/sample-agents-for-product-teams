@@ -552,3 +552,27 @@ def test_unbound_thread_mention_still_dispatches_normally(monkeypatch):
     sw.handler(_thread_mention_ev("<@U0BOT> @workitems plan this"))
     assert len(state["dispatched"]) == 1
     assert state["dispatched"][0]["agent_id"] == "workitems"
+
+
+def test_completed_thread_reply_with_alias_first_word_stays_on_bound_agent(monkeypatch):
+    """Regression (D8): a natural reply starting with a word that happens to be
+    another agent's alias must NOT be rerouted — only the explicit @agent form
+    switches agents on a bound thread."""
+    sw, state = _fresh(monkeypatch)
+    _bind(monkeypatch, sw, status="completed", agent_id="workitems")
+    sw.handler(_thread_mention_ev("<@U0BOT> plan the next sprint too", event_id="e-alias"))
+    assert len(state["dispatched"]) == 1
+    d = state["dispatched"][0]
+    assert d["agent_id"] == "workitems"
+    assert d["instruction"] == "plan the next sprint too"
+
+
+def test_completed_thread_reply_with_explicit_mention_switches_agent(monkeypatch):
+    sw, state = _fresh(monkeypatch)
+    _bind(monkeypatch, sw, status="completed", agent_id="researcher")
+    sw.handler(_thread_mention_ev("<@U0BOT> @workitems break this into tasks", event_id="e-expl"))
+    assert len(state["dispatched"]) == 1
+    d = state["dispatched"][0]
+    assert d["agent_id"] == "workitems"
+    assert d["instruction"] == "break this into tasks"
+    assert d["parent_assignment_id"] == "a-9"

@@ -64,6 +64,12 @@ class _State:
     agent_id: str = ""
     origin: str = ""
     cloned: dict = field(default_factory=dict)  # repo -> Path
+    # Last-known remote tip of each repo's wip branch ("" = branch absent).
+    # Load-bearing for pushes: shallow clones are single-branch, so git has NO
+    # origin/wip/<id> remote-tracking ref and a bare --force-with-lease can
+    # never take the lease ("stale info" on every push after the first). We
+    # therefore lease against THIS explicitly tracked sha.
+    remote_shas: dict = field(default_factory=dict)  # repo -> sha
 
 
 _state = _State()
@@ -87,6 +93,7 @@ def configure(*, assignment_id: str, agent_id: str, origin: str) -> None:
     _state.agent_id = agent_id or ""
     _state.origin = origin or ""
     _state.cloned = {}
+    _state.remote_shas = {}
 
 
 def enabled() -> bool:
@@ -212,6 +219,8 @@ def _clone(repo: str, *, ref: str = "", branch: str = "") -> Path:
     else:
         _git(["checkout", "-b", wip], cwd=dest)
     _state.cloned[repo] = dest
+    # Seed the lease base: the remote wip tip as of this clone ("" = absent).
+    _state.remote_shas[repo] = wip_sha
     return dest
 
 
@@ -227,16 +236,31 @@ def _commit_if_dirty(repo_dir: Path, message: str) -> bool:
 
 def _push(repo: str, repo_dir: Path) -> str:
     """Push the wip branch and VERIFY the remote tip matches local HEAD (D7 —
-    a pause checkpoint must be provably durable). Returns the pushed sha."""
+    a pause checkpoint must be provably durable). Returns the pushed sha.
+
+    The lease is EXPLICIT (``--force-with-lease=<ref>:<expected>``): shallow
+    clones are single-branch, so no origin/wip remote-tracking ref exists and
+    the bare flag would reject every push after the branch exists ("stale
+    info"). We lease against the sha we last observed on the remote (seeded at
+    clone, advanced after each successful push) — same safety property (a
+    concurrent foreign push loses us the lease and we fail loud) without
+    depending on remote-tracking state a shallow clone never has."""
     token = _mint_token(repo, write=True)
     wip = wip_branch()
-    _git(["push", "--force-with-lease", "origin", f"{wip}:{wip}"], cwd=repo_dir, token=token)
+    expected = _state.remote_shas.get(repo, "")
+    lease = f"refs/heads/{wip}:{expected}" if expected else f"refs/heads/{wip}:"
+    _git(
+        ["push", f"--force-with-lease={lease}", "origin", f"{wip}:{wip}"],
+        cwd=repo_dir,
+        token=token,
+    )
     local = _head_sha(repo_dir)
     remote = _remote_branch_sha(repo, wip, token)
     if remote != local:
         raise WorkspaceError(
             f"push verification failed for {repo}: local {local[:12]} != remote {remote[:12] or '(missing)'}"
         )
+    _state.remote_shas[repo] = local
     return local
 
 
@@ -348,14 +372,6 @@ def push_all_clean() -> list[dict]:
         sha = _push(repo, repo_dir)
         snapshot.append({"repo": repo, "branch": wip_branch(), "sha": sha})
     return snapshot
-
-
-def snapshot() -> list[dict]:
-    """The current durable positions WITHOUT pushing (for logging/telemetry)."""
-    return [
-        {"repo": repo, "branch": wip_branch(), "sha": _head_sha(repo_dir)}
-        for repo, repo_dir in _state.cloned.items()
-    ]
 
 
 def restore(workspace_snapshot: list[dict]) -> list[str]:

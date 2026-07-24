@@ -6,7 +6,6 @@ age windows. DynamoDB and the GitHub branch delete are faked.
 """
 
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -176,3 +175,27 @@ def test_recent_dispatch_left_alone(monkeypatch):
     }])
     assert sweeper.sweep_stale_dispatches(now=NOW) == 0
     assert table.rows["a-run"]["status"] == "dispatched"
+
+
+def test_resumed_dispatch_ages_from_resumed_at(monkeypatch):
+    """Regression: a run resumed hours after creation must NOT be swept —
+    staleness keys on resumed_at when present."""
+    table = _use(monkeypatch, [{
+        "assignment_id": "a-resumed", "agent_id": "docwriter",
+        "status": "dispatched",
+        "created_at": NOW - 20 * 3600,
+        "resumed_at": NOW - 600,
+    }])
+    assert sweeper.sweep_stale_dispatches(now=NOW) == 0
+    assert table.rows["a-resumed"]["status"] == "dispatched"
+
+
+def test_stale_resumed_dispatch_still_swept(monkeypatch):
+    table = _use(monkeypatch, [{
+        "assignment_id": "a-dead", "agent_id": "docwriter",
+        "status": "dispatched",
+        "created_at": NOW - 20 * 3600,
+        "resumed_at": NOW - 6 * 3600,
+    }])
+    assert sweeper.sweep_stale_dispatches(now=NOW) == 1
+    assert table.rows["a-dead"]["status"] == "failed"

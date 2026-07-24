@@ -129,7 +129,7 @@ def invoke(payload, context=None):
         # Asana-only — no repo workspace.
         session, durable_tools, hooks, durable_prompt = durable.durable_kit(
             assignment_id, agent_id=ACTOR_ID, origin="", repo_capable=False,
-            source=source,
+            source=source, source_context=source_context,
         )
         all_tools.extend(durable_tools)
 

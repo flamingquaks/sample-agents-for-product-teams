@@ -26,7 +26,7 @@ from shared.assignment import (
 )
 from shared.bedrock import build_model
 from shared.dispatch_context import slack_dispatch_block
-from shared.tools import gateway
+from shared.tools import gateway, workspace
 from strands import Agent
 from strands_tools.agent_core_memory import AgentCoreMemoryToolProvider
 from tools.check_doc_freshness import check_doc_freshness
@@ -148,7 +148,11 @@ def invoke(payload, context=None):
     # session manager restores the conversation on a resumed/cold-started run;
     # the workspace tools give docwriter a real clone/build/push loop.
     session, durable_tools, hooks, durable_prompt = durable.durable_kit(
-        assignment_id, agent_id=ACTOR_ID, origin=dispatch_repo or "", source=source
+        assignment_id,
+        agent_id=ACTOR_ID,
+        origin=dispatch_repo or "",
+        source=source,
+        source_context=source_context,
     )
     tools.extend(durable_tools)
     system_prompt += durable_prompt
@@ -170,9 +174,7 @@ def invoke(payload, context=None):
         )
         try:
             if resume:
-                from shared.tools import workspace as workspace_mod
-
-                workspace_mod.restore(resume.get("workspace_snapshot") or [])
+                workspace.restore(resume.get("workspace_snapshot") or [])
                 durable.mark_resumed(assignment_id)
                 result = agent(
                     durable.resume_payload(
@@ -189,7 +191,9 @@ def invoke(payload, context=None):
                 logger.exception("fail_assignment also failed for %s", assignment_id)
             raise
         try:
-            pause = durable.handle_agent_result(result, assignment_id)
+            pause = durable.handle_agent_result(
+                result, assignment_id, workspace=workspace
+            )
         except Exception as pause_error:
             # D7: a pause whose checkpoint can't land must FAIL LOUD — never
             # exit silently paused with unpushed work.

@@ -248,6 +248,33 @@ def test_usage_add_failure_never_breaks_completion(monkeypatch):
     assert fallback["ExpressionAttributeValues"][":token_usage"] == 2000
 
 
+def test_usage_add_transient_error_drops_segment_never_sets(monkeypatch):
+    """Regression: a NON-ValidationException ADD failure (throttle etc.) must
+    NOT fall back to SET — that would overwrite a resumed run's accumulated
+    totals with just the final segment. The segment is dropped instead."""
+    from botocore.exceptions import ClientError
+
+    class ThrottlingTable(FakeTable):
+        def update_item(self, **kwargs):
+            if kwargs["UpdateExpression"].startswith("ADD "):
+                raise ClientError(
+                    {"Error": {"Code": "ProvisionedThroughputExceededException",
+                               "Message": "slow down"}},
+                    "UpdateItem",
+                )
+            super().update_item(**kwargs)
+
+    table = ThrottlingTable()
+    monkeypatch.setattr(asg, "_get_table", lambda: table)
+    asg.complete_assignment("a-1", token_usage=2000)  # must not raise
+    # No SET fallback carrying usage values was issued.
+    usage_sets = [
+        u for u in table.updates
+        if u["UpdateExpression"].startswith("SET token_usage")
+    ]
+    assert usage_sets == []
+
+
 def test_extract_usage_per_direction():
     result = SimpleNamespace(
         metrics=SimpleNamespace(

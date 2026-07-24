@@ -170,6 +170,7 @@ def invoke(payload, context=None):
             origin=dispatch_repo or "",
             repo_capable=False,
             source=source,
+            source_context=source_context,
         )
         all_tools.extend(durable_tools)
         system_prompt += durable_prompt

@@ -11,6 +11,18 @@ replier authz, Slack webhook bound-thread routing, notifier
 (Phase 3: abandoned-pause timeout + wip cleanup, stuck-resume revert,
 stale-dispatch failure), dashboard status pills + paused-run banner.
 
+Post-review hardening (adversarial code review, 2026-07-24): pushes lease
+against an explicitly tracked remote sha (shallow clones are single-branch, so
+bare `--force-with-lease` can never re-take a lease); `resumed_at` restarts the
+stale-dispatch clock on resume; the resume answer is rewritten to a
+success-status tool result (strands packages cancels as errors); `handle_resume`
+runs the full pipeline (identity resolution → authz → guardrail → concurrency →
+lock); the usage-ADD SET fallback fires only on the legacy-NULL
+ValidationException; a paused assignment's thread binding is never overwritten
+by a newer dispatch; `ask_user` is gated on the presence of an actual resume
+trigger (Slack thread), not the source name; a D8 follow-up only switches
+agents on an explicit `@agent` mention.
+
 Notable deltas from the draft, decided at implementation:
 - `ask_user` is offered only on **Slack-originated** dispatches — the
   in-thread reply is the only resume trigger, and a GitHub/Asana pause would

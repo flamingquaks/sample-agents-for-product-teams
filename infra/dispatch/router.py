@@ -418,16 +418,42 @@ def thread_binding_key(team_id: str, channel_id: str, thread_ts: str) -> str:
 
 def write_thread_binding(source_context: dict, assignment_id: str, agent_id: str) -> None:
     """Bind the dispatch's Slack thread to this assignment (best-effort — a
-    missed binding only costs resumability, never the dispatch)."""
+    missed binding only costs resumability, never the dispatch).
+
+    A binding whose CURRENT assignment is paused (``awaiting_input``) or
+    mid-resume is NOT overwritten: the pause message told the user "reply in
+    this thread to resume", and rebinding the thread to a newer dispatch would
+    permanently orphan the paused run (its reply would route to the new
+    assignment). The new dispatch still proceeds — it just doesn't steal the
+    thread's resume anchor while a pause is outstanding."""
     team = str(source_context.get("workspace", "") or "")
     channel = str(source_context.get("channel_id", "") or "")
     thread_ts = str(source_context.get("thread_ts", "") or "")
     if not (team and channel and thread_ts):
         return
+    key = thread_binding_key(team, channel, thread_ts)
     try:
+        existing = assignments_table.get_item(Key={"assignment_id": key}).get("Item") or {}
+        bound_id = str(existing.get("bound_assignment_id", "") or "")
+        if bound_id and bound_id != assignment_id:
+            bound = (
+                assignments_table.get_item(
+                    Key={"assignment_id": bound_id},
+                    ProjectionExpression="#s",
+                    ExpressionAttributeNames={"#s": "status"},
+                ).get("Item")
+                or {}
+            )
+            if bound.get("status") in ("awaiting_input", "resuming"):
+                logger.info(
+                    "thread binding kept on paused assignment %s (not rebound to %s)",
+                    bound_id,
+                    assignment_id,
+                )
+                return
         assignments_table.put_item(
             Item={
-                "assignment_id": thread_binding_key(team, channel, thread_ts),
+                "assignment_id": key,
                 "kind": "thread_binding",
                 "bound_assignment_id": assignment_id,
                 "agent_id": agent_id,
@@ -612,11 +638,14 @@ def handle_resume(event) -> dict:
 
     The Slack webhook resolved the thread binding and sends
     ``{"resume_of": <assignment_id>, "body": <the reply>, "sender": ..., ...}``.
-    Order: trigger-authz on the replier (a resume is a dispatch — anyone in the
-    thread can type, so the reply must pass the same Cedar check), guardrail on
-    the reply text (untrusted input — no bypass), THEN the conditional
-    ``awaiting_input → resuming`` flip (the lock), THEN re-invoke the SAME
-    runtime with the saved interrupt id + workspace snapshot + the reply."""
+    Order mirrors the main dispatch pipeline stage for stage — a resume IS a
+    dispatch: identity resolution (so email/group-granted access applies to
+    the reply exactly as it did to the original dispatch, and a pending user
+    can't resume what they couldn't start), trigger-authz on the replier,
+    guardrail on the reply text (untrusted input — no bypass), THEN the
+    conditional ``awaiting_input → resuming`` flip (the lock), THEN re-invoke
+    the SAME runtime with the saved interrupt id + workspace snapshot + the
+    reply."""
     assignment_id = str(event.get("resume_of", ""))
     reply_text = event.get("body", "") or ""
     sender = event.get("sender", "unknown")
@@ -640,6 +669,35 @@ def handle_resume(event) -> dict:
     if agent_id not in agents:
         return _error(404, f"agent {agent_id} is no longer routable")
     agent_config = {**agents[agent_id], "agent_id": agent_id}
+
+    # Identity resolution + onboarding gate — same as the main pipeline (§16).
+    # Without it, a user whose access comes from an email- or group-scoped
+    # grant would be denied on their own agent's question (their groups are on
+    # the identity, not the raw principal), and a pending/not-onboarded user
+    # could resume work they could never dispatch.
+    principal = namespaced_principal(sender, "slack")
+    if principal and principal not in _UNRESOLVED_SENDERS:
+        person = resolve_dispatch_identity(sender, "slack", source_context)
+        if not person.usable:
+            _put_metric(
+                "UserNotOnboarded", dimensions={"Source": "slack", "AgentId": agent_id}
+            )
+            _post_block_reply(
+                "slack",
+                source_context,
+                onboarding_reply("slack", source_context, True),
+                agent_id=agent_id,
+            )
+            return _error(
+                403, f"sender '{sender}' is not onboarded (identity {person.status})"
+            )
+        if person.email:
+            source_context["requester_email"] = person.email
+        if person.groups:
+            existing_groups = list(source_context.get("principal_groups") or [])
+            source_context["principal_groups"] = sorted(
+                {*existing_groups, *person.groups}
+            )
 
     # Authorize the REPLIER — a resume is a dispatch, and anyone in the thread
     # can type. Same Cedar trigger-authz as any dispatch (fail-closed on an
@@ -681,6 +739,22 @@ def handle_resume(event) -> dict:
         )
         _post_block_reply("slack", source_context, message, agent_id=agent_id)
         return _error(400, f"resume reply blocked by guardrail: {guardrail_result.reason}")
+
+    # Concurrency — a resumed run occupies a runtime invocation exactly like a
+    # fresh dispatch (paused rows don't count as 'dispatched', so without this
+    # gate N simultaneous replies could stack N invocations past the cap).
+    max_concurrent = agent_config.get("limits", {}).get("max_concurrent", 5)
+    if not check_concurrency(agent_id, max_concurrent):
+        _post_block_reply(
+            "slack",
+            source_context,
+            f"⏳ @{agent_id} is at capacity right now — your answer wasn't lost; "
+            "reply again in a few minutes to resume.",
+            agent_id=agent_id,
+        )
+        return _error(
+            429, f"@{agent_id} is at capacity ({max_concurrent} active); resume deferred"
+        )
 
     # The lock: only one reply resumes; a racing second reply is rejected.
     if not _resume_lock(assignment_id):

@@ -152,19 +152,28 @@ _sync_skills_from_s3()
 app = BedrockAgentCoreApp()
 
 
-@app.handler
+@app.entrypoint
 def invoke(payload, context=None):
     user_input = ""
     source_context = {}
     assignment_id = ""
     source = ""
     resume = None
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (json.JSONDecodeError, TypeError):
+            payload = {"prompt": payload}
     if isinstance(payload, dict):
         try:
             body = json.loads(payload.get("body", "{}")) if isinstance(payload.get("body"), str) else payload
         except (json.JSONDecodeError, TypeError):
             body = payload
-        user_input = body.get("instruction", "") or body.get("body", "")
+        # The router sends the text as "prompt" (invoke_agent); "instruction"/
+        # "body" are kept as fallbacks for direct/manual invocations.
+        user_input = (
+            body.get("prompt", "") or body.get("instruction", "") or body.get("body", "")
+        )
         source_context = body.get("source_context", {})
         assignment_id = body.get("assignment_id", "")
         source = body.get("source", "")
@@ -202,7 +211,11 @@ def invoke(payload, context=None):
         # binds the dispatch identity for credential scoping and only offers
         # what the runtime actually supports (git+vendor / session bucket).
         session, durable_tools, hooks, durable_prompt = durable.durable_kit(
-            assignment_id, agent_id=AGENT_ID, origin=dispatch_repo, source=source
+            assignment_id,
+            agent_id=AGENT_ID,
+            origin=dispatch_repo,
+            source=source,
+            source_context=source_context,
         )
         all_tools.extend(durable_tools)
         prompt += durable_prompt
