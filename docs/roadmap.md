@@ -46,7 +46,9 @@ All four agents run Claude Sonnet 5 via Bedrock Mantle.
 ## Medium-term (the interesting work, no commitment)
 
 ### Jira + GitLab support
-Atlassian has an official remote MCP server (Jira, Confluence, Compass under one OAuth). The agent-side changes are small (point at a different MCP URL, tune prompts for Jira terminology). The dispatch side needs a Jira webhook receiver.
+Jira is now fully specified — see [`docs/specs/jira-connector-spec.md`](specs/jira-connector-spec.md): a first-class Jira connector (dispatch source + curated `JiraTarget` gateway broker + traceability + a new event-automation rule engine + per-user Slack DM notifications + a Connectors → Jira onboarding page), delivered in six phases. The spec supersedes the earlier "point at Atlassian's remote MCP" sketch: a Lambda broker with a curated tool schema was chosen over the remote MCP for destructive-tool exclusion and project scoping (spec §8.1).
+
+GitLab is harder — no production-grade official remote MCP. Community options exist (`zereight/gitlab-mcp`). Each shipping agent's system prompt would need merge-request vs. pull-request terminology adjustments.
 
 GitLab is harder — no production-grade official remote MCP. Community options exist (`zereight/gitlab-mcp`). Each shipping agent's system prompt would need merge-request vs. pull-request terminology adjustments.
 
@@ -90,7 +92,7 @@ Current docs in this repo:
 | [`aws-deploy.md`](aws-deploy.md) | What the project provisions in AWS + deterministic-deploy requirements |
 | [`agent-fleet-implementation-plan.md`](agent-fleet-implementation-plan.md) | Status doc (shipped vs. deferred) |
 | [`agents/*.md`](agents/) | Per-agent design docs for the four shipping agents |
-| [`specs/*.md`](specs/) | Detailed specs for each shipping agent, the Dispatch routing layer, and the Slack connectors + trigger-authz spec |
+| [`specs/*.md`](specs/) | Detailed specs for each shipping agent, the Dispatch routing layer, the Slack connectors + trigger-authz spec, and the proposed Jira connector spec |
 | [`threat-model.md`](threat-model.md) | Living threat model (STRIDE / OWASP LLM), updated as the fleet ships |
 | [`ai-sdlc-toolchain-map.md`](ai-sdlc-toolchain-map.md) | Role-by-role toolchain thinking (context, not spec) |
 | [`bot-patterns-recommendations.md`](bot-patterns-recommendations.md) | Bot-pattern survey (context, not spec) |

@@ -522,12 +522,12 @@ Mirrors the per-module style of the Slack suites; every phase lands with its tes
 
 ## 18. Threat-model additions (`docs/threat-model.md`)
 
-New components **C-23 Jira receiver + service account**, **C-24 Jira broker/target**, **C-25 automation-rule engine**. New threats:
+New components **C-23 Jira receiver + shared `atlassian-events` Forge forwarder + service account** (the forwarder component is shared with the Confluence connector's C-26 — whichever spec lands second references, rather than re-adds, it), **C-24 Jira broker/target**, **C-25 automation-rule engine**. New threats:
 
 | ID | Threat | Mitigation |
 |----|--------|-----------|
-| T-46 | Jira webhook forgery/spoofing | per-site secret, `X-Hub-Signature` HMAC timing-safe, fail-closed on missing secret; `issue.self` host cross-check (§6.1) |
-| T-47 | Silent webhook deafness (expiring dynamic webhooks) | admin-registered static webhooks only; liveness check + last-seen timestamp on the connector page (§6.1, §12) |
+| T-46 | Jira webhook forgery / cross-site event confusion | per-delivery Forge Invocation Token verified RS256 against Atlassian's JWKS (signature, expiry, audience, pinned app id); cloud-id + `issue.self` host cross-check; fail-closed when JWKS unavailable. No shared secret exists to steal or replant (§6.1–6.2) |
+| T-47 | Silent webhook deafness | Forge triggers are declarative manifest state (never expire, unlike OAuth dynamic webhooks); `webhook_last_seen_at` liveness on the connector page; shared-app note: uninstall silences both Atlassian connectors on the site — both pages surface it (§6.1, §12) |
 | T-48 | Site-wide token blast radius (no per-project credential exists) | broker project-allowlist enforcement + Cedar project forbid + interceptor origin pinning + curated no-delete tool schema (§8) |
 | T-49 | Automation loops / event storms | bot-actor guard, per-(rule,issue) cooldown, hourly ceiling + throttle alarm, chain-depth cap (§10.5) |
 | T-50 | Automation privilege escalation (a rule as a grant side door) | rules admin-gated; synthetic `automation:jira:<rule_id>` principal authorizes through the same AVP path via an auto-managed grant; default-deny backstop (§10.4) |
@@ -546,3 +546,4 @@ Plus DF rows for the Jira inbound flow, the broker outbound flow, automation dis
 3. **Agile tools** (boards/sprints, read-only) — additive to the curated schema when an agent needs them.
 4. **Automation for GitHub/Asana events** — the engine is source-agnostic by schema; wiring their receivers is a fast-follow after Phase 4 proves the model.
 5. **AgentCore Memory for cross-run issue context** — unchanged from the fleet roadmap; comment-history front-loading is sufficient for v1 conversations.
+6. **~~Transport~~ — DECIDED (2026-07-24): the shared `atlassian-events` Forge forwarder** (§6.1), superseding the original admin-registered System WebHook + HMAC secret. Same pre-build verification as the Confluence spec's §19: confirm Forge `avi:jira:*` trigger coverage for the three subscribed events (comment created, issue created, issue updated with changelog) delivers enough payload to drive §6.2; if a gap surfaces, the original static-webhook transport re-enters as the fallback for the affected event only.
