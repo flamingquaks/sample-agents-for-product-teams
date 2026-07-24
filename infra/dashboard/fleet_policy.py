@@ -370,6 +370,16 @@ AGENT_TOOL_GRANTS = {
         f"{_GH}___create_pull_request_review",
     ],
     "researcher": [
+        # GitHub — READ ONLY: ground research/backlog analysis in the real
+        # codebase and issue tracker. No write tools (tier has no write either).
+        f"{_GH}___get_file_contents",
+        f"{_GH}___search_code",
+        f"{_GH}___get_issue",
+        f"{_GH}___list_issues",
+        f"{_GH}___get_pull_request",
+        f"{_GH}___list_pull_requests",
+        f"{_GH}___list_commits",
+        f"{_GH}___list_milestones",
         f"{_AS}___get_task",
         f"{_AS}___list_tasks",
         f"{_AS}___list_projects",
@@ -411,7 +421,16 @@ AGENT_GITHUB_PERMISSIONS = {
         "pull_requests": "write",
         "metadata": "read",
     },
-    "researcher": {},
+    # READ-ONLY tier: the BA grounds backlog analysis, gap detection, and
+    # prioritization in the real codebase/issue tracker. No write of any kind —
+    # the broker intersects every mint with this tier, so even a write tool
+    # cannot produce a write credential for researcher.
+    "researcher": {
+        "contents": "read",
+        "issues": "read",
+        "pull_requests": "read",
+        "metadata": "read",
+    },
 }
 
 

@@ -6,9 +6,11 @@
 // gateway is not deployed. Keep the two in sync.
 
 // Cedar policies specific to the Researcher (business analyst) agent.
-// Researcher works exclusively through Asana. Can read broadly, create/update
-// tasks and comments, use web search and code execution.
-// No GitHub writes, no merge/close/delete.
+// Researcher works through Asana (read + create/update/comment) and has
+// READ-ONLY GitHub access so backlog analysis, gap detection, and
+// prioritization are grounded in the real codebase and issue tracker.
+// No GitHub writes of any kind, no merge/close/delete (the credential tier
+// in scm_broker.AGENT_GITHUB_PERMISSIONS is read-only too).
 
 permit(
     principal == AgentCore::Agent::"researcher",
@@ -26,6 +28,15 @@ permit(
     resource.toolName == "asana_create_task" ||
     resource.toolName == "asana_update_task" ||
     resource.toolName == "asana_add_comment" ||
+    // GitHub — read only (issues, PRs, files, history)
+    resource.toolName == "github_get_file_contents" ||
+    resource.toolName == "github_search_code" ||
+    resource.toolName == "github_get_issue" ||
+    resource.toolName == "github_list_issues" ||
+    resource.toolName == "github_get_pull_request" ||
+    resource.toolName == "github_list_pull_requests" ||
+    resource.toolName == "github_list_commits" ||
+    resource.toolName == "github_list_milestones" ||
     // Web search — competitive intelligence and market research
     resource.toolName == "web_search"
 };

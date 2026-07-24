@@ -296,5 +296,7 @@ def test_grants_filtered_to_deployed_targets(monkeypatch):
     stmt = created["sdlc_permit_workitems"]["definition"]["cedar"]["statement"]
     assert "GitHubTarget___get_issue" in stmt
     assert "AsanaTarget" not in stmt
-    # researcher is Asana-only → no permit at all (default-deny).
-    assert "sdlc_permit_researcher" not in created
+    # researcher keeps its GitHub READ grants but loses the Asana ones.
+    r_stmt = created["sdlc_permit_researcher"]["definition"]["cedar"]["statement"]
+    assert "GitHubTarget___get_file_contents" in r_stmt
+    assert "AsanaTarget" not in r_stmt

@@ -427,8 +427,10 @@ def test_permission_tiers_enforce_access_differentiation():
     # asserted by test_create_pull_request_review_forces_comment_event.
     assert perms["adr"]["contents"] == "read"
     assert perms["adr"].get("pull_requests") == "write"
-    # researcher: no GitHub
-    assert perms["researcher"] == {}
+    # researcher: READ-ONLY GitHub — grounds analysis in the real codebase and
+    # issue tracker; no write permission of any kind.
+    assert perms["researcher"]
+    assert all(level == "read" for level in perms["researcher"].values())
 
 
 def test_template_inline_schema_matches_source():

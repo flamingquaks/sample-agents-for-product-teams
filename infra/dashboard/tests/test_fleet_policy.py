@@ -207,9 +207,18 @@ def test_no_orphaned_write_tools():
     assert not orphans, f"WRITE_TOOLS granted to no agent (dead surface): {sorted(orphans)}"
 
 
-def test_researcher_permit_is_asana_only():
+def test_researcher_permit_is_read_only_on_github():
+    """Researcher grants: Asana read/write + GitHub READ tools only — never a
+    GitHub write or destructive tool (the credential tier is read-only too)."""
     actions = fleet_policy.AGENT_TOOL_GRANTS["researcher"]
-    assert actions and all(a.startswith("AsanaTarget___") for a in actions)
+    assert actions
+    github_tools = {
+        a.split("___", 1)[1] for a in actions if a.startswith(f"{fleet_policy.GITHUB_TARGET}___")
+    }
+    assert github_tools  # read access granted
+    assert github_tools <= set(fleet_policy.READ_TOOLS)
+    assert not github_tools & set(fleet_policy.WRITE_TOOLS)
+    assert not github_tools & set(fleet_policy.DESTRUCTIVE_TOOLS)
 
 
 def test_agent_permit_policies_names():

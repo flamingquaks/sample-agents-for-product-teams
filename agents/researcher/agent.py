@@ -1,7 +1,9 @@
 """Researcher — Autonomous Business Analyst agent.
 
 Performs research synthesis, competitive intelligence, requirements drafting,
-backlog analysis, and impact estimation. Works exclusively through Asana.
+backlog analysis, and impact estimation. Writes through Asana; has READ-ONLY
+GitHub access (issues, PRs, files, history) so analysis is grounded in the
+real codebase and issue tracker.
 
 Deployed to Amazon Bedrock AgentCore Runtime.
 Uses Claude Opus 4.7 via Bedrock and Asana's official MCP server.
@@ -74,7 +76,7 @@ def invoke(payload, context=None):
     # Dispatch context lives in the system prompt, not in the user message —
     # the "[Dispatch Context] ... [User Request]" wrapper trips Bedrock
     # Guardrails' PROMPT_ATTACK filter because it mirrors the canonical
-    # injection shape. Researcher only operates through Asana today.
+    # injection shape.
     dispatch_context_block = ""
     if source_context and source == "asana":
         dispatch_context_block = (
@@ -119,17 +121,26 @@ def invoke(payload, context=None):
         )
         tools.extend(memory_provider.tools)
 
+    # The origin repo anchors co-repo enforcement: a Slack dispatch carries the
+    # first channel-approved repo, and the interceptor scopes researcher's
+    # READ-ONLY GitHub reach from it. No repo (e.g. Asana dispatch) => no
+    # GitHub reads possible, exactly as before.
+    dispatch_repo = source_context.get("repo") or None
+
     # Gateway-only: route through the AgentCore Gateway (Cedar-enforced, SigV4).
-    # Researcher is Asana-only and touches no GitHub, so no dispatch origin — just
-    # its agent id (for per-principal tool filtering at the gateway).
-    with gateway.build_gateway_client(agent=ACTOR_ID) as gw:
+    # Origin + agent headers let the gateway enforce co-repo grouping and
+    # researcher's read-only GitHub tier.
+    with gateway.build_gateway_client(
+        dispatch_origin=dispatch_repo, agent=ACTOR_ID
+    ) as gw:
         all_tools = [*gw.list_tools_sync(), *tools]
 
-        # Durable session + ask_user (durable-repo-work spec). Researcher is
-        # Asana-only — no repo workspace.
+        # Durable session + ask_user (durable-repo-work spec). Researcher's
+        # GitHub access is READ-ONLY (API reads via the gateway) — no git
+        # workspace, so repo_capable stays False.
         session, durable_tools, hooks, durable_prompt = durable.durable_kit(
-            assignment_id, agent_id=ACTOR_ID, origin="", repo_capable=False,
-            source=source, source_context=source_context,
+            assignment_id, agent_id=ACTOR_ID, origin=dispatch_repo or "",
+            repo_capable=False, source=source, source_context=source_context,
         )
         all_tools.extend(durable_tools)
 

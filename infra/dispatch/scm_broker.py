@@ -90,7 +90,16 @@ AGENT_GITHUB_PERMISSIONS = {
         "pull_requests": "write",
         "metadata": "read",
     },
-    "researcher": {},
+    # READ-ONLY tier: the BA grounds backlog analysis, gap detection, and
+    # prioritization in the real codebase/issue tracker. No write of any kind —
+    # the broker intersects every mint with this tier, so even a write tool
+    # cannot produce a write credential for researcher.
+    "researcher": {
+        "contents": "read",
+        "issues": "read",
+        "pull_requests": "read",
+        "metadata": "read",
+    },
 }
 
 # Ordering for intersecting a tool's needed level with an agent's granted level.

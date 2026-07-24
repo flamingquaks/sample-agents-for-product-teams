@@ -582,27 +582,41 @@ def test_completed_thread_reply_with_explicit_mention_switches_agent(monkeypatch
 
 
 def test_mention_repo_scope_skipped_for_github_less_agent(monkeypatch):
-    """Regression: researcher (Asana-only, empty GitHub tier) must NOT get
-    channel repo scope — the instruction would promise repo access the
-    interceptor then refuses, killing the MCP session and failing the run."""
+    """Regression: an agent with an EMPTY GitHub tier must NOT get channel
+    repo scope — the instruction would promise repo access the interceptor
+    then refuses, killing the MCP session and failing the run."""
+    import scm_broker
+
     sw, state = _fresh(monkeypatch, channel_repos=["acme/web"])
-    ev = _events_event({"type": "event_callback", "team_id": TEAM, "event_id": "e-ba",
-                        "event": {"type": "app_mention",
-                                  "text": "<@U0BOT> @researcher what are the critical features",
-                                  "user": "U0ALICE", "channel": "C0ENG", "ts": "22.2"}})
-    REGISTRY["agents"]["researcher"] = {"aliases": ["ba"]}
-    try:
-        sw._registry._cache = None
-        sw.handler(ev)
-    finally:
-        del REGISTRY["agents"]["researcher"]
-        sw._registry._cache = None
+    # Synthetic tier-less built-in (researcher gained a read tier, so pin the
+    # gate's behavior with an explicit empty tier).
+    monkeypatch.setitem(scm_broker.AGENT_GITHUB_PERMISSIONS, "workitems", {})
+    sw.handler(_mention_ev("<@U0BOT> @workitems what are the critical features",
+                           event_id="e-tierless"))
     assert len(state["dispatched"]) == 1
     d = state["dispatched"][0]
-    assert d["agent_id"] == "researcher"
+    assert d["agent_id"] == "workitems"
     assert d["context"]["repo"] == ""
     assert d["context"]["repos"] == []
     assert "Repositories approved" not in d["instruction"]
+
+
+def test_mention_repo_scope_attached_for_read_only_agent(monkeypatch):
+    """Researcher's read-only tier is GitHub access — repo scope attaches so
+    the BA can ground analysis in the real codebase."""
+    sw, state = _fresh(monkeypatch, channel_repos=["acme/web"])
+    REGISTRY["agents"]["researcher"] = {"aliases": ["ba"]}
+    try:
+        sw._registry._cache = None
+        sw.handler(_mention_ev("<@U0BOT> @researcher what are the critical features",
+                               event_id="e-ba-read"))
+    finally:
+        del REGISTRY["agents"]["researcher"]
+        sw._registry._cache = None
+    d = state["dispatched"][0]
+    assert d["agent_id"] == "researcher"
+    assert d["context"]["repo"] == "acme/web"
+    assert d["context"]["repos"] == ["acme/web"]
 
 
 def test_mention_repo_scope_attached_for_github_agent(monkeypatch):
