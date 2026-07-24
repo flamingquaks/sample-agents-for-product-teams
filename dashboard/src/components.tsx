@@ -1,11 +1,10 @@
 // Small presentational components shared across views.
 
 import type { Run, TraceRefs } from "./types";
-import { statusClass } from "./format";
+import { statusClass, statusLabel } from "./format";
 
 export function StatusPill({ status }: { status?: string }) {
-  const label = status ?? "unknown";
-  return <span className={`pill ${statusClass(status)}`}>{label}</span>;
+  return <span className={`pill ${statusClass(status)}`}>{statusLabel(status)}</span>;
 }
 
 /**

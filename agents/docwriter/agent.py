@@ -148,7 +148,7 @@ def invoke(payload, context=None):
     # session manager restores the conversation on a resumed/cold-started run;
     # the workspace tools give docwriter a real clone/build/push loop.
     session, durable_tools, hooks, durable_prompt = durable.durable_kit(
-        assignment_id, agent_id=ACTOR_ID, origin=dispatch_repo or ""
+        assignment_id, agent_id=ACTOR_ID, origin=dispatch_repo or "", source=source
     )
     tools.extend(durable_tools)
     system_prompt += durable_prompt

@@ -182,16 +182,21 @@ def durable_kit(
     agent_id: str,
     origin: str,
     repo_capable: bool = True,
+    source: str = "",
 ):
     """One-call wiring for an agent entrypoint. Returns
     ``(session_manager, extra_tools, hooks, prompt_suffix)``:
 
     - the S3 session manager (or None when the bucket isn't deployed),
     - the durable-workspace tools (when ``repo_capable`` and the runtime has
-      git + the token vendor) and the ``ask_user`` tool (when the session is
-      durable — a pause without conversation durability would lose the run),
-    - the interrupt hook for ``ask_user``,
-    - the system-prompt addendum describing both.
+      git + the token vendor),
+    - the ``ask_user`` tool + its interrupt hook — offered ONLY when a resume
+      trigger actually exists: the session must be durable (a pause without
+      conversation durability would lose the run) AND the dispatch must be
+      Slack-originated (the in-thread reply is the only resume trigger today,
+      D6 — a GitHub/Asana run that paused would be stranded until the
+      timeout sweep, which reads as a hang to the requester),
+    - the system-prompt addendum describing what was wired.
 
     Also binds the workspace to this dispatch (assignment/agent/origin) so the
     clone/push credentials scope from server truth.
@@ -215,12 +220,14 @@ def durable_kit(
             "single file read, keep using the get_file_contents tool.\n"
         )
     session = session_manager(assignment_id)
-    if session is not None:
+    if session is not None and source == "slack":
         tools.append(ask_user)
         hooks.append(AskUserInterruptHook())
         prompt += (
             "\n\nWhen you are blocked on a decision only the requester can "
-            "make, use the ask_user tool — do not guess or fail.\n"
+            "make, use the ask_user tool — do not guess or fail. If it is "
+            "unavailable or errors, make your best assumption and state it "
+            "clearly in your answer.\n"
         )
     return session, tools, hooks, prompt
 

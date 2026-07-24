@@ -77,7 +77,7 @@ What it changes vs Strands, and therefore what this spec must govern:
 | Tool surface | Gateway MCP tools only (no shell, no filesystem tools) | Gateway MCP tools **plus optional built-in tools** (Bash, Read, Write, …) — a new capability class that must be granted, classified, and defaulted OFF (§5.3) |
 | Model call | Strands `AnthropicModel` → Mantle endpoint, guardrail headers injected per call | Claude Code CLI subprocess → same Mantle endpoint via `ANTHROPIC_BASE_URL` + short-term bearer token; guardrail via `ANTHROPIC_CUSTOM_HEADERS` (§5.1) |
 | Conversation state | None today (fresh `Agent` per invoke) | `session_store` (S3) + `resume`, per-turn (§6.1) |
-| Loop control | Single `agent(user_input)` call | `max_turns`, `max_budget_usd`, hooks, `permission_mode` — mapped from the capability's `limits` (§5.6) |
+| Loop control | Single `agent(user_input)` call | `max_turns`, `max_budget_usd`, hooks, `permission_mode` — mapped from the capability's `limits` (§5.8) |
 
 ## 3. Concepts
 
@@ -165,7 +165,7 @@ the image.
    `tools=[…]` and `allowed_tools`/`disallowed_tools` from the grant mapping
    (§5.3); `permission_mode="dontAsk"` with `can_use_tool` denying anything
    ungranted (defense in depth); `max_turns` / `max_budget_usd` from
-   `limits` (§5.6); hooks (§5.4, §6.3).
+   `limits` (§5.8); hooks (§5.4, §6.3).
 7. Run `query(prompt=…, options=…)` to completion; collect the final
    `ResultMessage`; map `usage` + `total_cost_usd` into
    `complete_assignment(...)` (which already ADD-accumulates across resumed
@@ -180,6 +180,7 @@ of these does not ship.
 | Integration | Strands mechanism | Claude mechanism |
 |---|---|---|
 | **5.1 Model via Mantle** | `AnthropicModel` on the Mantle endpoint; bearer from `aws-bedrock-token-generator`; `anthropic-workspace-id` header | `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` (same generator, minted per invoke, passed only in the subprocess env — never on disk) + `ANTHROPIC_CUSTOM_HEADERS`. `ANTHROPIC_MODEL=$BEDROCK_MODEL_ID` |
+| ↳ *auth is IAM-role-based* | — | **Both candidate paths derive from the runtime IAM role — no API key, no stored secret, same trust chain as Strands.** Spike results (2026-07-24, account 640168437444/us-east-1) select the path: **(a) SigV4 native mode (`CLAUDE_CODE_USE_BEDROCK=1`) — WORKS end-to-end** (CLI → bedrock-runtime, completion returned, cost computed); the CLI signs with the role's credentials directly. **(b) Mantle bearer mode — currently BLOCKED**: raw HTTP to the Mantle endpoint with a `aws-bedrock-token-generator` token returns 200, but the CLI pins an `anthropic-beta` header set including `prompt-caching-scope-2026-01-05`, which Mantle rejects (400 "invalid beta flag"); the flag set is not overridable via env (`DISABLE_PROMPT_CACHING`/`ANTHROPIC_CUSTOM_HEADERS` don't remove it). **P1 therefore ships on (a)**, with (b) tracked as the preferred end-state once Mantle accepts the CLI's beta set or the CLI makes it configurable. Consequences of (a) to resolve in P1: the Mantle project cost-attribution header doesn't apply on `bedrock-runtime` (fleet cost falls back to the assignment-row token accounting, which is authoritative anyway), and the guardrail must be verified on this path — the fleet's `X-Amzn-Bedrock-Guardrail*` headers are Mantle-endpoint headers; if the CLI's Bedrock mode can't attach a guardrail, P1 compensates with the router edge `ApplyGuardrail` (already fail-closed, unchanged) plus an adapter-side `ApplyGuardrail` check on the final output before `complete_assignment`. |
 | **Guardrail (fail-closed)** | `build_model` raises if `BEDROCK_GUARDRAIL_ID` unset; headers on every model call | Same headers via `ANTHROPIC_CUSTOM_HEADERS` on every CLI model call; adapter refuses to start without the id. Router edge `ApplyGuardrail` is upstream of both runtimes, unchanged |
 | **5.2 Gateway-only tools** | Strands `MCPClient` over SigV4 (`mcp_proxy_for_aws`); refuses to boot without `GATEWAY_MCP_URL` | In-process SDK MCP proxy server forwarding to the SAME SigV4 client (the SDK's `McpHttpServerConfig` supports only static headers, so direct connection is impossible by construction — a feature, not a gap). Boot-refusal identical. Tool names surface to the model as `mcp__gateway__<Target___tool>` |
 | **Cedar tool policy** | Gateway policy engine filters `list_tools_sync()` per agent id | Identical — the proxy calls the same gateway as the same principal; grants render through the same `fleet_policy` path |
@@ -202,10 +203,13 @@ enforced at the runtime boundary. Rules:
 - The fleet tool catalog (`fleet_policy`) gains a **`builtin:` namespace**:
   `builtin___Read`, `builtin___Bash`, … classified with the same
   read/write/destructive discipline: `Read`/`Glob`/`Grep` → `read`;
-  `Write`/`Edit`/`Bash`/`WebFetch`/`WebSearch` → `write`-class (grantable,
-  surfaced with an explicit warning in the picker); nothing in the namespace is
-  `destructive`, but **`permission_mode` values other than `dontAsk` and the
-  `bypassPermissions` mode are not configuration — they're hardcoded out**.
+  `Write`/`Edit`/`Bash` → `write`-class (grantable in v1, surfaced with an
+  explicit warning in the picker); `WebFetch`/`WebSearch` → `write`-class
+  (grantable in v1 — these bypass the Gateway by design, an accepted interim
+  posture until internal web tooling exists; see §5.6). Nothing in the
+  namespace is `destructive`, but **`permission_mode` values other than
+  `dontAsk` and the `bypassPermissions` mode are not configuration — they're
+  hardcoded out**.
 - A `claude-agent-sdk` capability with **no builtin grants** runs with
   `tools=[]` — Gateway MCP tools only, i.e. exactly the Strands security
   envelope. This is the default for new and cloned agents.
@@ -234,7 +238,48 @@ The adapter installs fleet hooks that authored config cannot remove:
 - `PostToolUse` on gateway tools — trace-ref capture (PR URLs, branch names)
   without waiting for the final message.
 
-### 5.5 AgentCore Memory
+### 5.5 Subagents & traceability
+
+Programmatic subagents (`ClaudeAgentOptions.agents`) ARE part of v1 — but as
+**fleet-defined roles, not free-form authored config**. The requirement they
+serve is accountability: every commit an agent (or its subagents) produces
+must be linkable to a trace that ties back to the triggering event, including
+the human who triggered it. Mechanics:
+
+- The adapter defines the subagent roster; a capability may toggle roster
+  entries on/off but cannot author arbitrary subagent prompts in v1.
+- Subagents inherit the parent's session context: the same `assignment_id`,
+  the same gateway proxy (same Cedar principal), the same builtin-grant
+  envelope — a subagent can never exceed the parent's grants.
+- **Commit ↔ trace linkage:** every commit made through the workspace tools
+  carries a trailer (`Sdlc-Assignment: <assignment_id>`), and `wip/` branch
+  names already embed the id. The `PostToolUse` hook records each
+  commit sha into the assignment row's `trace_refs`, alongside the existing
+  PR-URL/branch mining. Since the assignment row already records `requester`,
+  `source`, `trigger_type`, and `source_context`, the chain
+  **commit sha → assignment → triggering event → user** is queryable end to
+  end from the dashboard's run view. Subagent activity appears in the same
+  session transcript (§6.1), so the trace is complete even when a subagent
+  authored the change.
+
+### 5.6 WebSearch / WebFetch — accepted Gateway bypass (interim)
+
+`WebFetch`/`WebSearch` reach the public internet directly rather than through
+the Gateway. This is **accepted for v1**: the fleet has no internal
+web-research tooling yet (the Researcher's Tavily integration is a bespoke
+code-defined tool, per authoring spec §3.3), and blocking web access entirely
+would gut the research use cases the Claude runtime is being adopted for.
+Constraints that keep it bounded:
+
+- Grantable per-tool like everything else (`write`-class, warning treatment,
+  second-admin approval under the gate) — never on by default.
+- Tool calls still appear in the session transcript and OTel traces, so usage
+  is auditable per assignment.
+- **Sunset clause:** when an internal web-research Gateway target ships, these
+  builtin grants are deprecated in the catalog and existing grants flagged for
+  migration. Tracked as a roadmap item so the bypass doesn't ossify.
+
+### 5.7 AgentCore Memory
 
 The Strands built-ins wire optional `AgentCoreMemoryToolProvider` tools when
 `AGENTCORE_MEMORY_ID` is set (no Memory resource is provisioned today —
@@ -244,7 +289,7 @@ identically (`actor_id=AGENT_ID`, `session_id=assignment_id`,
 namespace `/agents/<id>/<session>`). Ships behind the same env flag; no new
 infra.
 
-### 5.6 Limits mapping
+### 5.8 Limits mapping
 
 | Capability `limits` | Claude runtime |
 |---|---|
@@ -441,42 +486,69 @@ second-admin approval, exactly like novel `requirements`/`skills`.
 - **D7 Resume payload flag** (`"resume": true`) interpreted natively per
   runtime.
 
-**Remaining questions (need an answer before P2):**
-- **Q1 — Builtin grant ceiling.** Should `Bash`/`Write` be grantable at all in
-  v1, or should P1 ship read-only builtins (`Read`/`Glob`/`Grep`) and defer
-  the write set to the durable-workspace wiring (§6.3)? Recommendation:
-  read-only in P1; write set lands with P3 so it never exists without the
-  push-clean protocol.
-- **Q2 — WebSearch/WebFetch.** These reach the public internet directly
-  (not via Gateway). Allow as grantable `write`-class, or exclude from the
-  catalog entirely in v1? Recommendation: exclude in v1 (the Researcher's
-  Tavily-shaped needs are a Gateway-target decision per authoring spec §3.3).
-- **Q3 — Subagents.** `ClaudeAgentOptions.agents` (programmatic subagents) is
-  powerful but multiplies the loop-control surface. Recommendation: not
-  exposed as authored config in v1; the adapter may use it internally later.
-- **Q4 — Mantle/Claude Code compatibility check.** The CLI is assumed to work
-  against the Mantle Messages endpoint via `ANTHROPIC_BASE_URL`; P1 starts
-  with a spike that proves model calls, guardrail headers, and cost headers
-  end-to-end before anything else is built.
+**Resolved (owner review, 2026-07-24):**
+- **Q1 — Builtin grant ceiling: ✅ `Bash`/`Write`/`Edit` ARE grantable in v1**
+  (write-class, warning treatment, approval-gated). Consequence: the
+  durable-workspace wiring (§6.3 — workspace tools, push-clean pause, env
+  scrubbing) moves INTO the same phase as write-grant availability, so a
+  write-granted agent never exists without the no-lost-work protocol.
+- **Q2 — WebSearch/WebFetch: ✅ grantable in v1, bypassing the Gateway** as an
+  accepted interim posture until internal web tooling exists — bounded and
+  sunset-claused in §5.6.
+- **Q3 — Subagents: ✅ in scope as fleet-defined roles** (not free-form
+  config), specifically to serve the accountability requirement: commits link
+  to traces that tie back to triggering events including the human trigger —
+  mechanics in §5.5 (commit trailers, `trace_refs` sha capture, shared
+  session transcript).
+- **Q4 — Mantle/Claude Code compatibility: ✅ spike COMPLETE (2026-07-24,
+  staging acct 640168437444 / us-east-1).** Findings:
+  1. **Raw Mantle auth works.** Direct HTTP to
+     `bedrock-mantle.us-east-1.api.aws/anthropic/v1/messages` with an
+     IAM-role-derived bearer token → 200, correct completion. The Q4
+     assumption (auth chain + endpoint shape) is proven.
+  2. **CLI → Mantle is blocked by a beta flag.** The bundled CLI
+     (claude-cli/2.1.218) sends a pinned `anthropic-beta` set; Mantle rejects
+     `prompt-caching-scope-2026-01-05` (also `oauth-2025-04-20`,
+     `prompt-caching-2024-07-31`) with 400 "invalid beta flag". Not
+     removable via `DISABLE_PROMPT_CACHING` or `ANTHROPIC_CUSTOM_HEADERS`.
+     Two spike traps worth recording: a 403 from Mantle surfaces as a silent
+     10-attempt retry loop (looks like a hang), and inherited
+     `CLAUDECODE`/`CLAUDE_CODE_*` env from a parent Claude Code process
+     changes CLI behavior — the adapter must construct the subprocess env
+     from scratch.
+  3. **CLI → Bedrock SigV4 native mode works end-to-end.**
+     `CLAUDE_CODE_USE_BEDROCK=1` + role credentials +
+     `model=global.anthropic.claude-sonnet-5` → completion + cost returned.
+  **Decision: P1 ships on the SigV4 native mode (§5.1)**; Mantle bearer mode
+  is the tracked end-state. Guardrail coverage on the SigV4 path is the one
+  P1 verification item (compensating control: router edge + adapter-side
+  `ApplyGuardrail`, §5.1).
+
+**Remaining questions:** none blocking.
 
 ## 11. Phasing
 
-- **P1 — Runtime seam + adapter spike:** `runtime` field (schema, API
-  validation, clone copy-through, seeding), buildspec routing,
-  `agents/_claude/` image + adapter with model auth (Q4 spike), gateway MCP
-  proxy, skills, assignment lifecycle, dispatch context. Zero builtin tools
+- **P1 — Runtime seam + adapter:** verify guardrail coverage on the SigV4
+  model path (per Q4; compensating `ApplyGuardrail` control if needed), then
+  `runtime` field (schema, API validation, clone copy-through, seeding),
+  buildspec routing,
+  `agents/_claude/` image + adapter with model auth, gateway MCP proxy,
+  skills, assignment lifecycle, dispatch context. Zero builtin tools
   (`tools=[]`). UI runtime selector + badge. Threat-model update.
 - **P2 — Sessions & resume:** sessions bucket + role/boundary changes;
   `session_store` wiring (Claude) + `S3SessionManager` wiring
   (`_base`, custom agents); router `resume` flag + thread-binding resume path
   (shared with the durable-work spec's Phase 2 — coordinate, don't duplicate).
-- **P3 — Builtin tool grants + workspace:** builtin catalog namespace +
-  classification + picker UI + approval-gate hook (read-only set first, per
-  Q1); workspace tools on the SDK MCP server; `ask_user` pause protocol +
-  `Stop` hook; env scrubbing.
-- **P4 — Parity extras:** AgentCore Memory tools behind the env flag;
-  trace-ref extraction from SDK messages; `max_turns` limit; CLI OTel
-  export tuning.
+- **P3 — Builtin tool grants + workspace (one phase, per Q1):** builtin
+  catalog namespace + classification + picker UI + approval-gate hook — full
+  v1 grant set (`Read`/`Glob`/`Grep`, `Bash`/`Write`/`Edit`,
+  `WebFetch`/`WebSearch`) shipping TOGETHER with the workspace tools on the
+  SDK MCP server, commit trailers + sha capture (§5.5), `ask_user` pause
+  protocol + `Stop` hook, and env scrubbing — write grants and the
+  no-lost-work protocol are inseparable.
+- **P4 — Subagent roster + parity extras:** fleet-defined subagent roles
+  (§5.5); AgentCore Memory tools behind the env flag; trace-ref extraction
+  from SDK messages; `max_turns` limit; CLI OTel export tuning.
 
 Each phase ships behind tests + the green-sweep discipline; docs
 (`03-design`, `aws-deploy`, `threat-model`, `roadmap.md` Document Index)

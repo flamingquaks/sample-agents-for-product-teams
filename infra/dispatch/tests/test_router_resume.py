@@ -82,6 +82,9 @@ def router(monkeypatch):
     router_mod.agentcore = MagicMock()
     monkeypatch.setattr(router_mod, "_post_block_reply", lambda *a, **k: True)
     monkeypatch.setattr(router_mod, "_put_metric", lambda *a, **k: None)
+    # Trigger authz (Cedar/AVP) is exercised in test_trigger_authz; the resume
+    # path re-checks the replier, so default to permitted here.
+    monkeypatch.setattr(router_mod, "authorize_trigger", lambda *a, **k: (True, ""))
     return router_mod
 
 
@@ -120,6 +123,21 @@ def test_resume_invokes_runtime_with_saved_state(router):
     assert payload["resume"]["workspace_snapshot"][0]["sha"] == "abc"
     # The lock flipped the row to resuming.
     assert router.assignments_table.rows["a-1"]["status"] == "resuming"
+
+
+def test_resume_requires_authorized_replier(router, monkeypatch):
+    """Anyone in the thread can type — an UNAUTHORIZED replier must not be
+    able to steer a paused agent, and the assignment stays resumable."""
+    router.assignments_table.rows["a-1"] = _paused_row()
+    monkeypatch.setattr(
+        router, "authorize_trigger", lambda *a, **k: (False, "no-grant")
+    )
+    with patch("guardrail.check_prompt") as gp:
+        gp.return_value = MagicMock(outcome="passed", reason="")
+        resp = router.handler(_resume_event(), None)
+    assert resp["statusCode"] == 403
+    router.agentcore.invoke_agent_runtime.assert_not_called()
+    assert router.assignments_table.rows["a-1"]["status"] == "awaiting_input"
 
 
 def test_resume_guardrail_blocks_reply(router):

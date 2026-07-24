@@ -4,13 +4,18 @@
 // predating a given enrichment, or in-flight runs, legitimately omit them — the
 // UI must render partial rows gracefully.
 
-/** Terminal + active statuses the router/agents write. */
+/** Terminal + active statuses the router/agents write. awaiting_input /
+ * resuming / timed_out are the durable pause lifecycle (an agent asked the
+ * requester a question and checkpointed; see durable-repo-work spec). */
 export type RunStatus =
   | "dispatched"
   | "completed"
   | "failed"
   | "blocked_guardrail"
   | "blocked_guardrail_error"
+  | "awaiting_input"
+  | "resuming"
+  | "timed_out"
   | string; // tolerate unknown/future statuses
 
 export interface Participant {
@@ -39,6 +44,13 @@ export interface Run {
   result_summary?: string | null;
   token_usage?: number | null;
   cost_estimate_usd?: number | null;
+  // Durable pause fields (status === "awaiting_input"; durable-repo-work spec):
+  // the question the agent asked and where its work is checkpointed.
+  pending_question?: string | null;
+  workspace_snapshot?: { repo: string; branch: string; sha: string }[] | null;
+  paused_at?: number | null;
+  // A follow-up started by replying on a completed thread links its prior run.
+  parent_assignment_id?: string | null;
 }
 
 export interface RunsPage {

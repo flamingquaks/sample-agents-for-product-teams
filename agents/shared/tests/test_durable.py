@@ -194,7 +194,7 @@ def test_durable_kit_full(monkeypatch):
 
     monkeypatch.setattr(ws, "enabled", lambda: True)
     session, tools, hooks, prompt = durable.durable_kit(
-        "a-1", agent_id="docwriter", origin="acme/web"
+        "a-1", agent_id="docwriter", origin="acme/web", source="slack"
     )
     assert session is not None
     tool_names = {getattr(t, "tool_name", getattr(t, "__name__", "")) for t in tools}
@@ -222,11 +222,38 @@ def test_durable_kit_repo_incapable_agent(monkeypatch):
 
     monkeypatch.setattr(ws, "enabled", lambda: True)
     _session, tools, _hooks, _prompt = durable.durable_kit(
-        "a-1", agent_id="workitems", origin="", repo_capable=False
+        "a-1", agent_id="workitems", origin="", repo_capable=False, source="slack"
     )
     tool_names = {getattr(t, "tool_name", getattr(t, "__name__", "")) for t in tools}
     assert "clone_repo" not in tool_names
     assert "ask_user" in tool_names
+
+
+def test_durable_kit_no_ask_user_without_resume_trigger(monkeypatch):
+    """A GitHub/Asana dispatch has no in-thread resume trigger — offering
+    ask_user there would strand the run in awaiting_input. Session + workspace
+    still wire; only the pause tool is withheld."""
+    monkeypatch.setenv("SESSION_BUCKET", "bkt")
+    monkeypatch.setenv("WORKSPACE_TOKEN_FUNCTION", "fn")
+
+    class FakeSM:
+        def __init__(self, **kwargs):
+            pass
+
+    import strands.session.s3_session_manager as sm_mod
+
+    monkeypatch.setattr(sm_mod, "S3SessionManager", FakeSM)
+    import shared.tools.workspace as ws
+
+    monkeypatch.setattr(ws, "enabled", lambda: True)
+    session, tools, hooks, prompt = durable.durable_kit(
+        "a-1", agent_id="docwriter", origin="acme/web", source="github"
+    )
+    assert session is not None  # conversation durability still on (crash safety)
+    tool_names = {getattr(t, "tool_name", getattr(t, "__name__", "")) for t in tools}
+    assert "clone_repo" in tool_names
+    assert "ask_user" not in tool_names
+    assert hooks == []
 
 
 # --- interrupt hook --------------------------------------------------------------

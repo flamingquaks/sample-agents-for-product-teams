@@ -143,6 +143,7 @@ def invoke(payload, context=None):
             agent_id=ACTOR_ID,
             origin=dispatch_repo or "",
             repo_capable=False,
+            source=source,
         )
         all_tools.extend(durable_tools)
 

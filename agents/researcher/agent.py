@@ -128,7 +128,8 @@ def invoke(payload, context=None):
         # Durable session + ask_user (durable-repo-work spec). Researcher is
         # Asana-only — no repo workspace.
         session, durable_tools, hooks, durable_prompt = durable.durable_kit(
-            assignment_id, agent_id=ACTOR_ID, origin="", repo_capable=False
+            assignment_id, agent_id=ACTOR_ID, origin="", repo_capable=False,
+            source=source,
         )
         all_tools.extend(durable_tools)
 

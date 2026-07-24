@@ -202,7 +202,7 @@ def invoke(payload, context=None):
         # binds the dispatch identity for credential scoping and only offers
         # what the runtime actually supports (git+vendor / session bucket).
         session, durable_tools, hooks, durable_prompt = durable.durable_kit(
-            assignment_id, agent_id=AGENT_ID, origin=dispatch_repo
+            assignment_id, agent_id=AGENT_ID, origin=dispatch_repo, source=source
         )
         all_tools.extend(durable_tools)
         prompt += durable_prompt

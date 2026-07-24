@@ -378,6 +378,9 @@ def _process_app_mention(event_data: dict, team_id: str) -> None:
                 "channel_id": channel_id_early,
                 "thread_ts": thread_ts,
                 "message_ts": event_data.get("ts"),
+                # Channel-membership group so a channel-scoped grant authorizes
+                # the resume reply exactly like the original dispatch.
+                "principal_groups": _principal_groups(team_id, channel_id_early),
                 **_sender_identity_context(team_id, user_id_early),
             }
             _dispatch_resume(bound_id, text, _principal(team_id, user_id_early), context)

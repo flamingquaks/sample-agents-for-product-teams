@@ -55,10 +55,20 @@ _STATUS_EVENTS = {
     # Durable pause (durable-repo-work spec D6): the agent asked the requester
     # a question and checkpointed. The origin-thread reply carries the question
     # + the how-to-resume copy; this fan-out line is the ops-channel signal.
+    # NOTE: the sweeper's stuck-resume revert (resuming -> awaiting_input) is a
+    # status change into this same mapping, so the question is automatically
+    # re-posted to the thread — the user learns their reply didn't take.
     "awaiting_input": (
         notify.TIER_ACTIONABLE,
         "awaiting_input",
         "⏸️ @{agent} is paused, waiting for the requester's reply (assignment `{id}`).",
+    ),
+    # Abandoned pause swept by the durable sweeper (Phase 3): wip branches
+    # deleted, work must be re-asked from scratch.
+    "timed_out": (
+        notify.TIER_INFORMATIVE,
+        "run_timed_out",
+        "⌛ @{agent} timed out waiting for a reply (assignment `{id}`); the paused work was cleaned up.",
     ),
 }
 
@@ -125,6 +135,12 @@ def _reply_to_origin(new: dict, new_status: str) -> None:
             f"_Reply in this thread with `@sdlc-agents <your answer>` and I'll "
             f"pick the work back up where I left off. Progress so far is "
             f"saved. (assignment `{assignment_id}`)_"
+        )
+    elif new_status == "timed_out":
+        text = (
+            f"⌛ I stopped waiting for a reply and cleaned up the paused work "
+            f"(assignment `{assignment_id}`). Mention me again with the "
+            f"request if you still need it."
         )
     else:  # awaiting_approval
         text = f"⏳ I need an approval to continue (assignment `{assignment_id}`) — an admin can approve it in the fleet dashboard."

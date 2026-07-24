@@ -44,10 +44,12 @@ TIER_EVENTS = {
         ("awaiting_approval", "A run is awaiting your approval"),
         ("review_requested", "A PR needs review"),
         ("question", "An agent asked the requester a question"),
+        ("awaiting_input", "A run paused waiting for the requester's reply"),
     ],
     "informative": [
         ("run_started", "A run kicked off"),
         ("run_completed", "A run completed"),
+        ("run_timed_out", "A paused run timed out waiting for a reply"),
         ("task_picked_up", "An agent picked up a task"),
         ("pr_opened", "A pull request was opened"),
         ("pr_merged", "A pull request was merged"),

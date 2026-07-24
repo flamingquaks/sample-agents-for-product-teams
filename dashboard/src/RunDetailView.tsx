@@ -112,6 +112,24 @@ function RunDetail({ run, onTrace }: { run: Run; onTrace: (d: string, v: string)
         <dd>{fmtCost(run.cost_estimate_usd)}</dd>
       </dl>
 
+      {run.status === "awaiting_input" && (
+        <div className="banner">
+          ⏸️ Paused — the agent asked the requester a question and is waiting for
+          an in-thread reply. Work so far is checkpointed on{" "}
+          {(run.workspace_snapshot ?? []).length > 0
+            ? (run.workspace_snapshot ?? [])
+                .map((w) => `${w.repo}@${w.branch}`)
+                .join(", ")
+            : "the conversation session"}
+          .
+          {run.pending_question && (
+            <pre className="prewrap" style={{ marginTop: 8 }}>
+              {run.pending_question}
+            </pre>
+          )}
+        </div>
+      )}
+
       {run.instruction && (
         <section>
           <h3>Instruction</h3>

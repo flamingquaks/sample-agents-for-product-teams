@@ -1,12 +1,29 @@
 # Durable Repo Work + Human-in-the-Loop Resume — Design Spec
 
-Status: **APPROVED — Phases 1+2 implemented** (Phase 3 watchdog/TTL pending) · Owner: fleet · Depends on: `dispatch-agent-assignment-spec.md`, `slack-connectors-spec.md`
+Status: **APPROVED — Phases 1–3 implemented** · Owner: fleet · Depends on: `dispatch-agent-assignment-spec.md`, `slack-connectors-spec.md`
 
 Implementation map: `agents/shared/tools/workspace.py` (git workspace + wip
 branches), `agents/shared/durable.py` (S3 sessions, `ask_user` interrupt,
 pause/resume protocol), `infra/dispatch/workspace_token_vendor.py` (scoped
-clone/push credential minting), router `handle_resume` + thread bindings,
-Slack webhook bound-thread routing, notifier `awaiting_input` copy.
+clone/push credential minting), router `handle_resume` + thread bindings +
+replier authz, Slack webhook bound-thread routing, notifier
+`awaiting_input`/`timed_out` copy, `infra/dispatch/durable_sweeper.py`
+(Phase 3: abandoned-pause timeout + wip cleanup, stuck-resume revert,
+stale-dispatch failure), dashboard status pills + paused-run banner.
+
+Notable deltas from the draft, decided at implementation:
+- `ask_user` is offered only on **Slack-originated** dispatches — the
+  in-thread reply is the only resume trigger, and a GitHub/Asana pause would
+  strand until the sweep (reads as a hang). Sessions still wire everywhere
+  (crash-restore value).
+- The resume reply is **authorized** (same Cedar trigger-authz as a dispatch)
+  before the guardrail — anyone can type in a thread; only permitted users
+  steer a paused agent.
+- The Phase 3 "watchdog re-dispatch from S3" was implemented as a
+  **stale-dispatch → failed sweep** (visibility + freed concurrency slot)
+  rather than automatic re-dispatch: an involuntary crash mid-edit loses
+  uncommitted work anyway (Loss boundary), so silent auto-retry risks
+  duplicate side effects for little gain. Human re-ask stays the recovery.
 
 ## Problem
 

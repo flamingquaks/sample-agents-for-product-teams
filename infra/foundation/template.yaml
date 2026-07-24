@@ -778,6 +778,48 @@ Resources:
             # notifications stay best-effort (the handler also self-guards).
             BisectBatchOnFunctionError: true
 
+  # Durable-work sweeper (durable-repo-work spec, Phase 3): scheduled cleanup
+  # for the pause/resume lifecycle — abandoned awaiting_input rows time out
+  # (+ wip branch deletion), stuck resuming rows revert to awaiting_input so
+  # the thread becomes resumable again. Status flips stream through the
+  # assignment notifier, which posts the user-facing note to the origin thread.
+  DurableSweeperFunction:
+    Type: AWS::Serverless::Function
+    # cryptography (github_app signs App JWTs for the wip-branch delete token).
+    Metadata:
+      BuildMethod: python3.12
+    Properties:
+      FunctionName: !Sub durable-sweeper-${Stage}
+      CodeUri: ../dispatch/
+      Handler: durable_sweeper.handler
+      Timeout: 300
+      Environment:
+        Variables:
+          ASSIGNMENTS_TABLE: !Ref AssignmentsTable
+          FLEET_CONFIG_TABLE: !Ref FleetConfigTable
+          GITHUB_APP_ID_PARAM: !Ref GitHubAppIdParam
+          GITHUB_APP_PRIVATE_KEY_SECRET_ARN: !Ref GitHubAppPrivateKey
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AssignmentsTable
+        # Per-owner install records for the wip-branch cleanup token.
+        - DynamoDBReadPolicy:
+            TableName: !Ref FleetConfigTable
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref GitHubAppPrivateKey
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/github-app-id
+      Events:
+        Sweep:
+          Type: Schedule
+          Properties:
+            Schedule: rate(30 minutes)
+            Description: Durable-work pause/resume lifecycle sweep
+
   WebhookApiAccessLogs:
     Type: AWS::Logs::LogGroup
     Properties:

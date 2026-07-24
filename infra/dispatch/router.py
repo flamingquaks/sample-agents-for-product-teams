@@ -591,12 +591,15 @@ def _resume_lock(assignment_id: str) -> bool:
     try:
         assignments_table.update_item(
             Key={"assignment_id": assignment_id},
-            UpdateExpression="SET #s = :resuming",
+            # resume_started_at bounds the sweeper's stuck-resume window (a
+            # resume whose agent never started reverts to awaiting_input).
+            UpdateExpression="SET #s = :resuming, resume_started_at = :now",
             ConditionExpression="#s = :awaiting",
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={
                 ":resuming": "resuming",
                 ":awaiting": "awaiting_input",
+                ":now": int(time.time()),
             },
         )
         return True
@@ -608,12 +611,15 @@ def handle_resume(event) -> dict:
     """Resume a paused (``awaiting_input``) assignment from an in-thread reply.
 
     The Slack webhook resolved the thread binding and sends
-    ``{"resume_of": <assignment_id>, "body": <the reply>, ...}``. Order:
-    guardrail on the reply (untrusted input — no bypass), THEN the conditional
+    ``{"resume_of": <assignment_id>, "body": <the reply>, "sender": ..., ...}``.
+    Order: trigger-authz on the replier (a resume is a dispatch — anyone in the
+    thread can type, so the reply must pass the same Cedar check), guardrail on
+    the reply text (untrusted input — no bypass), THEN the conditional
     ``awaiting_input → resuming`` flip (the lock), THEN re-invoke the SAME
     runtime with the saved interrupt id + workspace snapshot + the reply."""
     assignment_id = str(event.get("resume_of", ""))
     reply_text = event.get("body", "") or ""
+    sender = event.get("sender", "unknown")
     source_context = event.get("context", {}) or {}
 
     row = (
@@ -634,6 +640,29 @@ def handle_resume(event) -> dict:
     if agent_id not in agents:
         return _error(404, f"agent {agent_id} is no longer routable")
     agent_config = {**agents[agent_id], "agent_id": agent_id}
+
+    # Authorize the REPLIER — a resume is a dispatch, and anyone in the thread
+    # can type. Same Cedar trigger-authz as any dispatch (fail-closed on an
+    # unresolved sender), so a pause can't be hijacked by an unauthorized user
+    # steering the agent's next steps.
+    authorized, authz_reason = authorize_trigger(
+        agent_config, sender, "slack", source_context
+    )
+    if not authorized:
+        _put_metric(
+            "TriggerDenied",
+            dimensions={"Source": "slack", "AgentId": agent_id, "Reason": authz_reason},
+        )
+        _post_block_reply(
+            "slack",
+            source_context,
+            f"⛔ You're not authorized to resume this work (reason: {authz_reason}). "
+            "The original requester (or anyone with access) can reply instead.",
+            agent_id=agent_id,
+        )
+        return _error(
+            403, f"user '{sender}' not authorized to resume @{agent_id} ({authz_reason})"
+        )
 
     # The reply is untrusted input — same guardrail as any dispatch (no bypass).
     guardrail_result = guardrail.check_prompt(reply_text)

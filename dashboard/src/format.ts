@@ -42,15 +42,33 @@ export function statusClass(status?: RunStatus): string {
     case "blocked_guardrail_error":
       return "err";
     case "dispatched":
+    case "resuming":
       return "active";
+    case "awaiting_input":
+      return "warn"; // paused on the requester — a human should engage
+    case "timed_out":
+      return "unknown";
     default:
       return "unknown";
   }
 }
 
-/** Whether a run is still in flight (drives live-polling cadence). */
+/** Human-friendly label for a status pill (falls back to the raw value). */
+export function statusLabel(status?: RunStatus): string {
+  switch (status) {
+    case "awaiting_input":
+      return "awaiting reply";
+    case "timed_out":
+      return "timed out";
+    default:
+      return status || "unknown";
+  }
+}
+
+/** Whether a run is still in flight (drives live-polling cadence). A paused
+ * (awaiting_input) run is NOT active — it can sit for days; resuming is. */
 export function isActive(status?: RunStatus): boolean {
-  return status === "dispatched";
+  return status === "dispatched" || status === "resuming";
 }
 
 export interface SourceLink {
