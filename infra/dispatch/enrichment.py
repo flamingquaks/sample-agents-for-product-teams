@@ -128,6 +128,15 @@ def derive_trace_refs(source: str, source_context: dict, instruction: str = "") 
             refs["slack_channel"] = channel
         if thread_ts:
             refs["slack_thread_ts"] = thread_ts
+        # Composite thread identity — the END-TO-END trace key for a Slack
+        # conversation. thread_ts alone is not unique across channels; this
+        # key is. Every dispatch born in the thread (the original, D8 linked
+        # follow-ups, distinct agents serving the same thread) carries the
+        # same value, so the dashboard trace view shows the whole
+        # conversation as one timeline. (A RESUME re-enters the original
+        # assignment, so it is inherently part of that run's row.)
+        if workspace and channel and thread_ts:
+            refs["slack_thread"] = f"{workspace}#{channel}#{thread_ts}"
         jira_key = _extract_jira_key(instruction)
         if jira_key:
             refs["jira_key"] = jira_key

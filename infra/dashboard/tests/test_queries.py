@@ -213,6 +213,23 @@ def test_trace_matches_dimension(monkeypatch):
     assert out["truncated"] is False
 
 
+def test_trace_by_slack_thread(monkeypatch):
+    """The composite slack_thread ref is a valid trace dimension — grouping by
+    it returns every assignment born in one Slack conversation (the original
+    plus D8 follow-ups), i.e. the end-to-end thread trace."""
+    thread = "T0ACME#C0ENG#111.2"
+    rows = [
+        _run(0, trace_refs={"slack_thread": thread, "slack_channel": "C0ENG"}),
+        _run(1, trace_refs={"slack_thread": "T0ACME#C0ENG#999.9"}),
+        _run(2, trace_refs={"slack_thread": thread}),
+    ]
+    t = FakeTable(rows)
+    monkeypatch.setattr(queries, "_get_table", lambda: t)
+    assert "slack_thread" in queries.TRACE_DIMENSIONS
+    out = queries.trace("slack_thread", thread)
+    assert {r["assignment_id"] for r in out["runs"]} == {"a-0", "a-2"}
+
+
 def test_stats_rollup(monkeypatch):
     rows = [
         _run(0, status="dispatched", agent_id="workitems", source="github"),

@@ -16,6 +16,7 @@ its container, stands up its runtime, and republishes this registry), not a code
 change.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -33,6 +34,7 @@ import notify
 import reply
 import trigger_authz
 from botocore.config import Config
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -526,6 +528,73 @@ def fail_assignment_if_not_terminal(assignment_id: str, error: str) -> bool:
 # --- Agent Invocation --------------------------------------------------------
 
 
+def thread_runtime_session_id(
+    agent_id: str, source: str, source_context: dict | None
+) -> str | None:
+    """A deterministic AgentCore ``runtimeSessionId`` for a Slack thread.
+
+    AgentCore keeps a runtime session's microVM warm for ~15 minutes of
+    inactivity; invoking with the SAME runtimeSessionId lands on that warm
+    session. Deriving the id from (workspace, channel, thread, agent) means a
+    thread reply — a resume answer or a follow-up — reuses the invocation
+    environment that served the first request while it's still hot: no cold
+    start, and the working tree from the earlier segment is still on disk.
+    The S3 conversation session remains the durable fallback when the microVM
+    has expired.
+
+    Per-agent on purpose: two agents serving one thread get separate sessions.
+    Returns None off-thread (the caller falls back to a per-assignment id).
+    """
+    if source != "slack":
+        return None
+    ctx = source_context or {}
+    team = str(ctx.get("workspace", "") or "")
+    channel = str(ctx.get("channel_id", "") or "")
+    thread_ts = str(ctx.get("thread_ts", "") or "")
+    if not (team and channel and thread_ts):
+        return None
+    digest = hashlib.sha256(
+        f"{team}#{channel}#{thread_ts}#{agent_id}".encode()
+    ).hexdigest()
+    return f"thread-{digest}"  # 71 chars — within the API's 33–256 bound
+
+
+def _invoke_runtime(runtime_arn: str, payload: bytes, session_id: str, fallback_session_id: str):
+    """InvokeAgentRuntime with session affinity + busy-session fallback.
+
+    A RetryableConflictException means the warm thread session is currently
+    serving another invocation (e.g. two messages in quick succession) —
+    retry once on a fresh, unique session rather than failing the dispatch.
+    The fresh session cold-starts but the conversation still restores from S3.
+    """
+    try:
+        agentcore.invoke_agent_runtime(
+            agentRuntimeArn=runtime_arn,
+            qualifier="DEFAULT",
+            contentType="application/json",
+            accept="application/json",
+            payload=payload,
+            runtimeSessionId=session_id,
+        )
+    except ClientError as exc:
+        code = (exc.response.get("Error") or {}).get("Code", "")
+        if code != "RetryableConflictException" or session_id == fallback_session_id:
+            raise
+        logger.info(
+            "runtime session %s busy — falling back to fresh session %s",
+            session_id,
+            fallback_session_id,
+        )
+        agentcore.invoke_agent_runtime(
+            agentRuntimeArn=runtime_arn,
+            qualifier="DEFAULT",
+            contentType="application/json",
+            accept="application/json",
+            payload=payload,
+            runtimeSessionId=fallback_session_id,
+        )
+
+
 def invoke_agent(
     agent_config: dict,
     instruction: str,
@@ -553,13 +622,15 @@ def invoke_agent(
         }
     ).encode("utf-8")
 
-    agentcore.invoke_agent_runtime(
-        agentRuntimeArn=runtime_arn,
-        qualifier="DEFAULT",
-        contentType="application/json",
-        accept="application/json",
-        payload=payload,
+    # Thread-stable session id (Slack) so replies in the thread reuse the warm
+    # runtime session; per-assignment id (a 36-char UUID) everywhere else.
+    session_id = (
+        thread_runtime_session_id(
+            agent_config.get("agent_id", ""), source, source_context
+        )
+        or assignment_id
     )
+    _invoke_runtime(runtime_arn, payload, session_id, assignment_id)
 
 
 # --- Guardrail Block Handling ------------------------------------------------
@@ -811,13 +882,20 @@ def handle_resume(event) -> dict:
             "resume": resume_payload,
         }
     ).encode("utf-8")
+    # Session affinity: derive the SAME thread-stable runtimeSessionId the
+    # original dispatch used, so a reply within AgentCore's ~15-min idle
+    # window lands on the still-warm microVM that paused — conversation and
+    # working tree intact in place. Past the window (or if the session is
+    # busy), a fresh session cold-starts and restores from S3/the snapshot.
+    session_id = (
+        thread_runtime_session_id(
+            agent_id, str(row.get("source", "slack")), original_context
+        )
+        or assignment_id
+    )
     try:
-        agentcore.invoke_agent_runtime(
-            agentRuntimeArn=agent_config["runtime_arn"],
-            qualifier="DEFAULT",
-            contentType="application/json",
-            accept="application/json",
-            payload=payload,
+        _invoke_runtime(
+            agent_config["runtime_arn"], payload, session_id, assignment_id
         )
     except Exception as e:  # noqa: BLE001
         logger.error("Failed to resume agent %s: %s", agent_id, e)

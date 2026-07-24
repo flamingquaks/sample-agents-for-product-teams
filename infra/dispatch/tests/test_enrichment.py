@@ -93,6 +93,7 @@ def test_slack_refs():
         "slack_workspace": "T0ACME",
         "slack_channel": "C0ENG",
         "slack_thread_ts": "111.2",
+        "slack_thread": "T0ACME#C0ENG#111.2",
         "jira_key": "PROJ-42",
     }
 
@@ -100,6 +101,25 @@ def test_slack_refs():
 def test_slack_refs_omit_empty():
     refs = enrichment.derive_trace_refs("slack", {"channel_id": "C0ENG"})
     assert refs == {"slack_channel": "C0ENG"}
+
+
+def test_slack_thread_composite_requires_all_parts():
+    # Missing thread_ts → no composite key (parts still emitted individually).
+    refs = enrichment.derive_trace_refs(
+        "slack", {"workspace": "T0ACME", "channel_id": "C0ENG"}
+    )
+    assert "slack_thread" not in refs
+    assert refs["slack_workspace"] == "T0ACME"
+
+
+def test_slack_thread_composite_identical_for_followups():
+    """A D8 follow-up in the same thread (new assignment, same context) must
+    derive the SAME slack_thread ref as the original — that equality is what
+    groups a whole conversation into one dashboard trace."""
+    ctx = {"workspace": "T0ACME", "channel_id": "C0ENG", "thread_ts": "111.2"}
+    first = enrichment.derive_trace_refs("slack", ctx, "do the thing")
+    followup = enrichment.derive_trace_refs("slack", ctx, "now also add tests")
+    assert first["slack_thread"] == followup["slack_thread"]
 
 
 def test_slack_requester_is_a_participant():

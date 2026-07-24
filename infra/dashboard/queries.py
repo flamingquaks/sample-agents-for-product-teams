@@ -48,6 +48,14 @@ TRACE_DIMENSIONS = {
     "asana_task_gid",
     "project_gid",
     "project_name",
+    # Slack conversation identity. ``slack_thread`` is the composite
+    # workspace#channel#thread_ts key — grouping by it shows a whole Slack
+    # thread (original dispatch + follow-up assignments) as one end-to-end
+    # trace. The parts are also groupable individually.
+    "slack_thread",
+    "slack_workspace",
+    "slack_channel",
+    "slack_thread_ts",
 }
 
 _MAX_LIMIT = 100
