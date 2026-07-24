@@ -45,10 +45,8 @@ All four agents run Claude Sonnet 5 via Bedrock Mantle.
 
 ## Medium-term (the interesting work, no commitment)
 
-### Jira + GitLab support
-Jira is now fully specified — see [`docs/specs/jira-connector-spec.md`](specs/jira-connector-spec.md): a first-class Jira connector (dispatch source + curated `JiraTarget` gateway broker + traceability + a new event-automation rule engine + per-user Slack DM notifications + a Connectors → Jira onboarding page), delivered in six phases. The spec supersedes the earlier "point at Atlassian's remote MCP" sketch: a Lambda broker with a curated tool schema was chosen over the remote MCP for destructive-tool exclusion and project scoping (spec §8.1).
-
-GitLab is harder — no production-grade official remote MCP. Community options exist (`zereight/gitlab-mcp`). Each shipping agent's system prompt would need merge-request vs. pull-request terminology adjustments.
+### Atlassian (Jira + Confluence) + GitLab support
+Atlassian is now fully specified as one program — see [`docs/specs/atlassian-connector-spec.md`](specs/atlassian-connector-spec.md) (merges and supersedes the earlier separate Jira and Confluence connector specs): a shared foundation (one `atlassian_site#` record + service account, the `atlassian-events` Forge forwarder, `atlassian:<accountId>` identity, an event-automation rule engine, per-user Slack DM notifications, one Connectors → Atlassian page) carrying two product capabilities — Jira (dispatch source + curated `JiraTarget` gateway broker + traceability) and Confluence (deep-context reads for all agents + agent-maintained documentation with per-space propose/direct write modes + comment-mention dispatch) — delivered in six interleaved phases. The spec supersedes the earlier "point at Atlassian's remote MCP" sketch: Lambda brokers with curated tool schemas were chosen over the remote MCP for destructive-tool exclusion and project/space scoping (spec §B2.1/§C2.1).
 
 GitLab is harder — no production-grade official remote MCP. Community options exist (`zereight/gitlab-mcp`). Each shipping agent's system prompt would need merge-request vs. pull-request terminology adjustments.
 

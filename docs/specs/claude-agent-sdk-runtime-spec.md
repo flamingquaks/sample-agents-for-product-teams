@@ -46,8 +46,10 @@ that alternative:
 - **Plugin-marketplace install** (`capability.plugins`, authoring spec §6.4).
   This runtime makes it feasible (the SDK loads local plugins natively), but
   the field stays reserved/rejected until that spec lands.
-- Other runtimes (Codex / Kiro). The `runtime` field is an enum precisely so
-  they slot in later; nothing here builds for them.
+- Other runtimes (Codex / Kiro). The `runtime` field, per-runtime
+  `MODEL_CATALOG` entry, and generic-base-image recipe (§3.1b) are exactly the
+  extension points a **Codex SDK** runtime will reuse — that's a follow-on
+  spec, not built here.
 - Interactive/streaming sessions. Both runtimes stay request/response inside
   AgentCore's invoke window; long-lived interactive sessions are a separate
   roadmap item.
@@ -75,7 +77,7 @@ What it changes vs Strands, and therefore what this spec must govern:
 | | Strands runtime (`agents/_base`) | Claude runtime (`agents/_claude`) |
 |---|---|---|
 | Tool surface | Gateway MCP tools only (no shell, no filesystem tools) | Gateway MCP tools **plus optional built-in tools** (Bash, Read, Write, …) — a new capability class that must be granted, classified, and defaulted OFF (§5.3) |
-| Model call | Strands `AnthropicModel` → Mantle endpoint, guardrail headers injected per call | Claude Code CLI subprocess → same Mantle endpoint via `ANTHROPIC_BASE_URL` + short-term bearer token; guardrail via `ANTHROPIC_CUSTOM_HEADERS` (§5.1) |
+| Model call | Strands `AnthropicModel` → Mantle endpoint, guardrail headers injected per call | Claude Code CLI subprocess → SAME Mantle endpoint via the CLI's native Mantle mode (`CLAUDE_CODE_USE_MANTLE=1`, plain IAM role credentials); guardrail + project headers via `ANTHROPIC_CUSTOM_HEADERS` (§5.1) |
 | Conversation state | None today (fresh `Agent` per invoke) | `session_store` (S3) + `resume`, per-turn (§6.1) |
 | Loop control | Single `agent(user_input)` call | `max_turns`, `max_budget_usd`, hooks, `permission_mode` — mapped from the capability's `limits` (§5.8) |
 
@@ -98,6 +100,83 @@ runtime: "strands" | "claude-agent-sdk"     # NEW on capability# rows
 
 Missing/absent `runtime` on an existing row reads as `strands` — no migration
 required; `render_registry` and the router never see the field.
+
+### 3.1a Per-agent model selection, scoped by runtime
+
+Today the model is fleet-wide (`BEDROCK_MODEL_ID` env, default
+`anthropic.claude-sonnet-5`) — no per-agent choice. This spec makes the model
+part of the capability's declarative config, with the selectable set scoped by
+the chosen runtime:
+
+```
+model: str    # NEW on capability# rows — must be in MODEL_CATALOG[runtime];
+              # absent ⇒ the runtime's catalog default (today's fleet default)
+```
+
+- **One catalog, keyed by runtime** — `MODEL_CATALOG` lives in `fleet_policy`
+  beside the tool catalog (same authority pattern: the UI renders it, the API
+  validates against it, `check_gateway_manifest.py`-style reconciliation keeps
+  it honest):
+
+  ```python
+  MODEL_CATALOG = {
+      "strands": {                     # models the Mantle endpoint serves —
+          "default": "anthropic.claude-sonnet-5",     # BARE ids only; Mantle
+          "models": [                                  # routes internally and
+              "anthropic.claude-sonnet-5",             # rejects us./global.
+              "anthropic.claude-opus-4-8",             # prefixes AND the
+              "anthropic.claude-haiku-4-5",            # inference_geo param
+          ],                                           # (verified 2026-07-24)
+      },
+      "claude-agent-sdk": {            # CLI native Mantle mode — SAME bare-id
+          "default": "anthropic.claude-sonnet-5",      # dialect as Strands,
+          "models": [                                  # because both target
+              "anthropic.claude-sonnet-5",             # the Mantle endpoint
+              "anthropic.claude-opus-4-8",             # (verified end-to-end
+              "anthropic.claude-haiku-4-5",            # via CLI 2026-07-24)
+          ],
+      },
+      # "codex-sdk": {...}             # future runtime — same shape (§3.1b)
+  }
+  ```
+
+  Verification notes (staging 640168437444/us-east-1, 2026-07-24): Mantle
+  accepts only bare `anthropic.*` ids — `us.`/`global.` prefixes 404
+  ("model does not exist") and the `inference_geo` request param is
+  rejected ("Extra inputs are not permitted"); regional/geo routing is
+  Mantle-internal. Since BOTH runtimes now drive the same Mantle endpoint
+  (Strands directly, Claude via `CLAUDE_CODE_USE_MANTLE=1`), both catalogs
+  share the bare-id dialect today. The catalog stays keyed by runtime
+  anyway: it's the seam where a runtime whose provider needs a different
+  dialect (the CLI's `bedrock-runtime` fallback wants `us.*` inference
+  profiles; a future Codex SDK entry wants OpenAI model ids) plugs in
+  without schema churn.
+
+- **Validation at the API boundary:** `POST /admin/capabilities` rejects a
+  `model` not in `MODEL_CATALOG[runtime]` (400 naming the allowed set). A
+  `runtime` edit re-validates `model`; if the current model isn't in the new
+  runtime's catalog, the API resets it to that runtime's default and says so
+  in the response (never silently keeps an incompatible id).
+- **Flow to the runtime:** the deployer's env assembly injects the row's
+  `model` as `BEDROCK_MODEL_ID` (both runtimes read it — the Claude adapter
+  maps it to `ANTHROPIC_MODEL`). Built-ins keep the fleet default (model is
+  part of their locked config); a cloned built-in may change it.
+- **UI:** the create/clone/edit form gains a **Model** dropdown whose options
+  re-populate when the Runtime selector changes; the current selection resets
+  to the new runtime's default if incompatible.
+- Model choice is **not** approval-gate "novel config" — switching among
+  catalog models doesn't widen the capability envelope (all are already
+  fleet-approved models); the gate keys on deps/skills/builtin-grants as
+  before.
+
+### 3.1b The pattern generalizes (Codex SDK next)
+
+The `runtime` enum + per-runtime `MODEL_CATALOG` entry + a generic base image
+implementing the AgentCore entrypoint contract IS the recipe for every future
+runtime. Adding **Codex SDK** later means: one enum value, one catalog entry
+(its compatible OpenAI models), one `agents/_codex/` base image + buildspec
+branch, and its own §5-style parity matrix — schema, deployer, router, registry
+and UI machinery all reuse what this spec builds. No schema churn.
 
 ### 3.2 Same entrypoint, same payload, same registry
 
@@ -134,17 +213,22 @@ the image.
 
 1. Parse the dispatch payload; require an instruction; resolve
    `assignment_id`/`source`/`source_context` exactly as `_base` does.
-2. **Model auth (§5.1):** mint a short-term Mantle bearer token
-   (`aws_bedrock_token_generator.provide_token`, runtime-role creds — the same
-   no-stored-secret call `shared/bedrock.py:66-76` makes) and assemble the
-   subprocess env: `ANTHROPIC_BASE_URL=https://bedrock-mantle.<region>.api.aws/anthropic`,
-   `ANTHROPIC_AUTH_TOKEN=<token>`, `ANTHROPIC_MODEL=$BEDROCK_MODEL_ID`,
-   `ANTHROPIC_CUSTOM_HEADERS` carrying the guardrail trio
-   (`X-Amzn-Bedrock-GuardrailIdentifier/-Version/-Trace`) and the Mantle
-   cost-attribution header (`anthropic-workspace-id: $MANTLE_PROJECT_ID`).
+2. **Model auth (§5.1) — native Mantle mode, plain IAM credentials:**
+   assemble the CLI subprocess env **from scratch** (never inherit — a parent
+   Claude Code process's `CLAUDECODE`/`CLAUDE_CODE_*` vars corrupt CLI
+   behavior, per the Q4 spike): `CLAUDE_CODE_USE_MANTLE=1`, `AWS_REGION`,
+   `ANTHROPIC_MODEL=$BEDROCK_MODEL_ID`, `HOME=/app/home`,
+   `DISABLE_AUTOUPDATER=1`, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`,
+   and `ANTHROPIC_CUSTOM_HEADERS` carrying the guardrail trio
+   (`X-Amzn-Bedrock-GuardrailIdentifier/-Version/-Trace`) and
+   `anthropic-workspace-id: $MANTLE_PROJECT_ID` — the same headers
+   `shared/bedrock.py` sends on the Strands path. The CLI resolves the
+   runtime role's credentials from the standard AWS chain and drives Mantle
+   natively — no token minting, no key.
    **Fail-closed:** refuse to run if `BEDROCK_GUARDRAIL_ID` is unset (same
-   escape hatch env as `build_model`). Tokens are minted per invoke; runs are
-   bounded by the 900s invoke window, far inside token lifetime.
+   escape hatch env as `build_model`). P1 verification item: confirm the
+   guardrail actually intervenes on this path (header acceptance is proven;
+   intervention not yet exercised).
 3. **Gateway tools (§5.2):** open the existing SigV4 gateway client
    (`shared.tools.gateway`, stamped `agent=AGENT_ID`), enumerate
    `list_tools_sync()`, and wrap each tool in an **in-process SDK MCP server**
@@ -179,8 +263,8 @@ of these does not ship.
 
 | Integration | Strands mechanism | Claude mechanism |
 |---|---|---|
-| **5.1 Model via Mantle** | `AnthropicModel` on the Mantle endpoint; bearer from `aws-bedrock-token-generator`; `anthropic-workspace-id` header | `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` (same generator, minted per invoke, passed only in the subprocess env — never on disk) + `ANTHROPIC_CUSTOM_HEADERS`. `ANTHROPIC_MODEL=$BEDROCK_MODEL_ID` |
-| ↳ *auth is IAM-role-based* | — | **Both candidate paths derive from the runtime IAM role — no API key, no stored secret, same trust chain as Strands.** Spike results (2026-07-24, account 640168437444/us-east-1) select the path: **(a) SigV4 native mode (`CLAUDE_CODE_USE_BEDROCK=1`) — WORKS end-to-end** (CLI → bedrock-runtime, completion returned, cost computed); the CLI signs with the role's credentials directly. **(b) Mantle bearer mode — currently BLOCKED**: raw HTTP to the Mantle endpoint with a `aws-bedrock-token-generator` token returns 200, but the CLI pins an `anthropic-beta` header set including `prompt-caching-scope-2026-01-05`, which Mantle rejects (400 "invalid beta flag"); the flag set is not overridable via env (`DISABLE_PROMPT_CACHING`/`ANTHROPIC_CUSTOM_HEADERS` don't remove it). **P1 therefore ships on (a)**, with (b) tracked as the preferred end-state once Mantle accepts the CLI's beta set or the CLI makes it configurable. Consequences of (a) to resolve in P1: the Mantle project cost-attribution header doesn't apply on `bedrock-runtime` (fleet cost falls back to the assignment-row token accounting, which is authoritative anyway), and the guardrail must be verified on this path — the fleet's `X-Amzn-Bedrock-Guardrail*` headers are Mantle-endpoint headers; if the CLI's Bedrock mode can't attach a guardrail, P1 compensates with the router edge `ApplyGuardrail` (already fail-closed, unchanged) plus an adapter-side `ApplyGuardrail` check on the final output before `complete_assignment`. |
+| **5.1 Model via Mantle — native CLI mode, plain IAM credentials** | `AnthropicModel` on the Mantle endpoint; role credentials exchanged for a short-term bearer (`aws-bedrock-token-generator`) because the endpoint speaks Bearer, not SigV4; `anthropic-workspace-id` header; guardrail headers per call | **`CLAUDE_CODE_USE_MANTLE=1` — the CLI's first-class Bedrock **Mantle** provider mode** (distinct from `CLAUDE_CODE_USE_BEDROCK`, which targets the separate `bedrock-runtime` service). The CLI resolves the runtime role's credentials from the standard AWS chain and handles Mantle auth itself — no token minting in the adapter, no API key, no secret at rest. `ANTHROPIC_MODEL=$BEDROCK_MODEL_ID` (bare `anthropic.*` ids, same catalog dialect as Strands). Guardrail trio + `anthropic-workspace-id: $MANTLE_PROJECT_ID` attach via `ANTHROPIC_CUSTOM_HEADERS` — Mantle accepts them on this path (validated end-to-end, §10 Q4). **Full parity with the Strands model path: same endpoint, same guardrail pattern, same project cost attribution.** |
+| ↳ *fallback path* | — | `CLAUDE_CODE_USE_BEDROCK=1` (classic `bedrock-runtime`, SigV4, inference-profile `us.*` ids) also validated end-to-end and kept as a documented fallback if a CLI release regresses Mantle mode — but it loses project cost attribution and needs an adapter-side `ApplyGuardrail` compensating control, so it is not the default. |
 | **Guardrail (fail-closed)** | `build_model` raises if `BEDROCK_GUARDRAIL_ID` unset; headers on every model call | Same headers via `ANTHROPIC_CUSTOM_HEADERS` on every CLI model call; adapter refuses to start without the id. Router edge `ApplyGuardrail` is upstream of both runtimes, unchanged |
 | **5.2 Gateway-only tools** | Strands `MCPClient` over SigV4 (`mcp_proxy_for_aws`); refuses to boot without `GATEWAY_MCP_URL` | In-process SDK MCP proxy server forwarding to the SAME SigV4 client (the SDK's `McpHttpServerConfig` supports only static headers, so direct connection is impossible by construction — a feature, not a gap). Boot-refusal identical. Tool names surface to the model as `mcp__gateway__<Target___tool>` |
 | **Cedar tool policy** | Gateway policy engine filters `list_tools_sync()` per agent id | Identical — the proxy calls the same gateway as the same principal; grants render through the same `fleet_policy` path |
@@ -226,8 +310,9 @@ enforced at the runtime boundary. Rules:
 
 Container blast radius is unchanged: AgentCore microVM isolation, non-root
 user, permissions-boundaried runtime role, no long-lived credentials at rest
-(the only secret in the container is the per-invoke Mantle bearer token, which
-`workspace_run`-style env scrubbing keeps out of Bash subprocesses).
+(there is NO API key or bearer token at all — model auth is the runtime
+role's SigV4 credentials, and `workspace_run`-style env scrubbing keeps
+`AWS_*` out of model-directed Bash subprocesses).
 
 ### 5.4 Hooks are fleet infrastructure, not agent config
 
@@ -395,6 +480,9 @@ built-in). It gains one lookup it already performs anyway:
 ```
 runtime: "strands" | "claude-agent-sdk"   # NEW — absent ⇒ "strands";
                                           #       builtin rows locked "strands"
+model: str                                # NEW — must be in MODEL_CATALOG[runtime]
+                                          #       (§3.1a); absent ⇒ runtime default;
+                                          #       locked on builtin rows
 tool_grants: [str]                        # now accepts builtin___* ids ONLY
                                           #       when runtime == claude-agent-sdk
 limits.max_turns: int                     # NEW, optional (claude runtime)
@@ -402,11 +490,15 @@ limits.max_turns: int                     # NEW, optional (claude runtime)
 
 ### 8.2 Admin API
 
-- `POST /admin/capabilities` — accepts `runtime` on custom rows; rejects it on
-  `builtin` rows (400, same fixed-config rule as today); rejects
+- `POST /admin/capabilities` — accepts `runtime` and `model` on custom rows;
+  rejects both on `builtin` rows (400, same fixed-config rule as today);
+  rejects a `model` outside `MODEL_CATALOG[runtime]` (§3.1a); rejects
   `builtin___*` grants when `runtime != "claude-agent-sdk"`; rejects unknown
   builtin ids against the catalog. A `runtime` **edit** is treated like a
-  `requirements` edit: novel-config check → approval gate if ON → rebuild.
+  `requirements` edit: novel-config check → approval gate if ON → rebuild —
+  and re-validates `model`, resetting to the new runtime's default if
+  incompatible. A `model`-only edit needs no rebuild (env-only change →
+  deployer `update_agent_runtime` with the new env).
 - `POST /admin/capabilities/{id}/clone` — copies `runtime` from the source;
   the create form lets the admin change it before enabling (a clone of a
   Strands built-in can therefore become a Claude agent — this is the
@@ -419,8 +511,10 @@ limits.max_turns: int                     # NEW, optional (claude runtime)
 
 - **New/Clone editor:** a "Runtime" selector (radio: *Strands Agents* —
   default; *Claude Agent SDK*) with a one-line description of what changes
-  (built-in tool availability, session persistence). Hidden/read-only on
-  `edit` of built-ins.
+  (built-in tool availability, session persistence), and a **Model** dropdown
+  populated from `MODEL_CATALOG[runtime]` that re-populates on runtime change
+  (resetting to the new runtime's default if the selection is incompatible).
+  Both hidden/read-only on `edit` of built-ins.
 - **Tool grants picker:** builtin group appears only when runtime =
   Claude Agent SDK; `write`-class builtins carry the warning treatment.
 - **List rows:** a small runtime badge next to the agent id.
@@ -477,14 +571,24 @@ second-admin approval, exactly like novel `requirements`/`skills`.
   registry contracts identical; router/deployer untouched.
 - **D3 Gateway access via in-process SDK MCP proxy** — the SigV4 client stays
   the single egress; Cedar unchanged.
-- **D4 Model via Mantle env-injection** (base URL + per-invoke bearer +
-  custom headers), guardrail fail-closed.
+- **D4 Model via the CLI's native Mantle mode, plain IAM credentials**
+  (`CLAUDE_CODE_USE_MANTLE=1`) — full Strands parity: same endpoint, same
+  guardrail-header pattern, same `anthropic-workspace-id` project cost
+  attribution, all via `ANTHROPIC_CUSTOM_HEADERS`; validated end-to-end.
+  `CLAUDE_CODE_USE_BEDROCK=1` (classic bedrock-runtime, SigV4, `us.*`
+  profiles) validated too and kept as documented fallback (§5.1).
 - **D5 Conversation durability on BOTH runtimes**, S3-backed, keyed by
   `assignment_id`, per-turn; one bucket, per-framework/agent prefixes.
 - **D6 Builtin tools default OFF**, granted per-tool through the existing
   catalog + approval machinery.
 - **D7 Resume payload flag** (`"resume": true`) interpreted natively per
   runtime.
+- **D8 Per-agent model selection, runtime-scoped** (owner, 2026-07-24) — a
+  `model` field on the capability row validated against
+  `MODEL_CATALOG[runtime]` in `fleet_policy`; Strands agents pick from
+  Mantle-served models, Claude agents from Claude models the CLI's Bedrock
+  mode serves; the same catalog pattern extends to a future **Codex SDK**
+  runtime (§3.1a–b). Built-ins keep the fleet default (locked).
 
 **Resolved (owner review, 2026-07-24):**
 - **Q1 — Builtin grant ceiling: ✅ `Bash`/`Write`/`Edit` ARE grantable in v1**
@@ -501,40 +605,55 @@ second-admin approval, exactly like novel `requirements`/`skills`.
   mechanics in §5.5 (commit trailers, `trace_refs` sha capture, shared
   session transcript).
 - **Q4 — Mantle/Claude Code compatibility: ✅ spike COMPLETE (2026-07-24,
-  staging acct 640168437444 / us-east-1).** Findings:
+  staging acct 640168437444 / us-east-1). The CLI supports Mantle natively —
+  `CLAUDE_CODE_USE_MANTLE=1` is the selected P1 path.** Findings, in the
+  order discovered:
   1. **Raw Mantle auth works.** Direct HTTP to
      `bedrock-mantle.us-east-1.api.aws/anthropic/v1/messages` with an
-     IAM-role-derived bearer token → 200, correct completion. The Q4
-     assumption (auth chain + endpoint shape) is proven.
-  2. **CLI → Mantle is blocked by a beta flag.** The bundled CLI
-     (claude-cli/2.1.218) sends a pinned `anthropic-beta` set; Mantle rejects
-     `prompt-caching-scope-2026-01-05` (also `oauth-2025-04-20`,
-     `prompt-caching-2024-07-31`) with 400 "invalid beta flag". Not
-     removable via `DISABLE_PROMPT_CACHING` or `ANTHROPIC_CUSTOM_HEADERS`.
-     Two spike traps worth recording: a 403 from Mantle surfaces as a silent
-     10-attempt retry loop (looks like a hang), and inherited
-     `CLAUDECODE`/`CLAUDE_CODE_*` env from a parent Claude Code process
-     changes CLI behavior — the adapter must construct the subprocess env
-     from scratch.
-  3. **CLI → Bedrock SigV4 native mode works end-to-end.**
-     `CLAUDE_CODE_USE_BEDROCK=1` + role credentials +
-     `model=global.anthropic.claude-sonnet-5` → completion + cost returned.
-  **Decision: P1 ships on the SigV4 native mode (§5.1)**; Mantle bearer mode
-  is the tracked end-state. Guardrail coverage on the SigV4 path is the one
-  P1 verification item (compensating control: router edge + adapter-side
-  `ApplyGuardrail`, §5.1).
+     IAM-role-derived bearer token → 200, correct completion.
+  2. **A generic-base-URL override does NOT work** (the initial false
+     negative): pointing `ANTHROPIC_BASE_URL` at Mantle makes the CLI send
+     its first-party `anthropic-beta` set, and Mantle rejects
+     `prompt-caching-scope-2026-01-05` (400 "invalid beta flag"). This is a
+     misconfiguration, not an incompatibility — provider selection must go
+     through the CLI's provider modes, not a URL override. Two spike traps
+     worth recording: a Mantle 403 surfaces as a silent 10-attempt retry
+     loop (looks like a hang), and inherited `CLAUDECODE`/`CLAUDE_CODE_*`
+     env from a parent Claude Code process changes CLI behavior — the
+     adapter must construct the subprocess env from scratch.
+  3. **`CLAUDE_CODE_USE_MANTLE=1` works end-to-end** (owner-corrected; the
+     CLI's provider enum includes `mantle` as first-class, distinct from
+     `bedrock`): role credentials from the standard AWS chain, bare
+     `anthropic.claude-sonnet-5` id, completion + cost returned — AND
+     `ANTHROPIC_CUSTOM_HEADERS` carrying the fleet guardrail trio
+     (staging id `o4vpysl4cl65`) + `anthropic-workspace-id` with the real
+     staging project (`proj_pzvvb6rfjewhfillxel5`) → accepted, completion
+     OK. (A bogus project id is properly rejected — "not a valid project
+     ARN" — proving the header is evaluated, not ignored.)
+  4. **`CLAUDE_CODE_USE_BEDROCK=1` (classic `bedrock-runtime` — a different
+     service) also works end-to-end** with `us.*` inference-profile ids
+     (`us.anthropic.claude-sonnet-5`, `us.anthropic.claude-opus-4-8`,
+     `us.anthropic.claude-haiku-4-5-20251001-v1:0`; bare ids 400). Kept as
+     the documented fallback path only (§5.1) — it lacks project cost
+     attribution.
+  **Decision: P1 ships on `CLAUDE_CODE_USE_MANTLE=1`** — full Strands
+  parity (same endpoint, same guardrail headers, same project attribution).
+  Remaining P1 verification: exercise an actual guardrail **intervention**
+  on this path (header acceptance proven; a blocked prompt not yet
+  exercised).
 
 **Remaining questions:** none blocking.
 
 ## 11. Phasing
 
-- **P1 — Runtime seam + adapter:** verify guardrail coverage on the SigV4
-  model path (per Q4; compensating `ApplyGuardrail` control if needed), then
-  `runtime` field (schema, API validation, clone copy-through, seeding),
-  buildspec routing,
+- **P1 — Runtime seam + adapter:** exercise a guardrail intervention on the
+  CLI Mantle path (per Q4; headers proven accepted), then
+  `runtime` + `model` fields (schema, API validation vs `MODEL_CATALOG`,
+  clone copy-through, seeding), buildspec routing,
   `agents/_claude/` image + adapter with model auth, gateway MCP proxy,
   skills, assignment lifecycle, dispatch context. Zero builtin tools
-  (`tools=[]`). UI runtime selector + badge. Threat-model update.
+  (`tools=[]`). UI runtime selector + model dropdown + badge. Threat-model
+  update.
 - **P2 — Sessions & resume:** sessions bucket + role/boundary changes;
   `session_store` wiring (Claude) + `S3SessionManager` wiring
   (`_base`, custom agents); router `resume` flag + thread-binding resume path
