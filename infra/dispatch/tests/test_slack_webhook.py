@@ -89,8 +89,17 @@ def _fresh(monkeypatch, *, secret=SECRET, ws_enabled=True, channel_repos=None):
     )
     monkeypatch.setattr(
         sw.reply, "post_slack_message",
-        lambda team, chan, text, thread_ts=None: state["posted"].append(
-            {"team": team, "channel": chan, "text": text}) or True,
+        lambda team, chan, text, thread_ts=None, agent_id=None: state["posted"].append(
+            {"team": team, "channel": chan, "text": text, "agent_id": agent_id}) or True,
+    )
+    # The modal path posts via post_slack_message_ts to capture the thread anchor.
+    monkeypatch.setattr(
+        sw.reply, "post_slack_message_ts",
+        lambda team, chan, text, thread_ts=None, agent_id=None: (
+            state["posted"].append(
+                {"team": team, "channel": chan, "text": text, "agent_id": agent_id}
+            ) or (True, "1700000000.000100")
+        ),
     )
     # users.info profile lookup: default to an empty profile (no verified name /
     # email captured) so a test that doesn't care about it sees the bare context.
@@ -199,7 +208,45 @@ def test_app_mention_dispatches(monkeypatch):
     assert d["instruction"] == "break this up"
     assert d["context"] == {"workspace": TEAM, "channel_id": "C0ENG",
                             "thread_ts": "111.2", "message_ts": "111.2",
+                            "repo": "", "repos": [],
                             "principal_groups": ["channel:T0ACME12:C0ENG"]}
+
+
+def _mention_ev(text, event_id="e-repo"):
+    return _events_event({"type": "event_callback", "team_id": TEAM, "event_id": event_id,
+                          "event": {"type": "app_mention", "text": text,
+                                    "user": "U0ALICE", "channel": "C0ENG", "ts": "111.2"}})
+
+
+def test_app_mention_attaches_channel_approved_repos(monkeypatch):
+    # The channel's approved repo grants become the dispatch's codebase scope —
+    # without this the agent has no bridge to any repo and the gateway
+    # interceptor refuses every GitHub tool call (no dispatch origin).
+    sw, state = _fresh(monkeypatch, channel_repos=["acme/web", "acme/api"])
+    sw.handler(_mention_ev("<@U0BOT> @workitems break this up"))
+    d = state["dispatched"][0]
+    assert d["context"]["repo"] == "acme/web"  # first grant = origin
+    assert d["context"]["repos"] == ["acme/web", "acme/api"]
+    assert "acme/web" in d["instruction"]  # scope stated in the instruction
+
+
+def test_app_mention_named_approved_repo_becomes_origin(monkeypatch):
+    # Naming an approved repo in the message pins it as the dispatch origin.
+    sw, state = _fresh(monkeypatch, channel_repos=["acme/web", "acme/api"])
+    sw.handler(_mention_ev("<@U0BOT> @workitems fix the login bug in acme/api"))
+    d = state["dispatched"][0]
+    assert d["context"]["repo"] == "acme/api"
+    assert d["context"]["repos"] == ["acme/web", "acme/api"]
+
+
+def test_app_mention_unapproved_named_repo_not_honored(monkeypatch):
+    # A repo named in the message but NOT approved for the channel must not
+    # become the origin — the channel grant is the authorization boundary.
+    sw, state = _fresh(monkeypatch, channel_repos=["acme/web"])
+    sw.handler(_mention_ev("<@U0BOT> @workitems look at secret/repo please"))
+    d = state["dispatched"][0]
+    assert d["context"]["repo"] == "acme/web"
+    assert "secret/repo" not in d["context"]["repos"]
 
 
 def test_app_mention_captures_verified_profile(monkeypatch):
@@ -407,6 +454,9 @@ def test_message_agent_submit_dispatches_and_posts_visibly(monkeypatch):
     assert "Plan the sprint" in d["instruction"]
     # Visible in-channel confirmation.
     assert state["posted"] and "workitems" in state["posted"][0]["text"]
+    # The confirmation's ts becomes the run's thread anchor: the router's ack
+    # and the final result thread under it instead of new channel posts.
+    assert d["context"]["thread_ts"] == "1700000000.000100"
 
 
 def test_message_agent_submit_rejects_revoked_repo(monkeypatch):
@@ -438,3 +488,67 @@ def test_slash_command_unknown_agent_ephemeral(monkeypatch):
     assert resp["statusCode"] == 200
     assert json.loads(resp["body"])["response_type"] == "ephemeral"
     assert state["dispatched"] == []
+
+
+# --- bound-thread replies (durable-repo-work spec) -----------------------------
+
+
+def _thread_mention_ev(text, thread_ts="100.1", event_id="e-thread"):
+    return _events_event({"type": "event_callback", "team_id": TEAM, "event_id": event_id,
+                          "event": {"type": "app_mention", "text": text,
+                                    "user": "U0ALICE", "channel": "C0ENG",
+                                    "ts": "111.2", "thread_ts": thread_ts}})
+
+
+def _bind(monkeypatch, sw, *, assignment_id="a-9", agent_id="workitems", status="awaiting_input"):
+    monkeypatch.setattr(
+        sw, "_thread_binding",
+        lambda team, chan, ts: {"bound_assignment_id": assignment_id, "agent_id": agent_id}
+        if ts == "100.1" else None,
+    )
+    monkeypatch.setattr(sw, "_bound_assignment_status", lambda aid: status)
+
+
+def test_reply_on_paused_thread_resumes(monkeypatch):
+    """An in-thread reply on an awaiting_input assignment dispatches a RESUME —
+    same assignment, the reply is the answer, no agent name needed."""
+    sw, state = _fresh(monkeypatch)
+    _bind(monkeypatch, sw, status="awaiting_input")
+    sw.handler(_thread_mention_ev("<@U0BOT> use us-east-1 please"))
+    assert len(state["dispatched"]) == 1
+    d = state["dispatched"][0]
+    assert d["resume_of"] == "a-9"
+    assert d["body"] == "use us-east-1 please"
+    assert d["sender"] == "slack:T0ACME12:U0ALICE"
+    assert "agent_id" not in d  # resolved from the binding by the router
+
+
+def test_reply_on_completed_thread_starts_linked_assignment(monkeypatch):
+    """D8: a reply on a completed thread is a NEW assignment linked via
+    parent_assignment_id — agent resolved from the binding, not the text."""
+    sw, state = _fresh(monkeypatch)
+    _bind(monkeypatch, sw, status="completed", agent_id="workitems")
+    sw.handler(_thread_mention_ev("<@U0BOT> also add error handling"))
+    assert len(state["dispatched"]) == 1
+    d = state["dispatched"][0]
+    assert d["parent_assignment_id"] == "a-9"
+    assert d["agent_id"] == "workitems"
+    assert d["instruction"] == "also add error handling"
+    assert d["context"]["thread_ts"] == "100.1"
+
+
+def test_reply_on_in_flight_thread_falls_through(monkeypatch):
+    """A bound thread whose assignment is still running gets NORMAL mention
+    handling (which needs an agent name; free text without one is dropped)."""
+    sw, state = _fresh(monkeypatch)
+    _bind(monkeypatch, sw, status="dispatched")
+    sw.handler(_thread_mention_ev("<@U0BOT> how is it going?"))
+    assert state["dispatched"] == []
+
+
+def test_unbound_thread_mention_still_dispatches_normally(monkeypatch):
+    sw, state = _fresh(monkeypatch)
+    monkeypatch.setattr(sw, "_thread_binding", lambda *a: None)
+    sw.handler(_thread_mention_ev("<@U0BOT> @workitems plan this"))
+    assert len(state["dispatched"]) == 1
+    assert state["dispatched"][0]["agent_id"] == "workitems"

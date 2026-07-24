@@ -12,19 +12,20 @@ import os
 import sys
 from contextlib import ExitStack
 
-from strands import Agent
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
-from strands_tools.agent_core_memory import AgentCoreMemoryToolProvider
-
-from shared.assignment import complete_assignment, extract_token_usage, fail_assignment
-from shared.bedrock import build_model
-from shared.tools import gateway
-from prompts import SYSTEM_PROMPT
 from project_config import build_project_context
+from prompts import SYSTEM_PROMPT
+from shared import durable
+from shared.assignment import complete_assignment, extract_usage, fail_assignment
+from shared.bedrock import build_model
+from shared.dispatch_context import slack_dispatch_block
+from shared.tools import gateway
+from strands import Agent
+from strands_tools.agent_core_memory import AgentCoreMemoryToolProvider
+from tools.find_linked_issues import find_linked_issues
+from tools.format_rationale import format_pr_review_summary, format_tag_issue_comment
 from tools.index_adrs import index_adrs
 from tools.match_adrs import match_issue_to_adrs, match_pr_to_adrs
-from tools.find_linked_issues import find_linked_issues
-from tools.format_rationale import format_tag_issue_comment, format_pr_review_summary
 
 # --- Logging -----------------------------------------------------------------
 logging.basicConfig(
@@ -84,6 +85,10 @@ def invoke(payload, context=None):
             f"Reply to: GitHub {'PR' if is_pr else 'issue'} #{issue_or_pr_number} "
             f"on {source_context.get('repo', 'unknown')}\n"
         )
+    elif source_context and source == "slack":
+        # The codebase bridge for chat dispatches: which repos this channel is
+        # approved for, and when to reach for them (shared/dispatch_context.py).
+        dispatch_context_block = slack_dispatch_block(source_context)
 
     # The repo to act on comes from the dispatch (multi-repo fleet), not a baked
     # env var. Adr is GitHub-only, so the dispatch always carries the repo.
@@ -131,23 +136,56 @@ def invoke(payload, context=None):
         )
         all_tools = [*gw.list_tools_sync(), *tools]
 
+        # Durable session + ask_user (durable-repo-work spec). adr reviews and
+        # comments — no repo workspace (its tier is contents:read).
+        session, durable_tools, hooks, durable_prompt = durable.durable_kit(
+            assignment_id,
+            agent_id=ACTOR_ID,
+            origin=dispatch_repo or "",
+            repo_capable=False,
+        )
+        all_tools.extend(durable_tools)
+
         agent = Agent(
             model=model,
-            system_prompt=system_prompt,
+            system_prompt=system_prompt + durable_prompt,
             tools=all_tools,
+            hooks=hooks,
+            session_manager=session,
         )
         try:
-            result = agent(user_input)
+            resume = payload.get("resume") if isinstance(payload.get("resume"), dict) else None
+            if resume:
+                durable.mark_resumed(assignment_id)
+                result = agent(
+                    durable.resume_payload(
+                        str(resume.get("interrupt_id", "")),
+                        str(resume.get("response", "")),
+                    )
+                )
+            else:
+                result = agent(user_input)
         except Exception as agent_error:
             try:
                 fail_assignment(assignment_id, error=str(agent_error))
             except Exception:
                 logger.exception("fail_assignment also failed for %s", assignment_id)
             raise
+        try:
+            pause = durable.handle_agent_result(result, assignment_id)
+        except Exception as pause_error:
+            # D7: a pause whose checkpoint can't land must FAIL LOUD.
+            try:
+                fail_assignment(assignment_id, error=f"pause checkpoint failed: {pause_error}")
+            except Exception:
+                logger.exception("fail_assignment also failed for %s", assignment_id)
+            raise
+        if pause:
+            return {"result": f"PAUSED: {pause['question']}"}
         complete_assignment(
             assignment_id,
-            result_summary=str(result)[:500],
-            token_usage=extract_token_usage(result),
+            result_summary=str(result)[:3500],
+            token_usage=extract_usage(result),
         )
 
     return {"result": str(result)}

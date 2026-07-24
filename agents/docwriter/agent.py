@@ -12,26 +12,27 @@ import logging
 import os
 from contextlib import ExitStack
 
-from strands import Agent
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
-from strands_tools.agent_core_memory import AgentCoreMemoryToolProvider
-
+from project_config import build_project_context
+from prompts import SYSTEM_PROMPT
+from shared import durable
 from shared.assignment import (
     complete_assignment,
-    extract_token_usage,
     extract_trace_refs_from_messages,
     extract_trace_refs_from_result,
+    extract_usage,
     fail_assignment,
     update_trace_refs,
 )
 from shared.bedrock import build_model
+from shared.dispatch_context import slack_dispatch_block
 from shared.tools import gateway
-from prompts import SYSTEM_PROMPT
-from project_config import build_project_context
+from strands import Agent
+from strands_tools.agent_core_memory import AgentCoreMemoryToolProvider
+from tools.check_doc_freshness import check_doc_freshness
+from tools.detect_doc_gaps import detect_doc_gaps
 from tools.generate_api_docs import generate_api_docs
 from tools.generate_release_notes import generate_release_notes
-from tools.detect_doc_gaps import detect_doc_gaps
-from tools.check_doc_freshness import check_doc_freshness
 from tools.post_results import post_results
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,10 @@ def invoke(payload, context=None):
     assignment_id = payload.get("assignment_id", "")
     source = payload.get("source", "unknown")
     source_context = payload.get("source_context", {}) or payload.get("context", {}) or {}
+    # Resume dispatch (durable-repo-work spec): the saved interrupt id + the
+    # human's reply; the S3 session restores the conversation, the recorded
+    # workspace_snapshot restores the working tree.
+    resume = payload.get("resume") if isinstance(payload.get("resume"), dict) else None
 
     # Dispatch context lives in the system prompt, not in the user message —
     # the "[Dispatch Context] ... [User Request]" wrapper trips Bedrock
@@ -100,6 +105,10 @@ def invoke(payload, context=None):
             f"Project: {source_context.get('project_name', 'unknown')} ({source_context.get('project_gid', '')})\n"
             f"Reply to: Asana task {source_context.get('task_gid', 'unknown')}\n"
         )
+    elif source_context and source == "slack":
+        # The codebase bridge for chat dispatches: which repos this channel is
+        # approved for, and when to reach for them (shared/dispatch_context.py).
+        dispatch_context_block = slack_dispatch_block(source_context)
 
     # Build system prompt with project context + dispatch context. The repo to
     # act on comes from the dispatch (multi-repo fleet), not a baked env var.
@@ -135,6 +144,15 @@ def invoke(payload, context=None):
     # engine + SCM interceptor + observability). The origin + agent headers let
     # the gateway enforce co-repo grouping + per-agent access. See
     # agents/shared/tools/gateway.py.
+    # Durable session + workspace + ask_user (durable-repo-work spec). The
+    # session manager restores the conversation on a resumed/cold-started run;
+    # the workspace tools give docwriter a real clone/build/push loop.
+    session, durable_tools, hooks, durable_prompt = durable.durable_kit(
+        assignment_id, agent_id=ACTOR_ID, origin=dispatch_repo or ""
+    )
+    tools.extend(durable_tools)
+    system_prompt += durable_prompt
+
     with ExitStack() as stack:
         gw = stack.enter_context(
             gateway.build_gateway_client(
@@ -147,19 +165,51 @@ def invoke(payload, context=None):
             model=model,
             system_prompt=system_prompt,
             tools=all_tools,
+            hooks=hooks,
+            session_manager=session,
         )
         try:
-            result = agent(user_input)
+            if resume:
+                from shared.tools import workspace as workspace_mod
+
+                workspace_mod.restore(resume.get("workspace_snapshot") or [])
+                durable.mark_resumed(assignment_id)
+                result = agent(
+                    durable.resume_payload(
+                        str(resume.get("interrupt_id", "")),
+                        str(resume.get("response", "")),
+                    )
+                )
+            else:
+                result = agent(user_input)
         except Exception as agent_error:
             try:
                 fail_assignment(assignment_id, error=str(agent_error))
             except Exception:
                 logger.exception("fail_assignment also failed for %s", assignment_id)
             raise
+        try:
+            pause = durable.handle_agent_result(result, assignment_id)
+        except Exception as pause_error:
+            # D7: a pause whose checkpoint can't land must FAIL LOUD — never
+            # exit silently paused with unpushed work.
+            try:
+                fail_assignment(
+                    assignment_id,
+                    error=f"pause checkpoint failed (work may be unpushed): {pause_error}",
+                )
+            except Exception:
+                logger.exception("fail_assignment also failed for %s", assignment_id)
+            raise
+        if pause:
+            # Paused cleanly: workspace pushed + verified, row flipped to
+            # awaiting_input. The stream notifier posts the question to the
+            # origin thread; the reply resumes this same assignment.
+            return {"result": f"PAUSED: {pause['question']}"}
         complete_assignment(
             assignment_id,
-            result_summary=str(result)[:500],
-            token_usage=extract_token_usage(result),
+            result_summary=str(result)[:3500],
+            token_usage=extract_usage(result),
         )
         # If the run opened a doc PR, record branch/PR as trace refs so the work
         # is traceable on the dashboard. docwriter opens the PR itself via the

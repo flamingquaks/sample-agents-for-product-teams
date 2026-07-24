@@ -11,22 +11,23 @@ import logging
 import os
 import sys
 
-from strands import Agent
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
-from strands_tools.agent_core_memory import AgentCoreMemoryToolProvider
-
-from shared.assignment import complete_assignment, extract_token_usage, fail_assignment
-from shared.bedrock import build_model
-from prompts import SYSTEM_PROMPT
 from project_config import build_project_context
-from tools.synthesize_research import synthesize_research
-from tools.competitive_scan import competitive_scan
-from tools.review_spec import review_spec
+from prompts import SYSTEM_PROMPT
+from shared import durable
+from shared.assignment import complete_assignment, extract_usage, fail_assignment
+from shared.bedrock import build_model
+from shared.dispatch_context import slack_dispatch_block
+from shared.tools import gateway
+from strands import Agent
+from strands_tools.agent_core_memory import AgentCoreMemoryToolProvider
 from tools.analyze_backlog import analyze_backlog
+from tools.competitive_scan import competitive_scan
 from tools.draft_user_stories import draft_user_stories
 from tools.post_results import post_results
+from tools.review_spec import review_spec
+from tools.synthesize_research import synthesize_research
 from tools.web_search import web_search
-from shared.tools import gateway
 
 # --- Logging -----------------------------------------------------------------
 # Configure root logger to emit to stdout so AgentCore's OTel sidecar captures
@@ -85,6 +86,10 @@ def invoke(payload, context=None):
             f"Project: {source_context.get('project_name', 'unknown')} ({source_context.get('project_gid', '')})\n"
             f"Reply to: Asana task {source_context.get('task_gid', 'unknown')}\n"
         )
+    elif source_context and source == "slack":
+        # The codebase bridge for chat dispatches: which repos this channel is
+        # approved for, and when to reach for them (shared/dispatch_context.py).
+        dispatch_context_block = slack_dispatch_block(source_context)
 
     # Build system prompt with project context + dispatch context.
     system_prompt = SYSTEM_PROMPT.format(
@@ -120,23 +125,53 @@ def invoke(payload, context=None):
     with gateway.build_gateway_client(agent=ACTOR_ID) as gw:
         all_tools = [*gw.list_tools_sync(), *tools]
 
+        # Durable session + ask_user (durable-repo-work spec). Researcher is
+        # Asana-only — no repo workspace.
+        session, durable_tools, hooks, durable_prompt = durable.durable_kit(
+            assignment_id, agent_id=ACTOR_ID, origin="", repo_capable=False
+        )
+        all_tools.extend(durable_tools)
+
         agent = Agent(
             model=model,
-            system_prompt=system_prompt,
+            system_prompt=system_prompt + durable_prompt,
             tools=all_tools,
+            hooks=hooks,
+            session_manager=session,
         )
         try:
-            result = agent(user_input)
+            resume = payload.get("resume") if isinstance(payload.get("resume"), dict) else None
+            if resume:
+                durable.mark_resumed(assignment_id)
+                result = agent(
+                    durable.resume_payload(
+                        str(resume.get("interrupt_id", "")),
+                        str(resume.get("response", "")),
+                    )
+                )
+            else:
+                result = agent(user_input)
         except Exception as agent_error:
             try:
                 fail_assignment(assignment_id, error=str(agent_error))
             except Exception:
                 logger.exception("fail_assignment also failed for %s", assignment_id)
             raise
+        try:
+            pause = durable.handle_agent_result(result, assignment_id)
+        except Exception as pause_error:
+            # D7: a pause whose checkpoint can't land must FAIL LOUD.
+            try:
+                fail_assignment(assignment_id, error=f"pause checkpoint failed: {pause_error}")
+            except Exception:
+                logger.exception("fail_assignment also failed for %s", assignment_id)
+            raise
+        if pause:
+            return {"result": f"PAUSED: {pause['question']}"}
         complete_assignment(
             assignment_id,
-            result_summary=str(result)[:500],
-            token_usage=extract_token_usage(result),
+            result_summary=str(result)[:3500],
+            token_usage=extract_usage(result),
         )
 
     return {"result": str(result)}

@@ -18,12 +18,13 @@ import sys
 from contextlib import ExitStack
 from pathlib import Path
 
-from strands import Agent
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
-
-from shared.assignment import complete_assignment, extract_token_usage, fail_assignment
+from shared import durable
+from shared.assignment import complete_assignment, extract_usage, fail_assignment
 from shared.bedrock import build_model
-from shared.tools import gateway
+from shared.dispatch_context import slack_dispatch_block
+from shared.tools import gateway, workspace
+from strands import Agent
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
@@ -122,7 +123,7 @@ def _sync_skills_from_s3() -> None:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(body)
             logger.info("skill %s synced to %s", name, skill_dir)
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("skill %s: sync failed — skipping", name)
 
 
@@ -156,6 +157,8 @@ def invoke(payload, context=None):
     user_input = ""
     source_context = {}
     assignment_id = ""
+    source = ""
+    resume = None
     if isinstance(payload, dict):
         try:
             body = json.loads(payload.get("body", "{}")) if isinstance(payload.get("body"), str) else payload
@@ -164,8 +167,13 @@ def invoke(payload, context=None):
         user_input = body.get("instruction", "") or body.get("body", "")
         source_context = body.get("source_context", {})
         assignment_id = body.get("assignment_id", "")
+        source = body.get("source", "")
+        # Resume dispatch (durable-repo-work spec): the router re-invokes the
+        # runtime with the saved interrupt id + the human's reply; the S3
+        # session restores the conversation, the snapshot restores the tree.
+        resume = body.get("resume") if isinstance(body.get("resume"), dict) else None
 
-    if not user_input:
+    if not user_input and not resume:
         logger.error("no instruction in payload")
         return {"statusCode": 400, "body": "no instruction"}
 
@@ -183,24 +191,59 @@ def invoke(payload, context=None):
             plugins.append(skills_plugin)
 
         prompt = SYSTEM_PROMPT
-        if dispatch_repo:
+        if source == "slack":
+            # The codebase bridge for chat dispatches: which repos this channel
+            # is approved for and when to reach for them.
+            prompt += slack_dispatch_block(source_context)
+        elif dispatch_repo:
             prompt += f"\n\nCurrent Dispatch:\n- Repository: {dispatch_repo}\n"
+
+        # Durable session + workspace + ask_user (durable-repo-work spec):
+        # binds the dispatch identity for credential scoping and only offers
+        # what the runtime actually supports (git+vendor / session bucket).
+        session, durable_tools, hooks, durable_prompt = durable.durable_kit(
+            assignment_id, agent_id=AGENT_ID, origin=dispatch_repo
+        )
+        all_tools.extend(durable_tools)
+        prompt += durable_prompt
 
         agent = Agent(
             model=build_model(),
             system_prompt=prompt,
             tools=all_tools,
             plugins=plugins,
+            hooks=hooks,
+            session_manager=session,
         )
 
         try:
-            result = agent(user_input)
+            if resume:
+                # Restore the tree at the recorded shas, then feed the reply.
+                workspace.restore(resume.get("workspace_snapshot") or [])
+                durable.mark_resumed(assignment_id)
+                result = agent(
+                    durable.resume_payload(
+                        str(resume.get("interrupt_id", "")),
+                        str(resume.get("response", "")),
+                    )
+                )
+            else:
+                result = agent(user_input)
+
+            pause = durable.handle_agent_result(
+                result, assignment_id, workspace=workspace
+            )
+            if pause:
+                # Paused cleanly (workspace pushed, row flipped awaiting_input).
+                # The notifier posts the question to the origin thread.
+                return {"statusCode": 200, "body": f"PAUSED: {pause['question']}"}
+
             output = str(result)
             if assignment_id:
                 complete_assignment(
                     assignment_id,
-                    result_summary=output[:500],
-                    token_usage=extract_token_usage(result),
+                    result_summary=output[:3500],
+                    token_usage=extract_usage(result),
                 )
         except Exception as exc:
             logger.exception("agent run failed")

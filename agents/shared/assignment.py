@@ -31,39 +31,50 @@ logger = logging.getLogger(__name__)
 _dynamodb = None
 _table = None
 
-# Approximate blended Bedrock price per 1K tokens for the fleet's default model
-# (Claude Opus 4.7). Used only for a rough ``cost_estimate_usd`` on the
-# dashboard — it is explicitly an estimate, not billing. Override via env for a
-# different model/region. Kept as a single blended rate (not split in/out)
-# because the Strands result exposes a combined total; refine if per-direction
-# counts become available.
-_COST_PER_1K_TOKENS_USD = float(os.environ.get("COST_PER_1K_TOKENS_USD", "0.03"))
+# Per-direction prices per 1K tokens for the fleet's default model
+# (anthropic.claude-sonnet-5 on Bedrock Mantle: $3/M input, $15/M output).
+# Used only for a rough ``cost_estimate_usd`` on the dashboard — it is
+# explicitly an estimate, not billing. Override via env for a different model.
+# When only a combined total is available (older result shapes), the blended
+# fallback assumes the fleet's typical ~85/15 input/output split.
+_COST_PER_1K_INPUT_USD = float(os.environ.get("COST_PER_1K_INPUT_USD", "0.003"))
+_COST_PER_1K_OUTPUT_USD = float(os.environ.get("COST_PER_1K_OUTPUT_USD", "0.015"))
+_BLENDED_COST_PER_1K_USD = float(
+    os.environ.get(
+        "COST_PER_1K_TOKENS_USD",
+        str(round(_COST_PER_1K_INPUT_USD * 0.85 + _COST_PER_1K_OUTPUT_USD * 0.15, 6)),
+    )
+)
 
 
-def extract_token_usage(result) -> int | None:
-    """Best-effort total token count from a Strands agent result.
+def extract_usage(result) -> dict | None:
+    """Best-effort per-direction token usage from a Strands agent result.
 
     Strands surfaces usage on ``result.metrics.accumulated_usage`` (a dict like
-    ``{"inputTokens": N, "outputTokens": M, "totalTokens": T}``). Shapes vary
-    across SDK versions and some results carry none, so this tolerates missing
-    attributes/keys and returns None rather than raising — token capture must
-    never break a run's completion.
+    ``{"inputTokens": N, "outputTokens": M, "totalTokens": T}``). Returns
+    ``{"input": N, "output": M, "total": T}`` or None. Tolerates missing
+    attributes/keys — token capture must never break a run's completion.
     """
     try:
         metrics = getattr(result, "metrics", None)
         usage = getattr(metrics, "accumulated_usage", None)
         if not isinstance(usage, dict):
             return None
-        total = usage.get("totalTokens")
-        if total is None:
-            inp = usage.get("inputTokens") or 0
-            out = usage.get("outputTokens") or 0
-            total = inp + out
-        total = int(total)
-        return total if total > 0 else None
+        inp = int(usage.get("inputTokens") or 0)
+        out = int(usage.get("outputTokens") or 0)
+        total = int(usage.get("totalTokens") or (inp + out))
+        if total <= 0:
+            return None
+        return {"input": inp, "output": out, "total": total}
     except Exception:
         logger.debug("Could not extract token usage from result", exc_info=True)
         return None
+
+
+def extract_token_usage(result) -> int | None:
+    """Back-compat wrapper: the combined total from :func:`extract_usage`."""
+    usage = extract_usage(result)
+    return usage["total"] if usage else None
 
 
 # A GitHub PR URL as the agents are instructed to report it (workitems/prompts.py
@@ -177,17 +188,119 @@ def _fetch_created_at(table, assignment_id: str) -> int | None:
     return int(created) if created is not None else None
 
 
-def _usage_fields(token_usage: int | None) -> dict:
-    """Build the {token_usage, cost_estimate_usd} update fragment from a token
-    count. Returns an empty dict when usage is unknown, so we never overwrite a
-    real value with None."""
+def _usage_fields(token_usage: int | dict | None) -> dict:
+    """Build the {token_usage, cost_estimate_usd, ...} update fragment.
+
+    Accepts either the per-direction dict from :func:`extract_usage`
+    (``{"input": N, "output": M, "total": T}``) — preferred, prices each
+    direction at its real rate — or a bare combined total (back-compat, priced
+    at the blended rate). Returns an empty dict when usage is unknown, so we
+    never overwrite a real value with None.
+
+    These fields are applied with ``ADD`` (accumulate), never ``SET``: Strands
+    ``EventLoopMetrics`` resets per invocation, so a paused-and-resumed run
+    reports only its last segment's usage — overwriting would silently drop
+    every earlier segment's tokens/cost (durable-repo-work spec, "Cost
+    accounting fix")."""
+    if isinstance(token_usage, dict):
+        total = int(token_usage.get("total") or 0)
+        if total <= 0:
+            return {}
+        inp = int(token_usage.get("input") or 0)
+        out = int(token_usage.get("output") or 0)
+        if inp or out:
+            cost = round(
+                (inp / 1000.0) * _COST_PER_1K_INPUT_USD
+                + (out / 1000.0) * _COST_PER_1K_OUTPUT_USD,
+                6,
+            )
+        else:
+            cost = round((total / 1000.0) * _BLENDED_COST_PER_1K_USD, 6)
+        return {
+            "token_usage": total,
+            "input_tokens": inp,
+            "output_tokens": out,
+            "cost_estimate_usd": Decimal(str(cost)),
+        }
     if not token_usage or token_usage <= 0:
         return {}
-    cost = round((token_usage / 1000.0) * _COST_PER_1K_TOKENS_USD, 6)
+    cost = round((token_usage / 1000.0) * _BLENDED_COST_PER_1K_USD, 6)
     return {
         "token_usage": int(token_usage),
         "cost_estimate_usd": Decimal(str(cost)),
     }
+
+
+def _update_with_usage(
+    table,
+    assignment_id: str,
+    set_parts: list[str],
+    usage_fields: dict,
+    attr_names: dict,
+    attr_values: dict,
+) -> None:
+    """Apply the status/summary SET update, then ACCUMULATE usage with ADD.
+
+    Two separate writes on purpose:
+
+    - The SET update (status flip, summary, duration) is the run's completion
+      record — it must land, and a failure raises to the caller.
+    - The usage update uses ``ADD`` so a resumed run's segments accumulate
+      (``EventLoopMetrics`` resets per invocation — overwriting would drop all
+      but the last segment). It is best-effort: token capture must never break
+      a run's completion. Legacy rows carry ``token_usage: NULL`` (the router
+      used to write None at create), which ``ADD`` rejects — for those we fall
+      back to SET, which is safe precisely because a NULL row has no
+      accumulated value to lose.
+    """
+    if set_parts:
+        table.update_item(
+            Key={"assignment_id": assignment_id},
+            UpdateExpression="SET " + ", ".join(set_parts),
+            ExpressionAttributeNames=attr_names,
+            ExpressionAttributeValues=attr_values,
+        )
+    if not usage_fields:
+        return
+    add_values = {f":{key}": value for key, value in usage_fields.items()}
+    add_expr = "ADD " + ", ".join(f"{key} :{key}" for key in usage_fields)
+    try:
+        table.update_item(
+            Key={"assignment_id": assignment_id},
+            UpdateExpression=add_expr,
+            ExpressionAttributeValues=add_values,
+        )
+    except ClientError:
+        logger.warning(
+            "usage ADD failed for %s (legacy NULL fields?); falling back to SET",
+            assignment_id,
+        )
+        try:
+            table.update_item(
+                Key={"assignment_id": assignment_id},
+                UpdateExpression="SET "
+                + ", ".join(f"{key} = :{key}" for key in usage_fields),
+                ExpressionAttributeValues=add_values,
+            )
+        except Exception:
+            logger.exception("usage capture failed for %s", assignment_id)
+    except Exception:
+        logger.exception("usage capture failed for %s", assignment_id)
+
+
+def record_usage(assignment_id: str, token_usage: int | dict | None) -> None:
+    """Accumulate a run segment's usage WITHOUT touching status — used when a
+    run pauses (awaiting input): the segment's tokens must land now because
+    the next segment's metrics start from zero. Best-effort; never raises."""
+    if not assignment_id or assignment_id == "default":
+        return
+    usage_fields = _usage_fields(token_usage)
+    if not usage_fields:
+        return
+    try:
+        _update_with_usage(_get_table(), assignment_id, [], usage_fields, {}, {})
+    except Exception:
+        logger.exception("record_usage failed for %s", assignment_id)
 
 
 def complete_assignment(
@@ -199,7 +312,8 @@ def complete_assignment(
 
     :param token_usage: total tokens the run consumed (from the model result's
         usage metrics). When provided, ``token_usage`` and a derived
-        ``cost_estimate_usd`` are recorded; when omitted they are left unset.
+        ``cost_estimate_usd`` are ACCUMULATED onto the row (ADD — a resumed
+        run's segments sum up); when omitted they are left unset.
     """
     if not assignment_id or assignment_id == "default":
         logger.info(
@@ -221,17 +335,11 @@ def complete_assignment(
 
     if result_summary:
         set_parts.append("result_summary = :rs")
-        attr_values[":rs"] = result_summary[:1000]
+        attr_values[":rs"] = result_summary[:4000]
 
-    for key, value in _usage_fields(token_usage).items():
-        set_parts.append(f"{key} = :{key}")
-        attr_values[f":{key}"] = value
-
-    table.update_item(
-        Key={"assignment_id": assignment_id},
-        UpdateExpression="SET " + ", ".join(set_parts),
-        ExpressionAttributeNames=attr_names,
-        ExpressionAttributeValues=attr_values,
+    _update_with_usage(
+        table, assignment_id, set_parts, _usage_fields(token_usage),
+        attr_names, attr_values,
     )
     logger.info("Assignment %s marked completed", assignment_id)
 
@@ -241,7 +349,8 @@ def fail_assignment(
 ):
     """Mark an assignment as failed. Raises on DynamoDB failure.
 
-    Records duration and any token usage consumed before the failure so a
+    Records duration and ACCUMULATES any token usage consumed before the
+    failure (ADD — a resumed run's earlier segments are preserved) so a
     crashed run still shows cost on the dashboard.
     """
     if not assignment_id or assignment_id == "default":
@@ -261,15 +370,9 @@ def fail_assignment(
         set_parts.append("duration_seconds = :dur")
         attr_values[":dur"] = max(0, now - created_at)
 
-    for key, value in _usage_fields(token_usage).items():
-        set_parts.append(f"{key} = :{key}")
-        attr_values[f":{key}"] = value
-
-    table.update_item(
-        Key={"assignment_id": assignment_id},
-        UpdateExpression="SET " + ", ".join(set_parts),
-        ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues=attr_values,
+    _update_with_usage(
+        table, assignment_id, set_parts, _usage_fields(token_usage),
+        {"#s": "status"}, attr_values,
     )
     logger.info("Assignment %s marked failed", assignment_id)
 

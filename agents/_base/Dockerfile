@@ -3,6 +3,14 @@ FROM public.ecr.aws/docker/library/python:3.12-slim@sha256:46cb7cc2877e60fbd5e21
 RUN groupadd --system --gid 1001 agent \
  && useradd --system --uid 1001 --gid agent --no-create-home --shell /sbin/nologin agent
 
+# git for the durable-workspace tool (clone/commit/push of wip/<assignment_id>
+# branches — durable-repo-work spec D3/D4). The workspace itself lives under
+# /tmp/work/<assignment_id> (writable for the nologin agent user; everything on
+# disk is scratch per D1 — durability is the pushed branch, never the container).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 # Base requirements (the common set every config-driven agent needs). Per-agent

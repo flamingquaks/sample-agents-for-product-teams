@@ -25,8 +25,6 @@ import uuid
 from decimal import Decimal
 
 import boto3
-from botocore.config import Config
-
 import enrichment
 import fleet_config
 import guardrail
@@ -34,6 +32,7 @@ import identity as identity_map
 import notify
 import reply
 import trigger_authz
+from botocore.config import Config
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -352,8 +351,13 @@ def create_assignment(
     requester: str,
     instruction: str,
     source_context: dict,
+    parent_assignment_id: str = "",
 ) -> str:
-    """Record a new assignment in DynamoDB. Returns assignment_id."""
+    """Record a new assignment in DynamoDB. Returns assignment_id.
+
+    ``parent_assignment_id`` links a reply-on-a-completed-thread follow-up to
+    the prior assignment (durable-repo-work spec D8) — a NEW unit of work, not
+    a reopen."""
     assignment_id = str(uuid.uuid4())
     now = int(time.time())
     ttl = now + (30 * 24 * 60 * 60)  # 30 days
@@ -365,8 +369,12 @@ def create_assignment(
     trace_refs = enrichment.derive_trace_refs(source, source_context, instruction)
     participants = enrichment.derive_participants(source, requester, source_context)
 
+    item_extra = (
+        {"parent_assignment_id": parent_assignment_id} if parent_assignment_id else {}
+    )
     assignments_table.put_item(
         Item={
+            **item_extra,
             "assignment_id": assignment_id,
             # Constant PK for the "all runs, newest-first" fleet GSI (AllRunsIndex).
             "gsi_all": enrichment.ALL_RUNS_PK,
@@ -383,12 +391,51 @@ def create_assignment(
             "completed_at": None,
             "duration_seconds": None,
             "result_summary": None,
-            "token_usage": None,
-            "cost_estimate_usd": None,
+            # token_usage / cost_estimate_usd are deliberately ABSENT (not
+            # None): the agent accumulates them with DynamoDB ADD on every
+            # segment of a (possibly resumed) run, and ADD rejects a NULL-typed
+            # attribute — an explicit None here would break usage capture.
             "ttl": ttl,
         }
     )
     return assignment_id
+
+
+# --- Thread ↔ assignment binding (durable-repo-work spec) ---------------------
+#
+# A Slack dispatch binds its thread to the assignment so a later in-thread
+# @sdlc-agents reply can resume a paused run (or start a linked follow-up on a
+# completed one) WITHOUT naming the agent — the binding resolves it. Mirror of
+# the notif_thread# bookkeeping rows, same table.
+
+_THREAD_BINDING_PREFIX = "thread_binding#"
+_BINDING_TTL_SECONDS = 30 * 24 * 60 * 60
+
+
+def thread_binding_key(team_id: str, channel_id: str, thread_ts: str) -> str:
+    return f"{_THREAD_BINDING_PREFIX}{team_id}#{channel_id}#{thread_ts}"
+
+
+def write_thread_binding(source_context: dict, assignment_id: str, agent_id: str) -> None:
+    """Bind the dispatch's Slack thread to this assignment (best-effort — a
+    missed binding only costs resumability, never the dispatch)."""
+    team = str(source_context.get("workspace", "") or "")
+    channel = str(source_context.get("channel_id", "") or "")
+    thread_ts = str(source_context.get("thread_ts", "") or "")
+    if not (team and channel and thread_ts):
+        return
+    try:
+        assignments_table.put_item(
+            Item={
+                "assignment_id": thread_binding_key(team, channel, thread_ts),
+                "kind": "thread_binding",
+                "bound_assignment_id": assignment_id,
+                "agent_id": agent_id,
+                "ttl": int(time.time()) + _BINDING_TTL_SECONDS,
+            }
+        )
+    except Exception:
+        logger.exception("thread binding write failed for %s", assignment_id)
 
 
 def update_assignment(assignment_id: str, **kwargs):
@@ -478,7 +525,9 @@ def _put_metric(name: str, dimensions: dict | None = None, value: float = 1.0):
         logger.warning("Failed to emit metric %s: %s", name, exc)
 
 
-def _post_block_reply(source: str, source_context: dict, message: str) -> bool:
+def _post_block_reply(
+    source: str, source_context: dict, message: str, *, agent_id: str | None = None
+) -> bool:
     """Post the block-notice message to the originating thread. Returns True on success."""
     if source == "github":
         return reply.post_github_comment(
@@ -497,6 +546,7 @@ def _post_block_reply(source: str, source_context: dict, message: str) -> bool:
             channel=source_context.get("channel_id", ""),
             body=message,
             thread_ts=source_context.get("thread_ts"),
+            agent_id=agent_id,
         )
     logger.warning("No reply channel for source=%s — block notice not posted", source)
     return False
@@ -527,8 +577,129 @@ def _notify_fleet_event(
             unit=source_context.get("assignment_id", "") or "",
             actor={"source": id_source, "handle": handle, "workspace": workspace},
         )
-    except Exception:  # noqa: BLE001 — notifications are best-effort
+    except Exception:
         logger.exception("fleet-event notification failed (%s/%s)", tier, event)
+
+
+# --- Resume dispatch (durable-repo-work spec) ---------------------------------
+
+
+def _resume_lock(assignment_id: str) -> bool:
+    """Conditionally flip ``awaiting_input → resuming`` — the resume lock. A
+    second fast reply loses the conditional write and is rejected (the winner
+    is already feeding the agent). Returns True when this caller holds it."""
+    try:
+        assignments_table.update_item(
+            Key={"assignment_id": assignment_id},
+            UpdateExpression="SET #s = :resuming",
+            ConditionExpression="#s = :awaiting",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":resuming": "resuming",
+                ":awaiting": "awaiting_input",
+            },
+        )
+        return True
+    except assignments_table.meta.client.exceptions.ConditionalCheckFailedException:
+        return False
+
+
+def handle_resume(event) -> dict:
+    """Resume a paused (``awaiting_input``) assignment from an in-thread reply.
+
+    The Slack webhook resolved the thread binding and sends
+    ``{"resume_of": <assignment_id>, "body": <the reply>, ...}``. Order:
+    guardrail on the reply (untrusted input — no bypass), THEN the conditional
+    ``awaiting_input → resuming`` flip (the lock), THEN re-invoke the SAME
+    runtime with the saved interrupt id + workspace snapshot + the reply."""
+    assignment_id = str(event.get("resume_of", ""))
+    reply_text = event.get("body", "") or ""
+    source_context = event.get("context", {}) or {}
+
+    row = (
+        assignments_table.get_item(Key={"assignment_id": assignment_id}).get("Item")
+        or {}
+    )
+    if not row:
+        return _error(404, f"assignment {assignment_id} not found")
+    agent_id = str(row.get("agent_id", ""))
+    if row.get("status") != "awaiting_input":
+        return _error(
+            409,
+            f"assignment {assignment_id} is not awaiting input (status: {row.get('status')})",
+        )
+
+    registry = load_registry()
+    agents = registry.get("agents", {})
+    if agent_id not in agents:
+        return _error(404, f"agent {agent_id} is no longer routable")
+    agent_config = {**agents[agent_id], "agent_id": agent_id}
+
+    # The reply is untrusted input — same guardrail as any dispatch (no bypass).
+    guardrail_result = guardrail.check_prompt(reply_text)
+    if guardrail_result.outcome != "passed":
+        _put_metric(
+            "GuardrailTripped" if guardrail_result.outcome == "blocked" else "GuardrailError",
+            dimensions={"Source": "slack", "AgentId": agent_id},
+        )
+        message = (
+            BLOCKED_MESSAGE_TEMPLATE.format(
+                reason_suffix=f" ({guardrail_result.reason})" if guardrail_result.reason else "",
+                assignment_id=assignment_id,
+            )
+            if guardrail_result.outcome == "blocked"
+            else GUARDRAIL_ERROR_MESSAGE_TEMPLATE.format(assignment_id=assignment_id)
+        )
+        _post_block_reply("slack", source_context, message, agent_id=agent_id)
+        return _error(400, f"resume reply blocked by guardrail: {guardrail_result.reason}")
+
+    # The lock: only one reply resumes; a racing second reply is rejected.
+    if not _resume_lock(assignment_id):
+        return _error(409, f"assignment {assignment_id} is already resuming")
+
+    resume_payload = {
+        "interrupt_id": str(row.get("interrupt_id", "")),
+        "response": reply_text,
+        "workspace_snapshot": row.get("workspace_snapshot") or [],
+    }
+    original_context = row.get("source_context") or {}
+    payload = json.dumps(
+        {
+            "prompt": reply_text,
+            "session_id": assignment_id,
+            "source": row.get("source", "slack"),
+            "source_context": original_context,
+            "assignment_id": assignment_id,
+            "resume": resume_payload,
+        }
+    ).encode("utf-8")
+    try:
+        agentcore.invoke_agent_runtime(
+            agentRuntimeArn=agent_config["runtime_arn"],
+            qualifier="DEFAULT",
+            contentType="application/json",
+            accept="application/json",
+            payload=payload,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.error("Failed to resume agent %s: %s", agent_id, e)
+        update_assignment(
+            assignment_id, status="failed", result_summary=f"resume failed: {e}"
+        )
+        return _error(500, f"failed to resume @{agent_id}: {e}")
+
+    _post_block_reply(
+        "slack",
+        source_context,
+        f"▶️ Picking the work back up with your answer. (assignment `{assignment_id}`)",
+        agent_id=agent_id,
+    )
+    _put_metric("AssignmentResumed", dimensions={"AgentId": agent_id})
+    logger.info("Resumed assignment %s (agent %s)", assignment_id, agent_id)
+    return {
+        "statusCode": 200,
+        "body": json.dumps({"assignment_id": assignment_id, "status": "resuming"}),
+    }
 
 
 # --- Lambda Handler ----------------------------------------------------------
@@ -561,6 +732,12 @@ def handler(event, context):
     }
     """
     logger.info("Dispatch event: %s", json.dumps(event))
+
+    # Resume dispatch (durable-repo-work spec): an in-thread reply on a paused
+    # assignment re-enters here with resume_of set by the Slack webhook's
+    # thread-binding lookup. Separate path — same runtime, same assignment.
+    if event.get("resume_of"):
+        return handle_resume(event)
 
     registry = load_registry()
 
@@ -762,7 +939,14 @@ def handler(event, context):
         requester=sender,
         instruction=instruction,
         source_context=source_context,
+        # D8: a reply on a completed thread is a NEW linked assignment.
+        parent_assignment_id=str(event.get("parent_assignment_id", "") or ""),
     )
+
+    # Bind the Slack thread to this assignment so an in-thread reply can
+    # resume a pause (or start a linked follow-up) without naming the agent.
+    if source == "slack":
+        write_thread_binding(source_context, assignment_id, agent_id)
 
     # --- Invoke agent ---
     try:
@@ -780,9 +964,12 @@ def handler(event, context):
     # Slack dispatches are async (the receiver already 200-acked), so unlike
     # GitHub/Asana — where the mention comment is itself the acknowledgement —
     # there's no visible confirmation unless the router posts one. Best-effort.
+    # Posts under the agent's own identity (distinct username + icon).
     if source == "slack":
         _post_block_reply(
-            source, source_context, f"🏁 @{agent_id} is on it. (assignment `{assignment_id}`)"
+            source, source_context,
+            f"🏁 On it — working on your request now. (assignment `{assignment_id}`)",
+            agent_id=agent_id,
         )
 
     _notify_fleet_event(

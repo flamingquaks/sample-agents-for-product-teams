@@ -4,10 +4,13 @@ The Slack trigger source, at parity with the GitHub App + Asana receivers. Sits
 behind API Gateway (public HTTPS) on two routes:
 
   - POST /slack/events   — the Events API: ``url_verification`` handshake +
-    ``app_mention`` events ("@fleetbot @workitems break this up").
-  - POST /slack/commands — slash commands: ``/fleet <@agent> …`` (mention
-    dispatch) and ``/sdlc-onboard-channel [agent …]`` (a CHANNEL ONBOARDING
-    REQUEST an admin approves in the Connectors panel — never self-served).
+    ``app_mention`` events. This is the PRIMARY dispatch UX:
+    ``@sdlc-agents <agent> <message>`` — the agent name resolves bare (no
+    second @) or as ``@agent``, and the reply threads under the mention.
+  - POST /slack/commands — slash commands: ``/sdlc-message-agent`` (guided
+    modal, secondary path) and ``/sdlc-onboard-channel [agent …]`` (a CHANNEL
+    ONBOARDING REQUEST an admin approves in the Connectors panel — never
+    self-served).
 
 Multi-workspace: every delivery carries a ``team_id``; we resolve it to an
 onboarded, enabled ``slack_workspace`` row and verify the signature against THAT
@@ -32,11 +35,11 @@ import base64
 import json
 import logging
 import os
+import re
 import time
 from urllib.parse import parse_qs
 
 import boto3
-
 import mentions
 import reply
 import slack_modals
@@ -104,7 +107,7 @@ def _already_seen(event_id: str) -> bool:
     try:
         resp = _assignments_table().get_item(Key={"assignment_id": _dedup_key(event_id)})
         return "Item" in resp
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.exception("event dedup read failed for %s; treating as new", event_id)
         return False
 
@@ -122,11 +125,18 @@ def _mark_seen(event_id: str) -> None:
                 "ttl": int(time.time()) + _DEDUP_TTL_SECONDS,
             }
         )
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.exception("event dedup write failed for %s", event_id)
 
 
-def _dispatch(agent_id: str, instruction: str, sender: str, context: dict, trigger_type: str):
+def _dispatch(
+    agent_id: str,
+    instruction: str,
+    sender: str,
+    context: dict,
+    trigger_type: str,
+    parent_assignment_id: str = "",
+):
     payload = {
         "source": "slack",
         "trigger_type": trigger_type,
@@ -136,6 +146,10 @@ def _dispatch(agent_id: str, instruction: str, sender: str, context: dict, trigg
         "sender": sender,
         "context": context,
     }
+    if parent_assignment_id:
+        # D8 (durable-repo-work spec): a reply on a completed thread starts a
+        # NEW assignment linked to the prior one.
+        payload["parent_assignment_id"] = parent_assignment_id
     logger.info("Dispatching to %s: slack/%s", agent_id, trigger_type)
     _lambda.invoke(
         FunctionName=DISPATCH_FUNCTION,
@@ -222,12 +236,180 @@ def _record_channel_request(
 # --- event processing --------------------------------------------------------
 
 
+def _resolve_agent_from_text(text: str) -> tuple[str, str] | None:
+    """Resolve the agent from text after the bot mention is stripped.
+
+    Tries (in order):
+      1. Standard ``@agent rest of message`` (existing path).
+      2. Bare first word matching an agent id or alias — so users can type
+         ``@sdlc-agents researcher do X`` without a second ``@``.
+
+    Returns ``(agent_id, instruction)`` or None."""
+    resolved = _registry.resolve_mention(text)
+    if resolved:
+        return resolved
+    parts = (text or "").split(None, 1)
+    if not parts:
+        return None
+    first_word = parts[0].lower().lstrip("@")
+    registry = _registry.load() or {}
+    agents = registry.get("agents", {})
+    agent_id = None
+    if first_word in agents:
+        agent_id = first_word
+    else:
+        agent_id = next(
+            (aid for aid, cfg in agents.items() if first_word in (cfg.get("aliases") or [])),
+            None,
+        )
+    if agent_id:
+        instruction = parts[1].strip() if len(parts) > 1 else ""
+        return agent_id, instruction
+    return None
+
+
+def _mention_repo_scope(team_id: str, channel_id: str, instruction: str) -> tuple[str, list[str]]:
+    """The repo scope for a mention dispatch: ``(origin_repo, repos)``.
+
+    Slack mentions carry no repo the way a GitHub mention does, so the agent
+    would have NO codebase bridge — the gateway interceptor fails closed on a
+    missing dispatch origin and every GitHub tool call is refused. The channel's
+    APPROVED repo grants (the same set the /sdlc-message-agent modal offers as
+    checkboxes) are the natural scope for a mention from that channel:
+
+      - a repo explicitly named in the message (``owner/repo``) AND approved for
+        the channel becomes the dispatch origin — the user said which codebase
+        they mean, honor it;
+      - otherwise the channel's approved repos are attached wholesale, first as
+        origin (deterministic: grant order), siblings reachable via co-repo
+        grouping.
+
+    An unapproved repo named in the message is deliberately NOT honored — the
+    channel grant is the authorization boundary, mentioning a repo must not
+    widen it. No approved repos ⇒ ("", []) and the agent runs repo-less
+    (Slack-thread research, Asana work), same as before."""
+    approved = trigger_grants.channel_repos(team_id, channel_id)
+    if not approved:
+        return "", []
+    named = re.findall(r"\b([\w.-]+/[\w.-]+)\b", instruction or "")
+    approved_fold = {r.casefold(): r for r in approved}
+    for candidate in named:
+        hit = approved_fold.get(candidate.casefold())
+        if hit:
+            return hit, list(approved)
+    return approved[0], list(approved)
+
+
+def _thread_binding(team_id: str, channel_id: str, thread_ts: str) -> dict | None:
+    """The thread_binding# row for this thread, or None. Written by the router
+    on every Slack dispatch (durable-repo-work spec) — binds the thread to its
+    assignment + agent so a reply can resume without naming the agent."""
+    if not thread_ts:
+        return None
+    try:
+        resp = _assignments_table().get_item(
+            Key={"assignment_id": f"thread_binding#{team_id}#{channel_id}#{thread_ts}"}
+        )
+        return resp.get("Item") or None
+    except Exception:
+        logger.exception("thread binding read failed")
+        return None
+
+
+def _bound_assignment_status(assignment_id: str) -> str:
+    try:
+        resp = _assignments_table().get_item(
+            Key={"assignment_id": assignment_id},
+            ProjectionExpression="#s",
+            ExpressionAttributeNames={"#s": "status"},
+        )
+        return str((resp.get("Item") or {}).get("status", "") or "")
+    except Exception:
+        logger.exception("bound assignment read failed for %s", assignment_id)
+        return ""
+
+
+def _dispatch_resume(assignment_id: str, reply_text: str, sender: str, context: dict) -> None:
+    """Send a resume event to the router (same assignment, the reply is the
+    interrupt answer; the router holds the lock + guardrail)."""
+    payload = {
+        "resume_of": assignment_id,
+        "body": reply_text,
+        "sender": sender,
+        "context": context,
+    }
+    logger.info("Dispatching resume of %s", assignment_id)
+    _lambda.invoke(
+        FunctionName=DISPATCH_FUNCTION,
+        InvocationType="Event",
+        Payload=json.dumps(payload).encode(),
+    )
+
+
 def _process_app_mention(event_data: dict, team_id: str) -> None:
-    """Handle an ``app_mention`` event: resolve the @agent and dispatch."""
+    """Handle an ``app_mention`` event: resolve the @agent and dispatch.
+
+    Users type ``@sdlc-agents researcher do something`` — the Slack-encoded bot
+    mention is stripped, leaving ``researcher do something``. We resolve
+    ``researcher`` (or any alias) against the live registry, then dispatch with
+    the thread_ts so the agent's reply threads under the user's message. The
+    channel's approved repos are attached as the dispatch's codebase scope
+    (see _mention_repo_scope).
+
+    BOUND THREADS (durable-repo-work spec): a mention inside a thread the
+    router bound to an assignment doesn't need to name an agent — the binding
+    resolves it. A paused (awaiting_input) assignment RESUMES with the reply
+    as the interrupt answer; a completed one starts a NEW assignment linked to
+    the prior via parent_assignment_id (D8). Any other status falls through to
+    normal mention handling."""
     if event_data.get("bot_id") or event_data.get("subtype") == "bot_message":
         return  # bot-loop guard
     text = _strip_bot_mention(event_data.get("text", ""))
-    resolved = _registry.resolve_mention(text)
+    user_id_early = event_data.get("user", "")
+    channel_id_early = event_data.get("channel", "")
+    thread_ts = event_data.get("thread_ts") or ""
+    binding = _thread_binding(team_id, channel_id_early, thread_ts) if thread_ts else None
+    if binding and binding.get("bound_assignment_id"):
+        bound_id = str(binding["bound_assignment_id"])
+        status = _bound_assignment_status(bound_id)
+        if status == "awaiting_input":
+            context = {
+                "workspace": team_id,
+                "channel_id": channel_id_early,
+                "thread_ts": thread_ts,
+                "message_ts": event_data.get("ts"),
+                **_sender_identity_context(team_id, user_id_early),
+            }
+            _dispatch_resume(bound_id, text, _principal(team_id, user_id_early), context)
+            return
+        if status == "completed":
+            # D8: new linked assignment on the same thread — the binding names
+            # the agent, so the reply needn't; fresh work, prior linked.
+            resolved = _resolve_agent_from_text(text) or (
+                str(binding.get("agent_id", "")), text
+            )
+            agent_id, instruction = resolved
+            if agent_id:
+                instruction = instruction or text
+                origin_repo, repos = _mention_repo_scope(team_id, channel_id_early, instruction)
+                context = {
+                    "workspace": team_id,
+                    "channel_id": channel_id_early,
+                    "thread_ts": thread_ts,
+                    "message_ts": event_data.get("ts"),
+                    "repo": origin_repo,
+                    "repos": repos,
+                    "principal_groups": _principal_groups(team_id, channel_id_early),
+                    **_sender_identity_context(team_id, user_id_early),
+                }
+                _dispatch(
+                    agent_id, instruction, _principal(team_id, user_id_early),
+                    context, "comment_mention", parent_assignment_id=bound_id,
+                )
+                return
+        # any other status (dispatched/resuming/failed/…) → normal handling
+
+    resolved = _resolve_agent_from_text(text)
     if not resolved:
         return
     agent_id, instruction = resolved
@@ -235,11 +417,19 @@ def _process_app_mention(event_data: dict, team_id: str) -> None:
         instruction = "You were mentioned in Slack. Review the thread and take appropriate action."
     user_id = event_data.get("user", "")
     channel_id = event_data.get("channel", "")
+    origin_repo, repos = _mention_repo_scope(team_id, channel_id, instruction)
+    if repos:
+        instruction += (
+            "\n\nRepositories approved for this channel (work against these; "
+            f"the first is your primary): {', '.join([origin_repo] + [r for r in repos if r != origin_repo])}"
+        )
     context = {
         "workspace": team_id,
         "channel_id": channel_id,
         "thread_ts": event_data.get("thread_ts") or event_data.get("ts"),
         "message_ts": event_data.get("ts"),
+        "repo": origin_repo,
+        "repos": repos,
         "principal_groups": _principal_groups(team_id, channel_id),
         **_sender_identity_context(team_id, user_id),
     }
@@ -334,13 +524,15 @@ def _handle_slash_command(form: dict, team_id: str) -> dict:
     # Legacy mention-style command (/fleet @agent …) — kept for back-compat.
     if not text.strip():
         return _ephemeral(
-            f"Use `/{MESSAGE_COMMAND}` to message an agent with a guided form."
+            "Mention the bot to message an agent: `@sdlc-agents <agent> <message>` "
+            f"(threads the reply). Or use `/{MESSAGE_COMMAND}` for a guided form."
         )
     resolved = _registry.resolve_mention(text if text.startswith("@") else f"@{text}")
     if not resolved:
         return _ephemeral(
-            f"No known agent in `/{command} {text}`. Try `/{MESSAGE_COMMAND}` "
-            "for a guided form."
+            f"No known agent in `/{command} {text}`. Try "
+            "`@sdlc-agents <agent> <message>` or "
+            f"`/{MESSAGE_COMMAND}` for a guided form."
         )
     agent_id, instruction = resolved
     context = {
@@ -424,11 +616,24 @@ def _submit_message_agent(payload: dict, view: dict) -> dict:
     instruction = parsed["message"]
     if repos:
         instruction += "\n\nWork against these repositories (approved for this channel): " + ", ".join(repos)
+
+    # Post the visible confirmation FIRST and capture its ts — it becomes the
+    # THREAD ANCHOR for the whole run. The router's "on it" ack and the final
+    # result all thread under this one message instead of piling up as separate
+    # top-level channel posts. (A modal submit has no originating message to
+    # thread under, so we make one.)
+    scope = f" · repos: {', '.join(repos)}" if repos else ""
+    preview = parsed["message"][:200] + ("…" if len(parsed["message"]) > 200 else "")
+    _ok, anchor_ts = reply.post_slack_message_ts(
+        team_id, channel_id,
+        f"🤖 <@{user_id}> sent a message to *{parsed['agent_id']}*{scope}:\n> {preview}",
+        agent_id=parsed["agent_id"],
+    )
     context = {
         "workspace": team_id,
         "channel_id": channel_id,
-        "thread_ts": None,
-        "message_ts": None,
+        "thread_ts": anchor_ts,
+        "message_ts": anchor_ts,
         # The FIRST selected repo becomes the dispatch origin — the anchor the
         # gateway's co-repo grouping enforces reach from (siblings grouped with
         # it are reachable; unrelated repos are not).
@@ -440,13 +645,6 @@ def _submit_message_agent(payload: dict, view: dict) -> dict:
     _dispatch(
         parsed["agent_id"], instruction, _principal(team_id, user_id),
         context, "slash_command",
-    )
-    # Visible (non-ephemeral) confirmation in the channel.
-    scope = f" · repos: {', '.join(repos)}" if repos else ""
-    preview = parsed["message"][:200] + ("…" if len(parsed["message"]) > 200 else "")
-    reply.post_slack_message(
-        team_id, channel_id,
-        f"🤖 <@{user_id}> sent a message to *{parsed['agent_id']}*{scope}:\n> {preview}",
     )
     return _ack()  # close the modal
 
@@ -534,7 +732,7 @@ def handler(event, context=None):
             return _ephemeral("This workspace isn't onboarded for the fleet yet.")
         try:
             return _handle_slash_command(form, team_id)
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("error handling Slack slash command")
             return _ephemeral("Something went wrong handling that command.")
 
@@ -545,7 +743,7 @@ def handler(event, context=None):
     if is_interaction:
         try:
             return _handle_interaction(parse_qs(raw_body))
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("error handling Slack interaction")
             # A view_submission expects a 200 (empty body closes the modal).
             return _ack()
@@ -582,7 +780,7 @@ def handler(event, context=None):
     try:
         if event_data.get("type") == "app_mention":
             _process_app_mention(event_data, team_id)
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.exception("error processing Slack event")
         # Do NOT mark seen — let Slack retry the delivery.
         return {"statusCode": 500, "body": "processing error"}

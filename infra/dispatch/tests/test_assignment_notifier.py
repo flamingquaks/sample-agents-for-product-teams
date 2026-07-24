@@ -130,3 +130,124 @@ def test_one_bad_record_does_not_fail_batch():
         resp = an.handler({"Records": [bad, good]})
     assert resp["statusCode"] == 200
     assert m.call_count == 1  # the good record still processed
+
+
+# --- origin reply (the user-facing answer back to the Slack thread) -----------
+
+
+def _slack_completed_record(summary="Here is your research result.", thread_ts="123.456"):
+    ctx = {"workspace": "T0ACME01", "channel_id": "C0ENG"}
+    if thread_ts:
+        ctx["thread_ts"] = thread_ts
+    return _record(
+        new={"assignment_id": "a7", "agent_id": "researcher", "status": "completed",
+             "requester": "slack:T0ACME01:U9", "source": "slack",
+             "result_summary": summary, "source_context": ctx},
+        old={"status": "dispatched"},
+    )
+
+
+def test_completed_slack_run_posts_result_to_origin_thread():
+    rec = _slack_completed_record()
+    with patch.object(an.notify, "notify", return_value=1), \
+         patch.object(an.reply, "post_slack_message", return_value=True) as post:
+        an.handler({"Records": [rec]})
+    assert post.call_count == 1
+    args, kwargs = post.call_args
+    assert args[0] == "T0ACME01" and args[1] == "C0ENG"
+    assert "Here is your research result." in args[2]
+    assert kwargs["thread_ts"] == "123.456"
+    assert kwargs["agent_id"] == "researcher"
+
+
+def test_failed_slack_run_posts_error_to_origin():
+    rec = _record(
+        new={"assignment_id": "a8", "agent_id": "docwriter", "status": "failed",
+             "requester": "slack:T0ACME01:U9", "source": "slack",
+             "result_summary": "gateway timed out",
+             "source_context": {"workspace": "T0ACME01", "channel_id": "C0ENG"}},
+        old={"status": "dispatched"},
+    )
+    with patch.object(an.notify, "notify", return_value=1), \
+         patch.object(an.reply, "post_slack_message", return_value=True) as post:
+        an.handler({"Records": [rec]})
+    text = post.call_args[0][2]
+    assert "couldn't complete" in text and "gateway timed out" in text
+
+
+def test_non_slack_run_does_not_post_origin_reply():
+    rec = _record(
+        new={"assignment_id": "a9", "agent_id": "workitems", "status": "completed",
+             "requester": "github:alice", "source": "github",
+             "source_context": {"repo": "acme/web"}},
+        old={"status": "dispatched"},
+    )
+    with patch.object(an.notify, "notify", return_value=1), \
+         patch.object(an.reply, "post_slack_message") as post:
+        an.handler({"Records": [rec]})
+    post.assert_not_called()
+
+
+def test_origin_reply_failure_does_not_block_fanout():
+    rec = _slack_completed_record()
+    with patch.object(an.notify, "notify", return_value=1) as fanout, \
+         patch.object(an.reply, "post_slack_message", side_effect=RuntimeError("slack down")):
+        an.handler({"Records": [rec]})
+    fanout.assert_called_once()
+
+
+def test_long_result_truncated_for_slack():
+    rec = _slack_completed_record(summary="x" * 5000)
+    with patch.object(an.notify, "notify", return_value=1), \
+         patch.object(an.reply, "post_slack_message", return_value=True) as post:
+        an.handler({"Records": [rec]})
+    text = post.call_args[0][2]
+    assert len(text) < 4000 and "…" in text
+
+
+# --- awaiting_input (durable pause, durable-repo-work spec) ---------------------
+
+
+def test_awaiting_input_is_actionable_fanout():
+    rec = _record(
+        new={"assignment_id": "a7", "agent_id": "docwriter", "status": "awaiting_input",
+             "requester": "slack:T1:U9", "pending_question": "Which region?"},
+        old={"status": "dispatched"},
+    )
+    with patch.object(an.notify, "notify", return_value=1) as m:
+        an.handler({"Records": [rec]})
+    kw = m.call_args.kwargs
+    assert kw["tier"] == "actionable" and kw["event"] == "awaiting_input"
+
+
+def test_awaiting_input_posts_question_with_resume_copy():
+    """The origin-thread reply carries the agent's question AND the how-to-
+    resume instructions (D6: reply @sdlc-agents in-thread)."""
+    rec = _record(
+        new={"assignment_id": "a7", "agent_id": "docwriter", "status": "awaiting_input",
+             "requester": "slack:T1:U9", "source": "slack",
+             "pending_question": "Deploy to us-east-1 or us-west-2?",
+             "source_context": {"workspace": "T1", "channel_id": "C1", "thread_ts": "9.9"}},
+        old={"status": "dispatched"},
+    )
+    with patch.object(an.notify, "notify", return_value=1), \
+         patch.object(an.reply, "post_slack_message", return_value=True) as post:
+        an.handler({"Records": [rec]})
+    assert post.call_count == 1
+    args, kwargs = post.call_args
+    text = args[2]
+    assert "Deploy to us-east-1 or us-west-2?" in text
+    assert "@sdlc-agents" in text
+    assert kwargs["thread_ts"] == "9.9"
+    assert kwargs["agent_id"] == "docwriter"
+
+
+def test_thread_binding_rows_skipped():
+    rec = _record(
+        new={"assignment_id": "thread_binding#T1#C1#9.9", "kind": "thread_binding",
+             "status": "awaiting_input"},
+        old={"status": "x"},
+    )
+    with patch.object(an.notify, "notify") as m:
+        an.handler({"Records": [rec]})
+    m.assert_not_called()

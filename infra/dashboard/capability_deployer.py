@@ -39,7 +39,6 @@ import re
 import time
 
 import boto3
-
 import config_store
 
 # An ECR image tag we'll accept off a build event: alphanumerics, dot, underscore,
@@ -94,7 +93,15 @@ _REQUIRED_BASE_ENV = ("BEDROCK_GUARDRAIL_ID", "BEDROCK_GUARDRAIL_VERSION", "GATE
 # SKILLS_BUCKET is where the base agent pulls its skill packages from on startup
 # (§6.2); absent (skills feature not deployed), an agent with no skills is fine
 # and one with skills simply runs prompt-only.
-_OPTIONAL_BASE_ENV = ("MANTLE_PROJECT_ID", "SKILLS_BUCKET")
+# SESSION_BUCKET (durable conversations, spec D2) and WORKSPACE_TOKEN_FUNCTION
+# (durable-workspace credential vendor) degrade the same way: absent, agents
+# run non-durable / without the clone-push tools — exactly the prior behavior.
+_OPTIONAL_BASE_ENV = (
+    "MANTLE_PROJECT_ID",
+    "SKILLS_BUCKET",
+    "SESSION_BUCKET",
+    "WORKSPACE_TOKEN_FUNCTION",
+)
 
 
 def _base_env() -> tuple[dict[str, str], list[str]]:
@@ -116,6 +123,12 @@ def _base_env() -> tuple[dict[str, str], list[str]]:
         val = os.environ.get(key)
         if val:
             env[key] = val
+    # The stage's assignments table, so shared/assignment.py writes to the table
+    # the runtime role is actually granted (its fallback default is the dev
+    # table, which AccessDenies on any other stage).
+    env["ASSIGNMENTS_TABLE"] = os.environ.get(
+        "ASSIGNMENTS_TABLE", f"dispatch-assignments-{os.environ.get('STAGE', 'dev')}"
+    )
     return env, missing
 
 
@@ -181,7 +194,22 @@ def _ensure_runtime_role(agent_id: str) -> str:
                         "logs:PutLogEvents",
                     ],
                     "Resource": f"arn:aws:logs:{region}:{account}:log-group:/aws/bedrock-agentcore/runtimes/*",
-                }
+                },
+                # The AgentCore OTel sidecar exports spans/metrics to X-Ray +
+                # CloudWatch. Without these every runtime logs a "Failed to
+                # export span batch code: 403" on each batch — noisy and blinds
+                # tracing. These actions don't support resource scoping.
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "xray:PutTraceSegments",
+                        "xray:PutTelemetryRecords",
+                        "xray:PutSpans",
+                        "xray:PutSpansForIndexing",
+                        "cloudwatch:PutMetricData",
+                    ],
+                    "Resource": "*",
+                },
             ],
         },
         "dynamodb-assignments": {
@@ -277,6 +305,43 @@ def _ensure_runtime_role(agent_id: str) -> str:
                         f"arn:aws:s3:::{skills_bucket}",
                         f"arn:aws:s3:::{skills_bucket}/skills/*",
                     ],
+                }
+            ],
+        }
+    # Durable sessions (spec D2): the Strands S3SessionManager persists/restores
+    # conversation state under sessions/<assignment_id>. Read/write scoped to
+    # the one bucket + prefix (the boundary caps it the same way).
+    session_bucket = os.environ.get("SESSION_BUCKET", "")
+    if session_bucket:
+        policies["session-readwrite"] = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "s3:GetObject",
+                        "s3:PutObject",
+                        "s3:DeleteObject",
+                        "s3:ListBucket",
+                    ],
+                    "Resource": [
+                        f"arn:aws:s3:::{session_bucket}",
+                        f"arn:aws:s3:::{session_bucket}/sessions/*",
+                    ],
+                }
+            ],
+        }
+    # Durable-workspace credential minting: invoke ONLY the token vendor (the
+    # boundary also pins this single function).
+    token_vendor = os.environ.get("WORKSPACE_TOKEN_FUNCTION", "")
+    if token_vendor:
+        policies["workspace-token-vendor-invoke"] = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": "lambda:InvokeFunction",
+                    "Resource": f"arn:aws:lambda:{region}:{account}:function:{token_vendor}",
                 }
             ],
         }
@@ -437,14 +502,14 @@ def deploy_capability(agent_id: str, image_tag: str) -> None:
             build_id="",  # cleared; the row already recorded the build that ran
         )
         config_store.set_capability_status(agent_id, config_store.CAP_ACTIVE, detail="ready")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         # Never tear down a working runtime on failure — just record why.
         logger.exception("deploy failed for capability %s", agent_id)
         try:
             config_store.set_capability_status(
                 agent_id, config_store.CAP_FAILED, detail=f"deploy error: {exc}"[:900]
             )
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("could not mark %s failed", agent_id)
         return
 
@@ -454,7 +519,7 @@ def deploy_capability(agent_id: str, image_tag: str) -> None:
     # change, and the router refreshes its cached copy within its TTL meanwhile.
     try:
         config_store.publish_registry()
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.exception(
             "capability %s is active but registry publish failed; it will "
             "re-publish on the next capability change", agent_id
@@ -578,7 +643,7 @@ def teardown_capability(agent_id: str) -> None:
     config_store.delete_capability(agent_id)
     try:
         config_store.publish_registry()
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.exception("torn down %s but registry publish failed; re-publishes on next change", agent_id)
     logger.info("capability %s fully torn down", agent_id)
 
@@ -643,7 +708,7 @@ def handler(event, context=None):
             config_store.set_capability_status(
                 agent_id, config_store.CAP_FAILED, detail=f"build {status}"
             )
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("could not mark %s failed after build %s", agent_id, status)
         return {"ok": False, "agent_id": agent_id, "build_status": status}
 

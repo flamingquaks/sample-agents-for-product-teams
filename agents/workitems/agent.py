@@ -14,25 +14,26 @@ import os
 import sys
 from contextlib import ExitStack
 
-from strands import Agent
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
-from strands_tools.agent_core_memory import AgentCoreMemoryToolProvider
-
+from project_config import build_project_context
+from prompts import SYSTEM_PROMPT
+from shared import durable
 from shared.assignment import (
     complete_assignment,
-    extract_token_usage,
     extract_trace_refs_from_result,
+    extract_usage,
     fail_assignment,
     update_trace_refs,
 )
 from shared.bedrock import build_model
+from shared.dispatch_context import slack_dispatch_block
 from shared.tools import gateway
-from prompts import SYSTEM_PROMPT
-from project_config import build_project_context
-from tools.status_report import generate_status_report
-from tools.risk_detection import detect_risks
-from tools.sync import reconcile_sync
+from strands import Agent
+from strands_tools.agent_core_memory import AgentCoreMemoryToolProvider
 from tools.post_results import post_results
+from tools.risk_detection import detect_risks
+from tools.status_report import generate_status_report
+from tools.sync import reconcile_sync
 
 # --- Logging -----------------------------------------------------------------
 # Configure root logger to emit to stdout so AgentCore's OTel sidecar captures
@@ -74,6 +75,9 @@ def invoke(payload, context=None):
     session_id = payload.get("session_id", ctx.get("session_id", "default"))
     assignment_id = payload.get("assignment_id", "")
     source_context = payload.get("source_context", {})
+    # Resume dispatch (durable-repo-work spec): saved interrupt id + the
+    # human's reply; the S3 session restores the conversation.
+    resume = payload.get("resume") if isinstance(payload.get("resume"), dict) else None
 
     # Dispatch context lives in the system prompt, not in the user message.
     # Structured "[Dispatch Context] ... [User Request] ..." wrappers look
@@ -105,6 +109,10 @@ def invoke(payload, context=None):
             f"Reply to: GitHub issue #{source_context.get('issue_number', 'unknown')} "
             f"on {source_context.get('repo', 'unknown')}\n"
         )
+    elif source_context and source == "slack":
+        # The codebase bridge for chat dispatches: which repos this channel is
+        # approved for, and when to reach for them (shared/dispatch_context.py).
+        dispatch_context_block = slack_dispatch_block(source_context)
 
     # Cost attribution uses the fleet's shared Mantle project (MANTLE_PROJECT_ID
     # runtime env, read inside build_model) — a dispatch may span repos, so there
@@ -153,23 +161,60 @@ def invoke(payload, context=None):
             + dispatch_context_block
         )
 
+        # Durable session + ask_user (durable-repo-work spec). workitems does
+        # issue/task work, not repo work — no workspace tools (repo_capable=False;
+        # its GitHub tier has no contents grant anyway).
+        session, durable_tools, hooks, durable_prompt = durable.durable_kit(
+            assignment_id,
+            agent_id=ACTOR_ID,
+            origin=dispatch_repo or "",
+            repo_capable=False,
+        )
+        all_tools.extend(durable_tools)
+        system_prompt += durable_prompt
+
         agent = Agent(
             model=model,
             system_prompt=system_prompt,
             tools=all_tools,
+            hooks=hooks,
+            session_manager=session,
         )
         try:
-            result = agent(user_input)
+            if resume:
+                durable.mark_resumed(assignment_id)
+                result = agent(
+                    durable.resume_payload(
+                        str(resume.get("interrupt_id", "")),
+                        str(resume.get("response", "")),
+                    )
+                )
+            else:
+                result = agent(user_input)
         except Exception as agent_error:
             try:
                 fail_assignment(assignment_id, error=str(agent_error))
             except Exception:
                 logger.exception("fail_assignment also failed for %s", assignment_id)
             raise
+        try:
+            pause = durable.handle_agent_result(result, assignment_id)
+        except Exception as pause_error:
+            # D7: a pause whose checkpoint can't land must FAIL LOUD.
+            try:
+                fail_assignment(
+                    assignment_id,
+                    error=f"pause checkpoint failed: {pause_error}",
+                )
+            except Exception:
+                logger.exception("fail_assignment also failed for %s", assignment_id)
+            raise
+        if pause:
+            return {"result": f"PAUSED: {pause['question']}"}
         complete_assignment(
             assignment_id,
-            result_summary=str(result)[:500],
-            token_usage=extract_token_usage(result),
+            result_summary=str(result)[:3500],
+            token_usage=extract_usage(result),
         )
         # If the run opened a PR, record it as a trace ref so the work is
         # traceable by PR on the dashboard. Best-effort — never blocks the run.

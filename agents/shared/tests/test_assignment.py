@@ -174,6 +174,13 @@ def _last_update(table):
     return table.updates[-1]
 
 
+def _usage_update(table):
+    """The ADD (usage-accumulation) update — the write after the SET one."""
+    add_updates = [u for u in table.updates if u["UpdateExpression"].startswith("ADD ")]
+    assert add_updates, "no ADD usage update was emitted"
+    return add_updates[-1]
+
+
 def test_complete_sets_status_and_duration(fake_table):
     asg.complete_assignment("a-1", result_summary="done")
     upd = _last_update(fake_table)
@@ -186,10 +193,68 @@ def test_complete_sets_status_and_duration(fake_table):
 
 def test_complete_writes_token_and_cost(fake_table):
     asg.complete_assignment("a-1", token_usage=2000)
-    vals = _last_update(fake_table)["ExpressionAttributeValues"]
+    vals = _usage_update(fake_table)["ExpressionAttributeValues"]
     assert vals[":token_usage"] == 2000
-    # 2000 tokens * $0.03/1k = $0.06
+    # bare total → blended rate (0.85*$0.003 + 0.15*$0.015 = $0.00480/1k)
+    assert float(vals[":cost_estimate_usd"]) == pytest.approx(2 * 0.00480)
+
+
+def test_complete_writes_per_direction_cost(fake_table):
+    # per-direction dict → priced at real in/out rates ($3/M in, $15/M out)
+    asg.complete_assignment(
+        "a-1", token_usage={"input": 10_000, "output": 2_000, "total": 12_000}
+    )
+    vals = _usage_update(fake_table)["ExpressionAttributeValues"]
+    assert vals[":token_usage"] == 12_000
+    assert vals[":input_tokens"] == 10_000
+    assert vals[":output_tokens"] == 2_000
+    # 10k * $0.003/1k + 2k * $0.015/1k = $0.03 + $0.03 = $0.06
     assert float(vals[":cost_estimate_usd"]) == pytest.approx(0.06)
+
+
+def test_usage_accumulates_with_add_not_set(fake_table):
+    """Resume-safety (durable-repo-work spec): EventLoopMetrics resets per
+    invocation, so each segment's usage must ADD onto the row, never SET —
+    otherwise a paused-and-resumed run reports only its final segment."""
+    asg.complete_assignment("a-1", token_usage=2000)
+    usage = _usage_update(fake_table)
+    assert usage["UpdateExpression"].startswith("ADD ")
+    assert "SET" not in usage["UpdateExpression"]
+    # And the status SET write carries no usage keys.
+    set_update = fake_table.updates[0]
+    assert ":token_usage" not in set_update["ExpressionAttributeValues"]
+
+
+def test_usage_add_failure_never_breaks_completion(monkeypatch):
+    """A usage-ADD rejection (e.g. a legacy row's NULL token_usage) must not
+    raise out of complete_assignment — it falls back to SET."""
+    from botocore.exceptions import ClientError
+
+    class AddRejectingTable(FakeTable):
+        def update_item(self, **kwargs):
+            if kwargs["UpdateExpression"].startswith("ADD "):
+                raise ClientError(
+                    {"Error": {"Code": "ValidationException", "Message": "NULL"}},
+                    "UpdateItem",
+                )
+            super().update_item(**kwargs)
+
+    table = AddRejectingTable()
+    monkeypatch.setattr(asg, "_get_table", lambda: table)
+    asg.complete_assignment("a-1", token_usage=2000)  # must not raise
+    # The fallback SET carried the usage values.
+    fallback = table.updates[-1]
+    assert fallback["UpdateExpression"].startswith("SET token_usage")
+    assert fallback["ExpressionAttributeValues"][":token_usage"] == 2000
+
+
+def test_extract_usage_per_direction():
+    result = SimpleNamespace(
+        metrics=SimpleNamespace(
+            accumulated_usage={"inputTokens": 300, "outputTokens": 200, "totalTokens": 500}
+        )
+    )
+    assert asg.extract_usage(result) == {"input": 300, "output": 200, "total": 500}
 
 
 def test_complete_without_usage_omits_cost(fake_table):
@@ -218,11 +283,12 @@ def test_sentinel_assignment_id_is_noop(fake_table):
 
 def test_fail_sets_status_duration_and_usage(fake_table):
     asg.fail_assignment("a-1", error="boom", token_usage=1000)
-    vals = _last_update(fake_table)["ExpressionAttributeValues"]
+    vals = fake_table.updates[0]["ExpressionAttributeValues"]
     assert vals[":s"] == "failed"
     assert vals[":rs"] == "boom"
     assert ":dur" in vals
-    assert vals[":token_usage"] == 1000
+    usage_vals = _usage_update(fake_table)["ExpressionAttributeValues"]
+    assert usage_vals[":token_usage"] == 1000
 
 
 # --- update_trace_refs -------------------------------------------------------

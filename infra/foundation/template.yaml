@@ -412,6 +412,35 @@ Resources:
         - Key: Project
           Value: sdlc-agents
 
+  # Durable-session bucket (durable-repo-work spec D2): every agent's Strands
+  # S3SessionManager persists conversation + pending interrupts here keyed by
+  # assignment_id, so a paused / idle-stopped / crashed run restores its
+  # conversation on the next container. Short TTL — sessions are working state,
+  # not an archive (the assignment row + result_summary are the durable record).
+  SessionBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub sdlc-agent-sessions-${AWS::AccountId}-${Stage}
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-sessions
+            Status: Enabled
+            ExpirationInDays: 30
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 7
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: sdlc-agents
+
   # ---------------------------------------------------------------------------
   # Shared DLQ for async Lambda failures
   # ---------------------------------------------------------------------------
@@ -1902,6 +1931,14 @@ Resources:
               - logs:CreateLogGroup
               - logs:CreateLogStream
               - logs:PutLogEvents
+              # OTel sidecar span/metric export (X-Ray + CloudWatch). Without
+              # these every runtime logs "Failed to export span batch: 403" on
+              # each batch and tracing is blind.
+              - xray:PutTraceSegments
+              - xray:PutTelemetryRecords
+              - xray:PutSpans
+              - xray:PutSpansForIndexing
+              - cloudwatch:PutMetricData
               - dynamodb:GetItem
               - dynamodb:PutItem
               - dynamodb:UpdateItem
@@ -1935,6 +1972,27 @@ Resources:
             Resource:
               - !GetAtt SkillsBucket.Arn
               - !Sub ${SkillsBucket.Arn}/skills/*
+          # Durable conversation sessions (durable-repo-work spec D2): the
+          # Strands S3SessionManager reads/writes session objects keyed by
+          # assignment_id. Scoped to the one session bucket for the same
+          # reason as SkillsBucketRead.
+          - Sid: SessionBucketReadWrite
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:ListBucket
+            Resource:
+              - !GetAtt SessionBucket.Arn
+              - !Sub ${SessionBucket.Arn}/sessions/*
+          # Durable-workspace credential minting: agents invoke ONLY the
+          # workspace token vendor (short-lived, repo+permission-scoped GitHub
+          # App tokens for clone/push). Named function — not lambda:*.
+          - Sid: WorkspaceTokenVendorInvoke
+            Effect: Allow
+            Action: lambda:InvokeFunction
+            Resource: !GetAtt WorkspaceTokenVendorFunction.Arn
 
   CapabilityBuildRole:
     Type: AWS::IAM::Role
@@ -2096,6 +2154,9 @@ Resources:
       Environment:
         Variables:
           FLEET_CONFIG_TABLE: !Ref FleetConfigTable
+          # Injected onto every agent runtime so shared/assignment.py writes to
+          # the stage's table (its fallback default is the dev table).
+          ASSIGNMENTS_TABLE: !Ref AssignmentsTable
           REGISTRY_PARAM: !Sub /sdlc-agents/${Stage}/registry
           STAGE: !Ref Stage
           AWS_ACCOUNT_ID: !Ref AWS::AccountId
@@ -2107,6 +2168,11 @@ Resources:
           # SKILLS_BUCKET) so the generic base agent can pull its skills on startup
           # (§6.2), and used to scope the runtime role's skills-read grant.
           SKILLS_BUCKET: !Ref SkillsBucket
+          # Durable-repo-work spec: the conversation-session bucket (D2) and the
+          # workspace token vendor, both injected onto every runtime and used to
+          # scope the runtime role's session-read/write + vendor-invoke grants.
+          SESSION_BUCKET: !Ref SessionBucket
+          WORKSPACE_TOKEN_FUNCTION: !Ref WorkspaceTokenVendorFunction
           # The fleet's shared Mantle cost-attribution project, propagated onto
           # every agent runtime as MANTLE_PROJECT_ID (absent → account default).
           # The CFN-created project's id wins when provisioned here; otherwise a
@@ -2476,6 +2542,44 @@ Resources:
       Policies:
         # Mint per-owner GitHub App installation tokens: read the App private key
         # + app-id, and the per-owner install record from the fleet-config table.
+        - DynamoDBReadPolicy:
+            TableName: !Ref FleetConfigTable
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref GitHubAppPrivateKey
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/github-app-id
+
+  # Workspace token vendor (durable-repo-work spec): mints short-lived,
+  # repo+permission-scoped GitHub App tokens for the agents' durable-workspace
+  # git operations (clone/fetch/push of wip/<assignment_id> branches). Agents
+  # hold no GitHub credential (T-4); each git network op invokes this function
+  # and uses the token for that one command only (per-command http.extraheader,
+  # never env/.git/config/disk). Callers are ONLY the per-agent runtime roles
+  # (identity-based lambda:InvokeFunction granted by the capability deployer).
+  # Enforces the same boundaries as the SCM broker: onboarded + co-reachable
+  # from the dispatch origin, bounded by the agent's GitHub permission tier.
+  WorkspaceTokenVendorFunction:
+    Type: AWS::Serverless::Function
+    Condition: DashboardEnabled
+    # cryptography (github_app signs App JWTs) is a native wheel — build for
+    # the Lambda target (same as ScmBrokerFunction).
+    Metadata:
+      BuildMethod: python3.12
+    Properties:
+      FunctionName: !Sub workspace-token-vendor-${Stage}
+      CodeUri: ../dispatch/
+      Handler: workspace_token_vendor.handler
+      Timeout: 15
+      Environment:
+        Variables:
+          FLEET_CONFIG_TABLE: !Ref FleetConfigTable
+          GITHUB_APP_ID_PARAM: !Ref GitHubAppIdParam
+          GITHUB_APP_PRIVATE_KEY_SECRET_ARN: !Ref GitHubAppPrivateKey
+      Policies:
         - DynamoDBReadPolicy:
             TableName: !Ref FleetConfigTable
         - Statement:

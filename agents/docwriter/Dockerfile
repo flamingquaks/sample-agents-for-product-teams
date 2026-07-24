@@ -3,6 +3,13 @@ FROM public.ecr.aws/docker/library/python:3.12-slim@sha256:46cb7cc2877e60fbd5e21
 RUN groupadd --system --gid 1001 agent \
  && useradd --system --uid 1001 --gid agent --no-create-home --shell /sbin/nologin agent
 
+# git for the durable-workspace tool (clone/commit/push of wip/<assignment_id>
+# branches — durable-repo-work spec). docwriter is the repo-capable built-in
+# (contents:write); its workspace lives under /tmp/work/<assignment_id>.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 COPY docwriter/requirements.txt .
