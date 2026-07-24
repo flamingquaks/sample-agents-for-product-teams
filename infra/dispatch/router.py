@@ -488,6 +488,41 @@ def update_assignment(assignment_id: str, **kwargs):
     )
 
 
+def fail_assignment_if_not_terminal(assignment_id: str, error: str) -> bool:
+    """Mark an assignment failed ONLY if the agent hasn't already recorded a
+    terminal outcome. Returns True if this write landed.
+
+    The invoke call and the agent's own status writes RACE: the runtime can
+    finish the work, write ``completed`` (or pause with ``awaiting_input``),
+    and then die during response/teardown — surfacing an invoke exception
+    here AFTER the real outcome landed. An unconditional ``failed`` write
+    would clobber that outcome and tell the requester their finished work
+    failed. Guard on the row still being in a pre-terminal state."""
+    try:
+        assignments_table.update_item(
+            Key={"assignment_id": assignment_id},
+            UpdateExpression="SET #s = :failed, result_summary = :rs, completed_at = :now",
+            ConditionExpression="#s IN (:dispatched, :resuming)",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":failed": "failed",
+                ":rs": str(error)[:1000],
+                ":now": int(time.time()),
+                ":dispatched": "dispatched",
+                ":resuming": "resuming",
+            },
+        )
+        return True
+    except assignments_table.meta.client.exceptions.ConditionalCheckFailedException:
+        logger.info(
+            "assignment %s already reached a terminal state — invoke error "
+            "not recorded over it (%s)",
+            assignment_id,
+            str(error)[:200],
+        )
+        return False
+
+
 # --- Agent Invocation --------------------------------------------------------
 
 
@@ -786,9 +821,9 @@ def handle_resume(event) -> dict:
         )
     except Exception as e:  # noqa: BLE001
         logger.error("Failed to resume agent %s: %s", agent_id, e)
-        update_assignment(
-            assignment_id, status="failed", result_summary=f"resume failed: {e}"
-        )
+        # Same no-clobber rule as the dispatch path: the resumed agent may
+        # have finished (or re-paused) before the invoke error surfaced.
+        fail_assignment_if_not_terminal(assignment_id, f"resume failed: {e}")
         return _error(500, f"failed to resume @{agent_id}: {e}")
 
     _post_block_reply(
@@ -1061,7 +1096,22 @@ def handler(event, context):
         # emitting run_failed here too would double-notify subscribed channels.
         # Terminal-status events belong to the stream notifier; the router only
         # emits its own pre-dispatch events (run_started, guardrail_tripped).
-        update_assignment(assignment_id, status="failed", result_summary=str(e))
+        #
+        # CONDITIONAL: the agent may have already completed the work and
+        # written its terminal status before the runtime died in teardown —
+        # never clobber a real outcome with a transport error.
+        if not fail_assignment_if_not_terminal(assignment_id, str(e)):
+            return {
+                "statusCode": 200,
+                "body": json.dumps(
+                    {
+                        "assignment_id": assignment_id,
+                        "agent_id": agent_id,
+                        "status": "completed",
+                        "message": "run finished before the invoke error surfaced",
+                    }
+                ),
+            }
         return _error(500, f"failed to invoke @{agent_id}: {e}")
 
     # Slack dispatches are async (the receiver already 200-acked), so unlike

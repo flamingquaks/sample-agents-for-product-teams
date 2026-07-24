@@ -576,3 +576,39 @@ def test_completed_thread_reply_with_explicit_mention_switches_agent(monkeypatch
     assert d["agent_id"] == "workitems"
     assert d["instruction"] == "break this into tasks"
     assert d["parent_assignment_id"] == "a-9"
+
+
+# --- repo scope gated on the agent's GitHub access ------------------------------
+
+
+def test_mention_repo_scope_skipped_for_github_less_agent(monkeypatch):
+    """Regression: researcher (Asana-only, empty GitHub tier) must NOT get
+    channel repo scope — the instruction would promise repo access the
+    interceptor then refuses, killing the MCP session and failing the run."""
+    sw, state = _fresh(monkeypatch, channel_repos=["acme/web"])
+    ev = _events_event({"type": "event_callback", "team_id": TEAM, "event_id": "e-ba",
+                        "event": {"type": "app_mention",
+                                  "text": "<@U0BOT> @researcher what are the critical features",
+                                  "user": "U0ALICE", "channel": "C0ENG", "ts": "22.2"}})
+    REGISTRY["agents"]["researcher"] = {"aliases": ["ba"]}
+    try:
+        sw._registry._cache = None
+        sw.handler(ev)
+    finally:
+        del REGISTRY["agents"]["researcher"]
+        sw._registry._cache = None
+    assert len(state["dispatched"]) == 1
+    d = state["dispatched"][0]
+    assert d["agent_id"] == "researcher"
+    assert d["context"]["repo"] == ""
+    assert d["context"]["repos"] == []
+    assert "Repositories approved" not in d["instruction"]
+
+
+def test_mention_repo_scope_attached_for_github_agent(monkeypatch):
+    """workitems has a GitHub tier — repo scope still attaches."""
+    sw, state = _fresh(monkeypatch, channel_repos=["acme/web"])
+    sw.handler(_mention_ev("<@U0BOT> @workitems plan the work", event_id="e-wi"))
+    d = state["dispatched"][0]
+    assert d["context"]["repo"] == "acme/web"
+    assert d["context"]["repos"] == ["acme/web"]

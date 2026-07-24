@@ -59,6 +59,14 @@ class FakeAssignmentsTable:
         names = kwargs.get("ExpressionAttributeNames", {})
         if cond == "#s = :awaiting" and row.get("status") != values.get(":awaiting"):
             raise self._CondFail()
+        if cond and "#s IN" in cond:
+            # Emulate `#s IN (:a, :b)` — the no-clobber failure guard.
+            allowed = {
+                values[p.strip()]
+                for p in cond.split("(", 1)[1].rstrip(")").split(",")
+            }
+            if row.get("status") not in allowed:
+                raise self._CondFail()
         # Apply any `<attr-or-#alias> = :value` assignment for the status attr.
         for target, placeholder in re.findall(r"(#?\w+)\s*=\s*(:\w+)", kwargs.get("UpdateExpression", "")):
             attr = names.get(target, target)
@@ -375,3 +383,53 @@ def test_github_dispatch_writes_no_binding(dispatch_ready):
         gp.return_value = MagicMock(outcome="passed", reason="")
         router.handler(event, None)
     assert not [p for p in router.assignments_table.puts if p.get("kind") == "thread_binding"]
+
+
+# --- no-clobber failure writes (transport error vs real outcome) ----------------
+
+
+def test_invoke_error_does_not_clobber_completed_run(dispatch_ready):
+    """Regression: the agent can finish + write 'completed' before the runtime
+    dies in teardown and the invoke raises. The router's failure write must
+    NOT overwrite the real outcome."""
+    router = dispatch_ready
+
+    def invoke_completes_then_dies(agent_config, instruction, source, ctx, aid):
+        router.assignments_table.rows[aid]["status"] = "completed"
+        raise RuntimeError("Received error (500) from runtime")
+
+    with patch("guardrail.check_prompt") as gp, \
+         patch.object(router, "invoke_agent", side_effect=invoke_completes_then_dies):
+        gp.return_value = MagicMock(outcome="passed", reason="")
+        resp = router.handler(_slack_dispatch_event(), None)
+    assert resp["statusCode"] == 200
+    runs = [r for r in router.assignments_table.rows.values() if r.get("agent_id")]
+    assert runs[0]["status"] == "completed"
+
+
+def test_invoke_error_still_fails_a_dead_run(dispatch_ready):
+    router = dispatch_ready
+    with patch("guardrail.check_prompt") as gp, \
+         patch.object(router, "invoke_agent", side_effect=RuntimeError("boom")):
+        gp.return_value = MagicMock(outcome="passed", reason="")
+        resp = router.handler(_slack_dispatch_event(), None)
+    assert resp["statusCode"] == 500
+    runs = [r for r in router.assignments_table.rows.values() if r.get("agent_id")]
+    assert runs[0]["status"] == "failed"
+
+
+def test_resume_invoke_error_does_not_clobber_pause(router, monkeypatch):
+    """A resumed agent that re-pauses (awaiting_input) before the invoke error
+    surfaces keeps its pause — the reply stays answerable."""
+    router.assignments_table.rows["a-1"] = _paused_row()
+
+    def invoke_repauses_then_dies(**kwargs):
+        router.assignments_table.rows["a-1"]["status"] = "awaiting_input"
+        raise RuntimeError("teardown 500")
+
+    router.agentcore.invoke_agent_runtime.side_effect = invoke_repauses_then_dies
+    with patch("guardrail.check_prompt") as gp:
+        gp.return_value = MagicMock(outcome="passed", reason="")
+        resp = router.handler(_resume_event(), None)
+    assert resp["statusCode"] == 500
+    assert router.assignments_table.rows["a-1"]["status"] == "awaiting_input"

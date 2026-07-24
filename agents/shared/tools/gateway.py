@@ -26,9 +26,12 @@ filtered per principal by the policy engine, so one client's
 ``list_tools_sync()`` returns exactly the tools this agent's role may call.
 """
 
+import logging
 import os
 
 from strands.tools.mcp import MCPClient
+
+logger = logging.getLogger(__name__)
 
 # Trusted per-dispatch headers the agent stamps onto the gateway client. The
 # interceptor + broker read these (never LLM-supplied tool args) as server truth.
@@ -39,6 +42,32 @@ AGENT_HEADER = "x-dispatch-agent"  # calling agent id (workitems/docwriter/adr)
 class GatewayNotConfiguredError(RuntimeError):
     """GATEWAY_MCP_URL is unset. The fleet is gateway-only — an agent cannot run
     without the gateway (it is the policy-enforcement + observability chokepoint)."""
+
+
+class _TeardownSafeMCPClient(MCPClient):
+    """MCPClient whose context EXIT never raises.
+
+    The MCP session can die MID-RUN (e.g. the gateway closes the stream after
+    an interceptor rejection); the agent still finishes its answer and records
+    ``completed``. If ``__exit__`` then re-raises the dead-session error, the
+    whole invocation 500s and the requester is told their finished work failed
+    — the exact transport-beats-outcome corruption the router now also guards
+    against. Entry/tool-call errors still propagate normally; only CLEANUP of
+    an already-finished run is made best-effort."""
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            return super().__exit__(exc_type, exc_val, exc_tb)
+        except Exception:
+            logger.warning(
+                "gateway MCP client teardown failed (session already dead?) — "
+                "ignoring so the run's outcome stands",
+                exc_info=True,
+            )
+            # Never suppress an in-flight exception (returning False re-raises
+            # exc_val if one exists); with no in-flight exception, swallow the
+            # teardown error.
+            return False
 
 
 def gateway_url() -> str:
@@ -76,7 +105,7 @@ def build_gateway_client(
         headers[ORIGIN_HEADER] = dispatch_origin
     if agent:
         headers[AGENT_HEADER] = agent
-    return MCPClient(
+    return _TeardownSafeMCPClient(
         lambda: aws_iam_streamablehttp_client(
             endpoint=url,
             aws_region=region,

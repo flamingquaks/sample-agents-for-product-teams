@@ -268,7 +268,28 @@ def _resolve_agent_from_text(text: str) -> tuple[str, str] | None:
     return None
 
 
-def _mention_repo_scope(team_id: str, channel_id: str, instruction: str) -> tuple[str, list[str]]:
+def _agent_has_github_access(agent_id: str) -> bool:
+    """Whether ``agent_id`` can actually reach GitHub through the gateway.
+
+    Attaching channel repo scope to an agent with NO GitHub tier (e.g.
+    researcher, Asana-only by design) is worse than useless: the dispatch
+    instruction promises repo access, the model calls the GitHub tools, and
+    the interceptor rejects every call fail-closed (no dispatch origin) —
+    killing the MCP session mid-run and failing the whole request. The
+    broker's permission-tier table is the source of truth for which built-ins
+    hold ANY GitHub permission; custom agents (not in the table) default to
+    scoped-in since the vendor/broker give them a read tier."""
+    from scm_broker import AGENT_GITHUB_PERMISSIONS
+
+    tier = AGENT_GITHUB_PERMISSIONS.get(agent_id)
+    if tier is None:
+        return True  # custom agent — broker/vendor default it to a read tier
+    return bool(tier)
+
+
+def _mention_repo_scope(
+    team_id: str, channel_id: str, instruction: str, agent_id: str = ""
+) -> tuple[str, list[str]]:
     """The repo scope for a mention dispatch: ``(origin_repo, repos)``.
 
     Slack mentions carry no repo the way a GitHub mention does, so the agent
@@ -286,8 +307,11 @@ def _mention_repo_scope(team_id: str, channel_id: str, instruction: str) -> tupl
 
     An unapproved repo named in the message is deliberately NOT honored — the
     channel grant is the authorization boundary, mentioning a repo must not
-    widen it. No approved repos ⇒ ("", []) and the agent runs repo-less
+    widen it. No approved repos — or an agent with no GitHub access at all
+    (``_agent_has_github_access``) — ⇒ ("", []) and the agent runs repo-less
     (Slack-thread research, Asana work), same as before."""
+    if agent_id and not _agent_has_github_access(agent_id):
+        return "", []
     approved = trigger_grants.channel_repos(team_id, channel_id)
     if not approved:
         return "", []
@@ -399,7 +423,9 @@ def _process_app_mention(event_data: dict, team_id: str) -> None:
             agent_id, instruction = resolved
             if agent_id:
                 instruction = instruction or text
-                origin_repo, repos = _mention_repo_scope(team_id, channel_id_early, instruction)
+                origin_repo, repos = _mention_repo_scope(
+                    team_id, channel_id_early, instruction, agent_id=agent_id
+                )
                 context = {
                     "workspace": team_id,
                     "channel_id": channel_id_early,
@@ -425,7 +451,7 @@ def _process_app_mention(event_data: dict, team_id: str) -> None:
         instruction = "You were mentioned in Slack. Review the thread and take appropriate action."
     user_id = event_data.get("user", "")
     channel_id = event_data.get("channel", "")
-    origin_repo, repos = _mention_repo_scope(team_id, channel_id, instruction)
+    origin_repo, repos = _mention_repo_scope(team_id, channel_id, instruction, agent_id=agent_id)
     if repos:
         instruction += (
             "\n\nRepositories approved for this channel (work against these; "
