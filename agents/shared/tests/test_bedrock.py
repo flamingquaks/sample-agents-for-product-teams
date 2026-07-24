@@ -10,18 +10,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 @pytest.fixture
-def fake_openai_model(monkeypatch):
-    """Patch strands.models.openai.OpenAIModel + the bearer-token mint so no
-    network/boto call happens, and expose the captured constructor kwargs."""
+def fake_anthropic_model(monkeypatch):
+    """Patch strands.models.anthropic.AnthropicModel + the bearer-token mint so
+    no network/boto call happens, and expose the captured constructor kwargs."""
     import shared.bedrock as mod
 
-    # build_model imports OpenAIModel lazily from strands.models.openai and mints
-    # a token via _bearer_token — stub both.
+    # build_model imports AnthropicModel lazily from strands.models.anthropic and
+    # mints a token via _bearer_token — stub both.
     monkeypatch.setattr(mod, "_bearer_token", lambda: "tok-123")
     fake_module = MagicMock()
     mock_cls = MagicMock(return_value=MagicMock())
-    fake_module.OpenAIModel = mock_cls
-    monkeypatch.setitem(sys.modules, "strands.models.openai", fake_module)
+    fake_module.AnthropicModel = mock_cls
+    monkeypatch.setitem(sys.modules, "strands.models.anthropic", fake_module)
     return mock_cls
 
 
@@ -29,72 +29,73 @@ def _headers(mock_cls):
     return mock_cls.call_args.kwargs["client_args"]["default_headers"]
 
 
-def test_guardrail_headers_attached(monkeypatch, fake_openai_model):
+def test_guardrail_headers_attached(monkeypatch, fake_anthropic_model):
     monkeypatch.setenv("BEDROCK_GUARDRAIL_ID", "gr-x")
     monkeypatch.setenv("BEDROCK_GUARDRAIL_VERSION", "DRAFT")
     monkeypatch.setenv("AWS_REGION", "us-east-1")
     import shared.bedrock as mod
 
     mod.build_model()
-    h = _headers(fake_openai_model)
+    h = _headers(fake_anthropic_model)
     assert h["X-Amzn-Bedrock-GuardrailIdentifier"] == "gr-x"
     assert h["X-Amzn-Bedrock-GuardrailVersion"] == "DRAFT"
     assert h["X-Amzn-Bedrock-Trace"] == "ENABLED"
-    # Endpoint is the region's bedrock-mantle URL; auth is the minted bearer token.
-    ca = fake_openai_model.call_args.kwargs["client_args"]
-    assert ca["base_url"] == "https://bedrock-mantle.us-east-1.api.aws/v1"
+    # Endpoint is the region's bedrock-mantle Anthropic base (the SDK appends
+    # /v1/messages); auth is the minted bearer token.
+    ca = fake_anthropic_model.call_args.kwargs["client_args"]
+    assert ca["base_url"] == "https://bedrock-mantle.us-east-1.api.aws/anthropic"
     assert ca["api_key"] == "tok-123"
 
 
-def test_default_model_is_sonnet_5(monkeypatch, fake_openai_model):
+def test_default_model_is_sonnet_5(monkeypatch, fake_anthropic_model):
     monkeypatch.setenv("BEDROCK_GUARDRAIL_ID", "gr-x")
     monkeypatch.delenv("BEDROCK_MODEL_ID", raising=False)
     import shared.bedrock as mod
 
     mod.build_model()
-    assert fake_openai_model.call_args.kwargs["model_id"] == "anthropic.claude-sonnet-5"
+    assert fake_anthropic_model.call_args.kwargs["model_id"] == "anthropic.claude-sonnet-5"
 
 
-def test_project_arg_overrides_env(monkeypatch, fake_openai_model):
+def test_project_arg_overrides_env(monkeypatch, fake_anthropic_model):
     monkeypatch.setenv("BEDROCK_GUARDRAIL_ID", "gr-x")
     monkeypatch.setenv("MANTLE_PROJECT_ID", "fleet-project")
     import shared.bedrock as mod
 
     # An explicit project arg still wins over the env default.
     mod.build_model(project="proj-override")
-    assert _headers(fake_openai_model)["OpenAI-Project"] == "proj-override"
+    assert _headers(fake_anthropic_model)["anthropic-workspace-id"] == "proj-override"
 
 
-def test_project_defaults_to_env(monkeypatch, fake_openai_model):
+def test_project_defaults_to_env(monkeypatch, fake_anthropic_model):
     monkeypatch.setenv("BEDROCK_GUARDRAIL_ID", "gr-x")
     monkeypatch.setenv("MANTLE_PROJECT_ID", "fleet-project")
     import shared.bedrock as mod
 
     # No arg → the fleet-wide MANTLE_PROJECT_ID env is used for attribution.
     mod.build_model()
-    assert _headers(fake_openai_model)["OpenAI-Project"] == "fleet-project"
+    assert _headers(fake_anthropic_model)["anthropic-workspace-id"] == "fleet-project"
 
 
-def test_no_project_omits_header(monkeypatch, fake_openai_model):
+def test_no_project_omits_header(monkeypatch, fake_anthropic_model):
     monkeypatch.setenv("BEDROCK_GUARDRAIL_ID", "gr-x")
     monkeypatch.delenv("MANTLE_PROJECT_ID", raising=False)
     import shared.bedrock as mod
 
     mod.build_model()
-    assert "OpenAI-Project" not in _headers(fake_openai_model)
+    assert "anthropic-workspace-id" not in _headers(fake_anthropic_model)
 
 
-def test_missing_guardrail_id_raises(monkeypatch, fake_openai_model):
+def test_missing_guardrail_id_raises(monkeypatch, fake_anthropic_model):
     monkeypatch.delenv("BEDROCK_GUARDRAIL_ID", raising=False)
     monkeypatch.delenv("SDLC_ALLOW_MISSING_GUARDRAIL", raising=False)
     import shared.bedrock as mod
 
     with pytest.raises(RuntimeError, match="BEDROCK_GUARDRAIL_ID"):
         mod.build_model()
-    fake_openai_model.assert_not_called()
+    fake_anthropic_model.assert_not_called()
 
 
-def test_missing_guardrail_escape_hatch(monkeypatch, fake_openai_model, caplog):
+def test_missing_guardrail_escape_hatch(monkeypatch, fake_anthropic_model, caplog):
     monkeypatch.delenv("BEDROCK_GUARDRAIL_ID", raising=False)
     monkeypatch.setenv("SDLC_ALLOW_MISSING_GUARDRAIL", "1")
     import shared.bedrock as mod
@@ -102,14 +103,23 @@ def test_missing_guardrail_escape_hatch(monkeypatch, fake_openai_model, caplog):
     with caplog.at_level("WARNING"):
         mod.build_model()
     # No guardrail headers when the escape hatch is on.
-    h = _headers(fake_openai_model)
+    h = _headers(fake_anthropic_model)
     assert "X-Amzn-Bedrock-GuardrailIdentifier" not in h
     assert any("SDLC_ALLOW_MISSING_GUARDRAIL" in r.message for r in caplog.records)
 
 
-def test_extra_kwargs_forwarded(monkeypatch, fake_openai_model):
+def test_extra_kwargs_forwarded(monkeypatch, fake_anthropic_model):
     monkeypatch.setenv("BEDROCK_GUARDRAIL_ID", "gr-x")
     import shared.bedrock as mod
 
     mod.build_model(max_tokens=16000)
-    assert fake_openai_model.call_args.kwargs["max_tokens"] == 16000
+    assert fake_anthropic_model.call_args.kwargs["max_tokens"] == 16000
+
+
+def test_max_tokens_defaulted(monkeypatch, fake_anthropic_model):
+    # AnthropicModel requires max_tokens — build_model must always supply one.
+    monkeypatch.setenv("BEDROCK_GUARDRAIL_ID", "gr-x")
+    import shared.bedrock as mod
+
+    mod.build_model()
+    assert fake_anthropic_model.call_args.kwargs["max_tokens"] == 32000

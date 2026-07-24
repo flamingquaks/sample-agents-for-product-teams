@@ -28,7 +28,7 @@ def build_manifest(webhook_base: str, app_name: str = "SDLC Agent Fleet") -> dic
     return {
         "display_information": {"name": app_name},
         "features": {
-            "bot_user": {"display_name": "fleet", "always_online": True},
+            "bot_user": {"display_name": "sdlc-agents", "always_online": True},
             "slash_commands": [
                 {
                     "command": f"/{ONBOARD_COMMAND}",
@@ -57,8 +57,12 @@ def build_manifest(webhook_base: str, app_name: str = "SDLC Agent Fleet") -> dic
             "scopes": {
                 "bot": [
                     "app_mentions:read",
+                    "channels:join",
+                    "channels:read",
                     "chat:write",
+                    "chat:write.customize",
                     "commands",
+                    "groups:read",
                     "users:read",
                     "users:read.email",
                 ]

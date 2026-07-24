@@ -94,22 +94,60 @@ def slack_bot_token_param(team_id: str) -> str:
     return f"/sdlc-agents/{stage}/slack/{team_id}/bot-token"
 
 
+def _try_join_channel(token: str, channel: str) -> bool:
+    """Attempt conversations.join; return True if the bot joined successfully so
+    the caller can retry the message. Requires the ``channels:join`` scope."""
+    try:
+        resp = requests.post(
+            f"{SLACK_API}/conversations.join",
+            json={"channel": channel},
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            timeout=5,
+        )
+        data = resp.json()
+        if data.get("ok"):
+            logger.info("auto-joined channel %s", channel)
+            return True
+        logger.warning("conversations.join failed for %s: %s", channel, data.get("error"))
+    except Exception:  # noqa: BLE001
+        logger.exception("conversations.join exception for %s", channel)
+    return False
+
+
+# Per-agent display identity for Slack messages. Each agent posts with its own
+# name + emoji so users can visually distinguish who's talking in a thread.
+# Uses chat.postMessage's `username` + `icon_emoji` (requires chat:write.customize).
+AGENT_IDENTITIES: dict[str, dict[str, str]] = {
+    "researcher": {"username": "researcher", "icon_emoji": ":mag:"},
+    "workitems": {"username": "workitems", "icon_emoji": ":clipboard:"},
+    "docwriter": {"username": "docwriter", "icon_emoji": ":pencil:"},
+    "adr": {"username": "adr", "icon_emoji": ":triangular_ruler:"},
+}
+_DEFAULT_IDENTITY = {"username": "sdlc-agents", "icon_emoji": ":robot_face:"}
+
+
 def post_slack_message(
-    team_id: str, channel: str, body: str, thread_ts: str | None = None
+    team_id: str, channel: str, body: str, thread_ts: str | None = None,
+    *, agent_id: str | None = None,
 ) -> bool:
     """Post a message to a Slack channel/thread via chat.postMessage. Returns True
     on success. Thin bool wrapper over ``post_slack_message_ts`` for the reply
     call sites that don't need the message ts (block/reject notices)."""
-    ok, _ = post_slack_message_ts(team_id, channel, body, thread_ts)
+    ok, _ = post_slack_message_ts(team_id, channel, body, thread_ts, agent_id=agent_id)
     return ok
 
 
 def post_slack_message_ts(
-    team_id: str, channel: str, body: str, thread_ts: str | None = None
+    team_id: str, channel: str, body: str, thread_ts: str | None = None,
+    *, agent_id: str | None = None,
 ) -> tuple[bool, str | None]:
     """Post to Slack and return ``(ok, ts)`` — ``ts`` is the posted message's
     timestamp (the value a follow-up passes as ``thread_ts`` to thread under it),
     or None on failure. Used by notify.py for threaded notifications (spec §18.4).
+
+    When ``agent_id`` is supplied, the message posts under that agent's display
+    identity (distinct username + icon_emoji) so each agent has a recognizable
+    persona in Slack. Requires the ``chat:write.customize`` bot scope.
 
     Multi-workspace: the bot token is fetched per-invocation from the workspace's
     SSM SecureString (never a module global — threat T-8/T-36). Non-fatal on
@@ -121,7 +159,13 @@ def post_slack_message_ts(
     token = _get_secret(slack_bot_token_param(team_id))
     if not token:
         return False, None
-    payload = {"channel": channel, "text": body}
+    identity = AGENT_IDENTITIES.get(agent_id or "", _DEFAULT_IDENTITY)
+    payload: dict = {
+        "channel": channel,
+        "text": body,
+        "username": identity["username"],
+        "icon_emoji": identity["icon_emoji"],
+    }
     if thread_ts:
         payload["thread_ts"] = thread_ts
     try:
@@ -137,11 +181,15 @@ def post_slack_message_ts(
         response.raise_for_status()
         data = response.json()
         if not data.get("ok"):
+            err = data.get("error", "unknown")
+            if err in ("channel_not_found", "not_in_channel"):
+                if _try_join_channel(token, channel):
+                    return post_slack_message_ts(
+                        team_id, channel, body, thread_ts, agent_id=agent_id
+                    )
             logger.error(
                 "Slack chat.postMessage rejected for %s/%s: %s",
-                team_id,
-                channel,
-                data.get("error", "unknown"),
+                team_id, channel, err,
             )
             return False, None
         return True, data.get("ts")

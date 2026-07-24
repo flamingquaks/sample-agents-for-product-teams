@@ -750,6 +750,10 @@ RESERVED_ENV_KEYS = frozenset(
         # Deployer-wired from the stack; an authored env that set it could point
         # the startup skill sync at an attacker-controlled bucket.
         "SKILLS_BUCKET",
+        # Where shared/assignment.py records run state. Deployer-wired to the
+        # stage's table (the runtime role is only granted that one); an authored
+        # env that repointed it would just AccessDeny — reserve it anyway.
+        "ASSIGNMENTS_TABLE",
     }
 )
 

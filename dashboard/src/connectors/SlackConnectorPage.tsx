@@ -432,7 +432,8 @@ function ApproveChannelDialog({
         </div>
 
         <p className="muted" style={{ marginTop: 12, marginBottom: 4 }}>
-          <b>Repositories this channel may work on</b> — what <code>/sdlc-message-agent</code>{" "}
+          <b>Repositories this channel may work on</b> — what <code>@sdlc-agents</code> mentions
+          and <code>/sdlc-message-agent</code>{" "}
           from #{channel} can target. Repos grouped with an approved repo are reachable by the
           agent while working an approved repo, but can't be targeted directly unless approved
           here. Leave empty for agent-only (no-repo) work.

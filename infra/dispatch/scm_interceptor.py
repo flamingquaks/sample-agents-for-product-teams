@@ -102,34 +102,58 @@ def _untouched(event: dict) -> dict:
 
 def _passthrough(event: dict, body: dict) -> dict:
     """Forward the request with our modified ``body`` (injected server-truth
-    args). Same exact {headers, body} shape as _untouched."""
+    args). Same exact {headers, body} shape as _untouched.
+
+    The body's TYPE must match what the gateway delivered: the gateway sends
+    ``body`` as a parsed JSON object, and returning a json.dumps'd STRING in
+    its place is rejected as "Received invalid response from interceptor" —
+    which surfaces to the MCP client as a 500 and kills the whole session.
+    Echo a dict as a dict; only stringify if the input was a string."""
     gw = (event.get("mcp") or {}).get("gatewayRequest") or {}
+    out_body = json.dumps(body) if isinstance(gw.get("body"), str) else body
     return {
         "interceptorOutputVersion": "1.0",
         "mcp": {
             "transformedGatewayRequest": {
                 "headers": gw.get("headers") or {},
-                "body": json.dumps(body),
+                "body": out_body,
             }
         },
     }
 
 
 def _reject(body: dict, message: str) -> dict:
-    """Short-circuit the request with a JSON-RPC error result — the call never
-    reaches the target/GitHub. Echoes the request id so the client can correlate."""
+    """Short-circuit the request with a TOOL ERROR result — the call never
+    reaches the target/GitHub. Echoes the request id so the client can correlate.
+
+    Shape matters twice over:
+      - ``gatewayResponse`` must carry ``statusCode`` + ``headers`` + ``body``
+        (like ``transformedGatewayRequest``, a partial shape is rejected by the
+        gateway as "invalid response from interceptor" and surfaces as a 500 to
+        the client — which Strands' MCPClient treats as a dead session, killing
+        EVERY subsequent tool call in the run).
+      - the payload is a JSON-RPC *result* with ``isError: true`` (an MCP tool
+        error), not a JSON-RPC *error*. A protocol-level error also tears down
+        the client session; a tool error is returned to the model, which can
+        adapt (pick another repo, report the restriction) and keep working."""
     logger.warning("scm_interceptor: rejecting call — %s", message)
     return {
         "interceptorOutputVersion": "1.0",
         "mcp": {
             "gatewayResponse": {
-                "body": json.dumps(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": body.get("id"),
-                        "error": {"code": _ERR_FORBIDDEN, "message": message},
-                    }
-                )
+                "statusCode": 200,
+                "headers": {"Content-Type": "application/json"},
+                # A parsed JSON object, not a json.dumps'd string — the gateway
+                # rejects a stringified body as an invalid interceptor response
+                # (same contract as transformedGatewayRequest.body).
+                "body": {
+                    "jsonrpc": "2.0",
+                    "id": body.get("id"),
+                    "result": {
+                        "isError": True,
+                        "content": [{"type": "text", "text": f"Forbidden: {message}"}],
+                    },
+                },
             }
         },
     }

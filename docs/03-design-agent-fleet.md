@@ -268,7 +268,7 @@ The runtime's environment is assembled by the `capability-deployer` from the fle
 Shipped and **always deployed** (the `DeploySlack` gate was retired — the receiver is serverless/inert and fails closed, so Slack goes live only when an admin onboards a workspace). A `slack-webhook-${STAGE}` Lambda (`infra/dispatch/slack_webhook.py`) sits on the webhook API on three routes:
 
 **Inbound triggers:**
-- `/slack/events` — Events API `app_mention` ("@fleetbot @workitems break this up") → Dispatch Router
+- `/slack/events` — Events API `app_mention` ("@sdlc-agents workitems break this up") → Dispatch Router
 - `/slack/commands` — slash commands: `/fleet @agent …` (mention dispatch), `/sdlc-onboard-channel [agent …]` (files a channel-onboarding **request** an admin approves in the dashboard; never self-served), and `/sdlc-notify` (opens the notification-config modal)
 - `/slack/interactions` — Block Kit modal submits (the `/sdlc-notify` config modal — see §4.4)
 

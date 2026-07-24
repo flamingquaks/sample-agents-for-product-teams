@@ -48,7 +48,7 @@ The dispatch spine is otherwise reused wholesale. The router already accepts `so
 ### 3.1 Happy path (Slack mention)
 
 ```
-User in #eng (workspace ACME):  @fleetbot @workitems break this into issues
+User in #eng (workspace ACME):  @sdlc-agents workitems break this into issues
   │
   ▼  POST /slack/events  (API Gateway → slack-webhook Lambda)
 slack_webhook.handler
@@ -340,13 +340,13 @@ Mirrors `asana_webhook.py` / `github_webhook.py` as a thin source adapter.
 - **Retry & dedup.** Slack retries with `X-Slack-Retry-Num` and re-sends the same `event_id`. Dedup on a TTL'd `slack-event#<id>` item, but **record it only AFTER the event processed cleanly** (`_already_seen` before, `_mark_seen` after): a delivery that fails mid-dispatch returns 500 and is *not* marked, so Slack's retry is processed rather than swallowed by its own marker. A read/write error on the dedup store fails open (a duplicate dispatch is tolerated by the router's assignment-id + concurrency guard; a dropped mention is not).
 - **Bot-loop prevention.** Ignore events with `bot_id`, `subtype=="bot_message"`, or authored by our own bot user — else the agent's reply re-triggers it.
 - **Two inbound shapes.** `event_callback` (JSON: `app_mention`, `message`) incl. the `url_verification` `challenge` handshake (parity with Asana's `X-Hook-Secret`); and **slash commands** (`application/x-www-form-urlencoded`: `command`, `text`, `channel_id`, `user_id`, `trigger_id`, `response_url`) — agent id from the command name (`/workitems` → validated against the registry), text as instruction.
-- **Mention format.** `app_mention` text arrives as `<@U0FLEETBOT> @workitems …`; strip the leading bot mention (`re.sub(r'^\s*<@\w+>\s*', '', text)`) then `mentions.resolve_mention` — identical registry-driven resolution to GitHub/Asana. Supports a single fleet Slack app (`@fleetbot @agent …`).
+- **Mention format.** `app_mention` text arrives as `<@U0BOT> workitems …` (bot display name `sdlc-agents`); strip the leading bot mention (`re.sub(r'^\s*<@\w+>\s*', '', text)`) then resolve the agent — first via `mentions.resolve_mention` (`@agent` form), falling back to the bare first word against the registry's ids + aliases, so `@sdlc-agents workitems break this up` needs no second `@`. Identical registry-driven resolution to GitHub/Asana. Supports a single fleet Slack app.
 - **Threading.** Capture `thread_ts` (fall back to `ts`) so the ack and the final result land in-thread.
 - **Context populated for Cedar.** `context = {workspace: team_id, channel_id, thread_ts, message_ts, requester_email?, principal_groups?}`; `sender = "slack:<team_id>:<user_id>"`. The router **denies** if `channel_id` is missing when the workspace is allowlist-mode (fail-closed on missing context).
 
 ### 6.2 Single fleet Slack app (recommended)
 
-One Slack app (`@fleetbot`), one manifest, resolution by registry mention — far less operational overhead than per-agent apps, and registry-driven resolution already supports it. Scopes: `app_mentions:read`, `chat:write`, `commands`, `users:read.email`; events: `app_mention`; slash commands per agent (or one `/fleet` with the agent as the first token).
+One Slack app (`@sdlc-agents`), one manifest, resolution by registry mention — far less operational overhead than per-agent apps, and registry-driven resolution already supports it. Each agent still presents its own identity in-channel via `chat.postMessage` `username`/`icon_emoji` overrides (scope `chat:write.customize`). Scopes: `app_mentions:read`, `channels:join`, `channels:read`, `chat:write`, `chat:write.customize`, `commands`, `groups:read`, `users:read`, `users:read.email`; events: `app_mention`.
 
 ---
 

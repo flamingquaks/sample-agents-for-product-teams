@@ -12,11 +12,12 @@ env (a deployment targets one Asana project).
 
 import os
 
-# Asana — set these at runtime (deploy workflow / .env / AgentCore env config).
-# No defaults: each deployment targets a different project.
-ASANA_PROJECT_GID = os.environ["ASANA_PROJECT_GID"]
+# Asana — optional: a UI-onboarded capability may carry no Asana env (the
+# capability row's `env` map is often empty), and the agent must still boot —
+# a missing project just means no Asana scope for this deployment.
+ASANA_PROJECT_GID = os.environ.get("ASANA_PROJECT_GID", "")
 ASANA_PROJECT_NAME = os.environ.get("ASANA_PROJECT_NAME", "")
-ASANA_WORKSPACE_GID = os.environ["ASANA_WORKSPACE_GID"]
+ASANA_WORKSPACE_GID = os.environ.get("ASANA_WORKSPACE_GID", "")
 
 
 def _github_section(github_repo: str | None) -> str:
@@ -50,6 +51,19 @@ def build_project_context(github_repo: str | None = None) -> str:
     """Build a project context block for injection into the system prompt.
 
     ``github_repo`` is the dispatched repo (``source_context.repo``)."""
+    if not ASANA_PROJECT_GID:
+        return f"""\
+
+## Project Resources
+
+These are YOUR project resources. Use them directly — never ask the user
+for repo URLs or project IDs.
+
+{_github_section(github_repo)}
+
+No Asana project is configured for this deployment — track work in GitHub
+issues instead of Asana tasks unless the request names a project explicitly.
+"""
     project_line = f"- Project: {ASANA_PROJECT_NAME}\n" if ASANA_PROJECT_NAME else ""
     return f"""\
 

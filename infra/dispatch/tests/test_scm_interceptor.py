@@ -48,8 +48,10 @@ def _reach(monkeypatch):
 def _out_body(result):
     tr = result["mcp"].get("transformedGatewayRequest")
     if tr is not None:
-        return json.loads(tr["body"]), "pass"
-    return json.loads(result["mcp"]["gatewayResponse"]["body"]), "reject"
+        body = tr["body"]
+        return (json.loads(body) if isinstance(body, str) else body), "pass"
+    gw_body = result["mcp"]["gatewayResponse"]["body"]
+    return (json.loads(gw_body) if isinstance(gw_body, str) else gw_body), "reject"
 
 
 def test_in_group_call_passes_and_injects_origin_agent():
@@ -63,13 +65,21 @@ def test_in_group_call_passes_and_injects_origin_agent():
 
 
 def test_cross_group_call_rejected():
-    # secret/repo is NOT co-reachable from acme/web → rejected with an MCP error.
+    # secret/repo is NOT co-reachable from acme/web → rejected with an MCP TOOL
+    # error (isError result), not a protocol error — a protocol error kills the
+    # client session; a tool error lets the model adapt and keep working.
     res = _event(origin="acme/web", agent="docwriter", args={"owner": "secret", "repo": "repo", "issue_number": 1, "body": "x"})
-    body, kind = _out_body(scm_interceptor.handler(res))
+    result = scm_interceptor.handler(res)
+    body, kind = _out_body(result)
     assert kind == "reject"
-    assert body["error"]["code"] == scm_interceptor._ERR_FORBIDDEN
-    assert "not approved to run with" in body["error"]["message"]
+    assert body["result"]["isError"] is True
+    assert "not approved to run with" in body["result"]["content"][0]["text"]
     assert body["id"] == 7  # echoes request id
+    # gatewayResponse must be the full {statusCode, headers, body} shape — a
+    # partial shape is rejected by the gateway and 500s the client.
+    gw_resp = result["mcp"]["gatewayResponse"]
+    assert gw_resp["statusCode"] == 200
+    assert "Content-Type" in gw_resp["headers"]
 
 
 def test_group_spans_owners():
@@ -84,7 +94,7 @@ def test_missing_origin_rejected():
     res = _event(origin=None, agent="workitems", args={"owner": "acme", "repo": "api", "issue_number": 1, "body": "x"})
     body, kind = _out_body(scm_interceptor.handler(res))
     assert kind == "reject"
-    assert "no dispatch origin" in body["error"]["message"]
+    assert "no dispatch origin" in body["result"]["content"][0]["text"]
 
 
 def test_non_tool_call_passes_through():

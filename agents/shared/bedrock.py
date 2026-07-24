@@ -1,16 +1,24 @@
-"""Model construction for the fleet — Amazon Bedrock **Mantle** (OpenAI-compatible).
+"""Model construction for the fleet — Amazon Bedrock **Mantle** (Anthropic API).
 
 Every agent builds its model through ``build_model`` so the whole fleet shares
 one model backend, one guardrail attachment, and one cost-attribution scheme.
 
-The fleet runs on the **bedrock-mantle** endpoint (OpenAI-compatible), NOT the
-legacy ``bedrock-runtime`` Converse/Invoke path, because Mantle gives us:
+The fleet runs on the **bedrock-mantle** endpoint, NOT the legacy
+``bedrock-runtime`` Converse/Invoke path, because Mantle gives us:
   - **project**-scoped cost & usage attribution — the fleet uses ONE shared
     Mantle project (a dispatch is multi-repo: a run from one repo may act on
     others, so per-repo attribution is meaningless). The project id is a
     deploy-time constant injected as the ``MANTLE_PROJECT_ID`` runtime env, and
   - flexibility to run non-Anthropic / non-Bedrock models (GPT-OSS, etc.) through
     the same client if we bring other tools in.
+
+Anthropic models on Mantle serve the native **Anthropic Messages API** at
+``/anthropic/v1/messages`` — they reject the OpenAI-compatible
+``/v1/chat/completions`` surface ("The model does not support the
+'/v1/chat/completions' API"). So ``build_model`` returns a Strands
+``AnthropicModel`` pointed at the endpoint's ``/anthropic`` base path. On this
+API format cost attribution uses the ``anthropic-workspace-id`` header (the
+endpoint rejects ``OpenAI-Project`` here), carrying the same Mantle project id.
 
 Auth: a short-term Bedrock **bearer token** minted from the runtime role's own
 AWS credentials via ``aws-bedrock-token-generator`` (no long-lived secret to
@@ -45,13 +53,14 @@ _ALLOW_MISSING_GUARDRAIL_ENV = "SDLC_ALLOW_MISSING_GUARDRAIL"
 
 
 def _mantle_base_url() -> str:
-    """The bedrock-mantle OpenAI-compatible endpoint for this region. Overridable
-    via MANTLE_ENDPOINT for testing / non-standard partitions."""
+    """The bedrock-mantle Anthropic-API base for this region (the Anthropic SDK
+    appends /v1/messages). Overridable via MANTLE_ENDPOINT for testing /
+    non-standard partitions."""
     override = os.environ.get("MANTLE_ENDPOINT")
     if override:
         return override.rstrip("/")
     region = os.environ.get("AWS_REGION", "us-east-1")
-    return f"https://bedrock-mantle.{region}.api.aws/v1"
+    return f"https://bedrock-mantle.{region}.api.aws/anthropic"
 
 
 def _bearer_token() -> str:
@@ -111,18 +120,21 @@ def build_model(*, project: str | None = None, **extra):
         RuntimeError: if ``BEDROCK_GUARDRAIL_ID`` is unset and the
             ``SDLC_ALLOW_MISSING_GUARDRAIL=1`` escape hatch is not set.
     """
-    from strands.models.openai import OpenAIModel
+    from strands.models.anthropic import AnthropicModel
 
     model_id = os.environ.get("BEDROCK_MODEL_ID", DEFAULT_MODEL_ID)
     headers = _guardrail_headers()
-    # Cost attribution: the Mantle "OpenAI-Project" header tags usage to the
-    # fleet's shared project (injected as MANTLE_PROJECT_ID). One runtime image,
-    # one project — a dispatch spanning repos can't be split per repo anyway.
+    # Cost attribution: on the Anthropic API format Mantle takes the project id
+    # via "anthropic-workspace-id" (it rejects "OpenAI-Project" here). Injected
+    # fleet-wide as MANTLE_PROJECT_ID. One runtime image, one project — a
+    # dispatch spanning repos can't be split per repo anyway.
     project = project or os.environ.get("MANTLE_PROJECT_ID")
     if project:
-        headers["OpenAI-Project"] = project
+        headers["anthropic-workspace-id"] = project
 
-    return OpenAIModel(
+    # AnthropicModel requires max_tokens; keep it overridable via **extra.
+    extra.setdefault("max_tokens", 32000)
+    return AnthropicModel(
         model_id=model_id,
         client_args={
             "api_key": _bearer_token(),

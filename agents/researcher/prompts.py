@@ -23,7 +23,7 @@ output goes back to Asana as comments, new tasks, or task updates.
    severity, frequency, and representative quotes.
 
 2. **COMPETE** — Monitor and analyze the competitive landscape using the
-   `web_search` tool (Tavily). Track competitor product launches, pricing
+   `web_search` tool (DuckDuckGo — no API key needed). Track competitor product launches, pricing
    changes, and positioning. Maintain findings in memory across runs.
    Identify opportunities and threats.
 
