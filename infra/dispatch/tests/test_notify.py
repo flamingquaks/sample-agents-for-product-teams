@@ -143,3 +143,33 @@ def test_mention_only_on_actionable_error(notify_mod):
         assert "<@U9>" not in post2.call_args.kwargs["body"]  # informative does not
     identity_mod._table = None
     identity_mod.reset_cache()
+
+
+# --- unit_for / dashboard_run_url (Slack↔dashboard traceability) --------------
+
+
+def test_unit_for_keys_slack_threads_on_conversation(notify_mod):
+    """A D8 follow-up is a NEW assignment in the SAME Slack thread — both must
+    produce the same unit so ops-channel notifications share one thread."""
+    ctx = {"workspace": "T1", "channel_id": "C1", "thread_ts": "111.2"}
+    assert notify_mod.unit_for("a-1", ctx) == notify_mod.unit_for("a-2", ctx)
+    assert notify_mod.unit_for("a-1", ctx) == "thread:T1#C1#111.2"
+
+
+def test_unit_for_falls_back_to_assignment(notify_mod):
+    assert notify_mod.unit_for("a-1", {"repo": "acme/web"}) == "a-1"
+    assert notify_mod.unit_for("a-1", None) == "a-1"
+    # Partial Slack context (no thread) also falls back.
+    assert notify_mod.unit_for("a-1", {"workspace": "T1", "channel_id": "C1"}) == "a-1"
+
+
+def test_dashboard_run_url(notify_mod, monkeypatch):
+    monkeypatch.setenv("DASHBOARD_URL", "https://d123.cloudfront.net/")
+    assert (
+        notify_mod.dashboard_run_url("a-1")
+        == "https://d123.cloudfront.net/#/run/a-1"
+    )
+    monkeypatch.delenv("DASHBOARD_URL")
+    assert notify_mod.dashboard_run_url("a-1") == ""
+    monkeypatch.setenv("DASHBOARD_URL", "https://d123.cloudfront.net/")
+    assert notify_mod.dashboard_run_url("") == ""

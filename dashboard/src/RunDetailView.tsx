@@ -13,12 +13,14 @@ export function RunDetailView({
   assignmentId,
   onBack,
   onTrace,
+  onOpenRun,
   onAuthError,
 }: {
   api: DashboardApi;
   assignmentId: string;
   onBack: () => void;
   onTrace: (dimension: string, value: string) => void;
+  onOpenRun: (assignmentId: string) => void;
   onAuthError: () => void;
 }) {
   const handleError = useCallback(
@@ -50,13 +52,21 @@ export function RunDetailView({
       ) : !run ? (
         <p className="muted">Loading…</p>
       ) : (
-        <RunDetail run={run} onTrace={onTrace} />
+        <RunDetail run={run} onTrace={onTrace} onOpenRun={onOpenRun} />
       )}
     </div>
   );
 }
 
-function RunDetail({ run, onTrace }: { run: Run; onTrace: (d: string, v: string) => void }) {
+function RunDetail({
+  run,
+  onTrace,
+  onOpenRun,
+}: {
+  run: Run;
+  onTrace: (d: string, v: string) => void;
+  onOpenRun: (assignmentId: string) => void;
+}) {
   const link = sourceLink(run.source, run.trace_refs, run.source_context);
 
   return (
@@ -95,6 +105,26 @@ function RunDetail({ run, onTrace }: { run: Run; onTrace: (d: string, v: string)
         <dd>
           <TraceChips refs={run.trace_refs} onChipClick={onTrace} />
         </dd>
+
+        {run.parent_assignment_id && (
+          <>
+            <dt>Continues</dt>
+            <dd>
+              {/* D8 lineage: this run is a follow-up started by a reply on the
+                  parent's completed Slack thread. */}
+              <a
+                href="#"
+                className="mono"
+                onClick={(e) => {
+                  e.preventDefault();
+                  onOpenRun(run.parent_assignment_id!);
+                }}
+              >
+                {run.parent_assignment_id}
+              </a>
+            </dd>
+          </>
+        )}
 
         <dt>Started</dt>
         <dd>{fmtTime(run.created_at)}</dd>

@@ -5,7 +5,7 @@
 import { useCallback } from "react";
 import { ApiError, type DashboardApi } from "./api";
 import { StatusPill } from "./components";
-import { fmtCost, fmtDuration, fmtTime, isActive } from "./format";
+import { fmtCost, fmtDuration, fmtTime, isActive, sourceLink } from "./format";
 import { usePolling } from "./hooks";
 import type { TraceResult } from "./types";
 
@@ -39,7 +39,19 @@ export function TraceView({
   });
 
   const res = poll.data;
-  const runs = res?.runs ?? [];
+  // Oldest-first: a trace is a story (original request → follow-ups), so read
+  // it top-to-bottom in the order it happened. The API returns newest-first.
+  const runs = [...(res?.runs ?? [])].sort(
+    (a, b) => (a.created_at ?? 0) - (b.created_at ?? 0),
+  );
+  // Ids in this trace, for marking follow-ups whose parent is visible here.
+  const inTrace = new Set(runs.map((r) => r.assignment_id));
+  // The conversation link (same for every run in a slack_thread trace) —
+  // surface it once in the header.
+  const threadLink =
+    dimension === "slack_thread"
+      ? runs.map((r) => sourceLink(r.source, r.trace_refs, r.source_context)).find(Boolean)
+      : null;
 
   return (
     <div>
@@ -50,6 +62,14 @@ export function TraceView({
       <p className="muted">
         {res ? `${runs.length} run${runs.length === 1 ? "" : "s"} share this reference` : "Loading…"}
         {res?.truncated && " (sampled from the most recent runs — fleet exceeds the scan cap)"}
+        {threadLink && (
+          <>
+            {" · "}
+            <a href={threadLink.url} target="_blank" rel="noreferrer">
+              open in Slack ↗
+            </a>
+          </>
+        )}
       </p>
 
       {poll.error && !res && <div className="banner error">Failed to load trace: {poll.error}</div>}
@@ -76,6 +96,13 @@ export function TraceView({
                   <StatusPill status={r.status} />
                 </td>
                 <td>
+                  {/* D8 lineage marker: this run continued an earlier run in
+                      this same trace (a reply on its completed thread). */}
+                  {r.parent_assignment_id && inTrace.has(r.parent_assignment_id) && (
+                    <span className="muted" title={`Follow-up of ${r.parent_assignment_id}`}>
+                      ↳{" "}
+                    </span>
+                  )}
                   <a
                     href="#"
                     onClick={(e) => {

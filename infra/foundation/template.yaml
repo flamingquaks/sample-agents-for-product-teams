@@ -488,6 +488,13 @@ Resources:
           # fleet-config table (trigger_grants). Required — unset ⇒ fail-closed.
           TRIGGER_POLICY_STORE_ID: !GetAtt TriggerPolicyStore.PolicyStoreId
           STAGE: !Ref Stage
+          # Slack replies deep-link the assignment id to its dashboard run page
+          # (#/run/<id>). Absent when the dashboard isn't deployed — the reply
+          # copy degrades to the bare id.
+          DASHBOARD_URL: !If
+            - DashboardEnabled
+            - !Sub https://${DashboardDistribution.DomainName}/
+            - !Ref AWS::NoValue
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref AssignmentsTable
@@ -752,6 +759,12 @@ Resources:
           FLEET_CONFIG_TABLE: !Ref FleetConfigTable
           ASSIGNMENTS_TABLE: !Ref AssignmentsTable
           STAGE: !Ref Stage
+          # Result/pause replies deep-link the assignment id to its dashboard
+          # run page; absent (bare-id copy) when the dashboard isn't deployed.
+          DASHBOARD_URL: !If
+            - DashboardEnabled
+            - !Sub https://${DashboardDistribution.DomainName}/
+            - !Ref AWS::NoValue
       Policies:
         # Read notif_sub + identity rows (fan-out targets + mention resolution).
         - DynamoDBReadPolicy:

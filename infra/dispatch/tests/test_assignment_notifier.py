@@ -251,3 +251,47 @@ def test_thread_binding_rows_skipped():
     with patch.object(an.notify, "notify") as m:
         an.handler({"Records": [rec]})
     m.assert_not_called()
+
+
+# --- dashboard deep links + conversation-keyed fan-out threading --------------
+
+
+def test_origin_reply_links_assignment_to_dashboard(monkeypatch):
+    """When DASHBOARD_URL is set, the result reply's assignment footer is a
+    Slack-markup deep link to the run's dashboard page."""
+    monkeypatch.setenv("DASHBOARD_URL", "https://d123.cloudfront.net/")
+    rec = _slack_completed_record()
+    with patch.object(an.notify, "notify", return_value=1), \
+         patch.object(an.reply, "post_slack_message", return_value=True) as post:
+        an.handler({"Records": [rec]})
+    text = post.call_args[0][2]
+    assert "<https://d123.cloudfront.net/#/run/" in text
+    assert "|assignment `" in text
+
+
+def test_origin_reply_bare_id_without_dashboard(monkeypatch):
+    monkeypatch.delenv("DASHBOARD_URL", raising=False)
+    rec = _slack_completed_record()
+    with patch.object(an.notify, "notify", return_value=1), \
+         patch.object(an.reply, "post_slack_message", return_value=True) as post:
+        an.handler({"Records": [rec]})
+    text = post.call_args[0][2]
+    assert "assignment `" in text and "<http" not in text
+
+
+def test_fanout_unit_keys_on_slack_conversation():
+    """Fan-out notifications for a Slack-threaded run must key on the
+    conversation (so linked follow-up assignments continue the same ops
+    thread), not the assignment id."""
+    rec = _record(
+        new={"assignment_id": "a9", "agent_id": "docwriter", "status": "completed",
+             "requester": "slack:T1:U9", "source": "slack",
+             "result_summary": "done",
+             "source_context": {"workspace": "T1", "channel_id": "C1",
+                                "thread_ts": "111.2"}},
+        old={"status": "dispatched"},
+    )
+    with patch.object(an.notify, "notify", return_value=1) as m, \
+         patch.object(an.reply, "post_slack_message", return_value=True):
+        an.handler({"Records": [rec]})
+    assert m.call_args.kwargs["unit"] == "thread:T1#C1#111.2"

@@ -228,3 +228,112 @@ def _fake_table(rows):
                 row["status"] = values[":resuming"]
 
     return _T()
+
+
+# --- Slack permalink capture (dashboard → Slack traceability) ------------------
+
+
+def _assignment_row(router):
+    """The assignment Item among the fixture mock's put_item calls (a Slack
+    dispatch also puts a thread_binding bookkeeping row after it)."""
+    for call in router.assignments_table.put_item.call_args_list:
+        item = call.kwargs.get("Item") or (call.args[0] if call.args else {})
+        if item.get("kind") != "thread_binding" and "source_context" in item:
+            return item
+    raise AssertionError("no assignment row was written")
+
+
+def _stub_dispatch_pipeline(router, monkeypatch):
+    import identity as identity_mod
+
+    monkeypatch.setattr(router, "_post_block_reply", lambda *a, **k: True)
+    monkeypatch.setattr(router, "_put_metric", lambda *a, **k: None)
+    monkeypatch.setattr(router, "_notify_fleet_event", lambda *a, **k: None)
+    monkeypatch.setattr(router, "authorize_trigger", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(router, "check_repo_allowed", lambda *a, **k: True)
+    monkeypatch.setattr(router, "check_concurrency", lambda *a, **k: True)
+    monkeypatch.setattr(
+        router,
+        "resolve_dispatch_identity",
+        lambda *a, **k: identity_mod.Identity(
+            identity_id="id-1", email="a@b.c", status="active"
+        ),
+    )
+    router.assignments_table = MagicMock()
+    router.assignments_table.query.return_value = {"Count": 0}
+
+
+def test_slack_dispatch_captures_permalink_on_assignment(router, monkeypatch):
+    """The router resolves the triggering message's permalink once and stores
+    it in the assignment's source_context — the dashboard's link back to the
+    conversation."""
+    _stub_dispatch_pipeline(router, monkeypatch)
+    with patch("guardrail.check_prompt") as gp, patch(
+        "reply.slack_permalink",
+        return_value="https://acme.slack.com/archives/C1/p111222",
+    ) as pl:
+        gp.return_value = MagicMock(outcome="passed", reason="")
+        resp = router.handler(
+            {
+                "source": "slack",
+                "trigger_type": "comment_mention",
+                "agent_id": "docwriter",
+                "body": "write docs",
+                "instruction": "write docs",
+                "sender": "slack:T1:U1",
+                "context": {**SLACK_CTX, "message_ts": "111.222"},
+            },
+            None,
+        )
+    assert resp["statusCode"] == 200
+    pl.assert_called_once_with("T1", "C1", "111.222")
+    stored = _assignment_row(router)
+    assert (
+        stored["source_context"]["slack_permalink"]
+        == "https://acme.slack.com/archives/C1/p111222"
+    )
+
+
+def test_permalink_miss_dispatches_without_link(router, monkeypatch):
+    """A failed permalink lookup (returns "") must not block dispatch or write
+    an empty key."""
+    _stub_dispatch_pipeline(router, monkeypatch)
+    with patch("guardrail.check_prompt") as gp, patch(
+        "reply.slack_permalink", return_value=""
+    ):
+        gp.return_value = MagicMock(outcome="passed", reason="")
+        resp = router.handler(
+            {
+                "source": "slack",
+                "trigger_type": "comment_mention",
+                "agent_id": "docwriter",
+                "body": "write docs",
+                "instruction": "write docs",
+                "sender": "slack:T1:U1",
+                "context": {**SLACK_CTX, "message_ts": "111.222"},
+            },
+            None,
+        )
+    assert resp["statusCode"] == 200
+    stored = _assignment_row(router)
+    assert "slack_permalink" not in stored["source_context"]
+
+
+def test_nonslack_dispatch_skips_permalink(router, monkeypatch):
+    _stub_dispatch_pipeline(router, monkeypatch)
+    with patch("guardrail.check_prompt") as gp, patch(
+        "reply.slack_permalink"
+    ) as pl:
+        gp.return_value = MagicMock(outcome="passed", reason="")
+        router.handler(
+            {
+                "source": "github",
+                "trigger_type": "comment_mention",
+                "agent_id": "docwriter",
+                "body": "write docs",
+                "sender": "alice",
+                "context": {"repo": "acme/web", "issue_number": 7},
+            },
+            None,
+        )
+    pl.assert_not_called()

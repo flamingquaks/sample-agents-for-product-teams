@@ -47,6 +47,33 @@ _SEVERITY_RANK = {TIER_INFORMATIVE: 0, TIER_ACTIONABLE: 1, TIER_ERROR: 2}
 _NOTIF_SUB_PK_PREFIX = "notif_sub#"
 _THREAD_PK_PREFIX = "notif_thread#"
 
+
+def dashboard_run_url(assignment_id: str) -> str:
+    """Deep link to a run's dashboard detail page (SPA hash route ``#/run/<id>``),
+    or "" when the dashboard isn't deployed (DASHBOARD_URL unset). Read lazily so
+    tests can monkeypatch the env."""
+    base = os.environ.get("DASHBOARD_URL", "").rstrip("/")
+    if not base or not assignment_id:
+        return ""
+    return f"{base}/#/run/{assignment_id}"
+
+
+def unit_for(assignment_id: str, source_context: dict | None) -> str:
+    """The unit-of-work key notifications thread under.
+
+    A Slack-threaded dispatch keys on the CONVERSATION (workspace#channel#
+    thread_ts), not the assignment — so a D8 follow-up (a new assignment in the
+    same thread) continues the parent's ops-channel notification thread instead
+    of fragmenting one conversation across several. Everything else keys on the
+    assignment id as before."""
+    ctx = source_context or {}
+    team = str(ctx.get("workspace", "") or "")
+    channel = str(ctx.get("channel_id", "") or "")
+    thread_ts = str(ctx.get("thread_ts", "") or "")
+    if team and channel and thread_ts:
+        return f"thread:{team}#{channel}#{thread_ts}"
+    return assignment_id or ""
+
 _assignments = None
 _cache = None  # list of notif_sub records
 _cache_expires_at = 0.0

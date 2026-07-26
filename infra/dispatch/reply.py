@@ -198,6 +198,41 @@ def post_slack_message_ts(
         return False, None
 
 
+def slack_permalink(team_id: str, channel: str, message_ts: str) -> str:
+    """Resolve a message's shareable URL via ``chat.getPermalink``.
+
+    Captured once at dispatch time and stored on the assignment
+    (``source_context.slack_permalink``) so the dashboard can link a Slack run
+    back to the exact conversation — the workspace's real domain is baked into
+    the URL, which can't be derived offline from a T-team id. Best-effort:
+    returns "" on any failure (the dashboard simply shows no link). Uses the
+    same bot token the reply path already holds; no extra scope needed."""
+    if not (team_id and channel and message_ts):
+        return ""
+    token = _get_secret(slack_bot_token_param(team_id))
+    if not token:
+        return ""
+    try:
+        response = requests.get(
+            f"{SLACK_API}/chat.getPermalink",
+            params={"channel": channel, "message_ts": message_ts},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not data.get("ok"):
+            logger.warning(
+                "Slack chat.getPermalink rejected for %s/%s: %s",
+                team_id, channel, data.get("error", "unknown"),
+            )
+            return ""
+        return str(data.get("permalink") or "")
+    except (requests.RequestException, ValueError) as exc:
+        logger.warning("Failed to fetch Slack permalink for %s/%s: %s", team_id, channel, exc)
+        return ""
+
+
 def slack_user_profile(team_id: str, user_id: str) -> dict:
     """Fetch a Slack user's profile via ``users.info`` — the workspace's
     AUTHENTICATED directory, so the display name + email it returns are verified

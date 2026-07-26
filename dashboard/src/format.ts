@@ -111,5 +111,16 @@ export function sourceLink(
     return null;
   }
 
+  if (source === "slack") {
+    // The router captures the triggering message's permalink at dispatch time
+    // (the workspace domain only Slack knows). Older runs predate the capture —
+    // they render without a link, like a permalink-API miss.
+    const permalink = c.slack_permalink;
+    if (permalink) {
+      return { label: "Slack thread", url: permalink };
+    }
+    return null;
+  }
+
   return null;
 }

@@ -94,6 +94,16 @@ def _actor_from(item: dict) -> dict:
     return {"source": str(item.get("source", "") or ""), "handle": requester, "workspace": ""}
 
 
+def _run_ref(assignment_id: str) -> str:
+    """The assignment reference for user-facing replies: a dashboard deep link
+    (Slack ``<url|text>`` markup) when the dashboard is deployed, else the bare
+    id. Either way the id text stays visible — it's how users quote a run."""
+    url = notify.dashboard_run_url(assignment_id)
+    if url:
+        return f"<{url}|assignment `{assignment_id}`>"
+    return f"assignment `{assignment_id}`"
+
+
 def _reply_to_origin(new: dict, new_status: str) -> None:
     """Post the run's RESULT back to the Slack thread/channel that dispatched it.
 
@@ -113,14 +123,15 @@ def _reply_to_origin(new: dict, new_status: str) -> None:
     agent_id = str(new.get("agent_id", "") or "")
     summary = str(new.get("result_summary") or "").strip()
     assignment_id = str(new.get("assignment_id", "") or "")
+    run_ref = _run_ref(assignment_id)
     if new_status == "completed":
         body = summary or "Done — but I have no result text to share."
         if len(body) > _REPLY_MAX_CHARS:
             body = body[:_REPLY_MAX_CHARS] + "…"
-        text = f"{body}\n\n_✅ assignment `{assignment_id}`_"
+        text = f"{body}\n\n_✅ {run_ref}_"
     elif new_status == "failed":
         detail = summary[:600] or "no error detail recorded"
-        text = f"❌ I couldn't complete this request: {detail}\n\n_assignment `{assignment_id}`_"
+        text = f"❌ I couldn't complete this request: {detail}\n\n_{run_ref}_"
     elif new_status == "awaiting_input":
         # The durable pause (D6): deliver the agent's question and tell the
         # requester HOW to resume — an in-thread @sdlc-agents reply. The thread
@@ -134,16 +145,16 @@ def _reply_to_origin(new: dict, new_status: str) -> None:
             f"❓ {question}\n\n"
             f"_Reply in this thread with `@sdlc-agents <your answer>` and I'll "
             f"pick the work back up where I left off. Progress so far is "
-            f"saved. (assignment `{assignment_id}`)_"
+            f"saved. ({run_ref})_"
         )
     elif new_status == "timed_out":
         text = (
             f"⌛ I stopped waiting for a reply and cleaned up the paused work "
-            f"(assignment `{assignment_id}`). Mention me again with the "
+            f"({run_ref}). Mention me again with the "
             f"request if you still need it."
         )
     else:  # awaiting_approval
-        text = f"⏳ I need an approval to continue (assignment `{assignment_id}`) — an admin can approve it in the fleet dashboard."
+        text = f"⏳ I need an approval to continue ({run_ref}) — an admin can approve it in the fleet dashboard."
     try:
         reply.post_slack_message(
             team_id, channel_id, text,
@@ -183,7 +194,10 @@ def _handle_record(record: dict) -> None:
             summary=str(new.get("result_summary") or "")[:200],
         ),
         repo=str(ctx.get("repo", "") or ""),
-        unit=str(new.get("assignment_id", "") or ""),
+        # Same conversation-keyed threading as the router's run_started post —
+        # this completion/pause line must land in that thread, and follow-up
+        # assignments in the same Slack thread must continue it.
+        unit=notify.unit_for(str(new.get("assignment_id", "") or ""), ctx),
         actor=_actor_from(new),
     )
 

@@ -706,7 +706,11 @@ def _notify_fleet_event(
             event=event,
             text=text,
             repo=str(source_context.get("repo", "") or ""),
-            unit=source_context.get("assignment_id", "") or "",
+            # Slack conversations thread on the conversation key so linked
+            # follow-up assignments continue the same ops-channel thread.
+            unit=notify.unit_for(
+                source_context.get("assignment_id", "") or "", source_context
+            ),
             actor={"source": id_source, "handle": handle, "workspace": workspace},
         )
     except Exception:
@@ -963,6 +967,23 @@ def handler(event, context):
     sender = event.get("sender", "unknown")
     source_context = event.get("context", {})
 
+    # Slack → dashboard traceability: resolve the triggering message's shareable
+    # URL once at dispatch time and persist it on the assignment. The workspace
+    # domain lives only in Slack, so the dashboard can't construct this link
+    # itself. Best-effort (~1 API call); "" just means no link is rendered.
+    if source == "slack" and "slack_permalink" not in source_context:
+        permalink = reply.slack_permalink(
+            str(source_context.get("workspace", "") or ""),
+            str(source_context.get("channel_id", "") or ""),
+            str(
+                source_context.get("message_ts", "")
+                or source_context.get("thread_ts", "")
+                or ""
+            ),
+        )
+        if permalink:
+            source_context = {**source_context, "slack_permalink": permalink}
+
     # --- Resolve agent ---
     # If agent_id is pre-resolved (e.g. by Asana webhook receiver), use it directly.
     # Otherwise, parse @mention from body.
@@ -1197,9 +1218,15 @@ def handler(event, context):
     # there's no visible confirmation unless the router posts one. Best-effort.
     # Posts under the agent's own identity (distinct username + icon).
     if source == "slack":
+        run_url = notify.dashboard_run_url(assignment_id)
+        run_ref = (
+            f"<{run_url}|assignment `{assignment_id}`>"
+            if run_url
+            else f"assignment `{assignment_id}`"
+        )
         _post_block_reply(
             source, source_context,
-            f"🏁 On it — working on your request now. (assignment `{assignment_id}`)",
+            f"🏁 On it — working on your request now. ({run_ref})",
             agent_id=agent_id,
         )
 

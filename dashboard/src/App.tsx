@@ -346,6 +346,7 @@ export function App({ config }: { config: AppConfig }) {
               assignmentId={view.assignmentId}
               onBack={() => navigate({ name: "fleet" })}
               onTrace={(dimension, value) => navigate({ name: "trace", dimension, value })}
+              onOpenRun={(assignmentId) => navigate({ name: "run", assignmentId })}
               onAuthError={onAuthError}
             />
           )}
