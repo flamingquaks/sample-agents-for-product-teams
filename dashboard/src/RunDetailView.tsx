@@ -3,7 +3,7 @@
 
 import { useCallback } from "react";
 import { ApiError, type DashboardApi } from "./api";
-import { Participants, StatusPill, TraceChips } from "./components";
+import { Commits, Participants, StatusPill, Timeline, TraceChips } from "./components";
 import { fmtCost, fmtDuration, fmtTime, fmtTokens, isActive, sourceLink } from "./format";
 import { usePolling } from "./hooks";
 import type { Run } from "./types";
@@ -160,19 +160,32 @@ function RunDetail({
         </div>
       )}
 
-      {run.instruction && (
+      {(run.timeline ?? []).length > 0 ? (
+        // The full conversation supersedes the bare instruction/result blocks:
+        // every turn (request, agent questions, user replies, outcome) in order.
         <section>
-          <h3>Instruction</h3>
-          <pre className="prewrap">{run.instruction}</pre>
+          <h3>Conversation</h3>
+          <Timeline events={run.timeline} />
         </section>
+      ) : (
+        <>
+          {run.instruction && (
+            <section>
+              <h3>Instruction</h3>
+              <pre className="prewrap">{run.instruction}</pre>
+            </section>
+          )}
+
+          {run.result_summary && (
+            <section>
+              <h3>Result</h3>
+              <pre className="prewrap">{run.result_summary}</pre>
+            </section>
+          )}
+        </>
       )}
 
-      {run.result_summary && (
-        <section>
-          <h3>Result</h3>
-          <pre className="prewrap">{run.result_summary}</pre>
-        </section>
-      )}
+      <Commits commits={run.commits} />
     </>
   );
 }

@@ -392,3 +392,77 @@ def test_update_trace_refs_swallows_client_error(fake_table):
     fake_table.update_item = raise_on_second
     # Must not raise.
     asg.update_trace_refs("a-1", branch="feat/z")
+
+
+# --- timeline + commit records (run turn/change capture) ----------------------
+
+
+def test_complete_appends_result_turn(fake_table):
+    asg.complete_assignment("a-1", result_summary="all done")
+    upd = _last_update(fake_table)
+    assert "timeline = list_append" in upd["UpdateExpression"]
+    evt = upd["ExpressionAttributeValues"][":tl_evt"][0]
+    assert evt["kind"] == "result" and evt["actor"] == "agent"
+    assert evt["text"] == "all done"
+
+
+def test_fail_appends_error_turn(fake_table):
+    asg.fail_assignment("a-1", error="gateway exploded")
+    upd = _last_update(fake_table)
+    assert "timeline = list_append" in upd["UpdateExpression"]
+    evt = upd["ExpressionAttributeValues"][":tl_evt"][0]
+    assert evt["kind"] == "error"
+    assert "gateway exploded" in evt["text"]
+
+
+def test_timeline_event_caps_text():
+    evt = asg.timeline_event("result", "x" * 5000)
+    assert len(evt["text"]) == 2000
+
+
+def test_record_commit_appends_with_files(fake_table):
+    asg.record_commit(
+        "a-1",
+        repo="acme/web",
+        branch="wip/a-1",
+        sha="deadbeef" * 5,
+        message="add feature",
+        files=["src/app.py", "tests/test_app.py"],
+    )
+    upd = fake_table.updates[-1]
+    assert "commits = list_append" in upd["UpdateExpression"]
+    rec = upd["ExpressionAttributeValues"][":c"][0]
+    assert rec["repo"] == "acme/web"
+    assert rec["files"] == ["src/app.py", "tests/test_app.py"]
+    assert rec["files_total"] == 2
+
+
+def test_record_commit_caps_file_list(fake_table):
+    files = [f"f{i}.py" for i in range(250)]
+    asg.record_commit(
+        "a-1", repo="acme/web", branch="wip/a-1", sha="abc", message="m", files=files
+    )
+    rec = fake_table.updates[-1]["ExpressionAttributeValues"][":c"][0]
+    assert len(rec["files"]) == 100
+    assert rec["files_total"] == 250
+
+
+def test_record_commit_noop_without_assignment(fake_table):
+    asg.record_commit(
+        "", repo="acme/web", branch="b", sha="abc", message="m", files=[]
+    )
+    asg.record_commit(
+        "default", repo="acme/web", branch="b", sha="abc", message="m", files=[]
+    )
+    assert not fake_table.updates
+
+
+def test_record_commit_swallows_table_errors(fake_table, monkeypatch):
+    def boom(**kwargs):
+        raise RuntimeError("ddb down")
+
+    monkeypatch.setattr(fake_table, "update_item", boom)
+    # Must not raise — bookkeeping never fails the push that already landed.
+    asg.record_commit(
+        "a-1", repo="acme/web", branch="b", sha="abc", message="m", files=["f"]
+    )

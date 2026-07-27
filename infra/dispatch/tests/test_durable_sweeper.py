@@ -199,3 +199,28 @@ def test_stale_resumed_dispatch_still_swept(monkeypatch):
     }])
     assert sweeper.sweep_stale_dispatches(now=NOW) == 1
     assert table.rows["a-dead"]["status"] == "failed"
+
+
+def test_timeout_flip_appends_timeline_turn(monkeypatch, deleted_branches):
+    """A sweeper timeout is a turn in the run's story — the conversation view
+    must record how the run ended."""
+    captured = {}
+
+    table = _use(monkeypatch, [{
+        "assignment_id": "a-old", "agent_id": "docwriter",
+        "status": "awaiting_input",
+        "paused_at": NOW - 72 * 3600,
+        "workspace_snapshot": [],
+    }])
+    orig = table.update_item
+
+    def spy(Key, ConditionExpression=None, **kwargs):
+        captured.update(kwargs)
+        return orig(Key, ConditionExpression=ConditionExpression, **kwargs)
+
+    monkeypatch.setattr(table, "update_item", spy)
+    assert sweeper.sweep_abandoned_pauses(now=NOW) == 1
+    assert "timeline = list_append" in captured["UpdateExpression"]
+    evt = captured["ExpressionAttributeValues"][":tl_evt"][0]
+    assert evt["kind"] == "timed_out"
+    assert evt["actor"] == "sweeper"

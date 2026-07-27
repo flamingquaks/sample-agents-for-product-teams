@@ -374,3 +374,14 @@ def test_after_hook_leaves_genuine_cancels_and_other_tools_alone():
     real = RealCancel()
     hook._on_after_tool_call(real)
     assert real.result["status"] == "error"
+
+
+def test_pause_appends_question_turn(fake_table):
+    """The agent's question lands on the run timeline atomically with the
+    pause write — the dashboard's conversation view shows the turn."""
+    durable.handle_agent_result(_interrupt_result(), "a-1", workspace=FakeWorkspace())
+    flip = fake_table.updates[0]
+    assert "timeline = list_append" in flip["UpdateExpression"]
+    evt = flip["ExpressionAttributeValues"][":tl_evt"][0]
+    assert evt["kind"] == "question" and evt["actor"] == "agent"
+    assert evt["text"] == "Which region?"

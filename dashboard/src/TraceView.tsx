@@ -2,9 +2,9 @@
 // traceability join (e.g. all agents' runs on a branch, a Jira key, or an
 // issue). Reached by clicking a trace chip anywhere in the app.
 
-import { useCallback } from "react";
+import { Fragment, useCallback, useState } from "react";
 import { ApiError, type DashboardApi } from "./api";
-import { StatusPill } from "./components";
+import { Commits, StatusPill, Timeline } from "./components";
 import { fmtCost, fmtDuration, fmtTime, isActive, sourceLink } from "./format";
 import { usePolling } from "./hooks";
 import type { TraceResult } from "./types";
@@ -37,6 +37,15 @@ export function TraceView({
     deps: [api, dimension, value],
     onError: handleError,
   });
+  // Per-run expansion: the inline turns + commits panel under a row.
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const toggle = (id: string) =>
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
 
   const res = poll.data;
   // Oldest-first: a trace is a story (original request → follow-ups), so read
@@ -87,39 +96,68 @@ export function TraceView({
               <th>Started</th>
               <th>Duration</th>
               <th>Cost</th>
+              <th>Detail</th>
             </tr>
           </thead>
           <tbody>
-            {runs.map((r) => (
-              <tr key={r.assignment_id}>
-                <td>
-                  <StatusPill status={r.status} />
-                </td>
-                <td>
-                  {/* D8 lineage marker: this run continued an earlier run in
-                      this same trace (a reply on its completed thread). */}
-                  {r.parent_assignment_id && inTrace.has(r.parent_assignment_id) && (
-                    <span className="muted" title={`Follow-up of ${r.parent_assignment_id}`}>
-                      ↳{" "}
-                    </span>
+            {runs.map((r) => {
+              const turns = (r.timeline ?? []).length;
+              const commitCount = (r.commits ?? []).length;
+              const isOpen = expanded.has(r.assignment_id);
+              return (
+                <Fragment key={r.assignment_id}>
+                  <tr>
+                    <td>
+                      <StatusPill status={r.status} />
+                    </td>
+                    <td>
+                      {/* D8 lineage marker: this run continued an earlier run in
+                          this same trace (a reply on its completed thread). */}
+                      {r.parent_assignment_id && inTrace.has(r.parent_assignment_id) && (
+                        <span className="muted" title={`Follow-up of ${r.parent_assignment_id}`}>
+                          ↳{" "}
+                        </span>
+                      )}
+                      <a
+                        href="#"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          onOpenRun(r.assignment_id);
+                        }}
+                      >
+                        {r.agent_id ?? "—"}
+                      </a>
+                    </td>
+                    <td>{r.requester ?? "—"}</td>
+                    <td>{r.source ?? "—"}</td>
+                    <td>{fmtTime(r.created_at)}</td>
+                    <td>{fmtDuration(r.duration_seconds)}</td>
+                    <td>{fmtCost(r.cost_estimate_usd)}</td>
+                    <td>
+                      {turns > 0 || commitCount > 0 ? (
+                        <button className="link-btn" onClick={() => toggle(r.assignment_id)}>
+                          {isOpen ? "▾" : "▸"} {turns} turn{turns === 1 ? "" : "s"}
+                          {commitCount > 0 &&
+                            ` · ${commitCount} commit${commitCount === 1 ? "" : "s"}`}
+                        </button>
+                      ) : (
+                        <span className="muted">—</span>
+                      )}
+                    </td>
+                  </tr>
+                  {isOpen && (
+                    <tr className="trace-detail-row">
+                      {/* Inline story: every turn the agent took + every commit
+                          it pushed, without leaving the trace. */}
+                      <td colSpan={8}>
+                        <Timeline events={r.timeline} />
+                        <Commits commits={r.commits} />
+                      </td>
+                    </tr>
                   )}
-                  <a
-                    href="#"
-                    onClick={(e) => {
-                      e.preventDefault();
-                      onOpenRun(r.assignment_id);
-                    }}
-                  >
-                    {r.agent_id ?? "—"}
-                  </a>
-                </td>
-                <td>{r.requester ?? "—"}</td>
-                <td>{r.source ?? "—"}</td>
-                <td>{fmtTime(r.created_at)}</td>
-                <td>{fmtDuration(r.duration_seconds)}</td>
-                <td>{fmtCost(r.cost_estimate_usd)}</td>
-              </tr>
-            ))}
+                </Fragment>
+              );
+            })}
           </tbody>
         </table>
       )}

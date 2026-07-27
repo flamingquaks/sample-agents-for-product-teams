@@ -320,6 +320,70 @@ def record_usage(assignment_id: str, token_usage: int | dict | None) -> None:
         logger.exception("record_usage failed for %s", assignment_id)
 
 
+def timeline_event(kind: str, text: str, actor: str = "agent") -> dict:
+    """One turn in the run's ``timeline`` — the dashboard's conversation view.
+
+    Kinds in use: ``dispatched`` (router, at create), ``question`` (agent
+    pauses via ask_user), ``reply`` (router, the resume answer), ``result``
+    (agent completes), ``error`` (agent fails). Append-only; text capped so a
+    long transcript can't blow past the 400KB item limit."""
+    return {
+        "ts": int(time.time()),
+        "kind": kind,
+        "actor": actor,
+        "text": (text or "")[:2000],
+    }
+
+
+def _timeline_append_parts(event: dict, attr_values: dict) -> str:
+    """The SET fragment + values that append ``event`` to the timeline in the
+    same write as a status flip (if_not_exists covers pre-feature rows)."""
+    attr_values[":tl_evt"] = [event]
+    attr_values[":tl_empty"] = []
+    return "timeline = list_append(if_not_exists(timeline, :tl_empty), :tl_evt)"
+
+
+def record_commit(
+    assignment_id: str,
+    *,
+    repo: str,
+    branch: str,
+    sha: str,
+    message: str,
+    files: list[str],
+) -> None:
+    """Append a pushed commit (with its changed files) to the run's ``commits``
+    list — the dashboard's "what did this run change" record. Best-effort:
+    the push already succeeded; bookkeeping must never fail the run."""
+    if not assignment_id or assignment_id == "default":
+        return
+    try:
+        _get_table().update_item(
+            Key={"assignment_id": assignment_id},
+            UpdateExpression=(
+                "SET commits = list_append(if_not_exists(commits, :empty), :c)"
+            ),
+            ExpressionAttributeValues={
+                ":empty": [],
+                ":c": [
+                    {
+                        "ts": int(time.time()),
+                        "repo": repo,
+                        "branch": branch,
+                        "sha": sha,
+                        "message": (message or "")[:500],
+                        # Cap the file list; a huge generated-code commit still
+                        # records (count preserved via files_total).
+                        "files": list(files or [])[:100],
+                        "files_total": len(files or []),
+                    }
+                ],
+            },
+        )
+    except Exception:
+        logger.exception("record_commit failed for %s (%s@%s)", assignment_id, repo, sha[:12])
+
+
 def complete_assignment(
     assignment_id: str,
     result_summary: str = "",
@@ -354,6 +418,14 @@ def complete_assignment(
         set_parts.append("result_summary = :rs")
         attr_values[":rs"] = result_summary[:4000]
 
+    # The result turn lands in the same write as the status flip.
+    set_parts.append(
+        _timeline_append_parts(
+            timeline_event("result", result_summary or "(no result text)"),
+            attr_values,
+        )
+    )
+
     _update_with_usage(
         table, assignment_id, set_parts, _usage_fields(token_usage),
         attr_names, attr_values,
@@ -386,6 +458,12 @@ def fail_assignment(
     if created_at is not None:
         set_parts.append("duration_seconds = :dur")
         attr_values[":dur"] = max(0, now - created_at)
+
+    set_parts.append(
+        _timeline_append_parts(
+            timeline_event("error", str(error) or "(no error detail)"), attr_values
+        )
+    )
 
     _update_with_usage(
         table, assignment_id, set_parts, _usage_fields(token_usage),

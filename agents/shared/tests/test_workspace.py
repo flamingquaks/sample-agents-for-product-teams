@@ -270,3 +270,58 @@ def test_tool_errors_are_returned_not_raised(wsenv, monkeypatch):
 
     monkeypatch.setattr(ws, "_mint_token", boom)
     assert "ERROR: vendor said no" in ws.clone_repo("acme/web")
+
+
+def test_commit_and_push_records_commit_with_files(wsenv, monkeypatch):
+    """A pushed commit is recorded on the assignment (repo/sha/message/files)
+    so the dashboard shows what the run changed."""
+    recorded = []
+
+    import shared.assignment as asg
+
+    monkeypatch.setattr(
+        asg, "record_commit", lambda aid, **kw: recorded.append((aid, kw))
+    )
+    ws.clone_repo("acme/web")
+    repo_dir = ws._state.cloned["acme/web"]
+    (repo_dir / "new_file.py").write_text("print('hi')\n")
+    (repo_dir / "README.md").write_text("changed\n")
+    out = ws.commit_and_push("acme/web", "add feature")
+    assert "committed and pushed" in out
+    assert len(recorded) == 1
+    aid, kw = recorded[0]
+    assert aid == "a-123"
+    assert kw["repo"] == "acme/web"
+    assert kw["message"] == "add feature"
+    assert sorted(kw["files"]) == ["README.md", "new_file.py"]
+    assert kw["sha"]
+
+
+def test_push_without_new_commit_records_nothing(wsenv, monkeypatch):
+    recorded = []
+
+    import shared.assignment as asg
+
+    monkeypatch.setattr(
+        asg, "record_commit", lambda aid, **kw: recorded.append(aid)
+    )
+    ws.clone_repo("acme/web")
+    repo_dir = ws._state.cloned["acme/web"]
+    (repo_dir / "f.py").write_text("x\n")
+    ws.commit_and_push("acme/web", "first")
+    # Clean tree: pushes, but no commit → no record.
+    ws.commit_and_push("acme/web", "second")
+    assert len(recorded) == 1
+
+
+def test_record_failure_never_fails_the_push(wsenv, monkeypatch):
+    import shared.assignment as asg
+
+    def boom(*a, **k):
+        raise RuntimeError("ddb down")
+
+    monkeypatch.setattr(asg, "record_commit", boom)
+    ws.clone_repo("acme/web")
+    (ws._state.cloned["acme/web"] / "f.py").write_text("x\n")
+    out = ws.commit_and_push("acme/web", "msg")
+    assert "committed and pushed" in out  # push result unaffected

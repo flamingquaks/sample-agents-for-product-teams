@@ -433,3 +433,45 @@ def test_resume_invoke_error_does_not_clobber_pause(router, monkeypatch):
         resp = router.handler(_resume_event(), None)
     assert resp["statusCode"] == 500
     assert router.assignments_table.rows["a-1"]["status"] == "awaiting_input"
+
+
+# --- run timeline (turn capture) -----------------------------------------------
+
+
+def test_dispatch_seeds_timeline_with_request_turn(router, monkeypatch):
+    """create_assignment writes the first timeline turn — the request itself."""
+    aid = router.create_assignment(
+        agent_id="docwriter",
+        source="slack",
+        trigger_type="comment_mention",
+        requester="slack:T1:U1",
+        instruction="write the docs",
+        source_context={"workspace": "T1", "channel_id": "C1", "thread_ts": "1.2"},
+    )
+    row = router.assignments_table.rows[aid]
+    assert len(row["timeline"]) == 1
+    evt = row["timeline"][0]
+    assert evt["kind"] == "dispatched"
+    assert evt["actor"] == "slack:T1:U1"
+    assert evt["text"] == "write the docs"
+
+
+def test_resume_appends_reply_turn_atomically(router):
+    """The winning reply lands on the timeline in the SAME conditional write as
+    the awaiting_input→resuming flip."""
+    router.assignments_table.rows["a-1"] = _paused_row()
+    with patch("guardrail.check_prompt") as gp:
+        gp.return_value = MagicMock(outcome="passed", reason="")
+        resp = router.handler(_resume_event(body="use us-east-1"), None)
+    assert resp["statusCode"] == 200
+    lock_updates = [
+        u for u in router.assignments_table.updates
+        if ":resuming" in str(u.get("ExpressionAttributeValues", {}))
+    ]
+    assert lock_updates
+    upd = lock_updates[0]
+    assert "timeline = list_append" in upd["UpdateExpression"]
+    evt = upd["ExpressionAttributeValues"][":evt"][0]
+    assert evt["kind"] == "reply"
+    assert evt["text"] == "use us-east-1"
+    assert evt["actor"] == "slack:T1:U1"

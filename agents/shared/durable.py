@@ -160,13 +160,15 @@ def record_pause(
     interrupt on the row, then flip status → ``awaiting_input`` — one write, so
     the commit point and the resume data land atomically. Raises on failure
     (the caller must then fail loud, not exit silently paused)."""
-    from shared.assignment import _get_table
+    from shared.assignment import _get_table, timeline_event
 
     _get_table().update_item(
         Key={"assignment_id": assignment_id},
         UpdateExpression=(
             "SET #s = :s, interrupt_id = :iid, pending_question = :q, "
-            "workspace_snapshot = :ws, paused_at = :now"
+            "workspace_snapshot = :ws, paused_at = :now, "
+            # The question turn lands atomically with the pause itself.
+            "timeline = list_append(if_not_exists(timeline, :tl_empty), :tl_evt)"
         ),
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={
@@ -175,6 +177,8 @@ def record_pause(
             ":q": question[:2000],
             ":ws": workspace_snapshot,
             ":now": int(time.time()),
+            ":tl_empty": [],
+            ":tl_evt": [timeline_event("question", question)],
         },
     )
     logger.info("Assignment %s paused awaiting input (interrupt %s)", assignment_id, interrupt_id)

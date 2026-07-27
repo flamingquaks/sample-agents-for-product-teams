@@ -378,6 +378,18 @@ def create_assignment(
         Item={
             **item_extra,
             "assignment_id": assignment_id,
+            # Turn-by-turn record of the run (the dashboard's conversation
+            # view). Append-only: the agent adds question/result events, the
+            # router adds reply events on resume — each atomically with the
+            # status write that produces it.
+            "timeline": [
+                {
+                    "ts": now,
+                    "kind": "dispatched",
+                    "actor": requester,
+                    "text": instruction[:2000],
+                }
+            ],
             # Constant PK for the "all runs, newest-first" fleet GSI (AllRunsIndex).
             "gsi_all": enrichment.ALL_RUNS_PK,
             "agent_id": agent_id,
@@ -720,22 +732,38 @@ def _notify_fleet_event(
 # --- Resume dispatch (durable-repo-work spec) ---------------------------------
 
 
-def _resume_lock(assignment_id: str) -> bool:
+def _resume_lock(assignment_id: str, *, reply_text: str = "", sender: str = "") -> bool:
     """Conditionally flip ``awaiting_input → resuming`` — the resume lock. A
     second fast reply loses the conditional write and is rejected (the winner
-    is already feeding the agent). Returns True when this caller holds it."""
+    is already feeding the agent). Returns True when this caller holds it.
+
+    The winning reply is appended to the run's ``timeline`` in the SAME write,
+    so the dashboard's turn-by-turn view records exactly the answer that fed
+    the agent (a losing racer's text never lands)."""
     try:
         assignments_table.update_item(
             Key={"assignment_id": assignment_id},
             # resume_started_at bounds the sweeper's stuck-resume window (a
             # resume whose agent never started reverts to awaiting_input).
-            UpdateExpression="SET #s = :resuming, resume_started_at = :now",
+            UpdateExpression=(
+                "SET #s = :resuming, resume_started_at = :now, "
+                "timeline = list_append(if_not_exists(timeline, :empty), :evt)"
+            ),
             ConditionExpression="#s = :awaiting",
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={
                 ":resuming": "resuming",
                 ":awaiting": "awaiting_input",
                 ":now": int(time.time()),
+                ":empty": [],
+                ":evt": [
+                    {
+                        "ts": int(time.time()),
+                        "kind": "reply",
+                        "actor": sender,
+                        "text": (reply_text or "")[:2000],
+                    }
+                ],
             },
         )
         return True
@@ -867,7 +895,7 @@ def handle_resume(event) -> dict:
         )
 
     # The lock: only one reply resumes; a racing second reply is rejected.
-    if not _resume_lock(assignment_id):
+    if not _resume_lock(assignment_id, reply_text=reply_text, sender=sender):
         return _error(409, f"assignment {assignment_id} is already resuming")
 
     resume_payload = {

@@ -77,12 +77,17 @@ def _scan_status(status: str) -> list[dict]:
 
 def _conditional_flip(assignment_id: str, from_status: str, to_status: str, note: str) -> bool:
     """Flip status only if the row is still in ``from_status`` (a reply landing
-    mid-sweep wins). Returns True when this sweep did the flip."""
+    mid-sweep wins). Returns True when this sweep did the flip. The note also
+    lands as a timeline turn so the run's conversation view records how the
+    run actually ended."""
     table = _table()
     try:
         table.update_item(
             Key={"assignment_id": assignment_id},
-            UpdateExpression="SET #s = :to, result_summary = :note, completed_at = :now",
+            UpdateExpression=(
+                "SET #s = :to, result_summary = :note, completed_at = :now, "
+                "timeline = list_append(if_not_exists(timeline, :tl_empty), :tl_evt)"
+            ),
             ConditionExpression="#s = :from",
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={
@@ -90,6 +95,15 @@ def _conditional_flip(assignment_id: str, from_status: str, to_status: str, note
                 ":from": from_status,
                 ":note": note,
                 ":now": int(time.time()),
+                ":tl_empty": [],
+                ":tl_evt": [
+                    {
+                        "ts": int(time.time()),
+                        "kind": "error" if to_status == "failed" else to_status,
+                        "actor": "sweeper",
+                        "text": note[:2000],
+                    }
+                ],
             },
         )
         return True

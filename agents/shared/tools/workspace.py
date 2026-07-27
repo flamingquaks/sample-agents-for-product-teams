@@ -234,6 +234,37 @@ def _commit_if_dirty(repo_dir: Path, message: str) -> bool:
     return True
 
 
+def _head_changed_files(repo_dir: Path) -> list[str]:
+    """The files HEAD touched (relative paths). Best-effort — used only for
+    the run record's commit bookkeeping, never for git logic."""
+    try:
+        out = _git(
+            ["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
+            cwd=repo_dir,
+        )
+        return [line.strip() for line in out.splitlines() if line.strip()]
+    except WorkspaceError:
+        return []
+
+
+def _record_pushed_commit(repo: str, repo_dir: Path, sha: str, message: str) -> None:
+    """Append this pushed commit (+ changed files) to the assignment's run
+    record so the dashboard shows exactly what the run changed. Best-effort."""
+    try:
+        from shared.assignment import record_commit
+
+        record_commit(
+            _state.assignment_id,
+            repo=repo,
+            branch=wip_branch(),
+            sha=sha,
+            message=message,
+            files=_head_changed_files(repo_dir),
+        )
+    except Exception:  # noqa: BLE001 — bookkeeping never fails a push
+        logger.exception("could not record pushed commit %s@%s", repo, sha[:12])
+
+
 def _push(repo: str, repo_dir: Path) -> str:
     """Push the wip branch and VERIFY the remote tip matches local HEAD (D7 —
     a pause checkpoint must be provably durable). Returns the pushed sha.
@@ -349,6 +380,8 @@ def commit_and_push(repo: str, message: str) -> str:
     try:
         committed = _commit_if_dirty(repo_dir, message or "wip: agent checkpoint")
         sha = _push(repo, repo_dir)
+        if committed:
+            _record_pushed_commit(repo, repo_dir, sha, message or "wip: agent checkpoint")
         note = "committed and pushed" if committed else "nothing new to commit; pushed"
         return f"{note} {repo}@{sha[:12]} on {wip_branch()}. Open the PR from this branch when the work is done."
     except WorkspaceError as exc:
@@ -368,8 +401,14 @@ def push_all_clean() -> list[dict]:
     workspace_snapshot: [{repo, branch, sha}, ...]."""
     snapshot = []
     for repo, repo_dir in _state.cloned.items():
-        _commit_if_dirty(repo_dir, "wip: pause checkpoint (awaiting user input)")
+        committed = _commit_if_dirty(
+            repo_dir, "wip: pause checkpoint (awaiting user input)"
+        )
         sha = _push(repo, repo_dir)
+        if committed:
+            _record_pushed_commit(
+                repo, repo_dir, sha, "wip: pause checkpoint (awaiting user input)"
+            )
         snapshot.append({"repo": repo, "branch": wip_branch(), "sha": sha})
     return snapshot
 

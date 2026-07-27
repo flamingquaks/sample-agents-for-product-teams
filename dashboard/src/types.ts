@@ -51,6 +51,30 @@ export interface Run {
   paused_at?: number | null;
   // A follow-up started by replying on a completed thread links its prior run.
   parent_assignment_id?: string | null;
+  // Turn-by-turn record of the run: dispatched → (question → reply)* →
+  // result | error. Appended by the router/agent/sweeper alongside the status
+  // writes that produce each turn.
+  timeline?: TimelineEvent[] | null;
+  // Every commit the run pushed to its wip branch, with the files it touched.
+  commits?: CommitRecord[] | null;
+}
+
+export interface TimelineEvent {
+  ts: number;
+  kind: "dispatched" | "question" | "reply" | "result" | "error" | string;
+  actor: string;
+  text: string;
+}
+
+export interface CommitRecord {
+  ts: number;
+  repo: string;
+  branch: string;
+  sha: string;
+  message: string;
+  files: string[];
+  // files is capped at 100 entries; this preserves the true count.
+  files_total?: number;
 }
 
 export interface RunsPage {
