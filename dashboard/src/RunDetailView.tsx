@@ -161,11 +161,21 @@ function RunDetail({
       )}
 
       {(run.timeline ?? []).length > 0 ? (
-        // The full conversation supersedes the bare instruction/result blocks:
-        // every turn (request, agent questions, user replies, outcome) in order.
         <section>
           <h3>Conversation</h3>
           <Timeline events={run.timeline} />
+          {run.instruction && run.instruction.length > 2000 && (
+            <details>
+              <summary className="muted">Full instruction ({run.instruction.length} chars)</summary>
+              <pre className="prewrap">{run.instruction}</pre>
+            </details>
+          )}
+          {run.result_summary && run.result_summary.length > 2000 && (
+            <details>
+              <summary className="muted">Full result ({run.result_summary.length} chars)</summary>
+              <pre className="prewrap">{run.result_summary}</pre>
+            </details>
+          )}
         </section>
       ) : (
         <>

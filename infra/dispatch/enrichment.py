@@ -65,6 +65,21 @@ def _extract_jira_key(*texts: str) -> str | None:
     return None
 
 
+def slack_thread_key(workspace: str, channel: str, thread_ts: str) -> str | None:
+    """The canonical composite identity for a Slack conversation thread.
+
+    Returns workspace#channel#thread_ts when all three parts are present,
+    None otherwise. Used by enrichment (trace ref), notify (ops-thread unit),
+    and the router (runtime session hash input) — ONE derivation point so a
+    normalization change can't split what should be one conversation."""
+    ws = _clean(workspace)
+    ch = _clean(channel)
+    ts = _clean(thread_ts)
+    if not (ws and ch and ts):
+        return None
+    return f"{ws}#{ch}#{ts}"
+
+
 def derive_trace_refs(source: str, source_context: dict, instruction: str = "") -> dict:
     """Derive the structured trace-reference map for a dispatch.
 
@@ -135,8 +150,9 @@ def derive_trace_refs(source: str, source_context: dict, instruction: str = "") 
         # same value, so the dashboard trace view shows the whole
         # conversation as one timeline. (A RESUME re-enters the original
         # assignment, so it is inherently part of that run's row.)
-        if workspace and channel and thread_ts:
-            refs["slack_thread"] = f"{workspace}#{channel}#{thread_ts}"
+        thread_key = slack_thread_key(workspace or "", channel or "", thread_ts or "")
+        if thread_key:
+            refs["slack_thread"] = thread_key
         jira_key = _extract_jira_key(instruction)
         if jira_key:
             refs["jira_key"] = jira_key

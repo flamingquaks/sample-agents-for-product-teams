@@ -560,34 +560,30 @@ def thread_runtime_session_id(
     if source != "slack":
         return None
     ctx = source_context or {}
-    team = str(ctx.get("workspace", "") or "")
-    channel = str(ctx.get("channel_id", "") or "")
-    thread_ts = str(ctx.get("thread_ts", "") or "")
-    if not (team and channel and thread_ts):
+    thread_key = enrichment.slack_thread_key(
+        str(ctx.get("workspace", "") or ""),
+        str(ctx.get("channel_id", "") or ""),
+        str(ctx.get("thread_ts", "") or ""),
+    )
+    if not thread_key:
         return None
     digest = hashlib.sha256(
-        f"{team}#{channel}#{thread_ts}#{agent_id}".encode()
+        f"{thread_key}#{agent_id}".encode()
     ).hexdigest()
     return f"thread-{digest}"  # 71 chars — within the API's 33–256 bound
 
 
 def _invoke_runtime(runtime_arn: str, payload: bytes, session_id: str, fallback_session_id: str):
-    """InvokeAgentRuntime with session affinity + busy-session fallback.
-
-    A RetryableConflictException means the warm thread session is currently
-    serving another invocation (e.g. two messages in quick succession) —
-    retry once on a fresh, unique session rather than failing the dispatch.
-    The fresh session cold-starts but the conversation still restores from S3.
-    """
+    """InvokeAgentRuntime with session affinity + busy-session fallback."""
+    base_kwargs = {
+        "agentRuntimeArn": runtime_arn,
+        "qualifier": "DEFAULT",
+        "contentType": "application/json",
+        "accept": "application/json",
+        "payload": payload,
+    }
     try:
-        agentcore.invoke_agent_runtime(
-            agentRuntimeArn=runtime_arn,
-            qualifier="DEFAULT",
-            contentType="application/json",
-            accept="application/json",
-            payload=payload,
-            runtimeSessionId=session_id,
-        )
+        agentcore.invoke_agent_runtime(**base_kwargs, runtimeSessionId=session_id)
     except ClientError as exc:
         code = (exc.response.get("Error") or {}).get("Code", "")
         if code != "RetryableConflictException" or session_id == fallback_session_id:
@@ -597,14 +593,7 @@ def _invoke_runtime(runtime_arn: str, payload: bytes, session_id: str, fallback_
             session_id,
             fallback_session_id,
         )
-        agentcore.invoke_agent_runtime(
-            agentRuntimeArn=runtime_arn,
-            qualifier="DEFAULT",
-            contentType="application/json",
-            accept="application/json",
-            payload=payload,
-            runtimeSessionId=fallback_session_id,
-        )
+        agentcore.invoke_agent_runtime(**base_kwargs, runtimeSessionId=fallback_session_id)
 
 
 def invoke_agent(
@@ -995,23 +984,6 @@ def handler(event, context):
     sender = event.get("sender", "unknown")
     source_context = event.get("context", {})
 
-    # Slack → dashboard traceability: resolve the triggering message's shareable
-    # URL once at dispatch time and persist it on the assignment. The workspace
-    # domain lives only in Slack, so the dashboard can't construct this link
-    # itself. Best-effort (~1 API call); "" just means no link is rendered.
-    if source == "slack" and "slack_permalink" not in source_context:
-        permalink = reply.slack_permalink(
-            str(source_context.get("workspace", "") or ""),
-            str(source_context.get("channel_id", "") or ""),
-            str(
-                source_context.get("message_ts", "")
-                or source_context.get("thread_ts", "")
-                or ""
-            ),
-        )
-        if permalink:
-            source_context = {**source_context, "slack_permalink": permalink}
-
     # --- Resolve agent ---
     # If agent_id is pre-resolved (e.g. by Asana webhook receiver), use it directly.
     # Otherwise, parse @mention from body.
@@ -1196,6 +1168,25 @@ def handler(event, context):
             _put_metric("GuardrailReplyFailed", dimensions={"Source": source})
         return _error(503, f"guardrail check failed: {guardrail_result.reason}")
 
+    # Slack → dashboard traceability: resolve the triggering message's shareable
+    # URL once at dispatch time and persist it on the assignment. The workspace
+    # domain lives only in Slack, so the dashboard can't construct this link
+    # itself. Best-effort (~1 API call); "" just means no link is rendered.
+    # Placed here (after all authz/guardrail gates) so we never make an API call
+    # for a request we're going to reject.
+    if source == "slack" and "slack_permalink" not in source_context:
+        permalink = reply.slack_permalink(
+            str(source_context.get("workspace", "") or ""),
+            str(source_context.get("channel_id", "") or ""),
+            str(
+                source_context.get("message_ts", "")
+                or source_context.get("thread_ts", "")
+                or ""
+            ),
+        )
+        if permalink:
+            source_context = {**source_context, "slack_permalink": permalink}
+
     # --- Record assignment ---
     assignment_id = create_assignment(
         agent_id=agent_id,
@@ -1246,15 +1237,9 @@ def handler(event, context):
     # there's no visible confirmation unless the router posts one. Best-effort.
     # Posts under the agent's own identity (distinct username + icon).
     if source == "slack":
-        run_url = notify.dashboard_run_url(assignment_id)
-        run_ref = (
-            f"<{run_url}|assignment `{assignment_id}`>"
-            if run_url
-            else f"assignment `{assignment_id}`"
-        )
         _post_block_reply(
             source, source_context,
-            f"🏁 On it — working on your request now. ({run_ref})",
+            f"🏁 On it — working on your request now. ({notify.run_ref(assignment_id)})",
             agent_id=agent_id,
         )
 

@@ -55,7 +55,6 @@ const TURN_META: Record<string, { icon: string; label: string }> = {
   result: { icon: "✅", label: "Result" },
   error: { icon: "❌", label: "Error" },
   timed_out: { icon: "⌛", label: "Timed out" },
-  awaiting_input: { icon: "⏸️", label: "Pause re-opened" },
 };
 
 /**

@@ -95,13 +95,7 @@ def _actor_from(item: dict) -> dict:
 
 
 def _run_ref(assignment_id: str) -> str:
-    """The assignment reference for user-facing replies: a dashboard deep link
-    (Slack ``<url|text>`` markup) when the dashboard is deployed, else the bare
-    id. Either way the id text stays visible — it's how users quote a run."""
-    url = notify.dashboard_run_url(assignment_id)
-    if url:
-        return f"<{url}|assignment `{assignment_id}`>"
-    return f"assignment `{assignment_id}`"
+    return notify.run_ref(assignment_id)
 
 
 def _reply_to_origin(new: dict, new_status: str) -> None:

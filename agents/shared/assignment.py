@@ -46,6 +46,12 @@ _BLENDED_COST_PER_1K_USD = float(
     )
 )
 
+# Guard-rails for list attributes to keep items well under the 400KB DynamoDB
+# limit. Timeline is bounded by conversation turns (typically <30); commits can
+# grow unbounded in automation loops so we hard-cap reads before appending.
+_TIMELINE_TEXT_MAX = 2000
+_COMMITS_MAX = 50
+
 
 def extract_usage(result) -> dict | None:
     """Best-effort per-direction token usage from a Strands agent result.
@@ -331,7 +337,7 @@ def timeline_event(kind: str, text: str, actor: str = "agent") -> dict:
         "ts": int(time.time()),
         "kind": kind,
         "actor": actor,
-        "text": (text or "")[:2000],
+        "text": (text or "")[:_TIMELINE_TEXT_MAX],
     }
 
 
@@ -357,6 +363,15 @@ def record_commit(
     the push already succeeded; bookkeeping must never fail the run."""
     if not assignment_id or assignment_id == "default":
         return
+    try:
+        existing = _get_table().get_item(
+            Key={"assignment_id": assignment_id},
+            ProjectionExpression="commits",
+        )
+        if len((existing.get("Item") or {}).get("commits") or []) >= _COMMITS_MAX:
+            return
+    except Exception:
+        pass  # best-effort guard; proceed with the append on read failure
     try:
         _get_table().update_item(
             Key={"assignment_id": assignment_id},

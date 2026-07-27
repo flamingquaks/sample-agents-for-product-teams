@@ -81,6 +81,7 @@ def _conditional_flip(assignment_id: str, from_status: str, to_status: str, note
     lands as a timeline turn so the run's conversation view records how the
     run actually ended."""
     table = _table()
+    now = int(time.time())
     try:
         table.update_item(
             Key={"assignment_id": assignment_id},
@@ -94,12 +95,12 @@ def _conditional_flip(assignment_id: str, from_status: str, to_status: str, note
                 ":to": to_status,
                 ":from": from_status,
                 ":note": note,
-                ":now": int(time.time()),
+                ":now": now,
                 ":tl_empty": [],
                 ":tl_evt": [
                     {
-                        "ts": int(time.time()),
-                        "kind": "error" if to_status == "failed" else to_status,
+                        "ts": now,
+                        "kind": "error" if to_status == "failed" else "timed_out",
                         "actor": "sweeper",
                         "text": note[:2000],
                     }

@@ -58,6 +58,15 @@ def dashboard_run_url(assignment_id: str) -> str:
     return f"{base}/#/run/{assignment_id}"
 
 
+def run_ref(assignment_id: str) -> str:
+    """The assignment reference for user-facing Slack replies: a dashboard deep
+    link (``<url|text>`` markup) when deployed, else the bare id."""
+    url = dashboard_run_url(assignment_id)
+    if url:
+        return f"<{url}|assignment `{assignment_id}`>"
+    return f"assignment `{assignment_id}`"
+
+
 def unit_for(assignment_id: str, source_context: dict | None) -> str:
     """The unit-of-work key notifications thread under.
 
@@ -67,11 +76,15 @@ def unit_for(assignment_id: str, source_context: dict | None) -> str:
     of fragmenting one conversation across several. Everything else keys on the
     assignment id as before."""
     ctx = source_context or {}
-    team = str(ctx.get("workspace", "") or "")
-    channel = str(ctx.get("channel_id", "") or "")
-    thread_ts = str(ctx.get("thread_ts", "") or "")
-    if team and channel and thread_ts:
-        return f"thread:{team}#{channel}#{thread_ts}"
+    from enrichment import slack_thread_key
+
+    key = slack_thread_key(
+        str(ctx.get("workspace", "") or ""),
+        str(ctx.get("channel_id", "") or ""),
+        str(ctx.get("thread_ts", "") or ""),
+    )
+    if key:
+        return f"thread:{key}"
     return assignment_id or ""
 
 _assignments = None
