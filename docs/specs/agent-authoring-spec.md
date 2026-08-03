@@ -1,6 +1,9 @@
 # Agent Authoring & Lifecycle (v2.2) — SPEC / DESIGN
 
-> **Status: APPROVED — implementing.** This spec extends the
+> **Status: SHIPPED (P1–P5) — P6 deferred.** All non-deferred phases are built,
+> tested, and reflected in `docs/threat-model.md` (v2.2, T-46/47/48), `docs/aws-deploy.md`,
+> and `docs/03-design-agent-fleet.md`. Only the Claude Code marketplace fetch (P6, §6.4)
+> remains deferred behind the reserved `plugins` seam. This spec extends the
 > capability model (`docs/03-design-agent-fleet.md §4.4`, `docs/aws-deploy.md`,
 > `infra/dashboard/config_store.py`) so admins can **author config-driven agents
 > from the dashboard** instead of only registering repo-committed ones. It
