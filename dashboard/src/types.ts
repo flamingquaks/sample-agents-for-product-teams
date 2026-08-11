@@ -236,7 +236,7 @@ export interface ChannelPolicy {
 /** A WHO grant rule: subject → agent → workspace, permit or forbid. */
 export interface TriggerRule {
   rule_id: string;
-  connector: "slack" | "asana" | "github";
+  connector: "slack" | "asana" | "github" | "jira" | "confluence";
   subject_type: "user" | "group";
   subject_id: string;
   /** Human label for subject_id (person name / #channel / group name), server-resolved. */
@@ -331,9 +331,84 @@ export interface NotifSub {
   /** Human workspace name, server-resolved. */
   workspace_label?: string;
   repos: string[];
+  /** Jira project / Confluence space scopes (atlassian-connector §A9.1). */
+  projects?: string[];
+  spaces?: string[];
   tiers: { actionable?: string[]; informative?: string[]; error?: string[] };
   min_severity: "informative" | "actionable" | "error";
   created_by?: string;
+  created_at?: number;
+  updated_at?: number;
+}
+
+// --- Atlassian connector (docs/specs/atlassian-connector-spec.md) ------------
+
+/** One Atlassian site (cloud id) covering both products (§A6.1). */
+export interface AtlassianSite {
+  site_id: string;
+  site_url: string;
+  site_name?: string;
+  enabled: boolean;
+  products: { jira?: boolean; confluence?: boolean };
+  bot_account_id?: string;
+  bot_email?: string;
+  forge_app_id?: string;
+  webhook_last_seen?: { jira?: number | null; confluence?: number | null };
+  token_expires_at?: number | null;
+  default_project_policy: "allowlist" | "denylist";
+  default_space_policy: "allowlist" | "denylist";
+  status: "pending" | "active" | "disabled";
+  onboarded_by?: string;
+  onboarded_at?: number;
+}
+
+/** A Jira project allow/deny row + its linked-repo co-scope (§B1.2). */
+export interface JiraProject {
+  site_id: string;
+  project_key: string;
+  project_name?: string;
+  mode: "allow" | "deny";
+  repos: string[];
+  note?: string;
+  created_by?: string;
+  created_at?: number;
+}
+
+/** A Confluence space row — the WHERE axis AND the write-safety axis (§C1.2). */
+export interface ConfluenceSpace {
+  site_id: string;
+  space_key: string;
+  space_name?: string;
+  mode: "allow" | "deny";
+  write_mode: "direct" | "propose";
+  write_agents: string[];
+  repos: string[];
+  note?: string;
+  created_by?: string;
+  created_at?: number;
+}
+
+/** A data-driven event → agent automation rule (§A8.1). */
+export interface AutomationRule {
+  rule_id: string;
+  connector: "jira" | "confluence";
+  enabled: boolean;
+  event: string;
+  match: Record<string, unknown>;
+  action: { agent_id: string; instruction_template: string };
+  cooldown_seconds: number;
+  created_by?: string;
+  created_at?: number;
+  updated_at?: number;
+  last_fired_at?: number | null;
+  fire_count?: number;
+}
+
+/** A person's DM notification preference (§A9.2). */
+export interface NotifPref {
+  identity_id: string;
+  tiers: { actionable?: string[]; informative?: string[]; error?: string[] };
+  min_tier: "informative" | "actionable" | "error";
   created_at?: number;
   updated_at?: number;
 }

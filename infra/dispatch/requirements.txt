@@ -2,3 +2,6 @@ boto3>=1.34.0
 requests>=2.31.0
 pyyaml>=6.0
 cryptography>=42.0.0
+# PyJWT verifies the Forge Invocation Token (RS256 vs Atlassian's JWKS) on every
+# Jira/Confluence webhook delivery — see mentions.verify_forge_invocation_token.
+PyJWT>=2.8.0

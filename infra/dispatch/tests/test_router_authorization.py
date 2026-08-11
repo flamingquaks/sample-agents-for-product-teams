@@ -97,8 +97,25 @@ def test_namespaced_principal(router_module):
     # already-namespaced (slack, or a re-dispatch) is left as-is
     assert ns("slack:T0ACME:U1", "slack") == "slack:T0ACME:U1"
     assert ns("github:octocat", "github") == "github:octocat"
+    # jira/confluence account ids map to the ONE atlassian namespace
+    assert ns("712020:acct", "jira") == "atlassian:712020:acct"
+    assert ns("712020:acct", "confluence") == "atlassian:712020:acct"
+    assert ns("atlassian:712020:acct", "jira") == "atlassian:712020:acct"
     # empty passes through (the unresolved-sender guard handles it upstream)
     assert ns("", "github") == ""
+
+
+def test_synthetic_automation_principal_not_re_namespaced(router_module):
+    # An automation principal is already fully namespaced in its own reserved
+    # namespace — it must be returned verbatim (NOT re-prefixed with atlassian:
+    # for a jira/confluence dispatch), so it matches the rule's auto-authored
+    # grant subject `automation:<connector>:<rule_id>` (§A8.4).
+    ns = router_module.namespaced_principal
+    assert ns("automation:jira:r1", "jira") == "automation:jira:r1"
+    assert ns("automation:confluence:r2", "confluence") == "automation:confluence:r2"
+    assert router_module.is_synthetic_principal("automation:jira:r1") is True
+    assert router_module.is_synthetic_principal("atlassian:712020:acct") is False
+    assert router_module.is_synthetic_principal("") is False
 
 
 def test_authorize_passes_namespaced_principal_to_cedar(router_module):

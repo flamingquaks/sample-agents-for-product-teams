@@ -133,6 +133,36 @@ def derive_trace_refs(source: str, source_context: dict, instruction: str = "") 
         if jira_key:
             refs["jira_key"] = jira_key
 
+    elif source == "jira":
+        # Native Jira trace refs (§B3). site = the cloud id (workspace).
+        site = _clean(ctx.get("workspace"))
+        issue_key = _clean(ctx.get("issue_key"))
+        project = _clean(ctx.get("project_key"))
+        if site:
+            refs["jira_site"] = site
+        if project:
+            refs["jira_project"] = project
+        if issue_key:
+            # jira_key is already a TRACE_DIMENSION; emit it natively so a Jira
+            # dispatch joins the same dimension a GitHub PR mentioning ENG-142 does.
+            refs["jira_key"] = issue_key
+
+    elif source == "confluence":
+        # Native Confluence trace refs (§C4). The jira_key regex still scans the
+        # instruction so a page comment naming ENG-142 joins the Jira dimension.
+        site = _clean(ctx.get("workspace"))
+        space = _clean(ctx.get("space_key"))
+        page_id = _clean(ctx.get("page_id"))
+        if site:
+            refs["confluence_site"] = site
+        if space:
+            refs["confluence_space"] = space
+        if page_id:
+            refs["confluence_page"] = page_id
+        jira_key = _extract_jira_key(instruction, _clean(ctx.get("page_title")) or "")
+        if jira_key:
+            refs["jira_key"] = jira_key
+
     elif source == "slack":
         workspace = _clean(ctx.get("workspace"))
         channel = _clean(ctx.get("channel_id"))
@@ -222,6 +252,11 @@ def derive_participants(
             add(match.group(1), "commenter")
     elif source == "asana":
         add(ctx.get("task_assignee_gid"), "assignee")
+    elif source in ("jira", "confluence"):
+        # Jira: reporter/assignee account ids. Confluence: the page author.
+        add(ctx.get("reporter_account_id"), "assignee")
+        add(ctx.get("assignee_account_id"), "assignee")
+        add(ctx.get("author_account_id"), "assignee")
 
     # Preserve insertion order (requester first) while emitting the resolved kind.
     return [{"id": pid, "kind": kind, "source": source} for pid, kind in best.items()]

@@ -87,6 +87,9 @@ def _actor_from(item: dict) -> dict:
         parts = requester.split(":", 2)
         if len(parts) == 3:
             return {"source": "slack", "handle": parts[2], "workspace": parts[1]}
+    if requester.startswith("atlassian:"):
+        # Both Jira and Confluence map to the one atlassian identity source.
+        return {"source": "atlassian", "handle": requester[len("atlassian:"):], "workspace": ""}
     for src in ("github", "asana"):
         if requester.startswith(f"{src}:"):
             return {"source": src, "handle": requester[len(src) + 1 :], "workspace": ""}
@@ -179,21 +182,73 @@ def _handle_record(record: dict) -> None:
     # 2. The ops fan-out to subscribed channels.
     tier, event, template = mapping
     ctx = new.get("source_context") or {}
+    text = template.format(
+        agent=new.get("agent_id", "?"),
+        id=new.get("assignment_id", "?"),
+        summary=str(new.get("result_summary") or "")[:200],
+    )
     notify.notify(
         tier=tier,
         event=event,
-        text=template.format(
-            agent=new.get("agent_id", "?"),
-            id=new.get("assignment_id", "?"),
-            summary=str(new.get("result_summary") or "")[:200],
-        ),
+        text=text,
         repo=str(ctx.get("repo", "") or ""),
+        # Jira/Confluence dispatches carry the container so container-scoped subs
+        # match (atlassian-connector §A9.1).
+        project=str(ctx.get("project_key", "") or "") if new.get("source") == "jira" else "",
+        space=str(ctx.get("space_key", "") or "") if new.get("source") == "confluence" else "",
         # Same conversation-keyed threading as the router's run_started post —
         # this completion/pause line must land in that thread, and follow-up
         # assignments in the same Slack thread must continue it.
         unit=notify.unit_for(str(new.get("assignment_id", "") or ""), ctx),
         actor=_actor_from(new),
     )
+    # 3. Per-user DM to the requester if they opted in (§A9.2). One new call
+    # site; the same seam serves every source. Only fires for a requester whose
+    # identity is resolvable to a verified Slack handle — silent degrade
+    # otherwise. Best-effort: never block the fan-out above.
+    _dm_requester(new, tier, event, text)
+
+
+def _dm_requester(new: dict, tier: str, event: str, text: str) -> None:
+    """DM the run's requester on a terminal event if they've opted in. The DM
+    team is the requester's Slack workspace (from a slack dispatch) — for a
+    non-Slack dispatch we can only DM if the person has a verified handle in a
+    workspace notify can resolve, which notify_user checks."""
+    try:
+        import identity as identity_map
+
+        actor = _actor_from(new)
+        # Resolve the requester to an identity to DM across sources.
+        person = identity_map.find_by_handle(
+            actor.get("source", ""), actor.get("handle", ""), actor.get("workspace", "")
+        )
+        if not person or not person.identity_id:
+            return
+        # Prefer the dispatch's own Slack workspace; else any team the person has.
+        ctx = new.get("source_context") or {}
+        team_id = str(ctx.get("workspace", "") or "") if new.get("source") == "slack" else ""
+        if not team_id:
+            # Non-Slack dispatch — use the first Slack team the identity carries.
+            team_id = _first_slack_team(person.identity_id)
+        if not team_id:
+            return
+        notify.notify_user(
+            person.identity_id, tier=tier, event=event, text=text,
+            team_id=team_id, unit=notify.unit_for(str(new.get("assignment_id", "") or ""), ctx),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("requester DM failed for %s", new.get("assignment_id"))
+
+
+def _first_slack_team(identity_id: str) -> str:
+    import identity as identity_map
+
+    for rec in identity_map._snapshot():
+        if rec.get("identity_id") == identity_id:
+            slack = (rec.get("handles") or {}).get("slack") or {}
+            for team in slack:
+                return team
+    return ""
 
 
 def handler(event, context=None):

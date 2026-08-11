@@ -5,7 +5,7 @@ description: Use when the user wants to install, configure, or onboard the SDLC 
 
 # Install SDLC Agent Fleet in a new project
 
-The SDLC Agent Fleet is a set of autonomous agents that cover the software development lifecycle — project management, documentation, business analysis, and ADR linking. Each agent runs on Amazon Bedrock AgentCore. Shipping agents integrate with **Asana** (PM) and **GitHub** (SCM), and **Slack** ships as a trigger source (`@mention` + slash commands, onboarded in the dashboard Connectors → Slack panel). Additional tools (Jira, GitLab, Salesforce, Datadog) are planned but not yet supported end-to-end.
+The SDLC Agent Fleet is a set of autonomous agents that cover the software development lifecycle — project management, documentation, business analysis, and ADR linking. Each agent runs on Amazon Bedrock AgentCore. Shipping agents integrate with **Asana** or **Jira** (PM), **Confluence** (team docs), and **GitHub** (SCM); **Slack** ships as a trigger source (`@mention` + slash commands, onboarded in the dashboard Connectors → Slack panel), and Jira issues + Confluence page comments are trigger sources too (Connectors → Atlassian). Additional tools (GitLab, Salesforce, Datadog) are planned but not yet supported end-to-end.
 
 **Not every customer uses every agent.** Your job is to have a conversation that:
 
@@ -33,11 +33,12 @@ Never assume the cwd is the target. The `/sdlc-agents` slash command resolves a 
 
 Ask, don't scan. Start with the minimum viable set of questions:
 
-1. What do you use for project management? (Asana / Jira / Linear / Trello / Aha! / other / none) — only Asana is supported today
+1. What do you use for project management? (Asana / Jira / Linear / Trello / Aha! / other / none) — Asana and Jira are supported today
 2. What do you use for source control? (GitHub / GitLab / Bitbucket / other) — only GitHub is supported today
-3. What AWS account and region do you want the fleet to live in?
+3. Do you keep team documentation in Confluence? (Confluence connects alongside Jira — one Atlassian site connect covers both)
+4. What AWS account and region do you want the fleet to live in?
 
-Record answers. If the user names a tool that doesn't have a shipping connect skill (e.g. Jira, GitLab), tell them so immediately — don't let the conversation go ten questions deep before surfacing that their PM or SCM isn't supported yet.
+Record answers. If the user names a tool that doesn't have a shipping connect skill (e.g. Linear, GitLab), tell them so immediately — don't let the conversation go ten questions deep before surfacing that their PM or SCM isn't supported yet.
 
 ### Step 2 — Propose an agent selection
 
@@ -66,13 +67,14 @@ access) if they aren't already set up.
 For each tool the customer uses, invoke the matching connect skill:
 
 - Asana → **sdlc-agents-connect-asana** (OAuth app setup, MCP vs API app, PAT for webhook Lambda)
+- Jira / Confluence → **sdlc-agents-connect-atlassian** (service account + scoped API token pasted in the dashboard, the atlassian-events Forge forwarder install, project/space onboarding — one site connect covers both products)
 - GitHub → **sdlc-agents-connect-github** (register + install the fleet's GitHub App — the only credential model; the App webhook is the mention trigger and per-owner installation tokens back tool calls)
 
 Slack is onboarded differently — not via a connect skill but via the dashboard **Connectors → Slack** panel plus `scripts/bootstrap_slack.py` (app signing secret + per-workspace bot token, Slack app manifest registration). The receiver is always deployed (no flag); a workspace goes live when an admin onboards it. Users then request channel access with `/sdlc-onboard-channel` (an admin approves it) and self-serve notifications with `/sdlc-notify`.
 
 **Users onboard on first touch, from any source.** The first time someone @mentions the fleet (GitHub/Asana/Slack) they get a *pending* identity and a reply asking them to get onboarded; an admin approves them in **Connectors → Access** and assigns permission groups (the recommended way to grant access — a group's access applies across all the user's sources). Email is the identity's cross-source join key.
 
-Other tools (Jira, GitLab, Salesforce, Datadog) don't have connect skills yet — the shipping agents all work against Asana + GitHub (+ Slack triggers). If the user picked one of those other tools during discovery, tell them honestly that the connect path isn't written yet and point them at the vendor's remote MCP docs; don't fabricate setup steps.
+Other tools (GitLab, Linear, Salesforce, Datadog) don't have connect skills yet — the shipping agents work against Asana/Jira + Confluence + GitHub (+ Slack triggers). If the user picked one of those other tools during discovery, tell them honestly that the connect path isn't written yet and point them at the vendor's remote MCP docs; don't fabricate setup steps.
 
 Each connect skill knows the specific pitfalls of its tool (Asana's MCP-app-vs-API-app distinction is the classic one) and walks past them.
 

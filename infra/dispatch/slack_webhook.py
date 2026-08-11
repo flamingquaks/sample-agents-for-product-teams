@@ -541,6 +541,13 @@ def _handle_slash_command(form: dict, team_id: str) -> dict:
         return _ack()
 
     if command == NOTIFY_COMMAND:
+        # ``/sdlc-notify me`` → the PER-USER DM prefs modal (§A9.2); bare
+        # ``/sdlc-notify`` → the channel-subscription modal.
+        if text.strip().lower() == "me":
+            view = slack_notify.build_pref_modal(team_id=team_id, user_id=user_id)
+            if not slack_notify.open_modal(team_id=team_id, trigger_id=trigger_id, view=view):
+                return _ephemeral("Couldn't open your DM settings — please try again.")
+            return _ack()
         # Open the interactive notification-config modal. The slash-command
         # payload carries a trigger_id (valid ~3s); views.open must use it
         # promptly, so we open here and return an empty 200 (Slack shows the
@@ -710,6 +717,13 @@ def _handle_interaction(form: dict) -> dict:
         config = slack_notify.parse_view_submission(view)
         slack_notify.save_subscription(config)
         return _ack()  # empty 200 closes the modal
+    if callback == slack_notify.NOTIFY_PREF_VIEW_CALLBACK:
+        config = slack_notify.parse_pref_submission(view)
+        if not slack_notify.save_pref(config):
+            return _view_errors({"tier_actionable":
+                                 "You must be onboarded with a verified Slack "
+                                 "identity to receive DMs — ask an admin."})
+        return _ack()
     return _ack()
 
 

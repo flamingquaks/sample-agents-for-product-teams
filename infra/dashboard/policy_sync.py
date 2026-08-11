@@ -206,6 +206,39 @@ def sync_fleet_policy() -> None:
             pending.append(_upsert_policy(
                 client, engine_id, name, statement, known_ids=known_ids, poll=False,
             ))
+        # Atlassian container write-allowlist forbids (§B2.3/§C2.3), rendered
+        # from the onboarded project/space rows. AgentCore validates every Cedar
+        # action against the live tool list and REJECTS a policy naming a tool an
+        # undeployed target doesn't expose — so a container forbid is synced only
+        # when its target is actually on the gateway (mirrors the agent-permit
+        # target filtering). Otherwise the forbid would fail the WHOLE sync.
+        targets = _available_target_names(client, gateway_arn)
+        try:
+            allowed_projects = [p["project_key"] for p in config_store.allowed_jira_projects()]
+            allowed_spaces = [s["space_key"] for s in config_store.allowed_confluence_spaces()]
+        except Exception:  # noqa: BLE001 — degraded config read; render empty (fail closed)
+            logger.exception("could not read Atlassian containers; rendering empty allowlists")
+            allowed_projects, allowed_spaces = [], []
+        container_policies = fleet_policy.render_container_policies(
+            allowed_projects, allowed_spaces, gateway_arn,
+        )
+        _CONTAINER_POLICY_TARGET = {
+            "sdlc_allowed_projects": fleet_policy.JIRA_TARGET,
+            "sdlc_allowed_spaces": fleet_policy.CONFLUENCE_TARGET,
+        }
+        for name, statement in container_policies.items():
+            required_target = _CONTAINER_POLICY_TARGET[name]
+            if targets is not None and required_target not in targets:
+                # Target not deployed — retract any stale forbid and skip (a
+                # forbid naming its tools would be rejected by Cedar validation).
+                stale = known_ids.pop(name, None)
+                if stale:
+                    client.delete_policy(policyEngineId=engine_id, policyId=stale)
+                    logger.info("Deleted %s (target %s not deployed)", name, required_target)
+                continue
+            pending.append(_upsert_policy(
+                client, engine_id, name, statement, known_ids=known_ids, poll=False,
+            ))
         # Retire fleet policies older versions rendered (e.g. the destructive
         # forbid, now enforced by the target schema instead). A leftover —
         # possibly stuck CREATE_FAILED — otherwise lingers on the engine forever.

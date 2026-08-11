@@ -39,11 +39,13 @@ import config_query
 
 _IDENTITY_PK_PREFIX = "identity#"
 
-# Mirror config_store identity constants (schema contract).
+# Mirror config_store identity constants (schema contract). `atlassian` is one
+# handle key for BOTH Jira and Confluence — account ids are global across
+# Atlassian products (atlassian-connector spec §A6.3).
 IDENTITY_PENDING = "pending"
 IDENTITY_ACTIVE = "active"
 IDENTITY_DISABLED = "disabled"
-IDENTITY_SOURCES = ("github", "asana", "slack", "sdlc")
+IDENTITY_SOURCES = ("github", "asana", "slack", "sdlc", "atlassian")
 
 # Short TTL so an admin onboarding/grouping a user takes effect within a minute
 # across warm containers, without a DynamoDB read on every dispatch.

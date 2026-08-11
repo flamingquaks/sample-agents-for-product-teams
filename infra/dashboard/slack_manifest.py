@@ -63,6 +63,9 @@ def build_manifest(webhook_base: str, app_name: str = "SDLC Agent Fleet") -> dic
                     "chat:write.customize",
                     "commands",
                     "groups:read",
+                    # im:write opens a DM channel (conversations.open) for the
+                    # per-user DM notifications (atlassian-connector spec §A9.2).
+                    "im:write",
                     "users:read",
                     "users:read.email",
                 ]

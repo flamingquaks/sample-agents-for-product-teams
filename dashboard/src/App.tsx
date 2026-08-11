@@ -20,6 +20,7 @@ import { GroupsPage } from "./pages/GroupsPage";
 import { SlackConnectorPage } from "./connectors/SlackConnectorPage";
 import { GitHubConnectorPage } from "./connectors/GitHubConnectorPage";
 import { AsanaConnectorPage } from "./connectors/AsanaConnectorPage";
+import { AtlassianConnectorPage } from "./connectors/AtlassianConnectorPage";
 import { ApiError } from "./api";
 
 type View =
@@ -34,7 +35,8 @@ type View =
   | { name: "groups" }
   | { name: "slack" }
   | { name: "github" }
-  | { name: "asana" };
+  | { name: "asana" }
+  | { name: "atlassian" };
 
 /** Parse the current URL hash into a view. Unknown/empty hashes -> fleet. */
 function hashToView(hash: string): View {
@@ -48,6 +50,7 @@ function hashToView(hash: string): View {
   if (parts[0] === "connectors" && parts[1] === "slack") return { name: "slack" };
   if (parts[0] === "connectors" && parts[1] === "github") return { name: "github" };
   if (parts[0] === "connectors" && parts[1] === "asana") return { name: "asana" };
+  if (parts[0] === "connectors" && parts[1] === "atlassian") return { name: "atlassian" };
   if (parts[0] === "run" && parts[1]) return { name: "run", assignmentId: parts[1] };
   if (parts[0] === "trace" && parts[1] && parts[2]) {
     return { name: "trace", dimension: parts[1], value: parts[2] };
@@ -57,6 +60,7 @@ function hashToView(hash: string): View {
     if (parts[1] === "connectors" && parts[2] === "slack") return { name: "slack" };
     if (parts[1] === "connectors" && parts[2] === "github") return { name: "github" };
     if (parts[1] === "connectors" && parts[2] === "asana") return { name: "asana" };
+    if (parts[1] === "connectors" && parts[2] === "atlassian") return { name: "atlassian" };
     if (parts[1] === "connectors" && parts[2] === "access") return { name: "users" };
     if (parts[1] === "connectors") return { name: "slack" };
     // Redirect #/admin to #/repos (primary admin action)
@@ -78,6 +82,7 @@ function viewToHash(view: View): string {
     case "slack": return "#/connectors/slack";
     case "github": return "#/connectors/github";
     case "asana": return "#/connectors/asana";
+    case "atlassian": return "#/connectors/atlassian";
     case "run": return `#/run/${encodeURIComponent(view.assignmentId)}`;
     case "trace": return `#/trace/${encodeURIComponent(view.dimension)}/${encodeURIComponent(view.value)}`;
   }
@@ -96,6 +101,7 @@ function viewToNavId(view: View): string {
     case "slack": return "slack";
     case "github": return "github";
     case "asana": return "asana";
+    case "atlassian": return "atlassian";
     // Detail views: highlight Fleet
     case "run": return "fleet";
     case "trace": return "fleet";
@@ -173,6 +179,12 @@ const IconAsana = () => (
     <circle cx="18" cy="16" r="4" />
   </svg>
 );
+const IconAtlassian = () => (
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M7.5 11.5 2 21h7l3-6-4.5-3.5z" />
+    <path d="M12 3 8.5 9.5 15 21h7L12 3z" />
+  </svg>
+);
 const IconUsers = () => (
   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
     <path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2" />
@@ -205,6 +217,7 @@ function buildAdminNav(): NavItem[] {
     { id: "slack", label: "Slack", hash: "#/connectors/slack", icon: <IconSlack />, section: "CONNECTORS", adminOnly: true },
     { id: "github", label: "GitHub", hash: "#/connectors/github", icon: <IconGitHub />, adminOnly: true },
     { id: "asana", label: "Asana", hash: "#/connectors/asana", icon: <IconAsana />, adminOnly: true },
+    { id: "atlassian", label: "Atlassian", hash: "#/connectors/atlassian", icon: <IconAtlassian />, adminOnly: true },
     { id: "users", label: "Users", hash: "#/access/users", icon: <IconUsers />, section: "ACCESS", adminOnly: true },
     { id: "groups", label: "Groups", hash: "#/access/groups", icon: <IconGroups />, adminOnly: true },
     { id: "settings", label: "Settings", hash: "#/settings", icon: <IconSettings />, adminOnly: true },
@@ -307,7 +320,7 @@ export function App({ config }: { config: AppConfig }) {
   const activeNavId = viewToNavId(view);
 
   // Check if current view requires admin and user is not admin
-  const adminViews = ["agents", "repos", "skills", "settings", "users", "groups", "slack", "github", "asana"];
+  const adminViews = ["agents", "repos", "skills", "settings", "users", "groups", "slack", "github", "asana", "atlassian"];
   const requiresAdmin = adminViews.includes(view.name);
 
   return (
@@ -415,6 +428,19 @@ export function App({ config }: { config: AppConfig }) {
                 </div>
               </div>
               <AsanaConnectorPage api={api} onAuthError={onAuthError} />
+            </div>
+          )}
+          {view.name === "atlassian" && (
+            <div className="page">
+              <div className="page-header">
+                <div>
+                  <h1>Atlassian</h1>
+                  <p className="page-desc">
+                    Jira + Confluence: sites, projects/spaces, access rules, automations, and activity.
+                  </p>
+                </div>
+              </div>
+              <AtlassianConnectorPage api={api} onAuthError={onAuthError} />
             </div>
           )}
         </>

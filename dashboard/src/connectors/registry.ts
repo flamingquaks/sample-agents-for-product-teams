@@ -7,6 +7,7 @@ import type { ComponentType } from "react";
 import type { DashboardApi } from "../api";
 import { SlackConnectorPage } from "./SlackConnectorPage";
 import { AsanaConnectorPage } from "./AsanaConnectorPage";
+import { AtlassianConnectorPage } from "./AtlassianConnectorPage";
 import { GitHubConnectorPage } from "./GitHubConnectorPage";
 import { AccessConnectorPage } from "./AccessConnectorPage";
 
@@ -23,7 +24,7 @@ export interface ConnectorStatus {
 }
 
 export interface ConnectorDescriptor {
-  id: "slack" | "asana" | "github" | "access";
+  id: "slack" | "asana" | "github" | "atlassian" | "access";
   label: string;
   blurb: string;
   requiredRole: "admin";
@@ -71,6 +72,28 @@ export const CONNECTORS: ConnectorDescriptor[] = [
         : { health: "warn", label: "app not registered" };
     },
     Page: GitHubConnectorPage,
+  },
+  {
+    id: "atlassian",
+    label: "Atlassian",
+    icon: "🔷",
+    requiredRole: "admin",
+    blurb:
+      "Jira + Confluence on one foundation: connect a site once, onboard projects/spaces, mention @sdlc-agents on issues and page comments, and automate on transitions/labels.",
+    useStatus: async (api) => {
+      const { sites } = await api.listAtlassianSites();
+      const active = sites.filter((s) => s.enabled && s.status === "active");
+      if (!sites.length) return { health: "unknown", label: "no sites connected" };
+      if (!active.length) return { health: "warn", label: "sites disabled" };
+      // Token-expiry warning takes precedence over the count badge.
+      const now = Date.now() / 1000;
+      const expiring = active.filter(
+        (s) => s.token_expires_at && s.token_expires_at - now < 14 * 86400,
+      );
+      if (expiring.length) return { health: "warn", label: "API token expiring soon" };
+      return { health: "ok", label: `${active.length} active site${active.length === 1 ? "" : "s"}` };
+    },
+    Page: AtlassianConnectorPage,
   },
   {
     id: "access",

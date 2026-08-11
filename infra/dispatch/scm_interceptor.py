@@ -82,6 +82,24 @@ def _tool_and_args(body: dict) -> tuple[str, dict]:
     return tool, (args if isinstance(args, dict) else {})
 
 
+def _target_of(body: dict) -> str:
+    """The gateway target prefix of a tools/call (``GitHubTarget``,
+    ``JiraTarget``, ``ConfluenceTarget``, …), or "" for non-tool-call / unprefixed
+    requests. Lets the interceptor branch per target family."""
+    if body.get("method") != "tools/call":
+        return ""
+    name = (body.get("params") or {}).get("name", "")
+    return name.split(_TOOL_DELIM, 1)[0] if _TOOL_DELIM in name else ""
+
+
+# The Atlassian gateway targets — their tool calls carry site + container args
+# (not owner/repo), so they take a distinct injection path: the broker enforces
+# the container allowlist + write-mode itself, and the interceptor's job is to
+# inject the server-truth acting agent + dispatch origin (for write_agents and
+# the attribution signature) — never trusting model-set values.
+_ATLASSIAN_TARGETS = ("JiraTarget", "ConfluenceTarget")
+
+
 def _untouched(event: dict) -> dict:
     """Forward the request unmodified — echo the original headers + body.
     transformedGatewayRequest accepts EXACTLY {headers, body}: echoing extra
@@ -181,6 +199,24 @@ def handler(event, context=None):
 
     body = _body(event)
     tool, args = _tool_and_args(body)
+    target = _target_of(body)
+
+    # Atlassian tool calls (Jira/Confluence) don't carry owner/repo — the broker
+    # enforces the container allowlist + write-mode itself. The interceptor's role
+    # here is to inject the SERVER-TRUTH acting agent + dispatch origin (the
+    # broker reads these for write_agents narrowing and the attribution signature,
+    # never the model-visible args). Origin is optional for Atlassian (it feeds
+    # the signature + the container↔repo co-scope edge, not a hard co-repo gate).
+    if target in _ATLASSIAN_TARGETS and tool:
+        headers = _headers(event)
+        origin = str(headers.get(ORIGIN_HEADER, "")).strip()
+        agent = str(headers.get(AGENT_HEADER, "")).strip()
+        if agent:
+            args[AGENT_ARG] = agent
+        if origin:
+            args[ORIGIN_ARG] = origin
+        body.setdefault("params", {})["arguments"] = args
+        return _passthrough(event, body)
 
     # Non-tool-call requests (initialize, tools/list, ping, …) and non-SCM tools
     # carry no repo to gate — pass them straight through untouched.

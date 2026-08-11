@@ -85,6 +85,137 @@ def verify_slack_signature(
     return hmac.compare_digest(provided_signature, expected)
 
 
+class ForgeTokenError(Exception):
+    """A Forge Invocation Token failed verification (bad signature / expiry /
+    audience / app id, or the JWKS was unreachable). The receiver maps a
+    verification failure to 401 and a JWKS-unreachable to 503 (fail closed)."""
+
+    def __init__(self, message: str, *, unavailable: bool = False):
+        super().__init__(message)
+        self.unavailable = unavailable
+
+
+# Atlassian's published JWKS — RS256 keys used to sign every Forge Invocation
+# Token. Fetched + cached with a TTL; kid-rotation is tolerated (a kid miss
+# forces one refetch). Overridable via FORGE_JWKS_URL for tests/staging.
+_FORGE_JWKS_DEFAULT_URL = "https://forge.cdn.prod.atlassian-dev.net/.well-known/jwks.json"
+_jwks_cache: dict | None = None
+_jwks_expires_at = 0.0
+_JWKS_TTL_SECONDS = 3600
+
+
+def _jwks_url() -> str:
+    import os
+
+    return os.environ.get("FORGE_JWKS_URL") or _FORGE_JWKS_DEFAULT_URL
+
+
+def _load_jwks(*, force: bool = False) -> dict:
+    """Fetch + cache Atlassian's JWKS. Raises ForgeTokenError(unavailable=True)
+    when the endpoint can't be reached (the receiver returns 503 → Forge retries,
+    never accepting an unverifiable delivery)."""
+    global _jwks_cache, _jwks_expires_at
+    now = time.time()
+    if not force and _jwks_cache is not None and now < _jwks_expires_at:
+        return _jwks_cache
+    import requests
+
+    try:
+        resp = requests.get(_jwks_url(), timeout=5)
+        resp.raise_for_status()
+        _jwks_cache = resp.json()
+        _jwks_expires_at = now + _JWKS_TTL_SECONDS
+    except Exception as exc:  # noqa: BLE001
+        raise ForgeTokenError(f"could not fetch Forge JWKS: {exc}", unavailable=True) from exc
+    return _jwks_cache
+
+
+def _jwk_for_kid(kid: str, *, allow_refetch: bool = True) -> dict | None:
+    jwks = _load_jwks()
+    for key in jwks.get("keys", []):
+        if key.get("kid") == kid:
+            return key
+    if allow_refetch:
+        # kid rotation — force one refetch before giving up.
+        jwks = _load_jwks(force=True)
+        for key in jwks.get("keys", []):
+            if key.get("kid") == kid:
+                return key
+    return None
+
+
+def verify_forge_invocation_token(
+    token: str,
+    *,
+    expected_app_id: str,
+    expected_audience: str | None = None,
+    now: float | None = None,
+) -> dict:
+    """Verify a Forge Invocation Token (FIT) and return its claims (§A5).
+
+    A FIT is an asymmetrically-signed (RS256) JWT. We verify the signature
+    against Atlassian's published JWKS, the expiry, the audience (when supplied),
+    and the pinned Forge ``app`` id. There is NO shared secret — nothing to
+    capture, store, or rotate; the app id is pinned at first verified delivery.
+
+    Raises ForgeTokenError on any failure: a signature/claim mismatch is a hard
+    reject (→ 401); a JWKS-unreachable is ``unavailable=True`` (→ 503, fail
+    closed, Forge retries). Returns the decoded claims on success — the caller
+    reads the installation ``cloudId`` from them and cross-checks the site row.
+    """
+    if not token:
+        raise ForgeTokenError("missing Forge invocation token")
+    try:
+        import jwt as _jwt  # PyJWT
+        from jwt import PyJWKClient  # noqa: F401  (import guard)
+    except Exception as exc:  # noqa: BLE001
+        raise ForgeTokenError(f"JWT library unavailable: {exc}", unavailable=True) from exc
+    try:
+        header = _jwt.get_unverified_header(token)
+    except Exception as exc:  # noqa: BLE001
+        raise ForgeTokenError(f"malformed token header: {exc}") from exc
+    kid = header.get("kid")
+    if not kid:
+        raise ForgeTokenError("token header missing kid")
+    jwk = _jwk_for_kid(kid)
+    if jwk is None:
+        raise ForgeTokenError(f"no JWKS key for kid {kid!r}")
+    try:
+        from jwt.algorithms import RSAAlgorithm
+
+        public_key = RSAAlgorithm.from_jwk(json.dumps(jwk))
+        options = {"require": ["exp"], "verify_aud": expected_audience is not None}
+        claims = _jwt.decode(
+            token,
+            key=public_key,
+            algorithms=["RS256"],
+            audience=expected_audience if expected_audience else None,
+            options=options,
+        )
+    except Exception as exc:  # noqa: BLE001 — expired/bad-sig/bad-aud all reject
+        raise ForgeTokenError(f"token verification failed: {exc}") from exc
+    # Pin the Forge app id — the token's ``app`` (or ``app.id``) claim must match
+    # the site row's recorded forge_app_id, so a token from a DIFFERENT Forge app
+    # (even correctly signed by Atlassian) is rejected. When the site has no
+    # pinned id yet (expected_app_id == ""), the caller pins it from these claims
+    # on this first verified delivery.
+    app_id = forge_app_id_from_claims(claims)
+    if expected_app_id and app_id != expected_app_id:
+        raise ForgeTokenError(
+            f"token app id {app_id!r} does not match pinned {expected_app_id!r}"
+        )
+    return claims
+
+
+def forge_app_id_from_claims(claims: dict) -> str:
+    """The Forge app id (ari) a FIT's claims carry — the ``app`` claim, which is
+    either a bare string or an object with an ``id``. "" when absent. Shared by
+    the verify path (pin match) and the receivers (first-delivery pin)."""
+    app_claim = (claims or {}).get("app")
+    app_id = app_claim.get("id") if isinstance(app_claim, dict) else app_claim
+    return str(app_id or "")
+
+
 def resolve_mention(body: str, registry: dict) -> tuple[str, str] | None:
     """Resolve the FIRST @mention in ``body`` that maps to a known agent.
 

@@ -7,15 +7,20 @@
 // the UI can trigger re-authentication (the token likely expired).
 
 import type {
+  AtlassianSite,
+  AutomationRule,
   CapabilityConfig,
   ChannelPolicy,
   ChannelRequest,
+  ConfluenceSpace,
   FleetSettings,
   FleetStats,
   GitHubAppStatus,
   GitHubAvailableRepos,
   GitHubManifest,
   Identity,
+  JiraProject,
+  NotifPref,
   NotifSub,
   PermGroup,
   RepoConfig,
@@ -368,8 +373,15 @@ export class DashboardApi {
   simulateAccess(body: {
     principal: string;
     agent_id: string;
+    /** Dispatch source — drives the WHERE axis. Omit for a Slack-style test. */
+    source?: "slack" | "jira" | "confluence";
     workspace?: string;
+    /** Slack channel id (Slack). */
     channel_id?: string;
+    /** Jira project key (source=jira). */
+    project_key?: string;
+    /** Confluence space key (source=confluence). */
+    space_key?: string;
     principal_groups?: string[];
   }): Promise<{ decision: "ALLOW" | "DENY"; reason: string }> {
     return this.request("POST", "/admin/trigger-rules/simulate", { body });
@@ -479,5 +491,167 @@ export class DashboardApi {
       "DELETE",
       `/admin/notif-subs/${encodeURIComponent(teamId)}/${encodeURIComponent(channelId)}`,
     );
+  }
+
+  // --- Atlassian connector (atlassian-connector spec §A11) -------------------
+
+  listAtlassianSites(): Promise<{ sites: AtlassianSite[] }> {
+    return this.get<{ sites: AtlassianSite[] }>("/admin/atlassian/sites");
+  }
+
+  /** Forge forwarder deploy state + private install link (published to SSM by
+   *  the fleet deploy) — drives the Sites tab's app-install card. */
+  atlassianForgeStatus(): Promise<{ deployed: boolean; app_id: string; install_link: string }> {
+    return this.get("/admin/atlassian/forge-status");
+  }
+
+  /** One-step connect: verify the service-account token, resolve cloud id + bot
+   *  account, store the SecureString, write the row (the Slack pattern). */
+  connectAtlassianSite(body: {
+    site_url: string;
+    bot_email: string;
+    api_token: string;
+    site_id?: string;
+    site_name?: string;
+    products?: { jira?: boolean; confluence?: boolean };
+    token_expires_at?: number;
+  }): Promise<AtlassianSite> {
+    return this.request<AtlassianSite>("POST", "/admin/atlassian/sites/connect", { body });
+  }
+
+  setAtlassianProducts(
+    siteId: string,
+    products: { jira?: boolean; confluence?: boolean },
+  ): Promise<AtlassianSite> {
+    return this.request<AtlassianSite>(
+      "PUT",
+      `/admin/atlassian/sites/${encodeURIComponent(siteId)}/products`,
+      { body: { products } },
+    );
+  }
+
+  deleteAtlassianSite(siteId: string): Promise<{ site_id: string; deleted: boolean }> {
+    return this.request("DELETE", `/admin/atlassian/sites/${encodeURIComponent(siteId)}`);
+  }
+
+  /** Per-product delivery liveness (receiver-stamped webhook_last_seen). */
+  verifyAtlassianWebhook(
+    siteId: string,
+    product?: "jira" | "confluence",
+  ): Promise<{ site_id: string; product?: string; last_seen: unknown }> {
+    return this.request(
+      "POST",
+      `/admin/atlassian/sites/${encodeURIComponent(siteId)}/verify-webhook`,
+      { query: { product }, body: {} },
+    );
+  }
+
+  listJiraProjects(siteId?: string): Promise<{ projects: JiraProject[] }> {
+    return this.get<{ projects: JiraProject[] }>("/admin/atlassian/projects", {
+      site_id: siteId,
+    });
+  }
+
+  putJiraProject(body: {
+    site_id: string;
+    project_key: string;
+    mode?: "allow" | "deny";
+    project_name?: string;
+    repos?: string[];
+    note?: string;
+  }): Promise<JiraProject> {
+    return this.request<JiraProject>("POST", "/admin/atlassian/projects", { body });
+  }
+
+  deleteJiraProject(siteId: string, key: string): Promise<{ deleted: boolean }> {
+    return this.request(
+      "DELETE",
+      `/admin/atlassian/projects/${encodeURIComponent(siteId)}/${encodeURIComponent(key)}`,
+    );
+  }
+
+  listConfluenceSpaces(siteId?: string): Promise<{ spaces: ConfluenceSpace[] }> {
+    return this.get<{ spaces: ConfluenceSpace[] }>("/admin/atlassian/spaces", {
+      site_id: siteId,
+    });
+  }
+
+  putConfluenceSpace(body: {
+    site_id: string;
+    space_key: string;
+    mode?: "allow" | "deny";
+    space_name?: string;
+    write_mode?: "direct" | "propose";
+    write_agents?: string[];
+    repos?: string[];
+    note?: string;
+  }): Promise<ConfluenceSpace> {
+    return this.request<ConfluenceSpace>("POST", "/admin/atlassian/spaces", { body });
+  }
+
+  deleteConfluenceSpace(siteId: string, key: string): Promise<{ deleted: boolean }> {
+    return this.request(
+      "DELETE",
+      `/admin/atlassian/spaces/${encodeURIComponent(siteId)}/${encodeURIComponent(key)}`,
+    );
+  }
+
+  // --- automation rules (§A8) ------------------------------------------------
+
+  listAutomationRules(connector?: string): Promise<{ rules: AutomationRule[] }> {
+    return this.get<{ rules: AutomationRule[] }>("/admin/automation-rules", { connector });
+  }
+
+  createAutomationRule(body: {
+    connector: "jira" | "confluence";
+    event: string;
+    match?: Record<string, unknown>;
+    agent_id: string;
+    instruction_template: string;
+    enabled?: boolean;
+    cooldown_seconds?: number;
+  }): Promise<AutomationRule> {
+    return this.request<AutomationRule>("POST", "/admin/automation-rules", { body });
+  }
+
+  updateAutomationRule(ruleId: string, body: Partial<AutomationRule> & {
+    agent_id?: string;
+    instruction_template?: string;
+  }): Promise<AutomationRule> {
+    return this.request<AutomationRule>(
+      "PUT",
+      `/admin/automation-rules/${encodeURIComponent(ruleId)}`,
+      { body },
+    );
+  }
+
+  deleteAutomationRule(ruleId: string): Promise<{ rule_id: string; deleted: boolean }> {
+    return this.request("DELETE", `/admin/automation-rules/${encodeURIComponent(ruleId)}`);
+  }
+
+  setAutomationRuleEnabled(ruleId: string, enabled: boolean): Promise<AutomationRule> {
+    return this.request<AutomationRule>(
+      "POST",
+      `/admin/automation-rules/${encodeURIComponent(ruleId)}/${enabled ? "enable" : "disable"}`,
+      { body: {} },
+    );
+  }
+
+  // --- per-user DM notification prefs (§A9.2) ---------------------------------
+
+  getNotifPref(identityId: string): Promise<NotifPref> {
+    return this.get<NotifPref>(`/admin/notif-prefs/${encodeURIComponent(identityId)}`);
+  }
+
+  putNotifPref(identityId: string, body: Partial<NotifPref>): Promise<NotifPref> {
+    return this.request<NotifPref>(
+      "PUT",
+      `/admin/notif-prefs/${encodeURIComponent(identityId)}`,
+      { body },
+    );
+  }
+
+  deleteNotifPref(identityId: string): Promise<{ deleted: boolean }> {
+    return this.request("DELETE", `/admin/notif-prefs/${encodeURIComponent(identityId)}`);
   }
 }

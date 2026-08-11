@@ -176,16 +176,35 @@ def is_authorized(
 
     ctx = context or {}
     workspace = str(ctx.get("workspace", "") or "")
-    channel = str(ctx.get("channel_id", "") or "")
+    # The WHERE-axis "channel" is the Slack channel id for Slack, but the
+    # project/space key for an Atlassian dispatch (whose source_context carries
+    # project_key/space_key, never channel_id). Resolve it per source so the
+    # container check below — and the Cedar `channel`/`channelAllowed` context —
+    # both see the real key (atlassian-connector spec §A7).
+    if source == "jira":
+        channel = str(ctx.get("project_key", "") or "")
+    elif source == "confluence":
+        channel = str(ctx.get("space_key", "") or "")
+    else:
+        channel = str(ctx.get("channel_id", "") or "")
     email = ctx.get("requester_email")
     groups = ctx.get("principal_groups") or []
 
     # Resolve the DATA: the agent's grant sets + whether this channel is allowed.
     # A read error here must not fail open — trigger_grants reads through a cache
     # and any exception propagates to the except below (deny).
+    #
+    # For an Atlassian dispatch the WHERE axis is the container, not a Slack
+    # channel: workspace = the site (cloud id), channel = the project/space key,
+    # and the posture math is container_allowed (atlassian-connector spec §A7).
     try:
         grants = trigger_grants.agent_grants(agent_id, workspace)
-        channel_allowed = trigger_grants.channel_allowed(workspace, channel)
+        if source in ("jira", "confluence"):
+            channel_allowed = trigger_grants.container_allowed(
+                workspace, channel, source
+            )
+        else:
+            channel_allowed = trigger_grants.channel_allowed(workspace, channel)
     except Exception:  # noqa: BLE001
         logger.exception(
             "trigger-grant lookup failed (agent=%s workspace=%s); denying", agent_id, workspace

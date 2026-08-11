@@ -46,6 +46,11 @@ CHANNEL_POLICY_DENYLIST = "denylist"
 CHANNEL_MODE_ALLOW = "allow"
 CHANNEL_MODE_DENY = "deny"
 
+# Atlassian container posture (mirror config_store.CONTAINER_* — same values as
+# the Slack constants; kept as distinct names so each connector's reader reads
+# in its own vocabulary).
+ATLASSIAN_SITE_ACTIVE = "active"
+
 RULE_PERMIT = "permit"
 RULE_FORBID = "forbid"
 RULE_SUBJECT_USER = "user"
@@ -101,7 +106,31 @@ def _load_snapshot() -> dict:
         cid = str(item.get("channel_id", ""))
         if tid and cid:
             channels[(tid, cid)] = item
-    return {"rules": rules, "workspaces": workspaces, "channels": channels}
+    # Atlassian: site rows + per-product container rows (atlassian-connector
+    # spec §A7) — the WHERE axis the receivers/authz evaluate per dispatch.
+    sites: dict[str, dict] = {}
+    for item in config_query.query_kind("atlassian_site"):
+        sid = str(item.get("site_id", ""))
+        if sid:
+            sites[sid] = item
+    containers: dict[tuple, dict] = {}
+    for item in config_query.query_kind("jira_project"):
+        sid = str(item.get("site_id", ""))
+        key = str(item.get("project_key", ""))
+        if sid and key:
+            containers[("jira", sid, key)] = item
+    for item in config_query.query_kind("confluence_space"):
+        sid = str(item.get("site_id", ""))
+        key = str(item.get("space_key", ""))
+        if sid and key:
+            containers[("confluence", sid, key)] = item
+    return {
+        "rules": rules,
+        "workspaces": workspaces,
+        "channels": channels,
+        "atlassian_sites": sites,
+        "atlassian_containers": containers,
+    }
 
 
 def _snapshot(now: float | None = None) -> dict:
@@ -262,3 +291,66 @@ def channel_allowed(workspace: str, channel_id: str) -> bool:
         return not (row is not None and row.get("mode") == CHANNEL_MODE_DENY)
     # allowlist (default, recommended): only explicit allow rows pass.
     return row is not None and row.get("mode") == CHANNEL_MODE_ALLOW
+
+
+# --- Atlassian sites + containers (atlassian-connector spec §A6/§A7) ----------
+
+
+def atlassian_site(site_id: str) -> dict | None:
+    """The site row for ``site_id``, or None (through the snapshot cache)."""
+    if not site_id:
+        return None
+    return _snapshot().get("atlassian_sites", {}).get(site_id)
+
+
+def atlassian_product_enabled(site_id: str, product: str) -> bool:
+    """Whether ``site_id`` is an onboarded, enabled, active Atlassian site with
+    ``product`` ("jira" | "confluence") toggled on. Fail-closed on unknown /
+    disabled site or product — the receivers drop such deliveries (§A5), and
+    the brokers refuse tool calls against them."""
+    site = atlassian_site(site_id)
+    if site is None:
+        return False
+    if not site.get("enabled") or site.get("status") != ATLASSIAN_SITE_ACTIVE:
+        return False
+    return bool((site.get("products") or {}).get(product))
+
+
+def atlassian_container_row(product: str, site_id: str, container_key: str) -> dict | None:
+    """The jira_project / confluence_space row for a container, or None."""
+    return _snapshot().get("atlassian_containers", {}).get(
+        (product, site_id, container_key)
+    )
+
+
+def container_allowed(site_id: str, container_key: str, product: str) -> bool:
+    """The WHERE axis for an Atlassian dispatch (§A7) — the generalized sibling
+    of ``channel_allowed``: posture math over the product's container rows plus
+    the site's per-product default policy.
+
+    Fail-closed: an unknown/disabled site or product ⇒ False. allowlist (the
+    default, and strongly recommended for Confluence — §C2.4) ⇒ allowed iff an
+    ``allow`` row exists; denylist ⇒ allowed unless a ``deny`` row exists."""
+    if product not in ("jira", "confluence"):
+        return False
+    if not atlassian_product_enabled(site_id, product):
+        return False
+    site = atlassian_site(site_id) or {}
+    policy_key = (
+        "default_project_policy" if product == "jira" else "default_space_policy"
+    )
+    policy = site.get(policy_key, CHANNEL_POLICY_ALLOWLIST)
+    row = atlassian_container_row(product, site_id, container_key)
+    if policy == CHANNEL_POLICY_DENYLIST:
+        return not (row is not None and row.get("mode") == CHANNEL_MODE_DENY)
+    return row is not None and row.get("mode") == CHANNEL_MODE_ALLOW
+
+
+def container_repos(product: str, site_id: str, container_key: str) -> list[str]:
+    """The linked-repo co-scope edge for a container (§B1.2/§C1.2) — the repos a
+    dispatch originating in this project/space may reach with GitHub tools.
+    Empty when the container has no row / no linked repos."""
+    row = atlassian_container_row(product, site_id, container_key)
+    if not row:
+        return []
+    return sorted({r for r in (row.get("repos") or []) if r})

@@ -35,6 +35,11 @@ def _load(monkeypatch, *, engine_id=ENGINE, allowed=None):
     import policy_sync
 
     monkeypatch.setattr(config_store, "allowed_repos", lambda: allowed or ["acme/web"])
+    # Atlassian container allowlists default empty (no site onboarded in these
+    # tests) — the container forbids render `unless { false }` and are skipped
+    # unless their target is deployed on the fake gateway.
+    monkeypatch.setattr(config_store, "allowed_jira_projects", lambda: [])
+    monkeypatch.setattr(config_store, "allowed_confluence_spaces", lambda: [])
     # Skip real polling latency.
     monkeypatch.setattr(policy_sync, "_POLL_SLEEP_SECONDS", 0)
     return policy_sync

@@ -1,0 +1,74 @@
+# atlassian-events — the shared Forge event forwarder for the SDLC Agent Fleet
+# (atlassian-connector spec §A5). ONE app serves BOTH products: Forge product
+# triggers subscribe to the Jira + Confluence event sets and each invocation
+# forwards the payload to the per-product fleet webhook endpoint, carrying a
+# Forge Invocation Token the receiver verifies against Atlassian's JWKS.
+#
+# Event transport ONLY: the app declares read-only event scopes and its sole
+# permitted external egress (the fleet endpoint), so admins see exactly what data
+# flows where before installing. All REST reads/writes use the fleet's
+# service-account token (§A6), never app auth. No webhook secret exists.
+#
+# ${FLEET_WEBHOOK_BASE} and ${FLEET_SITE_ID} are baked into each installation's
+# environment at deploy time by scripts/deploy_forge_atlassian.py (forge variables
+# set + forge deploy). The receiver ALSO cross-checks the payload cloudId against
+# the {site} path segment (belt-and-braces).
+
+app:
+  id: "ari:cloud:ecosystem::app/REPLACE_AT_DEPLOY"
+  runtime:
+    name: nodejs20.x
+
+permissions:
+  scopes:
+    # Read-only event scopes — the app never mutates Atlassian data.
+    - read:jira-work
+    - read:confluence-content.summary
+  external:
+    fetch:
+      backend:
+        # The app's SOLE permitted external egress: the fleet webhook API.
+        - "${FLEET_WEBHOOK_BASE}"
+
+modules:
+  trigger:
+    # --- Jira product triggers (§A5) ---
+    - key: jira-comment-created
+      function: forwardJira
+      events:
+        - avi:jira:created:comment
+    - key: jira-issue-created
+      function: forwardJira
+      events:
+        - avi:jira:created:issue
+    - key: jira-issue-updated
+      function: forwardJira
+      events:
+        - avi:jira:updated:issue
+    # --- Confluence product triggers (§A5) ---
+    - key: confluence-comment-created
+      function: forwardConfluence
+      events:
+        - avi:confluence:created:comment
+    - key: confluence-page-created
+      function: forwardConfluence
+      events:
+        - avi:confluence:created:page
+    - key: confluence-page-updated
+      function: forwardConfluence
+      events:
+        - avi:confluence:updated:page
+    - key: confluence-label-added
+      function: forwardConfluence
+      events:
+        - avi:confluence:created:label
+    - key: confluence-label-removed
+      function: forwardConfluence
+      events:
+        - avi:confluence:deleted:label
+
+  function:
+    - key: forwardJira
+      handler: index.forwardJira
+    - key: forwardConfluence
+      handler: index.forwardConfluence

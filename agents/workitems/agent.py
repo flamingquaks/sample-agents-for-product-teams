@@ -26,7 +26,11 @@ from shared.assignment import (
     update_trace_refs,
 )
 from shared.bedrock import build_model
-from shared.dispatch_context import slack_dispatch_block
+from shared.dispatch_context import (
+    confluence_dispatch_block,
+    jira_dispatch_block,
+    slack_dispatch_block,
+)
 from shared.tools import gateway
 from strands import Agent
 from strands_tools.agent_core_memory import AgentCoreMemoryToolProvider
@@ -113,6 +117,10 @@ def invoke(payload, context=None):
         # The codebase bridge for chat dispatches: which repos this channel is
         # approved for, and when to reach for them (shared/dispatch_context.py).
         dispatch_context_block = slack_dispatch_block(source_context)
+    elif source_context and source == "jira":
+        dispatch_context_block = jira_dispatch_block(source_context)
+    elif source_context and source == "confluence":
+        dispatch_context_block = confluence_dispatch_block(source_context)
 
     # Cost attribution uses the fleet's shared Mantle project (MANTLE_PROJECT_ID
     # runtime env, read inside build_model) — a dispatch may span repos, so there

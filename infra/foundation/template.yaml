@@ -118,6 +118,46 @@ Parameters:
       Display name used when registering the fleet's GitHub App from the admin
       UI manifest flow. Must be unique across GitHub.
 
+  DeployJiraTarget:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Opt-in flag for the Jira MCP gateway target (atlassian-connector spec §B2).
+      Gated only because the gateway itself is DeployGateway-gated; the target's
+      broker uses the gateway's own IAM role (no OAuth prerequisite, unlike
+      Asana), so flip this true once the JiraTarget tool grants have merged and
+      the gateway is deployed. The Jira/Confluence WEBHOOK receivers + brokers
+      are always deployed and inert until a site is onboarded.
+
+  DeployConfluenceTarget:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Opt-in flag for the Confluence MCP gateway target (atlassian-connector spec
+      §C2). Same rationale as DeployJiraTarget — the broker uses the gateway IAM
+      role; flip true after the ConfluenceTarget grants merge and the gateway is
+      deployed.
+
+  ForgeJwksUrl:
+    Type: String
+    Default: "https://forge.cdn.prod.atlassian-dev.net/.well-known/jwks.json"
+    Description: >
+      Atlassian's published JWKS URL — the Jira/Confluence receivers verify every
+      Forge Invocation Token (RS256) against it (atlassian-connector spec §A5).
+      Overridable for staging/test.
+
+  ForgeExpectedAudience:
+    Type: String
+    Default: ""
+    Description: >
+      Optional expected ``aud`` claim for the Forge Invocation Token (the fleet's
+      webhook consumer ari). When set, the Jira/Confluence receivers verify the
+      token audience in addition to signature, expiry, and the pinned app id
+      (atlassian-connector spec §A5/T-54). Left blank the audience claim is not
+      checked (a mis-set value would otherwise deafen every delivery).
+
   # NOTE: the former `DeploySlack` opt-in flag was removed (spec §19). The Slack
   # receiver is serverless + inert at rest and fails closed at runtime, so it is
   # always deployed; Slack goes live only when an admin onboards a workspace.
@@ -129,6 +169,14 @@ Conditions:
   AsanaTargetEnabled: !And
     - !Condition GatewayEnabled
     - !Equals [!Ref DeployAsanaTarget, "true"]
+  # Jira/Confluence targets need the gateway AND their own opt-in (flipped after
+  # the tool grants merge — atlassian-connector spec §A13 Phase 2/6).
+  JiraTargetEnabled: !And
+    - !Condition GatewayEnabled
+    - !Equals [!Ref DeployJiraTarget, "true"]
+  ConfluenceTargetEnabled: !And
+    - !Condition GatewayEnabled
+    - !Equals [!Ref DeployConfluenceTarget, "true"]
   # Provision the shared Mantle project as a CFN resource (opt-in — the resource
   # type must be activated in the account+region first).
   MantleProjectEnabled: !Equals [!Ref DeployMantleProject, "true"]
@@ -544,6 +592,10 @@ Resources:
                 # Per-workspace Slack bot token — reply.post_slack_message posts
                 # the "on it" ack + reject notices back to the originating thread.
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/slack/*
+                # Per-site Atlassian API token — reply.post_jira_comment /
+                # post_confluence_comment post acks/rejects/onboarding replies to
+                # the originating Jira issue / Confluence page.
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/atlassian/*
             - Effect: Allow
               Action:
                 - cloudwatch:PutMetricData
@@ -742,6 +794,104 @@ Resources:
             Method: POST
             RestApiId: !Ref WebhookApi
 
+  # Jira + Confluence webhook receivers (atlassian-connector spec §B1/§C1), fed by
+  # the shared atlassian-events Forge forwarder. ALWAYS deployed, inert until a
+  # site row enables the product: no signing secret exists (every delivery carries
+  # a Forge Invocation Token verified RS256 vs Atlassian's JWKS), so there is NO
+  # ssm:PutParameter here — only GetParameter for the per-site API token (context
+  # fetches) + the registry, plus outbound HTTPS to the JWKS.
+  JiraWebhookFunction:
+    Type: AWS::Serverless::Function
+    # PyJWT/cryptography verify the Forge Invocation Token — native wheel, build
+    # for the Lambda target.
+    Metadata:
+      BuildMethod: python3.12
+    Properties:
+      FunctionName: !Sub jira-webhook-${Stage}
+      CodeUri: ../dispatch/
+      Handler: jira_webhook.handler
+      Timeout: 30
+      ReservedConcurrentExecutions: 10
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt LambdaDeadLetterQueue.Arn
+      Environment:
+        Variables:
+          DISPATCH_FUNCTION: !Ref DispatchRouterFunction
+          REGISTRY_PARAM: !Sub /sdlc-agents/${Stage}/registry
+          FLEET_CONFIG_TABLE: !Ref FleetConfigTable
+          ASSIGNMENTS_TABLE: !Ref AssignmentsTable
+          STAGE: !Ref Stage
+          FORGE_JWKS_URL: !Ref ForgeJwksUrl
+          FORGE_EXPECTED_AUDIENCE: !Ref ForgeExpectedAudience
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref DispatchRouterFunction
+        # Read site/container rows + write the event-dedup + automation cooldown
+        # markers (assignments table) + stamp webhook_last_seen (config table).
+        - DynamoDBCrudPolicy:
+            TableName: !Ref FleetConfigTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AssignmentsTable
+        - Statement:
+            # ONLY GetParameter — the API token (context fetches) + the registry.
+            # No PutParameter: the Forge transport has no secret to store (§A5).
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/atlassian/*
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/registry
+      Events:
+        Webhook:
+          Type: Api
+          Properties:
+            Path: /jira/webhook/{site}
+            Method: POST
+            RestApiId: !Ref WebhookApi
+
+  ConfluenceWebhookFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: python3.12
+    Properties:
+      FunctionName: !Sub confluence-webhook-${Stage}
+      CodeUri: ../dispatch/
+      Handler: confluence_webhook.handler
+      Timeout: 30
+      ReservedConcurrentExecutions: 10
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt LambdaDeadLetterQueue.Arn
+      Environment:
+        Variables:
+          DISPATCH_FUNCTION: !Ref DispatchRouterFunction
+          REGISTRY_PARAM: !Sub /sdlc-agents/${Stage}/registry
+          FLEET_CONFIG_TABLE: !Ref FleetConfigTable
+          ASSIGNMENTS_TABLE: !Ref AssignmentsTable
+          STAGE: !Ref Stage
+          FORGE_JWKS_URL: !Ref ForgeJwksUrl
+          FORGE_EXPECTED_AUDIENCE: !Ref ForgeExpectedAudience
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref DispatchRouterFunction
+        - DynamoDBCrudPolicy:
+            TableName: !Ref FleetConfigTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AssignmentsTable
+        - Statement:
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/atlassian/*
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/registry
+      Events:
+        Webhook:
+          Type: Api
+          Properties:
+            Path: /confluence/webhook/{site}
+            Method: POST
+            RestApiId: !Ref WebhookApi
+
   # Assignment-stream notifier — fans agent-side status transitions
   # (completed / failed / awaiting_approval) out to subscribed Slack channels via
   # the DynamoDB stream on the assignments table (spec §18.1). Agents hold no
@@ -790,6 +940,40 @@ Resources:
             # A poison record must not wedge the shard — bisect + skip so
             # notifications stay best-effort (the handler also self-guards).
             BisectBatchOnFunctionError: true
+
+  # Atlassian API-token expiry checker (atlassian-connector spec §A6.2/§A9.1):
+  # a daily scan that fans a credential_expired error notification when a site's
+  # token nears/passes expiry (14/3/0 days out). Read-only + best-effort; never
+  # rotates a token. Always deployed (inert with no onboarded sites).
+  AtlassianTokenCheckFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub atlassian-token-check-${Stage}
+      CodeUri: ../dispatch/
+      Handler: atlassian_token_check.handler
+      Timeout: 60
+      Environment:
+        Variables:
+          FLEET_CONFIG_TABLE: !Ref FleetConfigTable
+          ASSIGNMENTS_TABLE: !Ref AssignmentsTable
+          STAGE: !Ref Stage
+      Policies:
+        # Read site + notif_sub + identity rows; write notif_thread bookkeeping.
+        - DynamoDBReadPolicy:
+            TableName: !Ref FleetConfigTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AssignmentsTable
+        - Statement:
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/slack/*
+      Events:
+        Daily:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 day)
+            Description: Daily Atlassian API-token expiry check
 
   # Durable-work sweeper (durable-repo-work spec, Phase 3): scheduled cleanup
   # for the pause/resume lifecycle — abandoned awaiting_input rows time out
@@ -963,6 +1147,94 @@ Resources:
       Period: 300
       EvaluationPeriods: 2
       Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  JiraWebhookErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub jira-webhook-errors-${Stage}
+      AlarmDescription: Jira webhook receiver error rate
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref JiraWebhookFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  ConfluenceWebhookErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub confluence-webhook-errors-${Stage}
+      AlarmDescription: Confluence webhook receiver error rate
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ConfluenceWebhookFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  JiraBrokerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub jira-broker-errors-${Stage}
+      AlarmDescription: Jira broker (gateway target) error rate
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref JiraBrokerFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  ConfluenceBrokerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub confluence-broker-errors-${Stage}
+      AlarmDescription: Confluence broker (gateway target) error rate
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ConfluenceBrokerFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # Automation-rule throttle alarm (§A8.5): fires when a rule exceeds its hourly
+  # ceiling, surfacing a runaway/flapping rule to operators. Custom metric emitted
+  # by automation.py (SDLCAgents/Dispatch namespace).
+  AutomationRuleThrottledAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub automation-rule-throttled-${Stage}
+      AlarmDescription: An automation rule hit its hourly fire ceiling
+      Namespace: !Sub SDLCAgents/Dispatch
+      MetricName: AutomationRuleThrottled
+      Dimensions:
+        - Name: Stage
+          Value: !Ref Stage
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
 
@@ -1549,6 +1821,12 @@ Resources:
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/github-webhook-secret
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/slack/signing-secret
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/slack/*
+                # Atlassian: the connect route writes the per-site API token
+                # SecureString (atlassian-connector spec §A11) — the ONE Atlassian
+                # secret; the Forge transport has none. This PutParameter is the
+                # deliberate deviation from the Slack posture, justified because
+                # paste-token IS the first-class onboarding.
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/atlassian/*
         # Sync the fleet Cedar policy to the engine (gateway deploys only).
         - !If
           - GatewayEnabled
@@ -1897,6 +2175,76 @@ Resources:
             Path: /admin/notif-subs/{team_id}/{channel_id}
             Method: DELETE
             RestApiId: !Ref DashboardApi
+        # --- Atlassian connector (atlassian-connector spec §A11) ---
+        AtlassianSitesList:
+          Type: Api
+          Properties: {Path: "/admin/atlassian/sites", Method: GET, RestApiId: !Ref DashboardApi}
+        AtlassianSitesPost:
+          Type: Api
+          Properties: {Path: "/admin/atlassian/sites", Method: POST, RestApiId: !Ref DashboardApi}
+        AtlassianConnect:
+          Type: Api
+          Properties: {Path: "/admin/atlassian/sites/connect", Method: POST, RestApiId: !Ref DashboardApi}
+        AtlassianForgeStatus:
+          Type: Api
+          Properties: {Path: "/admin/atlassian/forge-status", Method: GET, RestApiId: !Ref DashboardApi}
+        AtlassianSitePut:
+          Type: Api
+          Properties: {Path: "/admin/atlassian/sites/{site_id}", Method: PUT, RestApiId: !Ref DashboardApi}
+        AtlassianSiteDelete:
+          Type: Api
+          Properties: {Path: "/admin/atlassian/sites/{site_id}", Method: DELETE, RestApiId: !Ref DashboardApi}
+        AtlassianProductsPut:
+          Type: Api
+          Properties: {Path: "/admin/atlassian/sites/{site_id}/products", Method: PUT, RestApiId: !Ref DashboardApi}
+        AtlassianVerifyWebhook:
+          Type: Api
+          Properties: {Path: "/admin/atlassian/sites/{site_id}/verify-webhook", Method: POST, RestApiId: !Ref DashboardApi}
+        JiraProjectsList:
+          Type: Api
+          Properties: {Path: "/admin/atlassian/projects", Method: GET, RestApiId: !Ref DashboardApi}
+        JiraProjectsPost:
+          Type: Api
+          Properties: {Path: "/admin/atlassian/projects", Method: POST, RestApiId: !Ref DashboardApi}
+        JiraProjectDelete:
+          Type: Api
+          Properties: {Path: "/admin/atlassian/projects/{site_id}/{key}", Method: DELETE, RestApiId: !Ref DashboardApi}
+        ConfluenceSpacesList:
+          Type: Api
+          Properties: {Path: "/admin/atlassian/spaces", Method: GET, RestApiId: !Ref DashboardApi}
+        ConfluenceSpacesPost:
+          Type: Api
+          Properties: {Path: "/admin/atlassian/spaces", Method: POST, RestApiId: !Ref DashboardApi}
+        ConfluenceSpaceDelete:
+          Type: Api
+          Properties: {Path: "/admin/atlassian/spaces/{site_id}/{key}", Method: DELETE, RestApiId: !Ref DashboardApi}
+        AutomationRulesList:
+          Type: Api
+          Properties: {Path: "/admin/automation-rules", Method: GET, RestApiId: !Ref DashboardApi}
+        AutomationRulesPost:
+          Type: Api
+          Properties: {Path: "/admin/automation-rules", Method: POST, RestApiId: !Ref DashboardApi}
+        AutomationRulePut:
+          Type: Api
+          Properties: {Path: "/admin/automation-rules/{rule_id}", Method: PUT, RestApiId: !Ref DashboardApi}
+        AutomationRuleDelete:
+          Type: Api
+          Properties: {Path: "/admin/automation-rules/{rule_id}", Method: DELETE, RestApiId: !Ref DashboardApi}
+        AutomationRuleEnable:
+          Type: Api
+          Properties: {Path: "/admin/automation-rules/{rule_id}/enable", Method: POST, RestApiId: !Ref DashboardApi}
+        AutomationRuleDisable:
+          Type: Api
+          Properties: {Path: "/admin/automation-rules/{rule_id}/disable", Method: POST, RestApiId: !Ref DashboardApi}
+        NotifPrefGet:
+          Type: Api
+          Properties: {Path: "/admin/notif-prefs/{identity_id}", Method: GET, RestApiId: !Ref DashboardApi}
+        NotifPrefPut:
+          Type: Api
+          Properties: {Path: "/admin/notif-prefs/{identity_id}", Method: PUT, RestApiId: !Ref DashboardApi}
+        NotifPrefDelete:
+          Type: Api
+          Properties: {Path: "/admin/notif-prefs/{identity_id}", Method: DELETE, RestApiId: !Ref DashboardApi}
 
   # ===========================================================================
   # Capability build pipeline + deployer (gated on DeployDashboard)
@@ -2494,6 +2842,11 @@ Resources:
                 Resource:
                   - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:scm-broker-${Stage}
                   - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:scm-interceptor-${Stage}
+                  # Atlassian brokers (Jira/Confluence gateway targets) — same
+                  # identity-based invoke the SCM broker needs. By-name to avoid a
+                  # dependency cycle. Harmless while their targets are off.
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:jira-broker-${Stage}
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:confluence-broker-${Stage}
         - PolicyName: policy-engine-eval
           PolicyDocument:
             Version: "2012-10-17"
@@ -2691,6 +3044,79 @@ Resources:
       # dependency cycle. Scope to the fleet gateway by account/region pattern
       # (same approach the gateway role uses for the same reason).
       SourceArn: !Sub arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/*
+
+  # Jira + Confluence brokers (atlassian-connector spec §B2.1/§C2.1) — the
+  # gateway's Atlassian tool targets. Same enforced-broker idiom as the SCM
+  # broker: the gateway invokes them with its IAM role, and they enforce the
+  # project/space allowlist + write-mode the site-wide token can't express, then
+  # call the Atlassian REST API with the per-site service-account token.
+  #
+  # ALWAYS deployed (inert until a site is onboarded), mirroring the receivers —
+  # no gateway gate on the function so the code ships regardless; only the
+  # gateway TARGET + the invoke permission are gateway-gated.
+  JiraBrokerFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: python3.12
+    Properties:
+      FunctionName: !Sub jira-broker-${Stage}
+      CodeUri: ../dispatch/
+      Handler: jira_broker.handler
+      Timeout: 30
+      Environment:
+        Variables:
+          FLEET_CONFIG_TABLE: !Ref FleetConfigTable
+          STAGE: !Ref Stage
+      Policies:
+        # Read site/container rows + the per-site API token (per-invocation). No
+        # PutParameter — the broker never writes secrets.
+        - DynamoDBReadPolicy:
+            TableName: !Ref FleetConfigTable
+        - Statement:
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/atlassian/*
+
+  ConfluenceBrokerFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: python3.12
+    Properties:
+      FunctionName: !Sub confluence-broker-${Stage}
+      CodeUri: ../dispatch/
+      Handler: confluence_broker.handler
+      Timeout: 30
+      Environment:
+        Variables:
+          FLEET_CONFIG_TABLE: !Ref FleetConfigTable
+          STAGE: !Ref Stage
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref FleetConfigTable
+        - Statement:
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/atlassian/*
+
+  JiraBrokerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: JiraTargetEnabled
+    Properties:
+      FunctionName: !Ref JiraBrokerFunction
+      Action: lambda:InvokeFunction
+      Principal: bedrock-agentcore.amazonaws.com
+      SourceArn: !GetAtt FleetGateway.GatewayArn
+
+  ConfluenceBrokerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: ConfluenceTargetEnabled
+    Properties:
+      FunctionName: !Ref ConfluenceBrokerFunction
+      Action: lambda:InvokeFunction
+      Principal: bedrock-agentcore.amazonaws.com
+      SourceArn: !GetAtt FleetGateway.GatewayArn
 
   # GitHub tool target — the "<TargetName>" (GitHubTarget) that prefixes the
   # generated Cedar action names. Must match fleet_policy.GITHUB_TARGET.
@@ -2978,6 +3404,329 @@ Resources:
             Endpoint: !Ref AsanaMcpEndpoint
             ListingMode: DYNAMIC
 
+  # Jira tool target — "JiraTarget" prefixes the generated Cedar action names
+  # (must match fleet_policy.JIRA_TARGET / jira_broker.TARGET_NAME). Curated
+  # InlinePayload (the remote Atlassian MCP is rejected — §A4 layer 4); the
+  # broker uses the gateway IAM role and mints no OAuth. Gated on
+  # DeployJiraTarget so it lands after the JiraTarget grants merge.
+  JiraGatewayTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Condition: JiraTargetEnabled
+    Properties:
+      GatewayIdentifier: !GetAtt FleetGateway.GatewayIdentifier
+      Name: JiraTarget
+      Description: Jira tools via the Jira broker (per-site service-account token)
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+      TargetConfiguration:
+        Mcp:
+          Lambda:
+            LambdaArn: !GetAtt JiraBrokerFunction.Arn
+            ToolSchema:
+              InlinePayload:
+              - Name: add_comment
+                Description: Jira add comment (site service-account token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    body:
+                      Type: string
+                    issue_key:
+                      Type: string
+                    project_key:
+                      Type: string
+                    site:
+                      Type: string
+                  Required: [body, issue_key, project_key, site]
+              - Name: add_remote_link
+                Description: Jira add remote link (site service-account token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    issue_key:
+                      Type: string
+                    project_key:
+                      Type: string
+                    site:
+                      Type: string
+                    title:
+                      Type: string
+                    url:
+                      Type: string
+                  Required: [issue_key, project_key, site, title, url]
+              - Name: assign_issue
+                Description: Jira assign issue (site service-account token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    account_id:
+                      Type: string
+                    issue_key:
+                      Type: string
+                    project_key:
+                      Type: string
+                    site:
+                      Type: string
+                  Required: [account_id, issue_key, project_key, site]
+              - Name: create_issue
+                Description: Jira create issue (site service-account token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    issue_type:
+                      Type: string
+                    project_key:
+                      Type: string
+                    site:
+                      Type: string
+                    summary:
+                      Type: string
+                  Required: [issue_type, project_key, site, summary]
+              - Name: get_issue
+                Description: Jira get issue (site service-account token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    issue_key:
+                      Type: string
+                    site:
+                      Type: string
+                  Required: [issue_key, site]
+              - Name: get_issue_comments
+                Description: Jira get issue comments (site service-account token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    issue_key:
+                      Type: string
+                    site:
+                      Type: string
+                  Required: [issue_key, site]
+              - Name: get_project
+                Description: Jira get project (site service-account token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    project_key:
+                      Type: string
+                    site:
+                      Type: string
+                  Required: [project_key, site]
+              - Name: get_transitions
+                Description: Jira get transitions (site service-account token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    issue_key:
+                      Type: string
+                    site:
+                      Type: string
+                  Required: [issue_key, site]
+              - Name: link_issues
+                Description: Jira link issues (site service-account token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    inward_key:
+                      Type: string
+                    link_type:
+                      Type: string
+                    outward_key:
+                      Type: string
+                    project_key:
+                      Type: string
+                    site:
+                      Type: string
+                  Required: [inward_key, link_type, outward_key, project_key, site]
+              - Name: list_projects
+                Description: Jira list projects (site service-account token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    site:
+                      Type: string
+                  Required: [site]
+              - Name: search_issues
+                Description: Jira search issues (site service-account token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    jql:
+                      Type: string
+                    site:
+                      Type: string
+                  Required: [jql, site]
+              - Name: transition_issue
+                Description: Jira transition issue (site service-account token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    issue_key:
+                      Type: string
+                    project_key:
+                      Type: string
+                    site:
+                      Type: string
+                    transition_name:
+                      Type: string
+                  Required: [issue_key, project_key, site, transition_name]
+              - Name: update_issue
+                Description: Jira update issue (site service-account token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    fields:
+                      Type: object
+                    issue_key:
+                      Type: string
+                    project_key:
+                      Type: string
+                    site:
+                      Type: string
+                  Required: [fields, issue_key, project_key, site]
+
+  # Confluence tool target — "ConfluenceTarget" (must match
+  # fleet_policy.CONFLUENCE_TARGET / confluence_broker.TARGET_NAME).
+  ConfluenceGatewayTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Condition: ConfluenceTargetEnabled
+    Properties:
+      GatewayIdentifier: !GetAtt FleetGateway.GatewayIdentifier
+      Name: ConfluenceTarget
+      Description: Confluence tools via the Confluence broker (per-site service-account token)
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+      TargetConfiguration:
+        Mcp:
+          Lambda:
+            LambdaArn: !GetAtt ConfluenceBrokerFunction.Arn
+            ToolSchema:
+              InlinePayload:
+              - Name: add_comment
+                Description: Confluence add comment (site service-account token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    body_markdown:
+                      Type: string
+                    page_id:
+                      Type: string
+                    site:
+                      Type: string
+                    space_key:
+                      Type: string
+                  Required: [body_markdown, page_id, site, space_key]
+              - Name: add_label
+                Description: Confluence add label (site service-account token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    label:
+                      Type: string
+                    page_id:
+                      Type: string
+                    site:
+                      Type: string
+                    space_key:
+                      Type: string
+                  Required: [label, page_id, site, space_key]
+              - Name: create_page
+                Description: Confluence create page (site service-account token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    body_markdown:
+                      Type: string
+                    site:
+                      Type: string
+                    space_key:
+                      Type: string
+                    title:
+                      Type: string
+                  Required: [body_markdown, site, space_key, title]
+              - Name: get_comments
+                Description: Confluence get comments (site service-account token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    page_id:
+                      Type: string
+                    site:
+                      Type: string
+                    space_key:
+                      Type: string
+                  Required: [page_id, site, space_key]
+              - Name: get_page
+                Description: Confluence get page (site service-account token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    page_id:
+                      Type: string
+                    site:
+                      Type: string
+                    space_key:
+                      Type: string
+                  Required: [page_id, site, space_key]
+              - Name: get_page_children
+                Description: Confluence get page children (site service-account token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    page_id:
+                      Type: string
+                    site:
+                      Type: string
+                    space_key:
+                      Type: string
+                  Required: [page_id, site, space_key]
+              - Name: get_space
+                Description: Confluence get space (site service-account token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    site:
+                      Type: string
+                    space_key:
+                      Type: string
+                  Required: [site, space_key]
+              - Name: list_spaces
+                Description: Confluence list spaces (site service-account token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    site:
+                      Type: string
+                  Required: [site]
+              - Name: search
+                Description: Confluence search (site service-account token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    cql_text:
+                      Type: string
+                    site:
+                      Type: string
+                    space_key:
+                      Type: string
+                  Required: [cql_text, site, space_key]
+              - Name: update_page
+                Description: Confluence update page (site service-account token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    base_version:
+                      Type: integer
+                    body_markdown:
+                      Type: string
+                    page_id:
+                      Type: string
+                    site:
+                      Type: string
+                    space_key:
+                      Type: string
+                  Required: [base_version, body_markdown, page_id, site, space_key]
+
   # --- SPA hosting: private S3 + CloudFront (OAC) ----------------------------
   # The built SPA is uploaded to a private bucket (account Block Public Access
   # stays on, consistent with the artifacts/logs buckets) and served only
@@ -3118,6 +3867,18 @@ Outputs:
   SlackInteractionsEndpoint:
     Value: !Sub https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/slack/interactions
     Description: Slack interactivity request URL — set this in the Slack app's Interactivity & Shortcuts
+
+  JiraWebhookEndpoint:
+    Value: !Sub https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/jira/webhook/{site}
+    Description: >
+      Jira webhook URL (per-site) — wired into the atlassian-events Forge app
+      manifest at deploy time (deploy_forge_atlassian.py). {site} is the cloud id.
+
+  ConfluenceWebhookEndpoint:
+    Value: !Sub https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/confluence/webhook/{site}
+    Description: >
+      Confluence webhook URL (per-site) — wired into the atlassian-events Forge
+      app manifest at deploy time. {site} is the cloud id.
 
   TriggerPolicyStoreId:
     Value: !GetAtt TriggerPolicyStore.PolicyStoreId

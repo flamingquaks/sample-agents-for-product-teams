@@ -336,6 +336,42 @@ def deploy_dashboard(runner: Runner, region: str, outputs: dict[str, str]) -> No
     logger.info("published dashboard: %s", outputs.get("DashboardUrl", ""))
 
 
+# --- Forge forwarder (atlassian-connector spec §A5) ---------------------------
+
+
+def deploy_forge_forwarder(stage: str, region: str, dry_run: bool) -> None:
+    """Deploy the atlassian-events Forge forwarder so Jira/Confluence are fully
+    connectable from the admin app with no separate manual asset deploy. The
+    forwarder is site-agnostic (cloud id derived per invocation), so this runs
+    once per stage; connecting a new site later needs only the in-dashboard
+    install link. Gracefully skipped — with the exact command to run — when the
+    Forge CLI isn't installed/authenticated, since Forge auth is interactive and
+    can't be automated here."""
+    logger.info("== Atlassian events forwarder (Forge) ==")
+    import deploy_forge_atlassian as forge
+
+    if not forge.forge_cli_ready(dry_run):
+        logger.warning(
+            "Forge CLI not available or not logged in — skipping the forwarder. "
+            "Jira/Confluence site CONNECT still works in the dashboard, but no "
+            "events flow until an operator runs:\n"
+            "    npm i -g @forge/cli && forge login\n"
+            "    python scripts/deploy_forge_atlassian.py --stage %s --region %s",
+            stage, region,
+        )
+        return
+    try:
+        forge.deploy(stage, region, dry_run=dry_run)
+    except (SystemExit, subprocess.CalledProcessError) as exc:
+        # The fleet deploy must not fail on the one non-AWS artifact; surface the
+        # fix and continue (receivers stay inert until delivery works anyway).
+        logger.warning(
+            "Forge forwarder deploy failed (%s). Re-run it directly:\n"
+            "    python scripts/deploy_forge_atlassian.py --stage %s --region %s",
+            exc, stage, region,
+        )
+
+
 # --- orchestration -----------------------------------------------------------
 
 
@@ -347,6 +383,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--skip-source", action="store_true",
                     help="skip uploading the agent build source (agents/ unchanged)")
     ap.add_argument("--skip-dashboard", action="store_true")
+    ap.add_argument("--skip-forge", action="store_true",
+                    help="skip deploying the atlassian-events Forge forwarder")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument(
         "--auto-approve", action="store_true",
@@ -379,6 +417,11 @@ def main(argv: list[str] | None = None) -> int:
             "GatewayPolicyEnforcement": "LOG_ONLY",
             "DeployMantleProject": "true",
             "RequireAgentApproval": "true",
+            # Atlassian gateway targets: the Jira/Confluence tool grants are
+            # merged (fleet_policy.AGENT_TOOL_GRANTS), so the full solution
+            # ships them — sites stay inert until connected in the dashboard.
+            "DeployJiraTarget": "true",
+            "DeployConfluenceTarget": "true",
         })
     for entry in args.param:
         if "=" not in entry:
@@ -437,6 +480,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.skip_dashboard:
         deploy_dashboard(runner, args.region, outputs)
+
+    if not args.skip_forge:
+        deploy_forge_forwarder(args.stage, args.region, args.dry_run)
 
     logger.info("Fleet base deploy complete%s. Onboard agents in the dashboard Admin view.",
                 " (dry-run)" if args.dry_run else "")

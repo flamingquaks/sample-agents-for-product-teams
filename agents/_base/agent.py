@@ -22,7 +22,11 @@ from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from shared import durable
 from shared.assignment import complete_assignment, extract_usage, fail_assignment
 from shared.bedrock import build_model
-from shared.dispatch_context import slack_dispatch_block
+from shared.dispatch_context import (
+    confluence_dispatch_block,
+    jira_dispatch_block,
+    slack_dispatch_block,
+)
 from shared.tools import gateway, workspace
 from strands import Agent
 
@@ -190,7 +194,9 @@ def invoke(payload, context=None):
 
     with ExitStack() as stack:
         gw = stack.enter_context(
-            gateway.build_gateway_client(agent=AGENT_ID)
+            gateway.build_gateway_client(
+                agent=AGENT_ID, dispatch_origin=dispatch_repo or None
+            )
         )
         all_tools = list(gw.list_tools_sync())
 
@@ -204,6 +210,10 @@ def invoke(payload, context=None):
             # The codebase bridge for chat dispatches: which repos this channel
             # is approved for and when to reach for them.
             prompt += slack_dispatch_block(source_context)
+        elif source == "jira":
+            prompt += jira_dispatch_block(source_context)
+        elif source == "confluence":
+            prompt += confluence_dispatch_block(source_context)
         elif dispatch_repo:
             prompt += f"\n\nCurrent Dispatch:\n- Repository: {dispatch_repo}\n"
 

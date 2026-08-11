@@ -117,21 +117,31 @@ def reset_cache() -> None:
     _cache_expires_at = 0.0
 
 
-def _subscription_wants(sub: dict, *, tier: str, event: str, repo: str) -> bool:
-    """Whether ``sub`` should receive this (tier, event, repo). A subscription
-    matches iff: the tier meets the subscription's severity floor, the event is
-    listed under that tier, and (when the event names a repo) the repo is in the
-    subscription's repo scope. An empty repo scope means "all subscribed repos"
-    is not assumed — a repo-scoped event with no matching repo is skipped, so a
-    channel never gets notifications for a repo it didn't select."""
+def _subscription_wants(
+    sub: dict, *, tier: str, event: str, repo: str,
+    project: str = "", space: str = "",
+) -> bool:
+    """Whether ``sub`` should receive this (tier, event, container). A
+    subscription matches iff: the tier meets the subscription's severity floor,
+    the event is listed under that tier, and (when the event names a container)
+    that container is in the subscription's scope. The container axes compose:
+    a GitHub event checks ``repos``, a Jira event checks ``projects``, a
+    Confluence event checks ``spaces`` (atlassian-connector spec §A9.1). A
+    container-scoped event with no matching scope is skipped, so a channel never
+    gets notifications for a container it didn't select."""
     if _SEVERITY_RANK.get(tier, 0) < _SEVERITY_RANK.get(sub.get("min_severity", TIER_INFORMATIVE), 0):
         return False
     tier_events = (sub.get("tiers") or {}).get(tier) or []
     if event not in tier_events:
         return False
     if repo:
-        sub_repos = sub.get("repos") or []
-        if repo.strip().casefold() not in sub_repos:
+        if repo.strip().casefold() not in (sub.get("repos") or []):
+            return False
+    if project:
+        if project not in (sub.get("projects") or []):
+            return False
+    if space:
+        if space not in (sub.get("spaces") or []):
             return False
     return True
 
@@ -199,6 +209,8 @@ def notify(
     event: str,
     text: str,
     repo: str = "",
+    project: str = "",
+    space: str = "",
     unit: str = "",
     actor: dict | None = None,
 ) -> int:
@@ -225,7 +237,9 @@ def notify(
     )
     posted = 0
     for sub in _subs_snapshot():
-        if not _subscription_wants(sub, tier=tier, event=event, repo=repo):
+        if not _subscription_wants(
+            sub, tier=tier, event=event, repo=repo, project=project, space=space
+        ):
             continue
         team_id = sub.get("team_id", "")
         channel_id = sub.get("channel_id", "")
@@ -248,3 +262,101 @@ def notify(
         else:
             logger.warning("notification delivery failed for %s/%s", team_id, channel_id)
     return posted
+
+
+# --- per-user DM notifications (atlassian-connector spec §A9.2) ---------------
+# Opt-in, self-serve: an ACTIVE identity with a VERIFIED Slack handle can hold a
+# notif_pref# row. Delivery opens an IM (conversations.open) and threads the DM.
+# No verified handle for a team ⇒ SILENT degrade (metric, never a mis-ping).
+
+_prefs_cache = None
+_prefs_expires_at = 0.0
+
+
+def _prefs_snapshot(now: float | None = None) -> list[dict]:
+    global _prefs_cache, _prefs_expires_at
+    current = time.time() if now is None else now
+    if _prefs_cache is None or current >= _prefs_expires_at:
+        _prefs_cache = config_query.query_kind("notif_pref")
+        _prefs_expires_at = current + _CACHE_TTL_SECONDS
+    return _prefs_cache
+
+
+def _get_pref(identity_id: str) -> dict | None:
+    for p in _prefs_snapshot():
+        if p.get("identity_id") == identity_id:
+            return p
+    return None
+
+
+def _pref_wants(pref: dict, *, tier: str, event: str) -> bool:
+    if _SEVERITY_RANK.get(tier, 0) < _SEVERITY_RANK.get(pref.get("min_tier", TIER_ACTIONABLE), 0):
+        return False
+    return event in ((pref.get("tiers") or {}).get(tier) or [])
+
+
+def notify_user(
+    identity_id: str, *, tier: str, event: str, text: str,
+    team_id: str, unit: str = "",
+) -> bool:
+    """DM a person if they've opted into this (tier, event) via their notif_pref
+    (§A9.2). Resolves the identity's Slack handle in ``team_id``; no handle ⇒
+    silent degrade (metric, never a mis-ping). Returns True if a DM was sent.
+
+    The same seam serves non-Atlassian events for free (run_completed / _failed /
+    awaiting_approval DMs to the requester — assignment_notifier's one new call
+    site). Best-effort throughout."""
+    if tier not in TIERS or not identity_id:
+        return False
+    pref = _get_pref(identity_id)
+    if not pref or not _pref_wants(pref, tier=tier, event=event):
+        return False
+    uid = identity_map.slack_handle_for(identity_id, team_id)
+    if not uid:
+        # No verified handle for this workspace — degrade silently (never DM the
+        # wrong person). A metric would be emitted by the caller's context.
+        logger.info("notify_user: no slack handle for %s in %s — degrading", identity_id, team_id)
+        return False
+    channel = _open_im(team_id, uid)
+    if not channel:
+        return False
+    thread_ts = _get_thread_ts(team_id, channel, unit) if unit else None
+    ok, new_ts = reply.post_slack_message_ts(team_id=team_id, channel=channel,
+                                             body=text, thread_ts=thread_ts)
+    if ok and unit and not thread_ts and new_ts:
+        _remember_thread_ts(team_id, channel, unit, new_ts)
+    return ok
+
+
+def _open_im(team_id: str, user_id: str) -> str | None:
+    """Open (or fetch) the IM channel id for a user via conversations.open
+    (needs the ``im:write`` scope). "" / None on failure."""
+    import os
+
+    import requests
+
+    token = reply._get_secret(reply.slack_bot_token_param(team_id))
+    if not token:
+        return None
+    try:
+        resp = requests.post(
+            "https://slack.com/api/conversations.open",
+            json={"users": user_id},
+            headers={"Authorization": f"Bearer {token}",
+                     "Content-Type": "application/json; charset=utf-8"},
+            timeout=10,
+        )
+        data = resp.json()
+        if not data.get("ok"):
+            logger.warning("conversations.open failed for %s: %s", team_id, data.get("error"))
+            return None
+        return (data.get("channel") or {}).get("id")
+    except (requests.RequestException, ValueError):
+        logger.exception("conversations.open error for %s", team_id)
+        return None
+
+
+def reset_prefs_cache() -> None:
+    global _prefs_cache, _prefs_expires_at
+    _prefs_cache = None
+    _prefs_expires_at = 0.0

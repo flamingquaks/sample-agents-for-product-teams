@@ -122,5 +122,28 @@ export function sourceLink(
     return null;
   }
 
+  if (source === "jira") {
+    // The receiver stores the site_url in source_context; the issue key is a
+    // native trace ref (atlassian-connector §B3).
+    const siteUrl = (c.site_url ?? "").replace(/\/$/, "");
+    const key = r.jira_key ?? c.issue_key;
+    if (siteUrl && key) {
+      return { label: key, url: `${siteUrl}/browse/${key}` };
+    }
+    return null;
+  }
+
+  if (source === "confluence") {
+    // <site_url>/wiki/spaces/<KEY>/pages/<id> (atlassian-connector §C4).
+    const siteUrl = (c.site_url ?? "").replace(/\/$/, "");
+    const space = r.confluence_space ?? c.space_key;
+    const pageId = r.confluence_page ?? c.page_id;
+    if (siteUrl && space && pageId) {
+      const title = c.page_title ? String(c.page_title) : `page ${pageId}`;
+      return { label: title, url: `${siteUrl}/wiki/spaces/${space}/pages/${pageId}` };
+    }
+    return null;
+  }
+
   return null;
 }

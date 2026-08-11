@@ -97,6 +97,14 @@ _IDENTITY_PK_PREFIX = "identity#"
 _USER_REQUEST_PK_PREFIX = "user_req#"
 _PERM_GROUP_PK_PREFIX = "perm_group#"
 _NOTIF_SUB_PK_PREFIX = "notif_sub#"
+# Atlassian connector (docs/specs/atlassian-connector-spec.md): one site row per
+# Atlassian cloud site (both products), per-product container rows, the
+# source-agnostic automation-rule engine, and per-user DM notification prefs.
+_ATLASSIAN_SITE_PK_PREFIX = "atlassian_site#"
+_JIRA_PROJECT_PK_PREFIX = "jira_proj#"
+_CONFLUENCE_SPACE_PK_PREFIX = "confluence_space#"
+_AUTOMATION_RULE_PK_PREFIX = "automation_rule#"
+_NOTIF_PREF_PK_PREFIX = "notif_pref#"
 
 # Capability lifecycle. A row starts "pending" the instant it's onboarded, moves
 # to "building" while the shared build pipeline runs, "active" once its runtime is
@@ -158,8 +166,10 @@ SLACK_WS_STATUSES = (SLACK_WS_PENDING, SLACK_WS_ACTIVE, SLACK_WS_DISABLED)
 
 # A trigger rule is scoped to exactly one connector sub-page (per-connector
 # rules, spec §4.3 / §9). Kept as a constant so the admin API can't persist a
-# rule for a connector the router will never evaluate.
-TRIGGER_CONNECTORS = ("slack", "asana", "github")
+# rule for a connector the router will never evaluate. jira + confluence are
+# per-product rules on the shared Atlassian foundation (atlassian-connector
+# spec §A7) — "may trigger from Jira" ≠ "may trigger from Confluence".
+TRIGGER_CONNECTORS = ("slack", "asana", "github", "jira", "confluence")
 RULE_SUBJECT_USER = "user"
 RULE_SUBJECT_GROUP = "group"
 RULE_SUBJECT_TYPES = (RULE_SUBJECT_USER, RULE_SUBJECT_GROUP)
@@ -187,8 +197,11 @@ IDENTITY_DISABLED = "disabled"
 IDENTITY_STATUSES = (IDENTITY_PENDING, IDENTITY_ACTIVE, IDENTITY_DISABLED)
 
 # The sources a handle can come from. `slack` handles are per-workspace (a nested
-# {team_id: user_id} map); the rest are a single string handle.
-IDENTITY_SOURCES = ("github", "asana", "slack", "sdlc")
+# {team_id: user_id} map); the rest are a single string handle. `atlassian` is
+# ONE handle key for both Jira and Confluence — account ids are global across
+# Atlassian sites and products (atlassian-connector spec §A6.3), so a person
+# onboarded via either product is the same identity in the other automatically.
+IDENTITY_SOURCES = ("github", "asana", "slack", "sdlc", "atlassian")
 
 # User-onboarding request lifecycle (spec §16.4) — filed on first touch from an
 # unknown/pending sender; an admin approves (→ identity active + group assign) or
@@ -1157,8 +1170,14 @@ def put_trigger_rule(
         raise ValueError("subject_id is required")
     if agent_id != "*" and not valid_agent_id(agent_id):
         raise ValueError(f"invalid agent_id {agent_id!r}")
-    if workspace != "*" and not valid_slack_team(workspace):
-        raise ValueError(f"invalid workspace {workspace!r}")
+    # A concrete workspace is the connector's workspace id: a Slack team id for
+    # slack rules, an Atlassian cloud id (site) for jira/confluence rules.
+    if workspace != "*":
+        if connector in ("jira", "confluence"):
+            if not valid_atlassian_site_id(workspace):
+                raise ValueError(f"invalid workspace {workspace!r}")
+        elif not valid_slack_team(workspace):
+            raise ValueError(f"invalid workspace {workspace!r}")
     if rule_id is None:
         import uuid
 
@@ -1652,15 +1671,17 @@ def put_notif_sub(
     channel_id: str,
     *,
     repos: list[str] | None = None,
+    projects: list[str] | None = None,
+    spaces: list[str] | None = None,
     tiers: dict | None = None,
     min_severity: str = NOTIF_TIER_INFORMATIVE,
     created_by: str = "",
 ) -> dict:
     """Create/replace a channel's notification subscription. Validates the Slack
-    ids and the tier map (keys ⊆ NOTIF_TIERS). ``repos`` is stored normalized;
-    the ADMIN API is responsible for bounding it to the channel's granted repos
-    before calling this (§18.2) — the store validates shape, the API validates
-    authorization, matching the repo/capability split elsewhere."""
+    ids and the tier map (keys ⊆ NOTIF_TIERS). ``repos``/``projects``/``spaces``
+    are the container scopes (§18.2 / atlassian-connector §A9.1) — stored
+    normalized/validated for shape; the ADMIN API bounds them to the channel's
+    granted containers, matching the repo/capability split elsewhere."""
     if not valid_slack_team(team_id):
         raise ValueError(f"invalid Slack team id {team_id!r}")
     if not valid_slack_channel(channel_id):
@@ -1672,6 +1693,8 @@ def put_notif_sub(
         if tier not in NOTIF_TIERS:
             raise ValueError(f"invalid notification tier {tier!r}")
         clean_tiers[tier] = [str(e).strip() for e in (events or []) if str(e).strip()]
+    clean_projects = sorted({p for p in (projects or []) if valid_jira_project_key(p)})
+    clean_spaces = sorted({s for s in (spaces or []) if valid_confluence_space_key(s)})
     existing = get_notif_sub(team_id, channel_id) or {}
     now = int(time.time())
     item = {
@@ -1680,6 +1703,8 @@ def put_notif_sub(
         "team_id": team_id,
         "channel_id": channel_id,
         "repos": sorted({_normalize_repo(r) for r in (repos or []) if r}),
+        "projects": clean_projects,
+        "spaces": clean_spaces,
         "tiers": clean_tiers,
         "min_severity": min_severity,
         "created_by": created_by or existing.get("created_by", ""),
@@ -1704,3 +1729,600 @@ def _scan_kind(kind: str, *, sort_key: str) -> list[dict]:
     rows = _query_kind(kind)
     rows.sort(key=lambda r: r.get(sort_key, 0) or 0, reverse=True)
     return rows
+
+
+# --- Atlassian connector (docs/specs/atlassian-connector-spec.md) -------------
+# ONE site record per Atlassian cloud site covering BOTH products (§A6.1): one
+# service account, one API token (SSM SecureString, per-invocation fetch), per-
+# product enablement. Container rows stay per product — Jira projects and
+# Confluence spaces carry different fields and postures (§B1.2 / §C1.2). Every
+# id below flows into a Cedar literal, an SSM path, or a REST URL, so each is
+# pinned to its provider's shape (§A11 validators).
+
+# Atlassian cloud id: a uuid (Atlassian formats them lowercase-hyphenated).
+_ATLASSIAN_SITE_ID_RE = re.compile(r"^[0-9a-f-]{36}$")
+# Atlassian account id, e.g. "712020:abc…" / "557058:…-…" — colon + base36/uuid.
+_ATLASSIAN_ACCOUNT_ID_RE = re.compile(r"^[0-9a-zA-Z:-]{1,128}$")
+# Jira project key: uppercase, starts with a letter, 2-10 chars total.
+_JIRA_PROJECT_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]{1,9}$")
+# Confluence space key: uppercase alnum; PERSONAL spaces (~ prefix) are rejected
+# by shape — the fleet never onboards personal spaces (spec non-goal, §A1).
+_CONFLUENCE_SPACE_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]{0,254}$")
+# Confluence label shape (add_label + automation match values).
+_ATLASSIAN_LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+
+ATLASSIAN_PRODUCTS = ("jira", "confluence")
+
+# WHERE-axis postures, per product (§A7). Same allowlist/denylist math as the
+# Slack channel posture; the container rows are interpreted against these.
+CONTAINER_POLICY_ALLOWLIST = "allowlist"
+CONTAINER_POLICY_DENYLIST = "denylist"
+CONTAINER_POLICIES = (CONTAINER_POLICY_ALLOWLIST, CONTAINER_POLICY_DENYLIST)
+CONTAINER_MODE_ALLOW = "allow"
+CONTAINER_MODE_DENY = "deny"
+CONTAINER_MODES = (CONTAINER_MODE_ALLOW, CONTAINER_MODE_DENY)
+
+ATLASSIAN_SITE_PENDING = "pending"
+ATLASSIAN_SITE_ACTIVE = "active"
+ATLASSIAN_SITE_DISABLED = "disabled"
+ATLASSIAN_SITE_STATUSES = (
+    ATLASSIAN_SITE_PENDING,
+    ATLASSIAN_SITE_ACTIVE,
+    ATLASSIAN_SITE_DISABLED,
+)
+
+# Confluence per-space write safety (§C3.2). Default is propose: create/update
+# page writes are broker-rejected and the agent posts its proposal as a comment;
+# an admin flips a trusted space to direct (one toggle, no policy deploy).
+CONFLUENCE_WRITE_PROPOSE = "propose"
+CONFLUENCE_WRITE_DIRECT = "direct"
+CONFLUENCE_WRITE_MODES = (CONFLUENCE_WRITE_PROPOSE, CONFLUENCE_WRITE_DIRECT)
+
+# Automation rules (§A8): the data-driven event → agent engine. Source-agnostic
+# by schema; Atlassian ships it (jira/confluence events), other connectors are a
+# fast-follow with zero schema work.
+AUTOMATION_EVENTS = {
+    "jira": ("issue_transitioned", "issue_created", "issue_commented", "issue_assigned"),
+    "confluence": ("page_labeled", "page_created", "page_updated"),
+}
+# Allowlisted template variables per connector (§A8.1) — unknown vars render
+# empty. Mirrored by the dispatch-side automation engine (schema contract).
+AUTOMATION_TEMPLATE_VARS = {
+    "jira": (
+        "issue_key", "summary", "project", "status", "from_status", "to_status",
+        "issue_type", "reporter", "assignee", "site_url",
+    ),
+    "confluence": ("title", "space", "page_id", "page_url", "label", "author"),
+}
+
+
+def valid_atlassian_site_id(site_id: str) -> bool:
+    return bool(_ATLASSIAN_SITE_ID_RE.match(site_id or ""))
+
+
+def valid_atlassian_account_id(account_id: str) -> bool:
+    return bool(_ATLASSIAN_ACCOUNT_ID_RE.match(account_id or ""))
+
+
+def valid_jira_project_key(key: str) -> bool:
+    return bool(_JIRA_PROJECT_KEY_RE.match(key or ""))
+
+
+def valid_confluence_space_key(key: str) -> bool:
+    """Uppercase alnum only — a personal-space key (``~<accountid>``) fails this
+    by shape, structurally excluding personal spaces from onboarding."""
+    return bool(_CONFLUENCE_SPACE_KEY_RE.match(key or ""))
+
+
+def valid_atlassian_label(label: str) -> bool:
+    return bool(_ATLASSIAN_LABEL_RE.match(label or ""))
+
+
+def _atlassian_site_pk(site_id: str) -> str:
+    return f"{_ATLASSIAN_SITE_PK_PREFIX}{site_id}"
+
+
+def atlassian_token_param(stage: str, site_id: str) -> str:
+    """Canonical SSM SecureString path for a site's service-account API token —
+    ONE token covering both products (§A6.1). Kept here so the admin connect
+    route and the dispatch-side readers agree on the layout."""
+    return f"/sdlc-agents/{stage}/atlassian/{site_id}/api-token"
+
+
+def list_atlassian_sites() -> list[dict]:
+    return _scan_kind("atlassian_site", sort_key="onboarded_at")
+
+
+def get_atlassian_site(site_id: str) -> dict | None:
+    resp = _get_table().get_item(Key={"pk": _atlassian_site_pk(site_id)})
+    return resp.get("Item")
+
+
+def put_atlassian_site(
+    site_id: str,
+    *,
+    site_url: str,
+    site_name: str = "",
+    stage: str,
+    enabled: bool = True,
+    products: dict | None = None,
+    bot_account_id: str = "",
+    bot_email: str = "",
+    forge_app_id: str = "",
+    token_expires_at: int | None = None,
+    default_project_policy: str = CONTAINER_POLICY_ALLOWLIST,
+    default_space_policy: str = CONTAINER_POLICY_ALLOWLIST,
+    onboarded_by: str = "",
+    status: str = ATLASSIAN_SITE_PENDING,
+) -> dict:
+    """Create/replace an Atlassian site record (§A6.1). Raises ValueError on a
+    malformed cloud id (it names the SSM token path + the Cedar workspace
+    literal), bot account id, posture, or status. The API token VALUE is written
+    by the admin connect route (SecureString); only its PATH is derived here.
+    ``webhook_last_seen`` (receiver-stamped liveness) is preserved on update —
+    an admin edit must not reset delivery-verification state."""
+    if not valid_atlassian_site_id(site_id):
+        raise ValueError(
+            f"invalid Atlassian site id {site_id!r} — must be a cloud id (uuid)"
+        )
+    if bot_account_id and not valid_atlassian_account_id(bot_account_id):
+        raise ValueError(f"invalid bot account id {bot_account_id!r}")
+    for policy in (default_project_policy, default_space_policy):
+        if policy not in CONTAINER_POLICIES:
+            raise ValueError(f"invalid container policy {policy!r}")
+    if status not in ATLASSIAN_SITE_STATUSES:
+        raise ValueError(f"invalid site status {status!r}")
+    url = (site_url or "").strip().rstrip("/")
+    if not re.match(r"^https://[A-Za-z0-9][A-Za-z0-9.-]*$", url):
+        raise ValueError(f"invalid site url {site_url!r} — must be https://<host>")
+    clean_products = {
+        p: bool((products or {}).get(p, False)) for p in ATLASSIAN_PRODUCTS
+    }
+    existing = get_atlassian_site(site_id) or {}
+    now = int(time.time())
+    item = {
+        "pk": _atlassian_site_pk(site_id),
+        "kind": "atlassian_site",
+        "site_id": site_id,
+        "site_url": url,
+        "site_name": site_name or existing.get("site_name", ""),
+        "enabled": bool(enabled),
+        "products": clean_products,
+        "bot_account_id": bot_account_id or existing.get("bot_account_id", ""),
+        "bot_email": bot_email or existing.get("bot_email", ""),
+        "api_token_param": atlassian_token_param(stage, site_id),
+        "forge_app_id": forge_app_id or existing.get("forge_app_id", ""),
+        "webhook_last_seen": existing.get(
+            "webhook_last_seen", {"jira": None, "confluence": None}
+        ),
+        "token_expires_at": (
+            token_expires_at
+            if token_expires_at is not None
+            else existing.get("token_expires_at")
+        ),
+        "default_project_policy": default_project_policy,
+        "default_space_policy": default_space_policy,
+        "onboarded_by": onboarded_by or existing.get("onboarded_by", ""),
+        "onboarded_at": existing.get("onboarded_at", now),
+        "updated_at": now,
+        "status": status,
+    }
+    _get_table().put_item(Item=item)
+    return item
+
+
+def set_atlassian_site_status(site_id: str, status: str) -> None:
+    if status not in ATLASSIAN_SITE_STATUSES:
+        raise ValueError(f"invalid site status {status!r}")
+    _get_table().update_item(
+        Key={"pk": _atlassian_site_pk(site_id)},
+        UpdateExpression="SET #s = :s, updated_at = :u",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":s": status, ":u": int(time.time())},
+        ConditionExpression="attribute_exists(pk)",
+    )
+
+
+def set_atlassian_products(site_id: str, products: dict) -> dict | None:
+    """Per-product enablement toggles (§A6.1). Returns the updated row, or None
+    if the site doesn't exist. A receiver drops events for a disabled product."""
+    clean = {p: bool((products or {}).get(p, False)) for p in ATLASSIAN_PRODUCTS}
+    if get_atlassian_site(site_id) is None:
+        return None
+    _get_table().update_item(
+        Key={"pk": _atlassian_site_pk(site_id)},
+        UpdateExpression="SET products = :p, updated_at = :u",
+        ExpressionAttributeValues={":p": clean, ":u": int(time.time())},
+        ConditionExpression="attribute_exists(pk)",
+    )
+    return get_atlassian_site(site_id)
+
+
+def delete_atlassian_site(site_id: str) -> bool:
+    """Delete a site row. Does NOT delete the container rows or the SSM token —
+    the admin API composes that lifecycle (mirrors delete_slack_workspace)."""
+    resp = _get_table().delete_item(
+        Key={"pk": _atlassian_site_pk(site_id)}, ReturnValues="ALL_OLD"
+    )
+    return bool(resp.get("Attributes"))
+
+
+# --- Jira project policy (§B1.2) ----------------------------------------------
+
+
+def _jira_project_pk(site_id: str, key: str) -> str:
+    return f"{_JIRA_PROJECT_PK_PREFIX}{site_id}#{key}"
+
+
+def list_jira_projects(site_id: str | None = None) -> list[dict]:
+    prefix = f"{_JIRA_PROJECT_PK_PREFIX}{site_id}#" if site_id else None
+    rows = _query_kind("jira_project", pk_prefix=prefix)
+    rows.sort(key=lambda r: r.get("project_key", ""))
+    return rows
+
+
+def get_jira_project(site_id: str, key: str) -> dict | None:
+    resp = _get_table().get_item(Key={"pk": _jira_project_pk(site_id, key)})
+    return resp.get("Item")
+
+
+def put_jira_project(
+    site_id: str,
+    project_key: str,
+    *,
+    mode: str,
+    project_name: str = "",
+    repos: list[str] | None = None,
+    note: str = "",
+    created_by: str = "",
+) -> dict:
+    """Create/replace a Jira project allow|deny row (§B1.2). ``repos`` is the
+    project's linked-repo co-scope edge — the interceptor's origin-pinning axis.
+    The project key flows into the ``sdlc_allowed_projects`` Cedar forbid, so it
+    is shape-validated here (the security boundary, like _valid_repo)."""
+    if not valid_atlassian_site_id(site_id):
+        raise ValueError(f"invalid Atlassian site id {site_id!r}")
+    if not valid_jira_project_key(project_key):
+        raise ValueError(
+            f"invalid Jira project key {project_key!r} — must match "
+            f"{_JIRA_PROJECT_KEY_RE.pattern}"
+        )
+    if mode not in CONTAINER_MODES:
+        raise ValueError(f"invalid container mode {mode!r}")
+    normalized_repos = sorted(
+        {_normalize_repo(r) for r in (repos or []) if r and r.strip()}
+    )
+    item = {
+        "pk": _jira_project_pk(site_id, project_key),
+        "kind": "jira_project",
+        "site_id": site_id,
+        "project_key": project_key,
+        "project_name": project_name,
+        "mode": mode,
+        "repos": normalized_repos,
+        "note": note,
+        "created_by": created_by,
+        "created_at": int(time.time()),
+    }
+    _get_table().put_item(Item=item)
+    return item
+
+
+def delete_jira_project(site_id: str, project_key: str) -> bool:
+    resp = _get_table().delete_item(
+        Key={"pk": _jira_project_pk(site_id, project_key)}, ReturnValues="ALL_OLD"
+    )
+    return bool(resp.get("Attributes"))
+
+
+def allowed_jira_projects() -> list[dict]:
+    """Every ALLOW-mode Jira project row on an enabled, active, jira-enabled
+    site — the set rendered into the ``sdlc_allowed_projects`` Cedar forbid
+    (§B2.3) and offered by the admin UI. ``[{site_id, project_key, repos}]``."""
+    sites = {
+        s["site_id"]: s
+        for s in list_atlassian_sites()
+        if s.get("enabled")
+        and s.get("status") == ATLASSIAN_SITE_ACTIVE
+        and (s.get("products") or {}).get("jira")
+    }
+    return [
+        {"site_id": r["site_id"], "project_key": r["project_key"],
+         "repos": list(r.get("repos") or [])}
+        for r in list_jira_projects()
+        if r.get("mode") == CONTAINER_MODE_ALLOW and r.get("site_id") in sites
+    ]
+
+
+# --- Confluence space policy (§C1.2) -------------------------------------------
+
+
+def _confluence_space_pk(site_id: str, key: str) -> str:
+    return f"{_CONFLUENCE_SPACE_PK_PREFIX}{site_id}#{key}"
+
+
+def list_confluence_spaces(site_id: str | None = None) -> list[dict]:
+    prefix = f"{_CONFLUENCE_SPACE_PK_PREFIX}{site_id}#" if site_id else None
+    rows = _query_kind("confluence_space", pk_prefix=prefix)
+    rows.sort(key=lambda r: r.get("space_key", ""))
+    return rows
+
+
+def get_confluence_space(site_id: str, key: str) -> dict | None:
+    resp = _get_table().get_item(Key={"pk": _confluence_space_pk(site_id, key)})
+    return resp.get("Item")
+
+
+def put_confluence_space(
+    site_id: str,
+    space_key: str,
+    *,
+    mode: str,
+    space_name: str = "",
+    write_mode: str = CONFLUENCE_WRITE_PROPOSE,
+    write_agents: list[str] | None = None,
+    repos: list[str] | None = None,
+    note: str = "",
+    created_by: str = "",
+) -> dict:
+    """Create/replace a Confluence space row — the WHERE axis AND the
+    write-safety axis (§C1.2/§C3.2). Personal-space keys (``~``) are rejected by
+    the key shape. ``write_agents`` narrows write tools in this space to the
+    listed agents even when others hold Cedar write grants ([] = any granted
+    agent); each id is validated (it's compared against ``_dispatch_agent``)."""
+    if not valid_atlassian_site_id(site_id):
+        raise ValueError(f"invalid Atlassian site id {site_id!r}")
+    if not valid_confluence_space_key(space_key):
+        raise ValueError(
+            f"invalid Confluence space key {space_key!r} — must match "
+            f"{_CONFLUENCE_SPACE_KEY_RE.pattern} (personal '~' spaces are not "
+            "onboardable)"
+        )
+    if mode not in CONTAINER_MODES:
+        raise ValueError(f"invalid container mode {mode!r}")
+    if write_mode not in CONFLUENCE_WRITE_MODES:
+        raise ValueError(f"invalid write mode {write_mode!r}")
+    agents = []
+    for a in write_agents or []:
+        if not valid_agent_id(a):
+            raise ValueError(f"invalid write agent id {a!r}")
+        if a not in agents:
+            agents.append(a)
+    normalized_repos = sorted(
+        {_normalize_repo(r) for r in (repos or []) if r and r.strip()}
+    )
+    item = {
+        "pk": _confluence_space_pk(site_id, space_key),
+        "kind": "confluence_space",
+        "site_id": site_id,
+        "space_key": space_key,
+        "space_name": space_name,
+        "mode": mode,
+        "write_mode": write_mode,
+        "write_agents": agents,
+        "repos": normalized_repos,
+        "note": note,
+        "created_by": created_by,
+        "created_at": int(time.time()),
+    }
+    _get_table().put_item(Item=item)
+    return item
+
+
+def delete_confluence_space(site_id: str, space_key: str) -> bool:
+    resp = _get_table().delete_item(
+        Key={"pk": _confluence_space_pk(site_id, space_key)}, ReturnValues="ALL_OLD"
+    )
+    return bool(resp.get("Attributes"))
+
+
+def allowed_confluence_spaces() -> list[dict]:
+    """Every ALLOW-mode Confluence space row on an enabled, active,
+    confluence-enabled site — rendered into the ``sdlc_allowed_spaces`` Cedar
+    forbid (§C2.3) and read by the broker's allowlist check."""
+    sites = {
+        s["site_id"]: s
+        for s in list_atlassian_sites()
+        if s.get("enabled")
+        and s.get("status") == ATLASSIAN_SITE_ACTIVE
+        and (s.get("products") or {}).get("confluence")
+    }
+    return [
+        {"site_id": r["site_id"], "space_key": r["space_key"],
+         "repos": list(r.get("repos") or [])}
+        for r in list_confluence_spaces()
+        if r.get("mode") == CONTAINER_MODE_ALLOW and r.get("site_id") in sites
+    ]
+
+
+# --- Automation rules (§A8) -----------------------------------------------------
+
+
+def _automation_rule_pk(rule_id: str) -> str:
+    return f"{_AUTOMATION_RULE_PK_PREFIX}{rule_id}"
+
+
+def automation_principal(connector: str, rule_id: str) -> str:
+    """The synthetic per-rule principal (§A6.3/§A8.4): a distinct namespace so a
+    rule can never inherit a person's grants. The admin API auto-authors a permit
+    trigger_rule for this principal on create/enable and removes it on
+    delete/disable — rules are grants, not bypasses."""
+    return f"automation:{connector}:{rule_id}"
+
+
+def list_automation_rules(connector: str | None = None) -> list[dict]:
+    rows = _scan_kind("automation_rule", sort_key="created_at")
+    if connector is not None:
+        rows = [r for r in rows if r.get("connector") == connector]
+    return rows
+
+
+def get_automation_rule(rule_id: str) -> dict | None:
+    resp = _get_table().get_item(Key={"pk": _automation_rule_pk(rule_id)})
+    return resp.get("Item")
+
+
+def put_automation_rule(
+    *,
+    connector: str,
+    event: str,
+    match: dict | None = None,
+    agent_id: str,
+    instruction_template: str,
+    enabled: bool = True,
+    cooldown_seconds: int = 3600,
+    created_by: str = "",
+    rule_id: str | None = None,
+) -> dict:
+    """Create (or replace, when rule_id is given) an automation rule (§A8.1).
+
+    Validates connector/event against the engine's known families, the agent id
+    (it's pre-resolved into the dispatch payload), the match keys' shapes where
+    they are load-bearing (site id, project/space key, label), and the template
+    against the connector's variable allowlist — an unknown ``{{var}}`` is
+    rejected at authoring time rather than silently rendering empty in every
+    dispatch. The match's free-text values (status names, title_contains) are
+    compared, never rendered into policy, so they're stored as-is."""
+    if connector not in AUTOMATION_EVENTS:
+        raise ValueError(f"invalid automation connector {connector!r}")
+    if event not in AUTOMATION_EVENTS[connector]:
+        raise ValueError(
+            f"invalid {connector} automation event {event!r} — must be one of "
+            f"{list(AUTOMATION_EVENTS[connector])}"
+        )
+    if not valid_agent_id(agent_id):
+        raise ValueError(f"invalid agent_id {agent_id!r}")
+    template = (instruction_template or "").strip()
+    if not template:
+        raise ValueError("instruction_template is required")
+    allowed_vars = set(AUTOMATION_TEMPLATE_VARS[connector])
+    for var in re.findall(r"\{\{\s*(\w+)\s*\}\}", template):
+        if var not in allowed_vars:
+            raise ValueError(
+                f"unknown template variable {{{{{var}}}}} for {connector} — "
+                f"allowed: {sorted(allowed_vars)}"
+            )
+    m = dict(match or {})
+    site = str(m.get("site", "*") or "*")
+    if site != "*" and not valid_atlassian_site_id(site):
+        raise ValueError(f"invalid match.site {site!r}")
+    project = str(m.get("project", "*") or "*")
+    if connector == "jira" and project != "*" and not valid_jira_project_key(project):
+        raise ValueError(f"invalid match.project {project!r}")
+    space = str(m.get("space", "*") or "*")
+    if connector == "confluence" and space != "*" and not valid_confluence_space_key(space):
+        raise ValueError(f"invalid match.space {space!r}")
+    label = str(m.get("label", "") or "")
+    if label and not valid_atlassian_label(label):
+        raise ValueError(f"invalid match.label {label!r}")
+    labels_any = [str(l) for l in (m.get("labels_any") or []) if str(l)]
+    for l in labels_any:
+        if not valid_atlassian_label(l):
+            raise ValueError(f"invalid match.labels_any entry {l!r}")
+    try:
+        cooldown = int(cooldown_seconds)
+    except (TypeError, ValueError):
+        raise ValueError("cooldown_seconds must be an integer")
+    if cooldown < 0:
+        raise ValueError("cooldown_seconds must be >= 0")
+
+    if rule_id is None:
+        import uuid
+
+        rule_id = str(uuid.uuid4())
+    existing = get_automation_rule(rule_id) or {}
+    item = {
+        "pk": _automation_rule_pk(rule_id),
+        "kind": "automation_rule",
+        "rule_id": rule_id,
+        "connector": connector,
+        "enabled": bool(enabled),
+        "event": event,
+        "match": m,
+        "action": {"agent_id": agent_id, "instruction_template": template},
+        "cooldown_seconds": cooldown,
+        "created_by": created_by or existing.get("created_by", ""),
+        "created_at": existing.get("created_at", int(time.time())),
+        "updated_at": int(time.time()),
+        "last_fired_at": existing.get("last_fired_at"),
+        "fire_count": existing.get("fire_count", 0),
+    }
+    _get_table().put_item(Item=item)
+    return item
+
+
+def set_automation_rule_enabled(rule_id: str, enabled: bool) -> dict | None:
+    if get_automation_rule(rule_id) is None:
+        return None
+    _get_table().update_item(
+        Key={"pk": _automation_rule_pk(rule_id)},
+        UpdateExpression="SET enabled = :e, updated_at = :u",
+        ExpressionAttributeValues={":e": bool(enabled), ":u": int(time.time())},
+        ConditionExpression="attribute_exists(pk)",
+    )
+    return get_automation_rule(rule_id)
+
+
+def delete_automation_rule(rule_id: str) -> bool:
+    """Delete a rule row. Does NOT remove its auto-authored trigger grant — the
+    admin API composes that (§A8.4) so the coupling is explicit + testable."""
+    resp = _get_table().delete_item(
+        Key={"pk": _automation_rule_pk(rule_id)}, ReturnValues="ALL_OLD"
+    )
+    return bool(resp.get("Attributes"))
+
+
+# --- Per-user DM notification prefs (§A9.2) -------------------------------------
+
+
+def _notif_pref_pk(identity_id: str) -> str:
+    return f"{_NOTIF_PREF_PK_PREFIX}{identity_id}"
+
+
+def get_notif_pref(identity_id: str) -> dict | None:
+    resp = _get_table().get_item(Key={"pk": _notif_pref_pk(identity_id)})
+    return resp.get("Item")
+
+
+def put_notif_pref(
+    identity_id: str,
+    *,
+    tiers: dict | None = None,
+    min_tier: str = NOTIF_TIER_ACTIONABLE,
+    created_by: str = "",
+) -> dict:
+    """Create/replace a person's DM notification preference (§A9.2). Only an
+    ACTIVE identity with a VERIFIED Slack handle may hold prefs — enforced by
+    the writer paths (admin API / the /sdlc-notify me submit), re-checked at
+    delivery (notify_user), so a pref can never mis-ping. Tier map validated
+    like put_notif_sub."""
+    if not (identity_id or "").strip():
+        raise ValueError("identity_id is required")
+    if min_tier not in NOTIF_TIERS:
+        raise ValueError(f"invalid min_tier {min_tier!r}")
+    clean_tiers: dict[str, list[str]] = {}
+    for tier, events in (tiers or {}).items():
+        if tier not in NOTIF_TIERS:
+            raise ValueError(f"invalid notification tier {tier!r}")
+        clean_tiers[tier] = [str(e).strip() for e in (events or []) if str(e).strip()]
+    existing = get_notif_pref(identity_id) or {}
+    now = int(time.time())
+    item = {
+        "pk": _notif_pref_pk(identity_id),
+        "kind": "notif_pref",
+        "identity_id": identity_id,
+        "tiers": clean_tiers,
+        "min_tier": min_tier,
+        "created_by": created_by or existing.get("created_by", ""),
+        "created_at": existing.get("created_at", now),
+        "updated_at": now,
+    }
+    _get_table().put_item(Item=item)
+    return item
+
+
+def delete_notif_pref(identity_id: str) -> bool:
+    resp = _get_table().delete_item(
+        Key={"pk": _notif_pref_pk(identity_id)}, ReturnValues="ALL_OLD"
+    )
+    return bool(resp.get("Attributes"))

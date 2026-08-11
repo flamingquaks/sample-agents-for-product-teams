@@ -135,6 +135,60 @@ def test_invoke_failure_does_not_directly_notify_run_failed(router):
     assert "run_failed" not in events
 
 
+def _event_automation():
+    # A synthetic automation dispatch (§A8.4): the sender is the reserved
+    # per-rule principal, source jira, agent pre-resolved by the engine.
+    return {
+        "source": "jira",
+        "trigger_type": "automation",
+        "agent_id": "workitems",
+        "instruction": "Review ENG-9",
+        "body": "Review ENG-9",
+        "sender": "automation:jira:r1",
+        "context": {"workspace": "site-1", "project_key": "ENG", "issue_key": "ENG-9"},
+    }
+
+
+def test_automation_principal_skips_identity_gate_and_dispatches(router):
+    # A synthetic automation principal has no person to onboard: the handler must
+    # NOT call resolve_dispatch_identity for it (that would file a bogus user
+    # request + 403), but it MUST still authorize + dispatch (fix #2).
+    with patch("guardrail.check_prompt") as mock_check, \
+         patch.object(router, "invoke_agent") as mock_invoke, \
+         patch.object(router, "resolve_dispatch_identity") as mock_ident, \
+         patch.object(router, "authorize_trigger", return_value=(True, "")) as mock_authz:
+        mock_check.return_value = MagicMock(outcome="passed", reason="")
+        resp = router.handler(_event_automation(), None)
+    assert resp["statusCode"] == 200
+    mock_ident.assert_not_called()  # no person identity resolution for a synthetic principal
+    mock_invoke.assert_called_once()
+    # Authorized through the SAME AVP path, with the verbatim synthetic principal.
+    assert mock_authz.call_args.args[1] == "automation:jira:r1"
+
+
+def test_automation_prefix_without_automation_trigger_still_onboards(router):
+    # Hardening (review finding #4): the onboarding-skip requires BOTH the
+    # reserved prefix AND trigger_type=="automation". A NON-automation dispatch
+    # whose sender merely collides with the 'automation:' prefix must NOT be
+    # exempted — it goes through identity resolution like any person.
+    import identity as identity_mod
+    with patch("guardrail.check_prompt") as mock_check, \
+         patch.object(router, "invoke_agent"), \
+         patch.object(router, "resolve_dispatch_identity",
+                      return_value=identity_mod.Identity(
+                          identity_id="id-x", email="x@acme.com", status="active")) as mock_ident, \
+         patch.object(router, "authorize_trigger", return_value=(True, "")):
+        mock_check.return_value = MagicMock(outcome="passed", reason="")
+        evt = {
+            "source": "jira", "trigger_type": "comment_mention",
+            "agent_id": "workitems", "instruction": "hi", "body": "hi",
+            "sender": "automation:jira:r1",  # crafted collision, but NOT an automation fire
+            "context": {"workspace": "site-1", "project_key": "ENG"},
+        }
+        router.handler(evt, None)
+    mock_ident.assert_called_once()  # NOT exempted — onboarding gate still applies
+
+
 def test_reply_failure_does_not_revert_block(router):
     with patch("guardrail.check_prompt") as mock_check, \
          patch("reply.post_github_comment", return_value=False), \

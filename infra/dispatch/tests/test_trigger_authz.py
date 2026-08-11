@@ -185,6 +185,68 @@ def test_channel_blocked_flows_to_context(monkeypatch):
     assert d.allow is False
 
 
+def test_atlassian_uses_container_key_not_channel_id(monkeypatch):
+    # For a jira/confluence dispatch the WHERE-axis key is the project/space key
+    # (source_context never carries channel_id) — is_authorized must resolve it
+    # from project_key/space_key, pass it to container_allowed, AND surface it as
+    # the Cedar `channel` context (atlassian-connector spec §A7).
+    monkeypatch.setenv("TRIGGER_POLICY_STORE_ID", "ps-1")
+    ta = _load()
+    from trigger_grants import AgentGrants
+
+    ta.trigger_grants.agent_grants = MagicMock(
+        return_value=AgentGrants(allowed_principals=["atlassian:acct"],
+                                 denied_principals=[], allowed_groups=[], denied_groups=[])
+    )
+    seen = {}
+
+    def fake_container_allowed(workspace, key, product):
+        seen["args"] = (workspace, key, product)
+        return key == "ENG" and product == "jira"
+
+    ta.trigger_grants.container_allowed = MagicMock(side_effect=fake_container_allowed)
+    # channel_allowed must NOT be used for atlassian sources.
+    ta.trigger_grants.channel_allowed = MagicMock(side_effect=AssertionError("used channel_allowed"))
+    avp = MagicMock()
+    avp.is_authorized.return_value = {"decision": "ALLOW"}
+    with patch.object(ta, "_avp_client", return_value=avp):
+        d = ta.is_authorized(
+            principal="atlassian:acct", agent_id="workitems", source="jira",
+            context={"workspace": "site-1", "project_key": "ENG"},
+        )
+    assert d.allow is True
+    assert seen["args"] == ("site-1", "ENG", "jira")
+    _, kw = avp.is_authorized.call_args
+    cm = kw["context"]["contextMap"]
+    assert cm["channel"] == {"string": "ENG"}
+    assert cm["channelAllowed"] == {"boolean": True}
+
+
+def test_atlassian_confluence_space_key_resolves(monkeypatch):
+    monkeypatch.setenv("TRIGGER_POLICY_STORE_ID", "ps-1")
+    ta = _load()
+    from trigger_grants import AgentGrants
+
+    ta.trigger_grants.agent_grants = MagicMock(
+        return_value=AgentGrants(allowed_principals=["atlassian:acct"],
+                                 denied_principals=[], allowed_groups=[], denied_groups=[])
+    )
+    ta.trigger_grants.container_allowed = MagicMock(return_value=False)
+    ta.trigger_grants.channel_allowed = MagicMock(side_effect=AssertionError("used channel_allowed"))
+    avp = MagicMock()
+    avp.is_authorized.return_value = {"decision": "DENY",
+                                      "determiningPolicies": [{"policyId": "sdlc_trigger_forbid_channel"}]}
+    with patch.object(ta, "_avp_client", return_value=avp):
+        ta.is_authorized(
+            principal="atlassian:acct", agent_id="docwriter", source="confluence",
+            context={"workspace": "site-1", "space_key": "DOCS"},
+        )
+    ta.trigger_grants.container_allowed.assert_called_once_with("site-1", "DOCS", "confluence")
+    _, kw = avp.is_authorized.call_args
+    assert kw["context"]["contextMap"]["channel"] == {"string": "DOCS"}
+    assert kw["context"]["contextMap"]["channelAllowed"] == {"boolean": False}
+
+
 def test_empty_context_defaults(monkeypatch):
     monkeypatch.setenv("TRIGGER_POLICY_STORE_ID", "ps-1")
     ta = _load()

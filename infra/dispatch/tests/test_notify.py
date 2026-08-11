@@ -173,3 +173,66 @@ def test_dashboard_run_url(notify_mod, monkeypatch):
     assert notify_mod.dashboard_run_url("a-1") == ""
     monkeypatch.setenv("DASHBOARD_URL", "https://d123.cloudfront.net/")
     assert notify_mod.dashboard_run_url("") == ""
+
+
+# --- Atlassian: per-user DM notifications (§A9.2) + container scopes ----------
+
+def test_subscription_wants_project_scope():
+    import notify
+    sub = {"min_severity": "informative", "tiers": {"informative": ["automation_fired"]},
+           "projects": ["ENG"]}
+    assert notify._subscription_wants(sub, tier="informative", event="automation_fired",
+                                      repo="", project="ENG") is True
+    assert notify._subscription_wants(sub, tier="informative", event="automation_fired",
+                                      repo="", project="OPS") is False
+
+
+def test_subscription_wants_space_scope():
+    import notify
+    sub = {"min_severity": "informative", "tiers": {"informative": ["page_published"]},
+           "spaces": ["DOCS"]}
+    assert notify._subscription_wants(sub, tier="informative", event="page_published",
+                                      repo="", space="DOCS") is True
+    assert notify._subscription_wants(sub, tier="informative", event="page_published",
+                                      repo="", space="SECRET") is False
+
+
+def test_notify_user_requires_optin(monkeypatch):
+    import notify
+    notify.reset_prefs_cache()
+    # No pref row → no DM.
+    monkeypatch.setattr(notify, "_prefs_snapshot", lambda now=None: [])
+    assert notify.notify_user("id-1", tier="actionable", event="agent_replied",
+                              text="hi", team_id="T1") is False
+
+
+def test_notify_user_silent_degrade_without_handle(monkeypatch):
+    import notify
+    monkeypatch.setattr(notify, "_prefs_snapshot", lambda now=None: [
+        {"identity_id": "id-1", "min_tier": "actionable",
+         "tiers": {"actionable": ["agent_replied"]}}])
+    # Opted in, but no slack handle in this workspace → degrade (False), no post.
+    monkeypatch.setattr(notify.identity_map, "slack_handle_for", lambda iid, team: None)
+    posted = []
+    monkeypatch.setattr(notify.reply, "post_slack_message_ts",
+                        lambda **k: posted.append(1) or (True, "1"))
+    assert notify.notify_user("id-1", tier="actionable", event="agent_replied",
+                              text="hi", team_id="T1") is False
+    assert posted == []
+
+
+def test_notify_user_dms_when_opted_in(monkeypatch):
+    import notify
+    monkeypatch.setattr(notify, "_prefs_snapshot", lambda now=None: [
+        {"identity_id": "id-1", "min_tier": "actionable",
+         "tiers": {"actionable": ["agent_replied"]}}])
+    monkeypatch.setattr(notify.identity_map, "slack_handle_for", lambda iid, team: "U9")
+    monkeypatch.setattr(notify, "_open_im", lambda team, uid: "D123")
+    sent = {}
+    def fake_post(**k):
+        sent.update(k)
+        return True, "ts1"
+    monkeypatch.setattr(notify.reply, "post_slack_message_ts", fake_post)
+    assert notify.notify_user("id-1", tier="actionable", event="agent_replied",
+                              text="you were mentioned", team_id="T1") is True
+    assert sent["channel"] == "D123" and "mentioned" in sent["body"]

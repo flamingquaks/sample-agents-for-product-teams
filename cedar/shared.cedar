@@ -20,5 +20,10 @@ forbid(
     resource.toolName == "github_delete_branch" ||
     resource.toolName == "asana_delete_task" ||
     resource.toolName == "asana_delete_project" ||
-    resource.toolName == "asana_delete_story"
+    resource.toolName == "asana_delete_story" ||
+    resource.toolName == "jira_delete_issue" ||
+    resource.toolName == "jira_delete_project" ||
+    resource.toolName == "confluence_delete_page" ||
+    resource.toolName == "confluence_archive_page" ||
+    resource.toolName == "confluence_delete_space"
 };

@@ -1,0 +1,10 @@
+{
+  "name": "atlassian-events",
+  "version": "1.0.0",
+  "private": true,
+  "description": "SDLC Agent Fleet — shared Forge event forwarder for Jira + Confluence (atlassian-connector spec §A5).",
+  "type": "module",
+  "dependencies": {
+    "@forge/api": "^4.0.0"
+  }
+}

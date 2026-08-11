@@ -163,24 +163,52 @@ def namespaced_principal(sender: str, source: str) -> str:
     unambiguous (an Asana gid can't collide with a GitHub login) and matches the
     ``github:<login>`` / ``asana:<gid>`` form the dashboard rule editor writes. A
     sender already carrying its ``<source>:`` prefix (Slack, or a re-dispatch) is
-    left as-is."""
+    left as-is.
+
+    Both Atlassian products map to ONE principal namespace —
+    ``atlassian:<accountId>`` — because account ids are global across Jira and
+    Confluence (atlassian-connector spec §A6.3); the dispatch ``source`` still
+    distinguishes the products.
+
+    A synthetic automation principal (``automation:<connector>:<rule_id>``,
+    §A8.4) is ALREADY fully namespaced in its own reserved namespace — never a
+    person — so it is returned verbatim, not re-prefixed with the source (which
+    would produce ``atlassian:automation:…`` and never match the rule's grant)."""
     if not sender:
         return sender
+    if is_synthetic_principal(sender):
+        return sender
+    if source in ("jira", "confluence") and not sender.startswith("atlassian:"):
+        return f"atlassian:{sender}"
     if source in ("github", "asana") and not sender.startswith(f"{source}:"):
         return f"{source}:{sender}"
     return sender
 
 
+def is_synthetic_principal(sender: str) -> bool:
+    """Whether ``sender`` is a synthetic (non-person) principal — today the
+    automation engine's per-rule principal (``automation:<connector>:<rule_id>``,
+    §A8.4). These are authorized through the same AVP path as people (via an
+    auto-authored grant) but must skip person identity resolution + the
+    first-touch onboarding gate — there is no human behind them to onboard."""
+    return bool(sender) and sender.startswith("automation:")
+
+
 def _identity_source_and_handle(sender: str, source: str, source_context: dict) -> tuple[str, str, str]:
     """Split a namespaced principal into (identity_source, handle, workspace) for
     the identity resolver. Slack senders are ``slack:<team>:<uid>``; github/asana
-    are the bare login/gid (namespaced only for authz). Returns the identity
-    ``source`` (one of IDENTITY_SOURCES), the source-native handle, and the Slack
-    workspace ("" for non-Slack)."""
+    are the bare login/gid (namespaced only for authz). Jira/Confluence senders
+    resolve to the ONE ``atlassian`` identity source (account ids are global
+    across products, §A6.3). Returns the identity ``source`` (one of
+    IDENTITY_SOURCES), the source-native handle, and the workspace ("" for
+    sources without one)."""
     if source == "slack" and sender.startswith("slack:"):
         parts = sender.split(":", 2)
         if len(parts) == 3:
             return "slack", parts[2], parts[1]
+    if source in ("jira", "confluence"):
+        handle = sender.split(":", 1)[1] if sender.startswith("atlassian:") else sender
+        return "atlassian", handle, str(source_context.get("workspace", "") or "")
     return source, sender, str(source_context.get("workspace", "") or "")
 
 
@@ -681,6 +709,19 @@ def _post_block_reply(
             thread_ts=source_context.get("thread_ts"),
             agent_id=agent_id,
         )
+    if source == "jira":
+        return reply.post_jira_comment(
+            site_id=source_context.get("workspace", ""),
+            issue_key=source_context.get("issue_key", ""),
+            body=message,
+        )
+    if source == "confluence":
+        return reply.post_confluence_comment(
+            site_id=source_context.get("workspace", ""),
+            page_id=source_context.get("page_id", ""),
+            body=message,
+            parent_comment_id=source_context.get("comment_id"),
+        )
     logger.warning("No reply channel for source=%s — block notice not posted", source)
     return False
 
@@ -1014,7 +1055,14 @@ def handler(event, context):
     # them. A resolved, ACTIVE identity's email + groups feed authorization so a
     # grant authored against an email/group applies across all their sources.
     principal = namespaced_principal(sender, source)
-    if principal and principal not in _UNRESOLVED_SENDERS:
+    # A synthetic automation principal has no person behind it: skip identity
+    # resolution + the first-touch onboarding gate, but still authorize it
+    # through AVP below (against its auto-authored grant, §A8.4). Gate the skip on
+    # BOTH the reserved-namespace prefix AND trigger_type=="automation" — a real
+    # sender must never be exempted from onboarding by a crafted/colliding id
+    # (the automation namespace is only legitimately produced by the engine).
+    is_automation = is_synthetic_principal(principal) and trigger_type == "automation"
+    if principal and principal not in _UNRESOLVED_SENDERS and not is_automation:
         person = resolve_dispatch_identity(sender, source, source_context)
         if not person.usable:
             org_owned = _is_org_owned(source, source_context)

@@ -37,6 +37,12 @@ manifest and MUST be confirmed on first deploy (see docs/aws-deploy.md):
 # Must match the GatewayTarget Name in infra/foundation/template.yaml.
 GITHUB_TARGET = "GitHubTarget"
 
+# Atlassian gateway target names — must match the GatewayTarget Names in
+# template.yaml AND jira_broker.TARGET_NAME / confluence_broker.TARGET_NAME, so
+# the Cedar action names (<Target>___<tool>) line up with what agents call.
+JIRA_TARGET = "JiraTarget"
+CONFLUENCE_TARGET = "ConfluenceTarget"
+
 # GitHub write tools the repo restriction applies to. Read tools are left
 # unrestricted here (the per-agent cedar/*.cedar policies still scope those).
 # Keep in sync with the live gateway tool manifest — see module docstring.
@@ -142,6 +148,41 @@ ASANA_TOOL_CLASS = {
 
 _ASANA_TARGET = "AsanaTarget"
 
+# Jira tool classification (§B2.2). Destructive Jira ops (any delete, worklog /
+# sprint / board / project / user admin) are never listed, so they can't be
+# granted and have no gateway surface (jira_broker._TOOLS omits them too).
+JIRA_TOOL_CLASS = {
+    "get_issue": CLASS_READ,
+    "get_issue_comments": CLASS_READ,
+    "get_transitions": CLASS_READ,
+    "search_issues": CLASS_READ,
+    "list_projects": CLASS_READ,
+    "get_project": CLASS_READ,
+    "add_comment": CLASS_WRITE,
+    "create_issue": CLASS_WRITE,
+    "update_issue": CLASS_WRITE,
+    "transition_issue": CLASS_WRITE,
+    "assign_issue": CLASS_WRITE,
+    "link_issues": CLASS_WRITE,
+    "add_remote_link": CLASS_WRITE,
+}
+
+# Confluence tool classification (§C2.2). Destructive ops (delete/archive/
+# restore, page moves, attachment writes, space/permission/user admin) are never
+# listed — no grant, no gateway surface (confluence_broker._TOOLS omits them).
+CONFLUENCE_TOOL_CLASS = {
+    "get_page": CLASS_READ,
+    "get_page_children": CLASS_READ,
+    "get_comments": CLASS_READ,
+    "search": CLASS_READ,
+    "list_spaces": CLASS_READ,
+    "get_space": CLASS_READ,
+    "create_page": CLASS_WRITE,
+    "update_page": CLASS_WRITE,
+    "add_comment": CLASS_WRITE,
+    "add_label": CLASS_WRITE,
+}
+
 
 def classify_tool(action_id: str) -> str | None:
     """Classify a gateway ``Target___tool`` action id as read|write|destructive,
@@ -161,6 +202,10 @@ def classify_tool(action_id: str) -> str | None:
         return None
     if target == _ASANA_TARGET:
         return ASANA_TOOL_CLASS.get(tool)
+    if target == JIRA_TARGET:
+        return JIRA_TOOL_CLASS.get(tool)
+    if target == CONFLUENCE_TARGET:
+        return CONFLUENCE_TOOL_CLASS.get(tool)
     return None
 
 
@@ -175,6 +220,10 @@ def tool_catalog() -> list[dict]:
         out.append({"action_id": f"{GITHUB_TARGET}___{tool}", "target": GITHUB_TARGET, "tool": tool, "klass": CLASS_WRITE})
     for tool, klass in ASANA_TOOL_CLASS.items():
         out.append({"action_id": f"{_ASANA_TARGET}___{tool}", "target": _ASANA_TARGET, "tool": tool, "klass": klass})
+    for tool, klass in JIRA_TOOL_CLASS.items():
+        out.append({"action_id": f"{JIRA_TARGET}___{tool}", "target": JIRA_TARGET, "tool": tool, "klass": klass})
+    for tool, klass in CONFLUENCE_TOOL_CLASS.items():
+        out.append({"action_id": f"{CONFLUENCE_TARGET}___{tool}", "target": CONFLUENCE_TARGET, "tool": tool, "klass": klass})
     return out
 
 
@@ -230,6 +279,72 @@ def _allow_condition(allowed_repos: list[str]) -> str:
         for owner, name in pairs
     )
     return f"context.input has owner && context.input has repo &&\n  ({clauses})"
+
+
+def _actions_block_for(target: str, tools) -> str:
+    """The Cedar action list for a set of ``<target>___<tool>`` write tools."""
+    lines = ",\n".join(
+        f'    AgentCore::Action::"{target}___{tool}"' for tool in tools
+    )
+    return f"[\n{lines}\n  ]"
+
+
+# Jira/Confluence WRITE tools the container allowlist applies to (the write
+# subset of each TOOL_CLASS). Reads are broker-enforced (§C2.4), not Cedar-gated,
+# matching GitHub's posture where the credential/broker already scopes reads.
+_JIRA_WRITE_TOOLS = tuple(t for t, k in JIRA_TOOL_CLASS.items() if k == CLASS_WRITE)
+_CONFLUENCE_WRITE_TOOLS = tuple(t for t, k in CONFLUENCE_TOOL_CLASS.items() if k == CLASS_WRITE)
+
+
+def _container_allow_condition(keys: list[str], param: str) -> str:
+    """The ``unless { ... }`` clause for a container write forbid: forbidden
+    unless the call's ``context.input.<param>`` (project_key / space_key) is in
+    the onboarded set. Empty ⇒ ``false`` (all writes forbidden — the safe
+    default before any container is onboarded), mirroring _allow_condition."""
+    if not keys:
+        return "false"
+    listed = ", ".join(f'"{k}"' for k in keys)
+    return (
+        f"context.input has {param} &&\n"
+        f"  context.input.{param} in [{listed}]"
+    )
+
+
+def render_container_policies(
+    allowed_projects: list[str],
+    allowed_spaces: list[str],
+    gateway_arn: str,
+) -> dict[str, str]:
+    """Render the Atlassian container write-allowlist forbids (§B2.3/§C2.3):
+
+      - sdlc_allowed_projects — Jira write tools forbidden unless the call's
+        ``project_key`` is an onboarded project.
+      - sdlc_allowed_spaces — Confluence write tools forbidden unless the call's
+        ``space_key`` is an onboarded space.
+
+    Same structure as sdlc_allowed_repos: a per-container forbid lifted only for
+    onboarded containers, empty ⇒ ``unless { false }``. Deterministic. Returned
+    only when the corresponding target's write tools could be called (the caller
+    filters to deployed targets, like the repo policy)."""
+    resource = f'AgentCore::Gateway::"{gateway_arn}"'
+    projects_forbid = (
+        "forbid(\n"
+        "  principal,\n"
+        f"  action in {_actions_block_for(JIRA_TARGET, _JIRA_WRITE_TOOLS)},\n"
+        f"  resource == {resource}\n"
+        f") unless {{\n  {_container_allow_condition(sorted(allowed_projects), 'project_key')}\n}};"
+    )
+    spaces_forbid = (
+        "forbid(\n"
+        "  principal,\n"
+        f"  action in {_actions_block_for(CONFLUENCE_TARGET, _CONFLUENCE_WRITE_TOOLS)},\n"
+        f"  resource == {resource}\n"
+        f") unless {{\n  {_container_allow_condition(sorted(allowed_spaces), 'space_key')}\n}};"
+    )
+    return {
+        "sdlc_allowed_projects": projects_forbid,
+        "sdlc_allowed_spaces": spaces_forbid,
+    }
 
 
 def render_fleet_policies(allowed_repos: list[str], gateway_arn: str) -> dict[str, str]:
@@ -312,6 +427,22 @@ RETIRED_FLEET_POLICY_NAMES = ("sdlc_forbid_destructive",)
 # through the gateway), so it gets only Asana actions.
 _GH = GITHUB_TARGET
 _AS = "AsanaTarget"  # must match the AsanaGatewayTarget Name in template.yaml
+_JR = JIRA_TARGET
+_CF = CONFLUENCE_TARGET
+
+# Jira grants (§B2.3): workitems owns ticket state (all reads + writes); adr /
+# docwriter comment-only; researcher reads. Confluence grants (§C2.3): docwriter
+# owns the doc surface (reads + create/update/comment/label); workitems + adr
+# read + comment (adr also labels); researcher reads. Every agent can READ
+# tickets + docs for deep context — writes are least-privilege per agent.
+_JIRA_READS = [
+    f"{_JR}___get_issue", f"{_JR}___get_issue_comments", f"{_JR}___get_transitions",
+    f"{_JR}___search_issues", f"{_JR}___list_projects", f"{_JR}___get_project",
+]
+_CONFLUENCE_READS = [
+    f"{_CF}___get_page", f"{_CF}___get_page_children", f"{_CF}___get_comments",
+    f"{_CF}___search", f"{_CF}___list_spaces", f"{_CF}___get_space",
+]
 
 AGENT_TOOL_GRANTS = {
     "workitems": [
@@ -331,6 +462,18 @@ AGENT_TOOL_GRANTS = {
         f"{_AS}___create_task",
         f"{_AS}___update_task",
         f"{_AS}___add_comment",
+        # Jira — the PM owns ticket state (§B2.3).
+        *_JIRA_READS,
+        f"{_JR}___add_comment",
+        f"{_JR}___create_issue",
+        f"{_JR}___update_issue",
+        f"{_JR}___transition_issue",
+        f"{_JR}___assign_issue",
+        f"{_JR}___link_issues",
+        f"{_JR}___add_remote_link",
+        # Confluence — grounds plans in specs; reports in threads (§C2.3).
+        *_CONFLUENCE_READS,
+        f"{_CF}___add_comment",
     ],
     "docwriter": [
         f"{_GH}___get_file_contents",
@@ -352,6 +495,16 @@ AGENT_TOOL_GRANTS = {
         f"{_AS}___search",
         f"{_AS}___add_comment",
         f"{_AS}___create_task",
+        # Jira — reads + comment/remote-link (§B2.3).
+        *_JIRA_READS,
+        f"{_JR}___add_comment",
+        f"{_JR}___add_remote_link",
+        # Confluence — owns the documentation surface (§C2.3).
+        *_CONFLUENCE_READS,
+        f"{_CF}___create_page",
+        f"{_CF}___update_page",
+        f"{_CF}___add_comment",
+        f"{_CF}___add_label",
     ],
     "adr": [
         f"{_GH}___get_file_contents",
@@ -368,6 +521,14 @@ AGENT_TOOL_GRANTS = {
         # Diff-anchored PR review (Modes 2/3). The broker forces event=COMMENT,
         # so this is comment-only — never approve/request-changes/merge.
         f"{_GH}___create_pull_request_review",
+        # Jira — reads + comment/remote-link (§B2.3).
+        *_JIRA_READS,
+        f"{_JR}___add_comment",
+        f"{_JR}___add_remote_link",
+        # Confluence — links decisions; tags pages, never edits them (§C2.3).
+        *_CONFLUENCE_READS,
+        f"{_CF}___add_comment",
+        f"{_CF}___add_label",
     ],
     "researcher": [
         # GitHub — READ ONLY: ground research/backlog analysis in the real
@@ -387,6 +548,9 @@ AGENT_TOOL_GRANTS = {
         f"{_AS}___create_task",
         f"{_AS}___update_task",
         f"{_AS}___add_comment",
+        # Jira + Confluence — reads only (context, §B2.3/§C2.3).
+        *_JIRA_READS,
+        *_CONFLUENCE_READS,
     ],
 }
 

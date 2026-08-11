@@ -281,6 +281,67 @@ def slack_user_profile(team_id: str, user_id: str) -> dict:
         return {"display_name": "", "email": ""}
 
 
+def post_jira_comment(site_id: str, issue_key: str, body: str) -> bool:
+    """Post a comment to a Jira issue (§B1.3). Site service-account token fetched
+    per-invocation; the body is wrapped in minimal ADF. Non-fatal + metric on
+    failure — the router uses this for acks, guardrail blocks, authz rejects, and
+    onboarding replies (agents post their answers via the gateway JiraTarget)."""
+    if not site_id or not issue_key:
+        logger.error("post_jira_comment missing site_id or issue_key")
+        return False
+    import atlassian_client as ac
+
+    site = ac.get_site(site_id)
+    if not site:
+        logger.error("post_jira_comment: unknown site %s", site_id)
+        return False
+    try:
+        token = ac.fetch_token(site)
+        status, _ = ac.rest(
+            site, "POST", f"/rest/api/3/issue/{issue_key}/comment", token,
+            body={"body": ac.text_to_adf(body)},
+        )
+        if not 200 <= status < 300:
+            logger.error("post_jira_comment rejected for %s/%s: HTTP %s", site_id, issue_key, status)
+            return False
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to post Jira comment to %s/%s: %s", site_id, issue_key, exc)
+        return False
+
+
+def post_confluence_comment(
+    site_id: str, page_id: str, body: str, parent_comment_id: str | None = None
+) -> bool:
+    """Post a footer comment (or a reply under ``parent_comment_id``, covering
+    inline threads) to a Confluence page (§C1.3). Body converted Markdown →
+    storage via the shared converter. Non-fatal + metric on failure."""
+    if not site_id or not page_id:
+        logger.error("post_confluence_comment missing site_id or page_id")
+        return False
+    import atlassian_client as ac
+
+    site = ac.get_site(site_id)
+    if not site:
+        logger.error("post_confluence_comment: unknown site %s", site_id)
+        return False
+    try:
+        token = ac.fetch_token(site)
+        payload = {"pageId": page_id,
+                   "body": {"representation": "storage",
+                            "value": ac.markdown_to_storage(body)}}
+        if parent_comment_id:
+            payload["parentCommentId"] = str(parent_comment_id)
+        status, _ = ac.rest(site, "POST", "/wiki/api/v2/footer-comments", token, body=payload)
+        if not 200 <= status < 300:
+            logger.error("post_confluence_comment rejected for %s/%s: HTTP %s", site_id, page_id, status)
+            return False
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to post Confluence comment to %s/%s: %s", site_id, page_id, exc)
+        return False
+
+
 def _github_token(repo: str) -> Optional[str]:
     """The GitHub bearer token for posting to ``repo``: a per-owner GitHub App
     installation token (bounded to that owner's installed repos — threat-model

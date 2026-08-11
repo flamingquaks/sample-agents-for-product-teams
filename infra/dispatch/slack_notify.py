@@ -34,6 +34,8 @@ STAGE = os.environ.get("STAGE", "dev")
 
 # The callback_id that identifies our notification modal on submit.
 NOTIFY_VIEW_CALLBACK = "sdlc_notify_config"
+# The callback_id for the PER-USER DM prefs modal (/sdlc-notify me, §A9.2).
+NOTIFY_PREF_VIEW_CALLBACK = "sdlc_notify_pref"
 
 # Tier → the specific events a channel can subscribe to, with human labels. Kept
 # here (the modal builder) as the single source of the option set; notify.py
@@ -45,6 +47,9 @@ TIER_EVENTS = {
         ("review_requested", "A PR needs review"),
         ("question", "An agent asked the requester a question"),
         ("awaiting_input", "A run paused waiting for the requester's reply"),
+        # Atlassian (atlassian-connector spec §A9.1).
+        ("agent_replied", "An agent replied to / mentioned you"),
+        ("doc_proposal_ready", "A propose-mode Confluence proposal awaits a human"),
     ],
     "informative": [
         ("run_started", "A run kicked off"),
@@ -54,12 +59,19 @@ TIER_EVENTS = {
         ("pr_opened", "A pull request was opened"),
         ("pr_merged", "A pull request was merged"),
         ("issue_opened", "An issue was opened"),
+        # Atlassian informative events.
+        ("agent_commented", "An agent commented on a ticket / page"),
+        ("issue_transitioned", "A Jira issue changed status"),
+        ("page_published", "An agent published a Confluence page (direct mode)"),
+        ("automation_fired", "An automation rule fired"),
     ],
     "error": [
         ("run_failed", "A run failed"),
         ("guardrail_tripped", "A prompt-injection guardrail tripped"),
         ("credential_expired", "A credential expired"),
         ("assignment_stuck", "An assignment is stuck"),
+        # Atlassian error events.
+        ("automation_throttled", "An automation rule hit its hourly ceiling"),
     ],
 }
 TIER_LABELS = {
@@ -161,6 +173,98 @@ def build_notify_modal(*, team_id: str, channel_id: str, channel_name: str, repo
         "close": {"type": "plain_text", "text": "Cancel"},
         "blocks": blocks,
     }
+
+
+def build_pref_modal(*, team_id: str, user_id: str) -> dict:
+    """The Block Kit view for ``/sdlc-notify me`` — the PER-USER DM prefs modal
+    (§A9.2). Only the DM-relevant events are offered (agent_replied, run status,
+    awaiting_approval). private_metadata carries the team + Slack uid so the
+    submit resolves the identity server-side (never trusting client state)."""
+    dm_events = {
+        "actionable": [("agent_replied", "An agent replied to / mentioned me"),
+                       ("awaiting_approval", "A run I requested awaits approval"),
+                       ("awaiting_input", "A run I requested is paused for my reply")],
+        "informative": [("run_completed", "A run I requested completed"),
+                        ("agent_commented", "An agent commented on my ticket / page")],
+        "error": [("run_failed", "A run I requested failed")],
+    }
+    blocks = [{
+        "type": "section",
+        "text": {"type": "mrkdwn",
+                 "text": "Choose which events *DM you directly*. You'll only be "
+                         "DM'd for events that name you (a reply, or a run you "
+                         "requested)."},
+    }]
+    for tier, opts in dm_events.items():
+        blocks.append({
+            "type": "input", "block_id": f"tier_{tier}", "optional": True,
+            "label": {"type": "plain_text", "text": TIER_LABELS[tier]},
+            "element": {"type": "checkboxes", "action_id": "events",
+                        "options": [{"text": {"type": "plain_text", "text": lbl},
+                                     "value": ev} for ev, lbl in opts]},
+        })
+    return {
+        "type": "modal",
+        "callback_id": NOTIFY_PREF_VIEW_CALLBACK,
+        "private_metadata": json.dumps({"team_id": team_id, "user_id": user_id}),
+        "title": {"type": "plain_text", "text": "My DM Notifications"},
+        "submit": {"type": "plain_text", "text": "Save"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": blocks,
+    }
+
+
+def parse_pref_submission(view: dict) -> dict:
+    """Extract ``{team_id, user_id, tiers, min_tier}`` from the DM-prefs modal."""
+    meta = {}
+    try:
+        meta = json.loads(view.get("private_metadata") or "{}")
+    except (ValueError, TypeError):
+        pass
+    state = (view.get("state") or {}).get("values") or {}
+    tiers: dict[str, list[str]] = {}
+    for tier in ("actionable", "informative", "error"):
+        block = state.get(f"tier_{tier}") or {}
+        opts = (block.get("events") or {}).get("selected_options") or []
+        events = [o.get("value") for o in opts if o.get("value")]
+        if events:
+            tiers[tier] = events
+    min_tier = "informative" if "informative" in tiers else (
+        "actionable" if "actionable" in tiers else "error")
+    return {"team_id": meta.get("team_id", ""), "user_id": meta.get("user_id", ""),
+            "tiers": tiers, "min_tier": min_tier}
+
+
+def save_pref(config: dict) -> bool:
+    """Persist a parsed DM pref as a ``notif_pref#<identity_id>`` row (§A9.2).
+    Resolves the Slack uid → identity; only an ACTIVE identity with a VERIFIED
+    slack handle may hold prefs (re-checked at delivery). Returns True if saved."""
+    import identity as identity_map
+
+    team_id, user_id = config.get("team_id", ""), config.get("user_id", "")
+    if not team_id or not user_id:
+        return False
+    person = identity_map.find_by_handle("slack", user_id, team_id)
+    if not person or not person.identity_id or person.status != identity_map.IDENTITY_ACTIVE:
+        return False
+    table = boto3.resource("dynamodb").Table(os.environ["FLEET_CONFIG_TABLE"])
+    # Verify the slack handle is marked verified on the identity record.
+    rec = table.get_item(Key={"pk": f"identity#{person.identity_id}"}).get("Item") or {}
+    if not (rec.get("verified") or {}).get("slack"):
+        return False
+    existing = table.get_item(Key={"pk": f"notif_pref#{person.identity_id}"}).get("Item") or {}
+    now = int(time.time())
+    table.put_item(Item={
+        "pk": f"notif_pref#{person.identity_id}",
+        "kind": "notif_pref",
+        "identity_id": person.identity_id,
+        "tiers": config.get("tiers", {}),
+        "min_tier": config.get("min_tier", "actionable"),
+        "created_by": existing.get("created_by", f"slack:{team_id}:{user_id}"),
+        "created_at": existing.get("created_at", now),
+        "updated_at": now,
+    })
+    return True
 
 
 def open_modal(*, team_id: str, trigger_id: str, view: dict) -> bool:

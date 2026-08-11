@@ -56,6 +56,14 @@ TRACE_DIMENSIONS = {
     "slack_workspace",
     "slack_channel",
     "slack_thread_ts",
+    # Atlassian (atlassian-connector spec §B3/§C4). jira_key already above joins
+    # Jira dispatches with GitHub PRs that name an issue key; the rest are the
+    # native site/project/space/page dimensions.
+    "jira_project",
+    "jira_site",
+    "confluence_page",
+    "confluence_space",
+    "confluence_site",
 }
 
 _MAX_LIMIT = 100

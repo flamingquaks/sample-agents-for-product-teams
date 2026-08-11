@@ -1071,38 +1071,86 @@ def _channel_allowed(workspace: str, channel_id: str) -> bool:
     return row is not None and row.get("mode") == config_store.CHANNEL_MODE_ALLOW
 
 
+def _container_allowed(source: str, site_id: str, container_key: str) -> bool:
+    """Mirror of trigger_grants.container_allowed for the simulator — the WHERE
+    axis for a Jira/Confluence dispatch. Posture math over the product's
+    container rows plus the site's per-product default policy. Fail-closed on an
+    unknown container key or a missing site."""
+    product = "jira" if source == "jira" else "confluence"
+    site = config_store.get_atlassian_site(site_id) or {}
+    policy_key = "default_project_policy" if product == "jira" else "default_space_policy"
+    policy = site.get(policy_key, config_store.CONTAINER_POLICY_ALLOWLIST)
+    if product == "jira":
+        row = config_store.get_jira_project(site_id, container_key)
+    else:
+        row = config_store.get_confluence_space(site_id, container_key)
+    if policy == config_store.CONTAINER_POLICY_DENYLIST:
+        return not (row is not None and row.get("mode") == config_store.CONTAINER_MODE_DENY)
+    return row is not None and row.get("mode") == config_store.CONTAINER_MODE_ALLOW
+
+
 def _simulate_access(body: dict) -> dict:
     """Dry-run the trigger-authz decision for a hypothetical (principal, agent,
-    workspace, channel, groups) — the "Test access" panel. Evaluates the SAME
-    data-driven logic the router applies (grant sets + channel posture + Cedar
-    forbid-wins), locally, so it needs no AVP round-trip and works before the
-    store is wired. Returns {decision, reason}."""
+    source, workspace, channel/container, groups) — the "Test access" panel.
+    Evaluates the SAME data-driven logic the router applies (grant sets + WHERE
+    posture + Cedar forbid-wins), locally, so it needs no AVP round-trip and
+    works before the store is wired. Returns {decision, reason}.
+
+    The WHERE axis is per-source, matching trigger_authz.is_authorized: Slack's
+    is the channel id + Slack-workspace posture; Jira/Confluence's is the
+    project/space key + the site's container posture. A Jira/Confluence container
+    arrives as ``project_key``/``space_key`` (never ``channel_id``), so we accept
+    those and fall back to ``channel_id`` for a generic caller."""
     principal = (body.get("principal") or "").strip()
     agent_id = (body.get("agent_id") or "").strip()
+    source = (body.get("source") or "").strip()
     workspace = (body.get("workspace") or "").strip()
-    channel = (body.get("channel_id") or "").strip()
     groups = set(body.get("principal_groups") or [])
     if not principal or not agent_id:
         return error(400, "body.principal and body.agent_id are required")
 
-    # The receiver drops every delivery from a workspace that isn't onboarded +
-    # enabled + active, BEFORE authz runs — so a Slack simulation must reflect
-    # that gate first, or the panel would report ALLOW where production is silent.
+    is_atlassian = source in ("jira", "confluence")
+    # The container key: project/space for Atlassian, channel for Slack. Accept
+    # the source-native field, falling back to channel_id.
+    if source == "jira":
+        channel = (body.get("project_key") or body.get("channel_id") or "").strip()
+    elif source == "confluence":
+        channel = (body.get("space_key") or body.get("channel_id") or "").strip()
+    else:
+        channel = (body.get("channel_id") or "").strip()
+
+    # The receiver drops every delivery from a workspace/site that isn't onboarded
+    # + enabled + active, BEFORE authz runs — so the simulation must reflect that
+    # gate first, or the panel would report ALLOW where production is silent. The
+    # gate is per-source: Slack workspace vs Atlassian site (+ product enabled).
     if workspace:
-        ws = config_store.get_slack_workspace(workspace)
-        if ws is None or not ws.get("enabled") or ws.get("status") != config_store.SLACK_WS_ACTIVE:
-            return ok({"decision": "DENY", "reason": "workspace-not-enabled"})
+        if is_atlassian:
+            site = config_store.get_atlassian_site(workspace)
+            product = "jira" if source == "jira" else "confluence"
+            if (site is None or not site.get("enabled")
+                    or site.get("status") != config_store.ATLASSIAN_SITE_ACTIVE
+                    or not (site.get("products") or {}).get(product)):
+                return ok({"decision": "DENY", "reason": "site-not-enabled"})
+        else:
+            ws = config_store.get_slack_workspace(workspace)
+            if ws is None or not ws.get("enabled") or ws.get("status") != config_store.SLACK_WS_ACTIVE:
+                return ok({"decision": "DENY", "reason": "workspace-not-enabled"})
 
     grants = _resolve_agent_grants(agent_id, workspace)
-    channel_ok = _channel_allowed(workspace, channel)
+    if is_atlassian:
+        # Fail-closed: an Atlassian dispatch always carries a container; without a
+        # workspace we can't resolve the site posture, so treat as not-allowed.
+        channel_ok = _container_allowed(source, workspace, channel) if workspace else False
+    else:
+        channel_ok = _channel_allowed(workspace, channel)
 
-    # forbid-wins: an explicit deny (principal or group) or a blocked channel
-    # denies regardless of any permit; then a permit requires an allowed
-    # principal or group; else default-deny.
+    # forbid-wins: an explicit deny (principal or group) or a blocked channel/
+    # container denies regardless of any permit; then a permit requires an
+    # allowed principal or group; else default-deny.
     if principal in grants["deniedPrincipals"] or (groups & set(grants["deniedGroups"])):
         return ok({"decision": "DENY", "reason": "explicitly-denied"})
     if not channel_ok:
-        return ok({"decision": "DENY", "reason": "channel-not-allowed"})
+        return ok({"decision": "DENY", "reason": "container-not-allowed" if is_atlassian else "channel-not-allowed"})
     if principal in grants["allowedPrincipals"] or (groups & set(grants["allowedGroups"])):
         return ok({"decision": "ALLOW", "reason": "granted"})
     return ok({"decision": "DENY", "reason": "no-matching-grant"})
@@ -1357,6 +1405,147 @@ def _decorate_trigger_rules(rules: list[dict], directory: _LabelDirectory) -> li
             row["workspace_label"] = directory.workspace(ws)
         out.append(row)
     return out
+
+
+# --- Atlassian connector (atlassian-connector spec §A11) ---------------------
+
+
+def _atlassian_token_ok(site_url: str, email: str, token: str) -> tuple[dict | None, str]:
+    """Verify an Atlassian API token by calling ``/rest/api/3/myself`` (Basic
+    auth). Returns ``(user_json, "")`` on success or ``(None, error_message)`` —
+    the response carries the service account's ``accountId`` (the bot anchor +
+    bot-loop filter) and cloud-agnostic identity. Never logs the token."""
+    import base64
+    import urllib.error
+    import urllib.request as _urlreq
+
+    auth = base64.b64encode(f"{email}:{token}".encode()).decode()
+    req = _urlreq.Request(
+        f"{site_url.rstrip('/')}/rest/api/3/myself",
+        headers={"Authorization": f"Basic {auth}", "Accept": "application/json"},
+    )
+    try:
+        with _urlreq.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode()), ""
+    except urllib.error.HTTPError as exc:
+        return None, f"Atlassian rejected the token (HTTP {exc.code})"
+    except (urllib.error.URLError, OSError) as exc:
+        return None, f"could not reach Atlassian: {exc}"
+
+
+def _resolve_cloud_id(site_url: str, email: str, token: str) -> str:
+    """Resolve the site's cloud id via ``/_edge/tenant_info`` (unauthenticated on
+    the site host, but we send auth anyway). Returns "" on failure — the admin can
+    also supply it explicitly."""
+    import base64
+    import urllib.error
+    import urllib.request as _urlreq
+
+    auth = base64.b64encode(f"{email}:{token}".encode()).decode()
+    req = _urlreq.Request(
+        f"{site_url.rstrip('/')}/_edge/tenant_info",
+        headers={"Authorization": f"Basic {auth}", "Accept": "application/json"},
+    )
+    try:
+        with _urlreq.urlopen(req, timeout=10) as resp:
+            return str(json.loads(resp.read().decode()).get("cloudId", "") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _connect_atlassian_site(event: dict, body: dict) -> dict:
+    """One-click site connect (§A11): verify the token → resolve cloud id + bot
+    account → store the SecureString → write the site row (active). The paste-
+    token onboarding is the deliberate deviation from the Slack posture — this is
+    the only route with ssm:PutParameter, scoped to the atlassian path."""
+    site_url = (body.get("site_url") or "").strip().rstrip("/")
+    email = (body.get("bot_email") or "").strip()
+    token = (body.get("api_token") or "").strip()
+    if not re.match(r"^https://[A-Za-z0-9][A-Za-z0-9.-]*$", site_url):
+        return error(400, "body.site_url must be https://<your-site>.atlassian.net")
+    if not email or not token:
+        return error(400, "body.bot_email and body.api_token are required")
+
+    user, err = _atlassian_token_ok(site_url, email, token)
+    if user is None:
+        return error(400, f"{err} — double-check the service-account email + scoped API token")
+    bot_account_id = str(user.get("accountId", "") or "")
+    if not config_store.valid_atlassian_account_id(bot_account_id):
+        return error(502, f"Atlassian returned an unexpected accountId: {bot_account_id!r}")
+
+    site_id = (body.get("site_id") or "").strip() or _resolve_cloud_id(site_url, email, token)
+    if not config_store.valid_atlassian_site_id(site_id):
+        return error(
+            400,
+            "could not resolve the site cloud id automatically — pass body.site_id "
+            "(the uuid from <site>/_edge/tenant_info)",
+        )
+
+    # Store the token SecureString at the derived path (the ONE Atlassian secret).
+    import boto3 as _boto3
+
+    ssm = _boto3.client("ssm")
+    param = config_store.atlassian_token_param(STAGE, site_id)
+    ssm.put_parameter(Name=param, Value=token, Type="SecureString", Overwrite=True)
+
+    try:
+        rec = config_store.put_atlassian_site(
+            site_id,
+            site_url=site_url,
+            site_name=(body.get("site_name") or "").strip(),
+            stage=STAGE,
+            enabled=True,
+            products=body.get("products") or {"jira": False, "confluence": False},
+            bot_account_id=bot_account_id,
+            bot_email=email,
+            token_expires_at=body.get("token_expires_at"),
+            onboarded_by=auth.caller_email(event),
+            status=config_store.ATLASSIAN_SITE_ACTIVE,
+        )
+    except ValueError as exc:
+        return error(400, str(exc))
+    # A container row change renders into the Cedar container forbids — sync so a
+    # freshly-connected site's (empty) allowlists are consistent on the gateway.
+    _sync_after_write(
+        f"policy sync failed after connecting Atlassian site {site_id}",
+        "site connected but the gateway policy update failed; retry",
+    )
+    return ok(rec)
+
+
+def _bounded_repos(repos) -> list[str]:
+    """Bound a container's linked-repo list to the fleet's onboarded repos — a
+    project/space can't link a repo the fleet doesn't manage (mirrors the notif
+    sub bounding). Shape-checking of the keys happens in config_store."""
+    requested = {config_store._normalize_repo(r) for r in (repos or []) if r and str(r).strip()}
+    onboarded = {r["repo"] for r in config_store.list_repos()}
+    return sorted(requested & onboarded)
+
+
+def _automation_grant_principal(rule: dict) -> str:
+    return config_store.automation_principal(rule["connector"], rule["rule_id"])
+
+
+def _author_automation_grant(rule: dict, caller: str) -> None:
+    """Auto-author the permit trigger_rule for a rule's synthetic principal
+    (§A8.4) — a deterministic rule id so create/enable overwrites rather than
+    duplicates. The automation dispatch then evaluates through the same AVP path;
+    deleting/disabling removes the grant (default-deny backstop)."""
+    principal = _automation_grant_principal(rule)
+    config_store.put_trigger_rule(
+        connector=rule["connector"],
+        subject_type=config_store.RULE_SUBJECT_USER,
+        subject_id=principal,
+        agent_id=rule["action"]["agent_id"],
+        workspace=(rule.get("match") or {}).get("site", "*") or "*",
+        effect=config_store.RULE_PERMIT,
+        created_by=caller,
+        rule_id=f"auto-{rule['rule_id']}",
+    )
+
+
+def _remove_automation_grant(rule: dict) -> None:
+    config_store.delete_trigger_rule(f"auto-{rule['rule_id']}")
 
 
 def _route(event: dict) -> dict:
@@ -1937,6 +2126,269 @@ def _route(event: dict) -> dict:
             team_id = (path_params.get("team_id") or "").strip()
             channel_id = (path_params.get("channel_id") or "").strip()
             return ok({"deleted": config_store.delete_notif_sub(team_id, channel_id)})
+
+    # --- Atlassian: sites (atlassian-connector spec §A11) ---
+    if resource == "/admin/atlassian/sites":
+        if method == "GET":
+            return ok({"sites": config_store.list_atlassian_sites()})
+        if method == "POST":
+            # Direct row write (products toggle / metadata) — connect is separate.
+            site_id = (body.get("site_id") or "").strip()
+            try:
+                rec = config_store.put_atlassian_site(
+                    site_id,
+                    site_url=(body.get("site_url") or "").strip(),
+                    site_name=(body.get("site_name") or "").strip(),
+                    stage=STAGE,
+                    enabled=bool(body.get("enabled", True)),
+                    products=body.get("products"),
+                    bot_account_id=(body.get("bot_account_id") or "").strip(),
+                    bot_email=(body.get("bot_email") or "").strip(),
+                    onboarded_by=auth.caller_email(event),
+                    status=(body.get("status") or config_store.ATLASSIAN_SITE_ACTIVE),
+                )
+            except ValueError as exc:
+                return error(400, str(exc))
+            return ok(rec)
+
+    if resource == "/admin/atlassian/sites/connect" and method == "POST":
+        return _connect_atlassian_site(event, body)
+
+    if resource == "/admin/atlassian/forge-status" and method == "GET":
+        # The forwarder's app id + private install link, published to SSM by
+        # scripts/deploy_forge_atlassian.py (run from deploy_fleet). Lets the
+        # Sites tab render the install card without any operator hand-off;
+        # deployed=false tells the admin the forwarder still needs its one-time
+        # CLI deploy (Forge auth is interactive, so it can't run server-side).
+        import boto3 as _boto3
+
+        _ssm = _boto3.client("ssm")
+        out = {"deployed": False, "app_id": "", "install_link": ""}
+        try:
+            out["app_id"] = _ssm.get_parameter(
+                Name=f"/sdlc-agents/{STAGE}/atlassian/forge-app-id"
+            )["Parameter"]["Value"]
+            out["install_link"] = _ssm.get_parameter(
+                Name=f"/sdlc-agents/{STAGE}/atlassian/forge-install-link"
+            )["Parameter"]["Value"]
+            out["deployed"] = bool(out["app_id"])
+        except Exception:  # noqa: BLE001 — not yet deployed is a normal state
+            pass
+        return ok(out)
+
+    if resource in ("/admin/atlassian/sites/{site_id}", "/admin/atlassian/sites/{site_id+}"):
+        site_id = (path_params.get("site_id") or path_params.get("site_id+") or "").strip()
+        if method == "PUT":
+            # Per-product enablement toggles.
+            rec = config_store.set_atlassian_products(site_id, body.get("products") or {})
+            if rec is None:
+                return error(404, f"no such site: {site_id}")
+            # Enabling/disabling a product changes which container forbids apply.
+            _sync_after_write(
+                f"policy sync failed after product toggle for {site_id}",
+                "products updated but the gateway policy update failed; retry",
+            )
+            return ok(rec)
+        if method == "DELETE":
+            return ok({"site_id": site_id, "deleted": config_store.delete_atlassian_site(site_id)})
+
+    if resource == "/admin/atlassian/sites/{site_id}/products" and method == "PUT":
+        site_id = (path_params.get("site_id") or "").strip()
+        rec = config_store.set_atlassian_products(site_id, body.get("products") or {})
+        if rec is None:
+            return error(404, f"no such site: {site_id}")
+        _sync_after_write(
+            f"policy sync failed after product toggle for {site_id}",
+            "products updated but the gateway policy update failed; retry",
+        )
+        return ok(rec)
+
+    if resource == "/admin/atlassian/sites/{site_id}/verify-webhook" and method == "POST":
+        # Per-product delivery liveness — reads receiver-stamped webhook_last_seen.
+        site_id = (path_params.get("site_id") or "").strip()
+        product = (event.get("queryStringParameters") or {}).get("product", "")
+        site = config_store.get_atlassian_site(site_id)
+        if site is None:
+            return error(404, f"no such site: {site_id}")
+        last = (site.get("webhook_last_seen") or {})
+        return ok({"site_id": site_id, "product": product,
+                   "last_seen": last.get(product) if product else last})
+
+    # --- Atlassian: Jira projects ---
+    if resource == "/admin/atlassian/projects":
+        if method == "GET":
+            site_id = (event.get("queryStringParameters") or {}).get("site_id")
+            return ok({"projects": config_store.list_jira_projects(site_id)})
+        if method == "POST":
+            try:
+                repos = _bounded_repos(body.get("repos"))
+                rec = config_store.put_jira_project(
+                    (body.get("site_id") or "").strip(),
+                    (body.get("project_key") or "").strip(),
+                    mode=(body.get("mode") or config_store.CONTAINER_MODE_ALLOW).strip(),
+                    project_name=(body.get("project_name") or "").strip(),
+                    repos=repos,
+                    note=(body.get("note") or "").strip(),
+                    created_by=auth.caller_email(event),
+                )
+            except ValueError as exc:
+                return error(400, str(exc))
+            # Writes render into sdlc_allowed_projects — sync under the rollback
+            # invariant (the container forbid is the gateway-plane boundary).
+            failure = _sync_after_write(
+                "policy sync failed after Jira project change",
+                "project saved but the gateway policy update failed; retry",
+            )
+            if failure is not None:
+                return failure
+            return ok(rec)
+
+    if resource == "/admin/atlassian/projects/{site_id}/{key}":
+        if method == "DELETE":
+            site_id = (path_params.get("site_id") or "").strip()
+            key = (path_params.get("key") or "").strip()
+            deleted = config_store.delete_jira_project(site_id, key)
+            _sync_after_write(
+                "policy sync failed after Jira project delete",
+                "project removed but the gateway policy update failed; retry",
+            )
+            return ok({"deleted": deleted})
+
+    # --- Atlassian: Confluence spaces ---
+    if resource == "/admin/atlassian/spaces":
+        if method == "GET":
+            site_id = (event.get("queryStringParameters") or {}).get("site_id")
+            return ok({"spaces": config_store.list_confluence_spaces(site_id)})
+        if method == "POST":
+            try:
+                repos = _bounded_repos(body.get("repos"))
+                rec = config_store.put_confluence_space(
+                    (body.get("site_id") or "").strip(),
+                    (body.get("space_key") or "").strip(),
+                    mode=(body.get("mode") or config_store.CONTAINER_MODE_ALLOW).strip(),
+                    space_name=(body.get("space_name") or "").strip(),
+                    write_mode=(body.get("write_mode") or config_store.CONFLUENCE_WRITE_PROPOSE).strip(),
+                    write_agents=body.get("write_agents") or [],
+                    repos=repos,
+                    note=(body.get("note") or "").strip(),
+                    created_by=auth.caller_email(event),
+                )
+            except ValueError as exc:
+                return error(400, str(exc))
+            failure = _sync_after_write(
+                "policy sync failed after Confluence space change",
+                "space saved but the gateway policy update failed; retry",
+            )
+            if failure is not None:
+                return failure
+            return ok(rec)
+
+    if resource == "/admin/atlassian/spaces/{site_id}/{key}":
+        if method == "DELETE":
+            site_id = (path_params.get("site_id") or "").strip()
+            key = (path_params.get("key") or "").strip()
+            deleted = config_store.delete_confluence_space(site_id, key)
+            _sync_after_write(
+                "policy sync failed after Confluence space delete",
+                "space removed but the gateway policy update failed; retry",
+            )
+            return ok({"deleted": deleted})
+
+    # --- Automation rules (§A8) ---
+    if resource == "/admin/automation-rules":
+        if method == "GET":
+            connector = (event.get("queryStringParameters") or {}).get("connector")
+            return ok({"rules": config_store.list_automation_rules(connector)})
+        if method == "POST":
+            try:
+                rec = config_store.put_automation_rule(
+                    connector=(body.get("connector") or "").strip(),
+                    event=(body.get("event") or "").strip(),
+                    match=body.get("match") or {},
+                    agent_id=(body.get("agent_id") or "").strip(),
+                    instruction_template=(body.get("instruction_template") or ""),
+                    enabled=bool(body.get("enabled", True)),
+                    cooldown_seconds=int(body.get("cooldown_seconds", 3600)),
+                    created_by=auth.caller_email(event),
+                )
+            except (ValueError, TypeError) as exc:
+                return error(400, str(exc))
+            # Create auto-authors the automation grant (§A8.4) when enabled.
+            if rec.get("enabled"):
+                _author_automation_grant(rec, auth.caller_email(event))
+            return ok(rec)
+
+    if resource in ("/admin/automation-rules/{rule_id}", "/admin/automation-rules/{rule_id+}"):
+        rule_id = (path_params.get("rule_id") or path_params.get("rule_id+") or "").strip()
+        if method == "PUT":
+            existing = config_store.get_automation_rule(rule_id)
+            if existing is None:
+                return error(404, f"no such automation rule: {rule_id}")
+            try:
+                rec = config_store.put_automation_rule(
+                    connector=(body.get("connector") or existing["connector"]).strip(),
+                    event=(body.get("event") or existing["event"]).strip(),
+                    match=body.get("match") if body.get("match") is not None else existing.get("match", {}),
+                    agent_id=(body.get("agent_id") or existing["action"]["agent_id"]).strip(),
+                    instruction_template=(body.get("instruction_template")
+                                          or existing["action"]["instruction_template"]),
+                    enabled=bool(body.get("enabled", existing.get("enabled", True))),
+                    cooldown_seconds=int(body.get("cooldown_seconds", existing.get("cooldown_seconds", 3600))),
+                    created_by=existing.get("created_by", ""),
+                    rule_id=rule_id,
+                )
+            except (ValueError, TypeError) as exc:
+                return error(400, str(exc))
+            if rec.get("enabled"):
+                _author_automation_grant(rec, auth.caller_email(event))
+            else:
+                _remove_automation_grant(rec)
+            return ok(rec)
+        if method == "DELETE":
+            existing = config_store.get_automation_rule(rule_id)
+            if existing is not None:
+                _remove_automation_grant(existing)
+            return ok({"rule_id": rule_id, "deleted": config_store.delete_automation_rule(rule_id)})
+
+    if resource in ("/admin/automation-rules/{rule_id}/enable",
+                    "/admin/automation-rules/{rule_id}/disable"):
+        if method == "POST":
+            rule_id = (path_params.get("rule_id") or "").strip()
+            enable = resource.endswith("/enable")
+            rec = config_store.set_automation_rule_enabled(rule_id, enable)
+            if rec is None:
+                return error(404, f"no such automation rule: {rule_id}")
+            if enable:
+                _author_automation_grant(rec, auth.caller_email(event))
+            else:
+                _remove_automation_grant(rec)
+            return ok(rec)
+
+    # --- Per-user DM notification prefs (§A9.2) ---
+    if resource in ("/admin/notif-prefs/{identity_id}", "/admin/notif-prefs/{identity_id+}"):
+        identity_id = (path_params.get("identity_id") or path_params.get("identity_id+") or "").strip()
+        if method == "GET":
+            rec = config_store.get_notif_pref(identity_id)
+            return ok(rec or {"identity_id": identity_id, "tiers": {}})
+        if method == "PUT":
+            # Only an active identity with a verified Slack handle may hold prefs.
+            ident = config_store.get_identity(identity_id)
+            if ident is None or ident.get("status") != config_store.IDENTITY_ACTIVE:
+                return error(400, "identity must be active to hold notification prefs")
+            if not (ident.get("verified") or {}).get("slack"):
+                return error(400, "identity has no verified Slack handle for DMs")
+            try:
+                rec = config_store.put_notif_pref(
+                    identity_id,
+                    tiers=body.get("tiers") or {},
+                    min_tier=(body.get("min_tier") or config_store.NOTIF_TIER_ACTIONABLE),
+                    created_by=auth.caller_email(event),
+                )
+            except ValueError as exc:
+                return error(400, str(exc))
+            return ok(rec)
+        if method == "DELETE":
+            return ok({"identity_id": identity_id, "deleted": config_store.delete_notif_pref(identity_id)})
 
     return error(404, f"no such admin route: {method} {resource}")
 
