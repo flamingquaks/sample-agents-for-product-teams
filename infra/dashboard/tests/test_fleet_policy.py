@@ -221,6 +221,32 @@ def test_researcher_permit_is_read_only_on_github():
     assert not github_tools & set(fleet_policy.DESTRUCTIVE_TOOLS)
 
 
+def test_reviewer_permit_is_comment_only_no_code_writes():
+    """Reviewer grants: read code + diff, post COMMENT reviews + advisory commit
+    status. Never code writes, PR creation, or label writes (spec §guardrails)."""
+    tools = {a.split("___", 1)[1] for a in fleet_policy.AGENT_TOOL_GRANTS["reviewer"]}
+    # Can read the diff/files and post an anchored review.
+    assert "get_pull_request_diff" in tools
+    assert "list_pull_request_files" in tools
+    assert "create_pull_request_review" in tools
+    assert "create_commit_status" in tools  # advisory status (v1.3)
+    assert "add_issue_comment" in tools
+    # Never writes code / opens PRs / branches / labels.
+    for forbidden in ("create_or_update_file", "push_files", "create_branch",
+                      "create_pull_request", "create_issue", "add_labels_to_issue"):
+        assert forbidden not in tools, f"reviewer must not be granted {forbidden}"
+
+
+def test_reviewer_tier_has_no_contents_write():
+    """Reviewer's GitHub App tier: contents READ only (merge/push impossible at
+    the credential layer), pull_requests + statuses write for reviews + status."""
+    tier = fleet_policy.AGENT_GITHUB_PERMISSIONS["reviewer"]
+    assert tier["contents"] == "read"
+    assert tier["pull_requests"] == "write"
+    assert tier["statuses"] == "write"
+    assert tier["issues"] == "write"
+
+
 def test_agent_permit_policies_names():
     policies = fleet_policy.agent_permit_policies(ACCT, GW)
     assert set(policies) == {
@@ -228,6 +254,7 @@ def test_agent_permit_policies_names():
         "sdlc_permit_docwriter",
         "sdlc_permit_adr",
         "sdlc_permit_researcher",
+        "sdlc_permit_reviewer",
     }
     for stmt in policies.values():
         assert stmt.startswith("permit(")

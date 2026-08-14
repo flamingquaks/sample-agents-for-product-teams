@@ -100,6 +100,17 @@ AGENT_GITHUB_PERMISSIONS = {
         "pull_requests": "read",
         "metadata": "read",
     },
+    # Reviewer: reads code + diffs, posts COMMENT-only PR reviews (same
+    # enforcement stack as adr — broker-forced event + Cedar forbid), and
+    # publishes an advisory commit status on the PR head. No contents:write, so
+    # merge/push stay impossible at the credential layer.
+    "reviewer": {
+        "contents": "read",
+        "issues": "write",
+        "pull_requests": "write",
+        "statuses": "write",
+        "metadata": "read",
+    },
 }
 
 # Ordering for intersecting a tool's needed level with an agent's granted level.
@@ -316,6 +327,30 @@ def _create_pull_request_review(token, owner, repo, args):
     return d
 
 
+def _create_commit_status(token, owner, repo, args):
+    # An ADVISORY status on a commit (the reviewer publishes its verdict on the
+    # PR head SHA, Bugbot-style). The state is clamped to success/neutral-ish
+    # values: agents may inform, never block — "failure"/"error" would gate a
+    # protected branch, which is a merge-adjacent power the fleet forbids
+    # (CLAUDE.md "agents NEVER … merge PRs"; a required failing status is a veto).
+    # "pending" is allowed so a long review can show in-flight.
+    state = str(args.get("state", "")).lower()
+    if state not in ("success", "pending"):
+        state = "success"
+    body = {
+        "state": state,
+        "context": args.get("status_context") or "sdlc-agents/review",
+    }
+    if args.get("description"):
+        body["description"] = str(args["description"])[:140]
+    if args.get("target_url"):
+        body["target_url"] = args["target_url"]
+    _s, d = _gh(
+        "POST", f"/repos/{owner}/{repo}/statuses/{args['sha']}", token, body=body
+    )
+    return d
+
+
 def _create_or_update_file(token, owner, repo, args):
     # GitHub's Contents API takes base64 content. Callers pass raw text; encode
     # it here so the tool schema stays simple ("content": string).
@@ -428,6 +463,7 @@ _TOOL_PERMISSIONS = {
     "add_labels_to_issue": {"issues": _WRITE},
     "create_pull_request": {"pull_requests": _WRITE, "contents": _READ},
     "create_pull_request_review": {"pull_requests": _WRITE},
+    "create_commit_status": {"statuses": _WRITE},
     "create_or_update_file": {"contents": _WRITE},
     "push_files": {"contents": _WRITE},
     "create_branch": {"contents": _WRITE},
@@ -475,6 +511,10 @@ _TOOLS = {
     "create_pull_request_review": (
         _create_pull_request_review,
         {"owner", "repo", "pull_number"},
+    ),
+    "create_commit_status": (
+        _create_commit_status,
+        {"owner", "repo", "sha", "state"},
     ),
     "create_or_update_file": (
         _create_or_update_file,

@@ -276,6 +276,11 @@ def _query_kind(kind: str, *, pk_prefix: str | None = None) -> list[dict]:
     return rows
 
 
+# Canonical GitHub ``owner/repo`` shape (post-normalization: already lowercased).
+# Mirrors the requested-repo check in trigger_grants.put_channel_request.
+_REPO_SHAPE_RE = re.compile(r"^[a-z0-9._-]+/[a-z0-9._-]+$")
+
+
 def _normalize_repo(repo: str) -> str:
     """Canonical repo form: trimmed + lowercased. GitHub owner/repo is
     case-insensitive, so we store one canonical casing. This keeps every
@@ -1784,6 +1789,9 @@ CONFLUENCE_WRITE_MODES = (CONFLUENCE_WRITE_PROPOSE, CONFLUENCE_WRITE_DIRECT)
 AUTOMATION_EVENTS = {
     "jira": ("issue_transitioned", "issue_created", "issue_commented", "issue_assigned"),
     "confluence": ("page_labeled", "page_created", "page_updated"),
+    # GitHub fast-follow (reviewer-agent spec §auto-trigger): auto-review rides
+    # pull_request opened/synchronize. Event ids mirror automation.github_facts.
+    "github": ("pull_request.opened", "pull_request.synchronize"),
 }
 # Allowlisted template variables per connector (§A8.1) — unknown vars render
 # empty. Mirrored by the dispatch-side automation engine (schema contract).
@@ -1793,6 +1801,10 @@ AUTOMATION_TEMPLATE_VARS = {
         "issue_type", "reporter", "assignee", "site_url",
     ),
     "confluence": ("title", "space", "page_id", "page_url", "label", "author"),
+    "github": (
+        "repo", "owner", "repo_name", "pr_number", "action", "author", "title",
+        "base_branch", "head_branch", "head_sha", "labels", "pr_url",
+    ),
 }
 
 
@@ -2203,6 +2215,20 @@ def put_automation_rule(
                 f"allowed: {sorted(allowed_vars)}"
             )
     m = dict(match or {})
+    # GitHub rules match on repo (owner/repo). It's compared exactly against the
+    # lowercased full_name automation.github_facts produces, so validate the
+    # shape AND normalize it here — otherwise a mistyped/mixed-case repo is
+    # stored verbatim and the rule silently never matches (e.g. "Acme/Web" or
+    # "acme web" != "acme/web"), an undiagnosable no-op for the admin.
+    if connector == "github":
+        repo = str(m.get("repo", "") or "").strip()
+        if repo:
+            normalized = _normalize_repo(repo)
+            if not _REPO_SHAPE_RE.match(normalized):
+                raise ValueError(
+                    f"invalid match.repo {repo!r} — must be 'owner/repo'"
+                )
+            m["repo"] = normalized
     site = str(m.get("site", "*") or "*")
     if site != "*" and not valid_atlassian_site_id(site):
         raise ValueError(f"invalid match.site {site!r}")

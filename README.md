@@ -26,6 +26,7 @@ they'll be listed here once their code ships.
 | [**Researcher**](docs/agents/researcher.md) | Business analyst — research synthesis, competitive intel | `@researcher` |
 | [**Docwriter**](docs/agents/docwriter.md) | Technical writer — API docs, user guides, release notes | `@docwriter` |
 | [**Adr**](docs/agents/adr.md) | ADR linker — tags issues and reviews PRs against the repo's ADR library | `@adr` on a GitHub issue or PR |
+| [**Reviewer**](docs/agents/reviewer.md) | Code reviewer — inline PR findings (correctness, safety, soundness) with severity + failure scenario + suggested fix | `@reviewer` on a GitHub PR (or per-repo auto-review) |
 
 ![Workitems decomposing an Asana task after an @mention](docs/assets/at-workitems-mention-asana.png)
 
@@ -55,6 +56,7 @@ agents/
   docwriter/     Strands agent — Technical writer
   researcher/    Strands agent — Business analyst
   adr/           Strands agent — ADR linker
+  reviewer/      Strands agent — code reviewer
   shared/        Shared tools and helpers
 dashboard/       Fleet monitoring SPA (React + Vite)
 infra/

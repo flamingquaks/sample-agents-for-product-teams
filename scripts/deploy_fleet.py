@@ -206,7 +206,7 @@ def upload_build_source(runner: Runner, outputs: dict[str, str]) -> None:
 
 # --- built-in capability seeding ---------------------------------------------
 
-# The 4 repo-resident system agents. Seeded as `builtin` capability rows so they
+# The 5 repo-resident system agents. Seeded as `builtin` capability rows so they
 # appear in the dashboard as fixed, enable/disable-only agents (spec §3.1). Config
 # here is DECLARATIVE metadata only (aliases/triggers/description) — the actual
 # behavior is the code under agents/<id>/. Aliases mirror CLAUDE.md's agent table.
@@ -232,6 +232,11 @@ _BUILTIN_AGENTS = {
         "description": "ADR linker — tags issues, reviews PRs vs the ADR library",
         "aliases": ["decisions", "architecture"],
         "triggers": {"github": ["comment_mention"]},
+    },
+    "reviewer": {
+        "description": "Code reviewer — inline PR findings (correctness, safety, soundness)",
+        "aliases": ["review", "cr"],
+        "triggers": {"github": ["comment_mention", "pull_request"]},
     },
 }
 

@@ -1532,12 +1532,22 @@ def _author_automation_grant(rule: dict, caller: str) -> None:
     duplicates. The automation dispatch then evaluates through the same AVP path;
     deleting/disabling removes the grant (default-deny backstop)."""
     principal = _automation_grant_principal(rule)
+    # The grant's concrete workspace is the connector's workspace id: an
+    # Atlassian site for jira/confluence. GitHub has no Slack-team/site-shaped
+    # workspace (the repo scoping lives in the rule's match.repo), so the grant
+    # is workspace-agnostic ("*") — otherwise put_trigger_rule would validate a
+    # repo string against the Slack-team shape and reject it.
+    match = rule.get("match") or {}
+    if rule["connector"] in ("jira", "confluence"):
+        workspace = match.get("site", "*") or "*"
+    else:
+        workspace = "*"
     config_store.put_trigger_rule(
         connector=rule["connector"],
         subject_type=config_store.RULE_SUBJECT_USER,
         subject_id=principal,
         agent_id=rule["action"]["agent_id"],
-        workspace=(rule.get("match") or {}).get("site", "*") or "*",
+        workspace=workspace,
         effect=config_store.RULE_PERMIT,
         created_by=caller,
         rule_id=f"auto-{rule['rule_id']}",

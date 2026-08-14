@@ -42,6 +42,9 @@ APP_PERMISSIONS = {
     "issues": "write",
     "pull_requests": "write",
     "contents": "write",
+    # Advisory commit statuses — the reviewer agent publishes its verdict on the
+    # PR head SHA (never a blocking failure state; see scm_broker).
+    "statuses": "write",
 }
 # ``issue_comment`` / ``pull_request_review_comment`` drive @mention dispatch;
 # ``issues`` + ``pull_request`` additionally feed SCM notifications (spec §18.3 —
