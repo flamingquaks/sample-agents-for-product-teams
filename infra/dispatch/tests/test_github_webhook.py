@@ -219,13 +219,17 @@ def test_pr_review_comment_routes(monkeypatch):
 # --- SCM notifications (spec §18.3) — pull_request / issues fan out, no dispatch
 
 
-def _pr_body(action, *, repo="acme/web", number=5, merged=False, author="alice"):
+def _pr_body(action, *, repo="acme/web", number=5, merged=False, author="alice",
+             draft=False, sender=None):
     return json.dumps(
         {
             "action": action,
             "pull_request": {"number": number, "title": "Add feature", "merged": merged,
-                             "user": {"login": author}},
+                             "draft": draft, "user": {"login": author}},
             "repository": {"full_name": repo},
+            # The delivery actor — the pusher on a synchronize. Defaults to the
+            # PR author when unspecified (GitHub's usual shape for `opened`).
+            "sender": {"login": sender if sender is not None else author},
         }
     )
 
@@ -299,3 +303,121 @@ def test_scm_notify_failure_does_not_fail_webhook(monkeypatch):
     monkeypatch.setattr(gw.notify, "notify", _boom)
     resp = gw.handler(_event(_pr_body("opened"), event="pull_request"))
     assert resp["statusCode"] == 200  # best-effort — never fails the delivery
+
+
+# --- Auto-review (reviewer-agent spec §auto-trigger) — automation dispatch ----
+
+
+def _quiet_notify(monkeypatch, gw):
+    monkeypatch.setattr(gw.notify, "notify", lambda **kw: 1)
+
+
+def test_pr_opened_runs_automation_after_notify(monkeypatch):
+    gw, dispatched = _fresh(monkeypatch)
+    _quiet_notify(monkeypatch, gw)
+    calls = []
+    monkeypatch.setattr(gw.automation, "match_and_dispatch",
+                        lambda **kw: calls.append(kw) or 1)
+    resp = gw.handler(_event(_pr_body("opened", author="alice"), event="pull_request"))
+    assert resp["statusCode"] == 200
+    assert len(calls) == 1
+    assert calls[0]["connector"] == "github"
+    assert calls[0]["event"] == "pull_request.opened"
+    assert calls[0]["facts"]["repo"] == "acme/web"
+
+
+def test_pr_synchronize_runs_automation(monkeypatch):
+    gw, dispatched = _fresh(monkeypatch)
+    _quiet_notify(monkeypatch, gw)
+    calls = []
+    monkeypatch.setattr(gw.automation, "match_and_dispatch",
+                        lambda **kw: calls.append(kw) or 1)
+    gw.handler(_event(_pr_body("synchronize"), event="pull_request"))
+    assert calls and calls[0]["event"] == "pull_request.synchronize"
+
+
+def test_bot_authored_pr_skips_automation(monkeypatch):
+    gw, dispatched = _fresh(monkeypatch)
+    _quiet_notify(monkeypatch, gw)
+    calls = []
+    monkeypatch.setattr(gw.automation, "match_and_dispatch",
+                        lambda **kw: calls.append(kw) or 1)
+    # A *[bot] author is skipped even without a configured slug (coarse backstop).
+    gw.handler(_event(_pr_body("opened", author="sdlc-agents[bot]"), event="pull_request"))
+    assert calls == []
+
+
+def test_bot_guard_matches_configured_slug(monkeypatch):
+    gw, dispatched = _fresh(monkeypatch)
+    _quiet_notify(monkeypatch, gw)
+    # Configure the slug so its bot login is matched exactly.
+    monkeypatch.setattr(gw, "GITHUB_APP_SLUG_PARAM", "/sdlc-agents/dev/github-app-slug")
+    monkeypatch.setattr(gw, "_app_bot_login", lambda: "myapp[bot]")
+    calls = []
+    monkeypatch.setattr(gw.automation, "match_and_dispatch",
+                        lambda **kw: calls.append(kw) or 1)
+    gw.handler(_event(_pr_body("opened", author="myapp[bot]"), event="pull_request"))
+    assert calls == []
+
+
+def test_bot_pusher_on_human_pr_skips_automation(monkeypatch):
+    gw, dispatched = _fresh(monkeypatch)
+    _quiet_notify(monkeypatch, gw)
+    calls = []
+    monkeypatch.setattr(gw.automation, "match_and_dispatch",
+                        lambda **kw: calls.append(kw) or 1)
+    # A fleet-bot PUSH to a human-opened PR: author stays the human, but the
+    # delivery sender is the bot. The guard must skip on the sender too, or the
+    # fleet's own push re-triggers a review (loop).
+    body = _pr_body("synchronize", author="alice", sender="sdlc-agents[bot]")
+    gw.handler(_event(body, event="pull_request"))
+    assert calls == []
+
+
+def test_draft_pr_skips_automation(monkeypatch):
+    gw, dispatched = _fresh(monkeypatch)
+    _quiet_notify(monkeypatch, gw)
+    calls = []
+    monkeypatch.setattr(gw.automation, "match_and_dispatch",
+                        lambda **kw: calls.append(kw) or 1)
+    # Draft PRs are not auto-reviewed by default (spec §Non-goals).
+    gw.handler(_event(_pr_body("opened", draft=True), event="pull_request"))
+    assert calls == []
+
+
+def test_pr_closed_does_not_run_automation(monkeypatch):
+    gw, dispatched = _fresh(monkeypatch)
+    _quiet_notify(monkeypatch, gw)
+    calls = []
+    monkeypatch.setattr(gw.automation, "match_and_dispatch",
+                        lambda **kw: calls.append(kw) or 1)
+    # closed isn't an auto-review action → github_facts returns None → no call.
+    gw.handler(_event(_pr_body("closed", merged=True), event="pull_request"))
+    assert calls == []
+
+
+def test_automation_failure_does_not_fail_webhook(monkeypatch):
+    gw, dispatched = _fresh(monkeypatch)
+    _quiet_notify(monkeypatch, gw)
+
+    def _boom(**kw):
+        raise RuntimeError("ddb down")
+
+    monkeypatch.setattr(gw.automation, "match_and_dispatch", _boom)
+    resp = gw.handler(_event(_pr_body("opened"), event="pull_request"))
+    assert resp["statusCode"] == 200  # best-effort — never fails the delivery
+
+
+def test_issues_event_does_not_run_pr_automation(monkeypatch):
+    gw, dispatched = _fresh(monkeypatch)
+    _quiet_notify(monkeypatch, gw)
+    calls = []
+    monkeypatch.setattr(gw.automation, "match_and_dispatch",
+                        lambda **kw: calls.append(kw) or 1)
+    body = json.dumps({
+        "action": "opened",
+        "issue": {"number": 11, "title": "Bug", "user": {"login": "carol"}},
+        "repository": {"full_name": "acme/web"},
+    })
+    gw.handler(_event(body, event="issues"))
+    assert calls == []  # automation only rides pull_request events

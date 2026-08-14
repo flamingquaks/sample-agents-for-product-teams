@@ -16,6 +16,7 @@ An autonomous agent fleet that handles the operational burden of software develo
 | **Researcher** | Business analyst: research synthesis, competitive scans, story drafting, spec review | Live |
 | **Docwriter** | Technical writer: API docs, release notes, doc PRs, freshness checks | Live |
 | **Adr** | ADR linker: tags issues with governing ADRs, reviews PRs against them | Live |
+| **Reviewer** | Code reviewer: inline PR findings (correctness/safety/soundness) with severity + failure scenario + suggested fix; `@reviewer` mention + per-repo auto-review; advisory commit status | Live (pending live eval) |
 
 Supporting infrastructure shipped:
 - **Dispatch Router** Lambda routes `@mention` events from GitHub, Asana, and Slack to the right runtime.
@@ -49,6 +50,9 @@ All four agents run Claude Sonnet 5 via Bedrock Mantle.
 Atlassian is now fully specified as one program — see [`docs/specs/atlassian-connector-spec.md`](specs/atlassian-connector-spec.md) (merges and supersedes the earlier separate Jira and Confluence connector specs): a shared foundation (one `atlassian_site#` record + service account, the `atlassian-events` Forge forwarder, `atlassian:<accountId>` identity, an event-automation rule engine, per-user Slack DM notifications, one Connectors → Atlassian page) carrying two product capabilities — Jira (dispatch source + curated `JiraTarget` gateway broker + traceability) and Confluence (deep-context reads for all agents + agent-maintained documentation with per-space propose/direct write modes + comment-mention dispatch) — delivered in six interleaved phases. The spec supersedes the earlier "point at Atlassian's remote MCP" sketch: Lambda brokers with curated tool schemas were chosen over the remote MCP for destructive-tool exclusion and project/space scoping (spec §B2.1/§C2.1).
 
 GitLab is harder — no production-grade official remote MCP. Community options exist (`zereight/gitlab-mcp`). Each shipping agent's system prompt would need merge-request vs. pull-request terminology adjustments.
+
+### Reviewer agent (automated PR review) — ✅ shipped, see Shipped above
+The fleet's answer to Cursor Bugbot/Origin, now live: inline findings with severity + failure scenario + suggested fix, `@reviewer` mention + per-repo auto-review on `pull_request.opened`/`synchronize` (the automation engine's GitHub extension), incremental re-review keyed on last-reviewed head SHA, a `.pdlc-agents/review.md` team-rules surface, and an advisory commit status. Same COMMENT-only broker/Cedar enforcement as Adr, plus a clamped `statuses:write`. See [`docs/specs/reviewer-agent-spec.md`](specs/reviewer-agent-spec.md) and [`docs/agents/reviewer.md`](agents/reviewer.md). Remaining: the live single-repo eval pass on the 20-PR set.
 
 ### UAT agent
 Generate Playwright tests from user stories and run them against staging. Requires a real solution for test-maintenance across UI changes, not just test-generation. Depends on AgentCore Browser (or a browser-in-Lambda fallback).

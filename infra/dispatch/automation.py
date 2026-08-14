@@ -38,6 +38,10 @@ TEMPLATE_VARS = {
         "issue_type", "reporter", "assignee", "site_url",
     ),
     "confluence": ("title", "space", "page_id", "page_url", "label", "author"),
+    "github": (
+        "repo", "owner", "repo_name", "pr_number", "action", "author", "title",
+        "base_branch", "head_branch", "head_sha", "labels", "pr_url",
+    ),
 }
 
 AUTOMATION_MAX_FIRES_PER_HOUR = int(os.environ.get("AUTOMATION_MAX_FIRES_PER_HOUR", "20"))
@@ -199,6 +203,52 @@ def confluence_facts(event_payload: dict, site: dict) -> dict | None:
     return None
 
 
+def github_facts(event_payload: dict, repo_row: dict | None = None) -> dict | None:
+    """Normalize a GitHub ``pull_request`` webhook payload into match facts +
+    template values (reviewer-agent spec §auto-trigger). Maps the delivery's
+    ``action`` to the automation event family ``pull_request.<action>`` — only
+    ``opened`` and ``synchronize`` are handled (the actions an auto-review rides).
+    Returns None for any other event/action so a rule never fires on a close,
+    label, or assignment. ``repo_row`` is the onboarded-repo row (unused today;
+    accepted so the signature matches jira_facts/confluence_facts)."""
+    action = str(event_payload.get("action", "")).lower()
+    if action not in ("opened", "synchronize"):
+        return None
+    pr = event_payload.get("pull_request") or {}
+    repo = (event_payload.get("repository") or {}).get("full_name", "")
+    number = pr.get("number")
+    if not repo or number is None:
+        return None
+    owner, _, repo_name = repo.partition("/")
+    head = pr.get("head") or {}
+    base = pr.get("base") or {}
+    labels = [l.get("name", "") for l in (pr.get("labels") or []) if l.get("name")]
+    return {
+        "event": f"pull_request.{action}",
+        "connector": "github",
+        "repo": repo,
+        "owner": owner,
+        "repo_name": repo_name,
+        "pr_number": str(number),
+        "action": action,
+        "author": (pr.get("user") or {}).get("login", ""),
+        "title": pr.get("title", ""),
+        "base_branch": base.get("ref", ""),
+        "head_branch": head.get("ref", ""),
+        "head_sha": head.get("sha", ""),
+        "draft": bool(pr.get("draft", False)),
+        # ``labels`` is the TEMPLATE value — a human-readable comma-joined string
+        # ("bug, enhancement"), not the list, so {{labels}} doesn't render a
+        # Python list repr ("['bug', 'enhancement']"). ``labels_present`` keeps
+        # the list for the labels_any match set.
+        "labels": ", ".join(labels),
+        "labels_present": labels,
+        "pr_url": pr.get("html_url", ""),
+        # Cooldown unit is the PR — a force-push storm on one PR shares a window.
+        "unit": f"pr:{repo}:{number}",
+    }
+
+
 # --- matching -----------------------------------------------------------------
 
 
@@ -305,11 +355,14 @@ def _over_hourly_ceiling(rule_id: str) -> bool:
         return False
 
 
-def match_and_dispatch(*, connector: str, event: str, facts: dict, site: dict,
+def match_and_dispatch(*, connector: str, event: str, facts: dict, site: dict | None = None,
                        dispatch, chain: list | None = None) -> int:
     """Match rules for this event and dispatch each through the router spine.
     ``dispatch`` is the receiver's ``_dispatch(agent_id, instruction, sender,
     context, trigger_type)`` callable. Returns the number of rules fired.
+
+    ``site`` is the Atlassian site row (jira/confluence); GitHub has no site, so
+    it defaults to None and the GitHub context path uses the facts' repo instead.
 
     Applies the cooldown, hourly ceiling, and chain-depth brakes (§A8.5)."""
     chain = list(chain or [])
@@ -355,17 +408,43 @@ def _notify_automation_fired(connector: str, agent_id: str, facts: dict) -> None
                  f"{facts.get('issue_key') or facts.get('title') or facts.get('unit', '')}.",
             project=facts.get("project", "") if connector == "jira" else "",
             space=facts.get("space", "") if connector == "confluence" else "",
+            repo=facts.get("repo", "") if connector == "github" else "",
             unit=str(facts.get("unit", "")),
         )
     except Exception:  # noqa: BLE001
         logger.exception("automation_fired notify failed")
 
 
-def _dispatch_context(connector: str, facts: dict, site: dict, rule_id: str, chain: list) -> dict:
+def _dispatch_context(connector: str, facts: dict, site: dict | None, rule_id: str, chain: list) -> dict:
     """Build the router dispatch context for an automation fire — the same
     source_context shape a mention dispatch carries, plus the automation trace
     ref + the chain of rule ids (chain-depth safety)."""
     import trigger_grants
+
+    if connector == "github":
+        # GitHub has no "workspace" the way Slack (team) / Atlassian (site) do —
+        # the repo is the origin, and it travels as `repo`, NOT `workspace`. The
+        # whole authz model assumes "github/asana carry no workspace/channel"
+        # (trigger_authz docstring): with an empty workspace, channel_allowed()
+        # short-circuits to True (the channel axis doesn't apply). Stuffing the
+        # repo into `workspace` instead made channel_allowed() look the repo up
+        # in the Slack-workspace table, miss, and fail closed — denying every
+        # auto-review. Leave workspace unset to match the @mention path
+        # (github_webhook._issue_context sets no workspace either).
+        repo = facts.get("repo", "")
+        return {
+            "repo": repo,
+            "repos": [repo] if repo else [],
+            "pr_number": facts.get("pr_number", ""),
+            "issue_number": facts.get("pr_number", ""),
+            "pr_title": facts.get("title", ""),
+            "head_sha": facts.get("head_sha", ""),
+            "base_branch": facts.get("base_branch", ""),
+            "draft": facts.get("draft", False),
+            "automation_event": facts.get("event", ""),
+            "automation_rule_id": rule_id,
+            "automation_chain": chain + [rule_id],
+        }
 
     ctx = {
         "workspace": site["site_id"],

@@ -391,7 +391,7 @@ export interface ConfluenceSpace {
 /** A data-driven event → agent automation rule (§A8.1). */
 export interface AutomationRule {
   rule_id: string;
-  connector: "jira" | "confluence";
+  connector: "jira" | "confluence" | "github";
   enabled: boolean;
   event: string;
   match: Record<string, unknown>;

@@ -46,7 +46,7 @@ def test_seed_writes_all_builtins_disabled():
     os.environ["AWS_DEFAULT_REGION"] = REGION
     table = _make_table()
     deploy_fleet.seed_builtin_capabilities(_Runner(), {"FleetConfigTableName": TABLE})
-    for agent_id in ("workitems", "researcher", "docwriter", "adr"):
+    for agent_id in ("workitems", "researcher", "docwriter", "adr", "reviewer"):
         row = _get(table, agent_id)
         assert row is not None, agent_id
         assert row["builtin"] is True

@@ -29,9 +29,11 @@ import base64
 import json
 import logging
 import os
+import time
 
 import boto3
 
+import automation
 import mentions
 import notify
 
@@ -52,9 +54,19 @@ GITHUB_WEBHOOK_SECRET_PARAM = os.environ.get(
 # against. Cached with a short TTL so an onboard/disable propagates within the
 # window across warm invocations.
 REGISTRY_PARAM = os.environ.get("REGISTRY_PARAM", "/dispatch/agents")
+# The GitHub App slug — its bot login is ``<slug>[bot]``. Used by the
+# automation bot-actor guard so an auto-review never fires on the fleet's own
+# PR activity (loop safety, reviewer-agent spec §auto-trigger step 2). Read
+# per-invocation with a short-TTL cache; absent ⇒ the guard simply can't match
+# the bot login (fail-open on the guard is acceptable — the cooldown + chain
+# brakes still bound loops; but the slug is normally set once the App exists).
+GITHUB_APP_SLUG_PARAM = os.environ.get("GITHUB_APP_SLUG_PARAM")
 
 _ssm = boto3.client("ssm")
 _lambda = boto3.client("lambda")
+
+_slug_cache: dict = {"value": None, "expires_at": 0.0}
+_SLUG_TTL = 300.0
 
 # Registry-backed @mention resolution + a short-TTL cache, shared with the other
 # receivers (mentions.py). The registry — not a hardcoded roster — decides which
@@ -226,6 +238,71 @@ def _notify_scm(event_type: str, payload: dict) -> None:
         )
 
 
+def _app_bot_login() -> str:
+    """The fleet App's bot login (``<slug>[bot]``), short-TTL cached. Empty when
+    the slug param is unset/unreadable — the caller then can't match the bot and
+    the cooldown/chain brakes remain the loop backstop."""
+    if not GITHUB_APP_SLUG_PARAM:
+        return ""
+    now = time.time()
+    if _slug_cache["value"] is not None and now < _slug_cache["expires_at"]:
+        return _slug_cache["value"]
+    slug = ""
+    try:
+        resp = _ssm.get_parameter(Name=GITHUB_APP_SLUG_PARAM)
+        raw = (resp["Parameter"]["Value"] or "").strip()
+        # The template seeds a placeholder before the App exists — treat any
+        # non-real value as "no slug" so we never build a bogus bot login.
+        if raw and not raw.lower().startswith("placeholder"):
+            slug = f"{raw}[bot]"
+    except Exception:  # noqa: BLE001
+        logger.warning("could not read GitHub App slug param %s", GITHUB_APP_SLUG_PARAM)
+    _slug_cache["value"] = slug
+    _slug_cache["expires_at"] = now + _SLUG_TTL
+    return slug
+
+
+def _run_automation(payload: dict) -> None:
+    """Match a pull_request event against GitHub automation rules and dispatch
+    (reviewer-agent spec §auto-trigger). Runs ONLY after _notify_scm and ONLY
+    when the PR author is not the fleet bot (loop guard) — a mention is explicit
+    intent and takes its own path; automation is the no-mention fallback.
+    Best-effort: a matching/dispatch failure never fails the webhook."""
+    pr = payload.get("pull_request") or {}
+    author = (pr.get("user") or {}).get("login", "")
+    # The event actor — on `synchronize` this is the PUSHER, which may be the
+    # fleet bot pushing to a human-opened PR (durable repo work pushes to
+    # wip/... with the App token). The PR author stays the human in that case,
+    # so guarding on the author alone would let a bot push re-trigger a review
+    # (a loop the head-SHA ledger dampens but doesn't structurally prevent).
+    sender = (payload.get("sender") or {}).get("login", "")
+    bot_login = _app_bot_login()
+    # Bot-actor guard: the App's own PR activity never triggers an auto-review.
+    # Match either the PR author OR the delivery sender against the fleet bot
+    # login; also skip any *[bot] actor as a coarse backstop when the slug is
+    # unknown.
+    for actor in (author, sender):
+        if actor and (actor == bot_login or actor.endswith("[bot]")):
+            logger.info("github webhook: bot actor (%s) — no automation", actor)
+            return
+    # Draft PRs are not auto-reviewed by default (reviewer-agent spec §Non-goals:
+    # "Review draft PRs unless the repo config opts in"). A draft is work in
+    # progress — reviewing it wastes a run and posts premature findings/status.
+    # (Per-repo review_drafts opt-in is a future repo-config knob; until then the
+    # safe default is skip. An @reviewer mention still reviews a draft — that's
+    # explicit human intent on its own path.)
+    if pr.get("draft"):
+        logger.info("github webhook: draft PR — no auto-review")
+        return
+    facts = automation.github_facts(payload)
+    if not facts:
+        return  # not an opened/synchronize event we auto-review
+    automation.match_and_dispatch(
+        connector="github", event=facts["event"], facts=facts,
+        dispatch=_dispatch,
+    )
+
+
 def handler(event, context=None):
     """API Gateway entry point for GitHub App webhook deliveries."""
     headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
@@ -275,6 +352,14 @@ def handler(event, context=None):
             _notify_scm(event_type, payload)
         except Exception:  # noqa: BLE001 — notifications are best-effort
             logger.exception("SCM notification fan-out failed for %s", event_type)
+        # Auto-review: after notifying, match pull_request events against GitHub
+        # automation rules (reviewer-agent spec §auto-trigger). No rule / no
+        # match / bot author ⇒ no-op. Never fails the webhook.
+        if event_type == "pull_request":
+            try:
+                _run_automation(payload)
+            except Exception:  # noqa: BLE001 — automation is best-effort here
+                logger.exception("GitHub automation dispatch failed")
         return {"statusCode": 200, "body": "ok"}
 
     if not trigger_type:

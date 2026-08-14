@@ -216,3 +216,115 @@ def test_disabled_rule_inert():
                               facts={"unit": "u", "issue_key": "E-1"}, site=SITE,
                               dispatch=lambda *a: None)
     assert n == 0
+
+
+# --- GitHub connector (reviewer-agent spec §auto-trigger) --------------------
+
+def _pr_payload(action="opened", number=7, draft=False, author="alice"):
+    return {
+        "action": action,
+        "repository": {"full_name": "acme/web"},
+        "pull_request": {
+            "number": number,
+            "title": "Add cache layer",
+            "user": {"login": author},
+            "draft": draft,
+            "head": {"ref": "feature", "sha": "def456"},
+            "base": {"ref": "main"},
+            "labels": [{"name": "enhancement"}],
+            "html_url": "https://github.com/acme/web/pull/7",
+        },
+    }
+
+
+def test_github_facts_opened_maps_event_and_unit():
+    au = _load()
+    f = au.github_facts(_pr_payload(action="opened"))
+    assert f["event"] == "pull_request.opened"
+    assert f["repo"] == "acme/web" and f["pr_number"] == "7"
+    assert f["head_sha"] == "def456" and f["base_branch"] == "main"
+    assert f["unit"] == "pr:acme/web:7"  # cooldown unit is the PR
+    assert f["labels_present"] == ["enhancement"]  # list — used by labels_any match
+    # ``labels`` is the TEMPLATE value: a human-readable string, not a list repr.
+    assert f["labels"] == "enhancement"
+
+
+def test_github_labels_render_as_readable_string():
+    au = _load()
+    payload = _pr_payload()
+    payload["pull_request"]["labels"] = [{"name": "bug"}, {"name": "p1"}]
+    out = au.render_template("github", "Labels: {{labels}}", au.github_facts(payload))
+    # NOT "Labels: ['bug', 'p1']" — a list repr would leak brackets/quotes.
+    assert out == "Labels: bug, p1"
+
+
+def test_github_facts_synchronize():
+    au = _load()
+    assert au.github_facts(_pr_payload(action="synchronize"))["event"] == \
+        "pull_request.synchronize"
+
+
+def test_github_facts_ignores_other_actions():
+    au = _load()
+    assert au.github_facts(_pr_payload(action="closed")) is None
+    assert au.github_facts(_pr_payload(action="labeled")) is None
+
+
+def test_github_template_vars_render():
+    au = _load()
+    out = au.render_template(
+        "github", "Review PR #{{pr_number}} in {{repo}} ({{head_sha}}) {{nope}}",
+        au.github_facts(_pr_payload()),
+    )
+    assert out == "Review PR #7 in acme/web (def456) "
+
+
+@mock_aws
+def test_github_match_and_dispatch_shapes_context():
+    _make_tables()
+    _rule(rule_id="g1", connector="github", event="pull_request.opened",
+          match={"repo": "acme/web"},
+          action={"agent_id": "reviewer",
+                  "instruction_template": "Review PR #{{pr_number}} in {{repo}}"})
+    au = _load()
+    captured = {}
+    sender = {}
+    def dispatch(agent, instr, sndr, ctx, tt):
+        captured.update(ctx)
+        sender["v"] = sndr
+        sender["agent"] = agent
+        sender["instr"] = instr
+        sender["tt"] = tt
+    facts = au.github_facts(_pr_payload(action="opened"))
+    n = au.match_and_dispatch(connector="github", event="pull_request.opened",
+                              facts=facts, dispatch=dispatch)  # no site for github
+    assert n == 1
+    assert sender["agent"] == "reviewer"
+    assert sender["v"] == "automation:github:g1"
+    assert sender["tt"] == "automation"
+    assert sender["instr"] == "Review PR #7 in acme/web"
+    # Context matches the github mention/reviewer shape.
+    assert captured["repo"] == "acme/web"
+    assert captured["repos"] == ["acme/web"]
+    assert captured["pr_number"] == "7"
+    assert captured["head_sha"] == "def456"
+    assert captured["automation_event"] == "pull_request.opened"
+    # The repo travels as `repo`, NOT `workspace`: github carries no workspace,
+    # so trigger_authz's channel axis stays inapplicable (channel_allowed→True).
+    # A repo-shaped workspace would fail-close the Slack-workspace lookup and
+    # deny every auto-review.
+    assert "workspace" not in captured
+
+
+@mock_aws
+def test_github_repo_match_key_filters():
+    _make_tables()
+    _rule(rule_id="g1", connector="github", event="pull_request.opened",
+          match={"repo": "acme/other"}, action={"agent_id": "reviewer",
+                 "instruction_template": "x"})
+    au = _load()
+    fired = []
+    facts = au.github_facts(_pr_payload(action="opened"))  # repo=acme/web
+    n = au.match_and_dispatch(connector="github", event="pull_request.opened",
+                              facts=facts, dispatch=lambda *a: fired.append(1))
+    assert n == 0 and fired == []  # match.repo=acme/other != acme/web

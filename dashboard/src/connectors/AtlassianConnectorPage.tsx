@@ -580,6 +580,9 @@ function AutomationsTab({ api, onAuthError }: ConnectorPageProps) {
   // Populate the form from an existing rule (its match is reversed back into the
   // discrete fields), so "edit" reuses the same builder as "create".
   const startEdit = (r: AutomationRule) => {
+    // This builder is Atlassian-only; github rules are edited in the GitHub
+    // connector's Auto-review tab and never surface here (poll is filtered).
+    if (r.connector !== "jira" && r.connector !== "confluence") return;
     setEditingId(r.rule_id);
     setConnector(r.connector);
     setEvent(r.event);
@@ -634,7 +637,11 @@ function AutomationsTab({ api, onAuthError }: ConnectorPageProps) {
     } catch (e) { handleErr(e); } finally { setBusy(false); }
   };
 
-  const rules = poll.data?.rules ?? [];
+  // Atlassian builder shows only jira/confluence rules — github auto-review
+  // rules live in the GitHub connector's Auto-review tab.
+  const rules = (poll.data?.rules ?? []).filter(
+    (r) => r.connector === "jira" || r.connector === "confluence",
+  );
   const sites = sitesPoll.data?.sites ?? [];
   return (
     <div>

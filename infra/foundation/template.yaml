@@ -689,6 +689,9 @@ Resources:
           STAGE: !Ref Stage
           GITHUB_APP_ID_PARAM: !Ref GitHubAppIdParam
           GITHUB_APP_PRIVATE_KEY_SECRET_ARN: !Ref GitHubAppPrivateKey
+          # App slug → bot login (<slug>[bot]) for the automation bot-actor guard
+          # so an auto-review never fires on the fleet's own PR activity.
+          GITHUB_APP_SLUG_PARAM: !Ref GitHubAppSlugParam
       Policies:
         - LambdaInvokePolicy:
             FunctionName: !Ref DispatchRouterFunction
@@ -711,6 +714,7 @@ Resources:
               Resource:
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/github-webhook-secret
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/github-app-id
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/github-app-slug
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/registry
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdlc-agents/${Stage}/slack/*
             - Effect: Allow
@@ -3177,6 +3181,20 @@ Resources:
                     repo:
                       Type: string
                   Required: [branch, owner, repo]
+              - Name: create_commit_status
+                Description: GitHub create commit status (per-owner App token).
+                InputSchema:
+                  Type: object
+                  Properties:
+                    owner:
+                      Type: string
+                    repo:
+                      Type: string
+                    sha:
+                      Type: string
+                    state:
+                      Type: string
+                  Required: [owner, repo, sha, state]
               - Name: create_issue
                 Description: GitHub create issue (per-owner App token).
                 InputSchema:

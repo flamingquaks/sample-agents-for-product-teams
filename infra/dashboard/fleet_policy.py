@@ -54,6 +54,7 @@ WRITE_TOOLS = (
     "add_issue_comment",
     "create_pull_request",
     "create_pull_request_review",
+    "create_commit_status",
     "create_or_update_file",
     "push_files",
     "create_branch",
@@ -530,6 +531,25 @@ AGENT_TOOL_GRANTS = {
         f"{_CF}___add_comment",
         f"{_CF}___add_label",
     ],
+    "reviewer": [
+        # GitHub — read code + the diff, then annotate. Reviewer is GitHub-only
+        # (no Asana/Jira/Confluence): it reviews PRs against the diff + repo.
+        f"{_GH}___get_file_contents",
+        f"{_GH}___search_code",
+        f"{_GH}___get_issue",
+        f"{_GH}___list_issues",
+        f"{_GH}___get_pull_request",
+        f"{_GH}___list_pull_requests",
+        f"{_GH}___get_pull_request_diff",
+        f"{_GH}___list_pull_request_files",
+        f"{_GH}___list_commits",
+        f"{_GH}___add_issue_comment",
+        # Diff-anchored PR review (broker forces event=COMMENT — never
+        # approve/request-changes/merge, same posture as adr).
+        f"{_GH}___create_pull_request_review",
+        # Advisory commit status on the PR head (never a blocking failure).
+        f"{_GH}___create_commit_status",
+    ],
     "researcher": [
         # GitHub — READ ONLY: ground research/backlog analysis in the real
         # codebase and issue tracker. No write tools (tier has no write either).
@@ -593,6 +613,17 @@ AGENT_GITHUB_PERMISSIONS = {
         "contents": "read",
         "issues": "read",
         "pull_requests": "read",
+        "metadata": "read",
+    },
+    # Reviewer: reads code + diffs, posts COMMENT-only PR reviews (broker forces
+    # event=COMMENT + Cedar COMMENT_ONLY_REVIEW_TOOLS backstop, exactly like adr),
+    # and publishes an ADVISORY commit status (statuses:write). No contents:write,
+    # so it can never push or merge — a review agent informs, never gates.
+    "reviewer": {
+        "contents": "read",
+        "issues": "write",
+        "pull_requests": "write",
+        "statuses": "write",
         "metadata": "read",
     },
 }

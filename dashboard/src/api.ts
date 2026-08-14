@@ -603,7 +603,7 @@ export class DashboardApi {
   }
 
   createAutomationRule(body: {
-    connector: "jira" | "confluence";
+    connector: "jira" | "confluence" | "github";
     event: string;
     match?: Record<string, unknown>;
     agent_id: string;

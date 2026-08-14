@@ -205,6 +205,46 @@ def test_automation_principal_namespace():
     assert cs.automation_principal("jira", "r1") == "automation:jira:r1"
 
 
+@mock_aws
+def test_github_automation_rule_roundtrip():
+    # GitHub auto-review rule (reviewer-agent spec §auto-trigger): pull_request
+    # event family, repo match key, github template vars.
+    _make_table()
+    cs = _load_store()
+    rule = cs.put_automation_rule(
+        connector="github", event="pull_request.opened",
+        match={"repo": "Acme/Web"}, agent_id="reviewer",
+        instruction_template="Review PR #{{pr_number}} in {{repo}} ({{head_sha}}).",
+    )
+    assert rule["connector"] == "github"
+    assert rule["action"]["agent_id"] == "reviewer"
+    # match.repo is normalized to the canonical lowercase owner/repo, so it
+    # matches the lowercased full_name automation.github_facts emits (else the
+    # rule silently never fires).
+    assert rule["match"]["repo"] == "acme/web"
+    assert cs.automation_principal("github", rule["rule_id"]).startswith("automation:github:")
+    # Wrong event family for github is rejected.
+    with pytest.raises(ValueError):
+        cs.put_automation_rule(
+            connector="github", event="issue_transitioned",
+            agent_id="reviewer", instruction_template="x",
+        )
+    # Unknown github template var is rejected at authoring time.
+    with pytest.raises(ValueError, match="unknown template variable"):
+        cs.put_automation_rule(
+            connector="github", event="pull_request.synchronize",
+            agent_id="reviewer", instruction_template="Review {{not_a_var}}",
+        )
+    # A malformed repo (no owner/repo shape) is rejected at authoring time
+    # rather than stored as an undiagnosable never-matching no-op.
+    with pytest.raises(ValueError, match="invalid match.repo"):
+        cs.put_automation_rule(
+            connector="github", event="pull_request.opened",
+            match={"repo": "not a repo"}, agent_id="reviewer",
+            instruction_template="x",
+        )
+
+
 # --- notif prefs --------------------------------------------------------------
 
 

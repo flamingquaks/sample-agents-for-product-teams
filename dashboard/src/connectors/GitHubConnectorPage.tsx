@@ -6,6 +6,7 @@
 import { GitHubAppPanel } from "../GitHubAppPanel";
 import { ActivityPanel } from "./ActivityPanel";
 import { ConnectorLayout } from "./ConnectorLayout";
+import { GitHubAutomationsTab } from "./GitHubAutomationsTab";
 import type { ConnectorPageProps } from "./registry";
 
 export function GitHubConnectorPage({ api, onAuthError }: ConnectorPageProps) {
@@ -25,6 +26,11 @@ export function GitHubConnectorPage({ api, onAuthError }: ConnectorPageProps) {
               </p>
             </div>
           ),
+        },
+        {
+          key: "automations",
+          label: "Auto-review",
+          render: () => <GitHubAutomationsTab api={api} onAuthError={onAuthError} />,
         },
         {
           key: "activity",
