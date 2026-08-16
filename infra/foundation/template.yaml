@@ -49,6 +49,32 @@ Parameters:
       account's default project. Ignored when DeployMantleProject is "true" (the
       created project's id wins).
 
+  DeployAgentCoreMemory:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Provision the fleet's shared AgentCore Memory as a CloudFormation resource
+      (AWS::BedrockAgentCore::Memory) and inject its id as AGENTCORE_MEMORY_ID
+      on every agent runtime. Default "true". Unlike AWS::BedrockMantle::Project
+      this is a NATIVE AgentCore type (same family as the Gateway) — no
+      `activate-type` step is required. Set "false" to skip provisioning and
+      instead supply a pre-existing id via AgentCoreMemoryId (or leave both off:
+      agents that find AGENTCORE_MEMORY_ID unset simply skip loading memory
+      tools, so the fleet still runs — the reviewer's incremental-review ledger
+      just no-ops).
+
+  AgentCoreMemoryId:
+    Type: String
+    Default: ""
+    Description: >
+      A pre-existing AgentCore Memory id, used only when DeployAgentCoreMemory
+      is "false". Injected as AGENTCORE_MEMORY_ID on every agent runtime. One
+      Memory fleet-wide — agents partition it by actor_id + namespace
+      (/agents/<agent>/...). Blank leaves agents memory-less (they degrade
+      gracefully). Ignored when DeployAgentCoreMemory is "true" (the created
+      Memory's id wins).
+
   DeployDashboard:
     Type: String
     Default: "false"
@@ -185,6 +211,19 @@ Conditions:
   # MantleProjectEnabled, else from this param, else leaves agents on the
   # account's default Mantle project.
   HasMantleProjectId: !Not [!Equals [!Ref MantleProjectId, ""]]
+  # Provision the shared AgentCore Memory (native type — no activation step,
+  # unlike the Mantle project above).
+  AgentCoreMemoryEnabled: !Equals [!Ref DeployAgentCoreMemory, "true"]
+  # A pre-existing memory id was supplied (used when not provisioning here).
+  HasAgentCoreMemoryId: !Not [!Equals [!Ref AgentCoreMemoryId, ""]]
+  # SOME memory id exists (provisioned or supplied) — gates the permissions
+  # boundary's memory data-plane statement, which needs a concrete ARN to scope
+  # to; with neither, the statement is omitted and runtime roles get no memory
+  # grant at all (matching the deployer, which only attaches the per-role grant
+  # when AGENTCORE_MEMORY_ID is set).
+  AgentCoreMemoryAvailable: !Or
+    - !Condition AgentCoreMemoryEnabled
+    - !Condition HasAgentCoreMemoryId
   # GatewayPolicyEnforcement is expressed in per-policy terms (LOG_ONLY|ACTIVE);
   # the gateway→engine attachment Mode instead uses LOG_ONLY|ENFORCE. This maps
   # the ACTIVE choice to the attachment's ENFORCE value (see FleetGateway).
@@ -1098,6 +1137,37 @@ Resources:
       Tags:
         - Key: sdlc-fleet
           Value: !Ref Stage
+
+  # The fleet's single shared AgentCore Memory — the agents' cross-invocation
+  # store (e.g. the reviewer's per-PR review ledger: last-reviewed head SHA +
+  # finding fingerprints + resolved set, docs/specs/reviewer-agent-spec.md).
+  # One Memory fleet-wide: agents partition it by actor_id + namespace
+  # (/agents/<agent>/...), so per-agent Memory resources would add only IAM
+  # sprawl. Its id flows to AGENTCORE_MEMORY_ID on every agent runtime (see
+  # CapabilityDeployerFunction); an agent that finds the var unset skips
+  # loading memory tools, so this resource is safe to toggle off.
+  #
+  # Deliberately NO MemoryStrategies (short-term raw-event memory only): the
+  # review ledger needs VERBATIM values (SHAs, fingerprints) read back exactly
+  # as written via the event APIs, and an LLM-extraction strategy would
+  # paraphrase them. EventExpiryDuration 90 (days): the ledger only needs to
+  # outlive a PR's ACTIVE life — 90 days comfortably covers long-lived PRs
+  # while stale per-PR ledgers age out on their own (a re-review after expiry
+  # just degrades to a full review).
+  #
+  # Native AgentCore CFN type (same family as FleetGateway) — unlike
+  # AWS::BedrockMantle::Project above, no `activate-type` step is needed.
+  FleetAgentCoreMemory:
+    Type: AWS::BedrockAgentCore::Memory
+    Condition: AgentCoreMemoryEnabled
+    Properties:
+      # Name pattern is ^[a-zA-Z][a-zA-Z0-9_]{0,47}$ (no hyphens) — mirror the
+      # gateway's sdlcFleet<stage> convention.
+      Name: !Sub sdlcFleetMemory${Stage}
+      Description: Shared cross-invocation memory for the SDLC agent fleet (per-agent namespaces)
+      EventExpiryDuration: 90
+      Tags:
+        sdlc-fleet: !Ref Stage
 
   # ---------------------------------------------------------------------------
   # CloudWatch — Observability
@@ -2400,6 +2470,35 @@ Resources:
             Effect: Allow
             Action: lambda:InvokeFunction
             Resource: !GetAtt WorkspaceTokenVendorFunction.Arn
+          # AgentCore Memory data plane (cross-invocation agent state, e.g. the
+          # reviewer's per-PR review ledger). Scoped to the ONE fleet Memory
+          # even in the boundary, for the same reason as SkillsBucketRead: an
+          # unscoped memory grant here would let any future per-role grant (or
+          # a deployer bug) read every Memory in the account. Delete* stays in:
+          # the Strands memory tool set includes pruning an agent's OWN entries,
+          # and the resource scope keeps that inside the fleet Memory. Omitted
+          # entirely when no memory id exists (feature off) — matching the
+          # deployer, which then attaches no per-role memory policy either.
+          - !If
+            - AgentCoreMemoryAvailable
+            - Sid: FleetMemoryDataPlane
+              Effect: Allow
+              Action:
+                - bedrock-agentcore:CreateEvent
+                - bedrock-agentcore:GetEvent
+                - bedrock-agentcore:ListEvents
+                - bedrock-agentcore:DeleteEvent
+                - bedrock-agentcore:ListActors
+                - bedrock-agentcore:ListSessions
+                - bedrock-agentcore:RetrieveMemoryRecords
+                - bedrock-agentcore:GetMemoryRecord
+                - bedrock-agentcore:ListMemoryRecords
+                - bedrock-agentcore:DeleteMemoryRecord
+              Resource: !If
+                - AgentCoreMemoryEnabled
+                - !GetAtt FleetAgentCoreMemory.MemoryArn
+                - !Sub arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:memory/${AgentCoreMemoryId}
+            - !Ref AWS::NoValue
 
   CapabilityBuildRole:
     Type: AWS::IAM::Role
@@ -2588,6 +2687,16 @@ Resources:
             - MantleProjectEnabled
             - !GetAtt FleetMantleProject.Id
             - !If [HasMantleProjectId, !Ref MantleProjectId, !Ref "AWS::NoValue"]
+          # The fleet's shared AgentCore Memory, propagated onto every agent
+          # runtime as AGENTCORE_MEMORY_ID and used to scope the runtime role's
+          # memory data-plane grant (absent → agents skip loading memory tools
+          # and the reviewer's incremental-review ledger no-ops). The
+          # CFN-created Memory's id wins when provisioned here; otherwise a
+          # pre-existing AgentCoreMemoryId param is used.
+          AGENTCORE_MEMORY_ID: !If
+            - AgentCoreMemoryEnabled
+            - !GetAtt FleetAgentCoreMemory.MemoryId
+            - !If [HasAgentCoreMemoryId, !Ref AgentCoreMemoryId, !Ref "AWS::NoValue"]
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref FleetConfigTable
@@ -3933,6 +4042,13 @@ Outputs:
     Description: The fleet's shared Bedrock Mantle project id (injected as MANTLE_PROJECT_ID on agent runtimes)
     Export:
       Name: !Sub ${AWS::StackName}-MantleProjectId
+
+  AgentCoreMemoryId:
+    Condition: AgentCoreMemoryEnabled
+    Value: !GetAtt FleetAgentCoreMemory.MemoryId
+    Description: The fleet's shared AgentCore Memory id (injected as AGENTCORE_MEMORY_ID on agent runtimes)
+    Export:
+      Name: !Sub ${AWS::StackName}-AgentCoreMemoryId
 
   # --- Dashboard (only present when DeployDashboard=true) --------------------
 

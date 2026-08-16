@@ -380,9 +380,40 @@ def test_draft_pr_skips_automation(monkeypatch):
     calls = []
     monkeypatch.setattr(gw.automation, "match_and_dispatch",
                         lambda **kw: calls.append(kw) or 1)
-    # Draft PRs are not auto-reviewed by default (spec §Non-goals).
+    # Draft PRs are not auto-reviewed by default (spec §Non-goals). Stub the
+    # repo-config read to the default (no opt-in) so the test stays offline.
+    monkeypatch.setattr(gw, "_repo_reviews_drafts", lambda repo: False)
     gw.handler(_event(_pr_body("opened", draft=True), event="pull_request"))
     assert calls == []
+
+
+def test_draft_pr_with_review_drafts_optin_runs_automation(monkeypatch):
+    gw, dispatched = _fresh(monkeypatch)
+    _quiet_notify(monkeypatch, gw)
+    calls = []
+    monkeypatch.setattr(gw.automation, "match_and_dispatch",
+                        lambda **kw: calls.append(kw) or 1)
+    # The repo opted in via .pdlc-agents/review.yaml (spec §Repo config) — the
+    # trigger layer honors it, so the draft PR IS auto-reviewed.
+    monkeypatch.setattr(gw, "_repo_reviews_drafts", lambda repo: True)
+    gw.handler(_event(_pr_body("opened", draft=True), event="pull_request"))
+    assert len(calls) == 1
+    assert calls[0]["event"] == "pull_request.opened"
+
+
+def test_non_draft_pr_never_consults_repo_config(monkeypatch):
+    gw, dispatched = _fresh(monkeypatch)
+    _quiet_notify(monkeypatch, gw)
+    calls = []
+    monkeypatch.setattr(gw.automation, "match_and_dispatch",
+                        lambda **kw: calls.append(kw) or 1)
+
+    def _never(repo):
+        raise AssertionError("_repo_reviews_drafts must not run for non-draft PRs")
+
+    monkeypatch.setattr(gw, "_repo_reviews_drafts", _never)
+    gw.handler(_event(_pr_body("opened", draft=False), event="pull_request"))
+    assert len(calls) == 1  # automation ran without spending a config fetch
 
 
 def test_pr_closed_does_not_run_automation(monkeypatch):
@@ -421,3 +452,111 @@ def test_issues_event_does_not_run_pr_automation(monkeypatch):
     })
     gw.handler(_event(body, event="issues"))
     assert calls == []  # automation only rides pull_request events
+
+
+# --- _app_bot_login sentinel handling (template seeds "unset") --------------
+
+
+def test_app_bot_login_unset_sentinel_yields_empty(monkeypatch):
+    # infra/foundation/template.yaml seeds the slug param with Value: "unset";
+    # before FIX the code only knew the "placeholder" sentinel and built a
+    # bogus "unset[bot]" login that matches nothing.
+    gw, _ = _fresh(monkeypatch)
+    monkeypatch.setattr(gw, "GITHUB_APP_SLUG_PARAM", "/sdlc-agents/test/github-app-slug")
+
+    class _SSM:
+        def get_parameter(self, Name, WithDecryption=False):
+            return {"Parameter": {"Value": "unset"}}
+
+    monkeypatch.setattr(gw, "_ssm", _SSM())
+    gw._slug_cache.update({"value": None, "expires_at": 0.0})
+    assert gw._app_bot_login() == ""
+
+
+# --- _repo_reviews_drafts (trigger-layer .pdlc-agents/review.yaml read) ------
+
+
+def _stub_contents_api(monkeypatch, gw, *, status=200, body_text=None,
+                       get_raises=None, token_raises=None):
+    """Stub the modules _repo_reviews_drafts imports inside the function
+    (github_app + requests are import-inside-function, so sys.modules injection
+    is what the helper actually sees). Clears the per-repo TTL cache."""
+    import types
+
+    def _token(repo):
+        if token_raises:
+            raise token_raises
+        return "test-installation-token"
+
+    fake_gh = types.SimpleNamespace(
+        GITHUB_API_BASE="https://api.github.com",
+        installation_token_for_repo=_token,
+    )
+
+    class _Resp:
+        status_code = status
+
+        def json(self):
+            import base64
+            return {"content": base64.b64encode((body_text or "").encode()).decode()}
+
+    def _get(url, headers=None, timeout=None):
+        if get_raises:
+            raise get_raises
+        return _Resp()
+
+    monkeypatch.setitem(sys.modules, "github_app", fake_gh)
+    monkeypatch.setitem(sys.modules, "requests", types.SimpleNamespace(get=_get))
+    gw._drafts_cfg_cache.clear()
+
+
+def test_repo_reviews_drafts_true_from_config(monkeypatch):
+    gw, _ = _fresh(monkeypatch)
+    _stub_contents_api(monkeypatch, gw,
+                       body_text="review_drafts: true\nmin_severity: low\n")
+    assert gw._repo_reviews_drafts("acme/web") is True
+
+
+def test_repo_reviews_drafts_absent_key_defaults_false(monkeypatch):
+    gw, _ = _fresh(monkeypatch)
+    _stub_contents_api(monkeypatch, gw, body_text="min_severity: low\n")
+    assert gw._repo_reviews_drafts("acme/web") is False
+
+
+def test_repo_reviews_drafts_404_returns_false(monkeypatch):
+    gw, _ = _fresh(monkeypatch)
+    _stub_contents_api(monkeypatch, gw, status=404)
+    assert gw._repo_reviews_drafts("acme/web") is False
+
+
+def test_repo_reviews_drafts_network_error_returns_false(monkeypatch):
+    gw, _ = _fresh(monkeypatch)
+    _stub_contents_api(monkeypatch, gw, get_raises=RuntimeError("network down"))
+    assert gw._repo_reviews_drafts("acme/web") is False
+
+
+def test_repo_reviews_drafts_token_error_returns_false(monkeypatch):
+    gw, _ = _fresh(monkeypatch)
+    _stub_contents_api(monkeypatch, gw, token_raises=RuntimeError("no installation"))
+    assert gw._repo_reviews_drafts("acme/web") is False
+
+
+def test_repo_reviews_drafts_malformed_yaml_returns_false(monkeypatch):
+    gw, _ = _fresh(monkeypatch)
+    _stub_contents_api(monkeypatch, gw, body_text="review_drafts: [true\n  broken:")
+    assert gw._repo_reviews_drafts("acme/web") is False
+
+
+def test_repo_reviews_drafts_caches_per_repo(monkeypatch):
+    gw, _ = _fresh(monkeypatch)
+    _stub_contents_api(monkeypatch, gw, body_text="review_drafts: true\n")
+    assert gw._repo_reviews_drafts("acme/web") is True
+    # Second call within the TTL must serve from cache — swap the requests stub
+    # (WITHOUT clearing the cache) for one that explodes if consulted.
+    import types
+
+    def _boom(url, headers=None, timeout=None):
+        raise AssertionError("must be served from cache")
+
+    monkeypatch.setitem(sys.modules, "requests", types.SimpleNamespace(get=_boom))
+    assert gw._repo_reviews_drafts("acme/web") is True

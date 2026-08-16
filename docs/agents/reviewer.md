@@ -63,3 +63,20 @@ A per-PR review ledger (`/agents/reviewer/<repo>/pr/<number>`) holds the last-re
 - GitHub App tier (`contents:read`, `pull_requests:write`, `issues:write`, `statuses:write`, `metadata:read`) — identical to Adr's plus the advisory-status permission.
 - Broker forces `event=COMMENT`; `fleet_policy.COMMENT_ONLY_REVIEW_TOOLS` Cedar forbid rejects anything else; the commit-status state is clamped to success/pending in both the broker and `cedar/reviewer.cedar`.
 - Never granted: `create_or_update_file`, `push_files`, `create_branch`, `create_pull_request`, or any label writes.
+
+## Running the eval
+
+The 20-case behavioral set (`agents/reviewer/tests/eval_dataset.json`) is executed by `agents/reviewer/tests/run_eval.py` — this is the "live single-repo eval pass" the roadmap gates broad enablement on.
+
+- **Offline (CI):** `python tests/run_eval.py --mode=offline` — validates dataset shape only (every case has `name`/`input`/`expected_behavior`/`tags`, names unique), no AWS calls, non-zero exit on any malformed case.
+- **Live:** invokes the **deployed** reviewer AgentCore runtime per case with the exact Dispatch Router payload shape (`prompt`/`session_id`/`source`/`source_context`/`assignment_id`), then scores the result against the case's `expected_behavior` with an LLM judge on the fleet's own model plumbing (`agents/shared/bedrock.build_model` — Bedrock Mantle, no `temperature`). Prints a per-case table + per-tag pass counts, writes `--out eval_report.json`, exits non-zero when the pass rate is under `--threshold` (default 0.9).
+
+The dataset cases are behavioral descriptions, **not fixture repos** — you point each case at a real PR that exhibits its scenario. Supply one target fleet-wide (`--repo owner/name --pr N`), or per case via `--map mapping.json` (`{"case_name": {"repo": "owner/name", "pr": 12}}`); unmapped cases abort the run before anything is invoked (`--only` runs a subset). The runtime ARN comes from `--runtime-arn` or is resolved from the SSM registry the router reads (`--registry-param`, default `$REGISTRY_PARAM` or `/dispatch/agents`; the deployed stack writes `/sdlc-agents/<stage>/registry`).
+
+```bash
+cd agents/reviewer
+python tests/run_eval.py --runtime-arn arn:aws:bedrock-agentcore:... \
+    --map eval_prs.json --out eval_report.json --threshold 0.9
+```
+
+Live mode needs the same env an agent runtime gets, because the judge goes through `build_model()`: `BEDROCK_GUARDRAIL_ID` (+ `BEDROCK_GUARDRAIL_VERSION`) — fail-closed, `SDLC_ALLOW_MISSING_GUARDRAIL=1` only for local runs — plus optional `AWS_REGION`/`MANTLE_ENDPOINT`/`MANTLE_PROJECT_ID`/`BEDROCK_MODEL_ID`, and AWS credentials that can mint a Bedrock bearer token, call `bedrock-agentcore:InvokeAgentRuntime`, and read the registry param.

@@ -64,8 +64,11 @@ Triggered by an `@reviewer` mention, or an automation rule on
      soften it into a vague "consider…". No scenario, no finding.
    - **A suggested fix**: a GitHub ```suggestion block when the fix fits the
      hunk; prose otherwise.
-7. Drop findings below the repo's `min_severity`. Cap at `max_findings`; if you
-   drop overflow, say so in the summary.
+7. Pass the repo's `min_severity` and `max_findings` into `format_review` — the
+   tool enforces the floor and the cap structurally and notes any drops in the
+   summary. You may still pre-filter obvious below-floor findings (count what
+   you pre-drop for the cap in `dropped_overflow`), but the tool is the
+   enforcement point.
 8. Post ONE PR review (event=COMMENT) with the surviving findings inline.
 9. Call `record_review` with the head SHA and finding fingerprints.
 

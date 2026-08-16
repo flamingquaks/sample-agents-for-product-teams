@@ -313,6 +313,62 @@ def test_no_skills_manifest_without_bucket(monkeypatch):
     assert not any(p["PolicyName"] == "skills-read" for p in iam.put_policies)
 
 
+def test_memory_id_injected_and_grant_scoped_to_one_memory(monkeypatch):
+    """With AGENTCORE_MEMORY_ID set (Memory provisioned by the stack, or a
+    pre-existing id supplied), every runtime gets the env var — that's what
+    activates the agents' AgentCoreMemoryToolProvider (reviewer ledger) — and
+    the role gets a memory data-plane grant scoped to that ONE Memory ARN,
+    never memory/*."""
+    import json as _json
+
+    cd = _fresh()
+    monkeypatch.setenv("AGENTCORE_MEMORY_ID", "sdlcFleetMemorytest-ABCDEFghij")
+    # Pin the region: the ambient shell may export a different AWS_REGION than
+    # the module-import setdefault, and the ARN assertion below embeds it.
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    agentcore = _FakeAgentCore(statuses={"new-rt-id": ["READY"]})
+    iam = _FakeIam()
+    _install_fakes(cd, monkeypatch, agentcore, iam)
+    monkeypatch.setattr(cd.config_store, "get_capability", lambda a: {"agent_id": a, "env": {}})
+
+    cd.handler(_build_event("triage", "build-1", "SUCCEEDED"))
+    env = agentcore.created[0]["environmentVariables"]
+    assert env["AGENTCORE_MEMORY_ID"] == "sdlcFleetMemorytest-ABCDEFghij"
+    mem = [p for p in iam.put_policies if p["PolicyName"] == "agentcore-memory"]
+    assert mem
+    stmt = _json.loads(mem[0]["PolicyDocument"])["Statement"][0]
+    assert stmt["Resource"] == (
+        "arn:aws:bedrock-agentcore:us-east-1:123456789012:"
+        "memory/sdlcFleetMemorytest-ABCDEFghij"
+    )
+    # The provider's read/write set is present; nothing is granted on "*".
+    for action in ("bedrock-agentcore:CreateEvent",
+                   "bedrock-agentcore:ListEvents",
+                   "bedrock-agentcore:RetrieveMemoryRecords",
+                   "bedrock-agentcore:GetMemoryRecord"):
+        assert action in stmt["Action"]
+
+
+def test_no_memory_env_or_grant_when_feature_off(monkeypatch):
+    """AGENTCORE_MEMORY_ID is OPTIONAL base env: absent (memory feature not
+    deployed), the deploy still succeeds, the runtime env omits the var (agents
+    then skip loading memory tools — the prior behavior), and no memory policy
+    is attached to the role."""
+    cd = _fresh()
+    monkeypatch.delenv("AGENTCORE_MEMORY_ID", raising=False)
+    agentcore = _FakeAgentCore(statuses={"new-rt-id": ["READY"]})
+    iam = _FakeIam()
+    calls = _install_fakes(cd, monkeypatch, agentcore, iam)
+    monkeypatch.setattr(cd.config_store, "get_capability", lambda a: {"agent_id": a, "env": {}})
+
+    cd.handler(_build_event("triage", "build-1", "SUCCEEDED"))
+    env = agentcore.created[0]["environmentVariables"]
+    assert "AGENTCORE_MEMORY_ID" not in env
+    assert not any(p["PolicyName"] == "agentcore-memory" for p in iam.put_policies)
+    # Optional, not boot-critical — the capability still goes active.
+    assert any(s[1] == cd.config_store.CAP_ACTIVE for s in calls["status"])
+
+
 def test_new_runtime_is_tagged_as_fleet(monkeypatch):
     cd = _fresh()
     agentcore = _FakeAgentCore(statuses={"new-rt-id": ["READY"]})
