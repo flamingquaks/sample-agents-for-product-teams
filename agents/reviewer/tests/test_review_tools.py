@@ -111,3 +111,63 @@ def test_format_review_sorts_by_severity_and_notes_overflow():
     out = _fmt(findings, files_reviewed=1, dropped_overflow=3)
     assert out["comments"][0]["body"].count("high") >= 1  # high sorted first
     assert "3 lower-severity finding(s) dropped" in out["summary"]
+
+
+def _finding(sev, line=1, title="t"):
+    return {"path": "a.py", "line": line, "severity": sev, "title": title,
+            "failure_scenario": "bad input → wrong output"}
+
+
+def test_format_review_min_severity_floor_drops_and_notes():
+    findings = [_finding("high", 1), _finding("low", 2), _finding("medium", 3)]
+    out = _fmt(findings, files_reviewed=1, min_severity="medium")
+    assert len(out["comments"]) == 2
+    assert out["counts"] == {"high": 1, "medium": 1, "low": 0}
+    assert "1 finding(s) below the min_severity floor dropped." in out["summary"]
+
+
+def test_format_review_unknown_severity_coerces_to_low_and_hits_floor():
+    # Unknown severity coerces to low BEFORE the floor test, so it can't dodge it.
+    out = _fmt([_finding("bogus")], files_reviewed=1, min_severity="medium")
+    assert out["has_findings"] is False
+    assert out["comments"] == []
+    assert out["counts"] == {"high": 0, "medium": 0, "low": 0}
+    assert "1 finding(s) below the min_severity floor dropped." in out["summary"]
+    # With the default floor (low), the same finding survives as a low.
+    out = _fmt([_finding("bogus")], files_reviewed=1)
+    assert out["counts"] == {"high": 0, "medium": 0, "low": 1}
+    assert "🟡 low" in out["comments"][0]["body"]
+
+
+def test_format_review_cap_truncates_keeping_most_severe():
+    findings = [_finding("low", 1), _finding("high", 2), _finding("medium", 3)]
+    out = _fmt(findings, files_reviewed=1, dropped_overflow=2, max_findings=2)
+    assert len(out["comments"]) == 2
+    assert "🔴 high" in out["comments"][0]["body"]
+    assert "🟠 medium" in out["comments"][1]["body"]
+    # counts/has_findings reflect KEPT findings only.
+    assert out["counts"] == {"high": 1, "medium": 1, "low": 0}
+    assert out["has_findings"] is True
+    # Truncated 1 here + 2 pre-dropped by the caller = 3 in the note.
+    assert "3 lower-severity finding(s) dropped for the per-review cap." in out["summary"]
+
+
+def test_format_review_all_below_floor_leaves_summary_artifact():
+    out = _fmt([_finding("low"), _finding("low", 2)], files_reviewed=2,
+               min_severity="high")
+    assert out["has_findings"] is False
+    assert out["comments"] == []
+    assert "Nothing rose above" in out["summary"]
+    assert "2 finding(s) below the min_severity floor dropped." in out["summary"]
+
+
+def test_format_review_defaults_unchanged():
+    # A call without the new args behaves exactly as before for findings all
+    # >= low and <= 10: nothing dropped, no floor/cap notes in the summary.
+    findings = [_finding("low", 1), _finding("medium", 2), _finding("high", 3)]
+    out = _fmt(findings, files_reviewed=1)
+    assert len(out["comments"]) == 3
+    assert out["counts"] == {"high": 1, "medium": 1, "low": 1}
+    assert out["has_findings"] is True
+    assert "floor" not in out["summary"]
+    assert "cap" not in out["summary"]

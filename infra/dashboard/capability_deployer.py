@@ -96,11 +96,16 @@ _REQUIRED_BASE_ENV = ("BEDROCK_GUARDRAIL_ID", "BEDROCK_GUARDRAIL_VERSION", "GATE
 # SESSION_BUCKET (durable conversations, spec D2) and WORKSPACE_TOKEN_FUNCTION
 # (durable-workspace credential vendor) degrade the same way: absent, agents
 # run non-durable / without the clone-push tools — exactly the prior behavior.
+# AGENTCORE_MEMORY_ID points agents at the fleet's shared AgentCore Memory
+# (cross-invocation state, e.g. the reviewer's per-PR review ledger —
+# reviewer-agent-spec v1.2); absent, agents skip loading the memory tools and
+# incrementality degrades to full reviews — again the prior behavior.
 _OPTIONAL_BASE_ENV = (
     "MANTLE_PROJECT_ID",
     "SKILLS_BUCKET",
     "SESSION_BUCKET",
     "WORKSPACE_TOKEN_FUNCTION",
+    "AGENTCORE_MEMORY_ID",
 )
 
 
@@ -342,6 +347,41 @@ def _ensure_runtime_role(agent_id: str) -> str:
                     "Effect": "Allow",
                     "Action": "lambda:InvokeFunction",
                     "Resource": f"arn:aws:lambda:{region}:{account}:function:{token_vendor}",
+                }
+            ],
+        }
+    # AgentCore Memory data plane: the Strands AgentCoreMemoryToolProvider's
+    # tool set — record (CreateEvent), list/get events, retrieve/get/list
+    # memory records, and pruning an agent's OWN entries (DeleteEvent /
+    # DeleteMemoryRecord). Scoped to the ONE fleet Memory, never memory/*:
+    # the boundary (template FleetMemoryDataPlane) caps it the same way, and a
+    # broader grant would let a runtime read every Memory in the account.
+    # Only attached when the memory feature is deployed (AGENTCORE_MEMORY_ID
+    # set on this function by the stack); absent, agents run memory-less as
+    # before. Attached to every role even for agents that ignore it — harmless
+    # and keeps one role shape (same rationale as skills-read).
+    memory_id = os.environ.get("AGENTCORE_MEMORY_ID", "")
+    if memory_id:
+        policies["agentcore-memory"] = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "bedrock-agentcore:CreateEvent",
+                        "bedrock-agentcore:GetEvent",
+                        "bedrock-agentcore:ListEvents",
+                        "bedrock-agentcore:DeleteEvent",
+                        "bedrock-agentcore:ListActors",
+                        "bedrock-agentcore:ListSessions",
+                        "bedrock-agentcore:RetrieveMemoryRecords",
+                        "bedrock-agentcore:GetMemoryRecord",
+                        "bedrock-agentcore:ListMemoryRecords",
+                        "bedrock-agentcore:DeleteMemoryRecord",
+                    ],
+                    "Resource": (
+                        f"arn:aws:bedrock-agentcore:{region}:{account}:memory/{memory_id}"
+                    ),
                 }
             ],
         }

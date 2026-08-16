@@ -68,6 +68,19 @@ _lambda = boto3.client("lambda")
 _slug_cache: dict = {"value": None, "expires_at": 0.0}
 _SLUG_TTL = 300.0
 
+# Sentinel prefixes meaning "no App slug yet". infra/foundation/template.yaml
+# seeds the slug param with Value: "unset"; older docs/deploys used
+# "placeholder". The check must cover BOTH: a wrong sentinel silently builds a
+# bot login (e.g. "unset[bot]") that matches nothing, gutting the exact-match
+# half of the bot-actor guard. Matched case-insensitively as prefixes.
+_NO_SLUG_SENTINELS = ("unset", "placeholder")
+
+# Per-repo cache of the .pdlc-agents/review.yaml `review_drafts` opt-in, short
+# TTL (mirrors _slug_cache) — a push storm on a draft PR must not hammer the
+# GitHub contents API with one config fetch per delivery.
+_drafts_cfg_cache: dict = {}
+_DRAFTS_CFG_TTL = 300.0
+
 # Registry-backed @mention resolution + a short-TTL cache, shared with the other
 # receivers (mentions.py). The registry — not a hardcoded roster — decides which
 # agents are reachable, so a UI-onboarded agent resolves here with NO code change.
@@ -251,15 +264,56 @@ def _app_bot_login() -> str:
     try:
         resp = _ssm.get_parameter(Name=GITHUB_APP_SLUG_PARAM)
         raw = (resp["Parameter"]["Value"] or "").strip()
-        # The template seeds a placeholder before the App exists — treat any
-        # non-real value as "no slug" so we never build a bogus bot login.
-        if raw and not raw.lower().startswith("placeholder"):
+        # The template seeds a sentinel before the App exists — treat any
+        # sentinel value as "no slug" so we never build a bogus bot login
+        # (see _NO_SLUG_SENTINELS for why both prefixes must be covered).
+        if raw and not raw.lower().startswith(_NO_SLUG_SENTINELS):
             slug = f"{raw}[bot]"
     except Exception:  # noqa: BLE001
         logger.warning("could not read GitHub App slug param %s", GITHUB_APP_SLUG_PARAM)
     _slug_cache["value"] = slug
     _slug_cache["expires_at"] = now + _SLUG_TTL
     return slug
+
+
+def _repo_reviews_drafts(repo: str) -> bool:
+    """Whether ``repo`` opted into auto-reviewing draft PRs via the
+    ``review_drafts`` key of ``.pdlc-agents/review.yaml`` on its default branch
+    (reviewer-agent spec §Repo config). Best-effort trigger-layer read: EVERY
+    failure path — missing file/404, bad YAML, token error, network error —
+    returns False, because the safe default is skip-drafts and a config fetch
+    failure must never block the webhook. Cached per-repo with a short TTL
+    (_drafts_cfg_cache) so a push storm on a draft PR doesn't hammer the
+    contents API."""
+    now = time.time()
+    cached = _drafts_cfg_cache.get(repo)
+    if cached and now < cached["expires_at"]:
+        return cached["value"]
+    value = False
+    try:
+        import github_app
+        import requests
+        import yaml
+
+        token = github_app.installation_token_for_repo(repo)
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+        }
+        resp = requests.get(
+            f"{github_app.GITHUB_API_BASE}/repos/{repo}/contents/.pdlc-agents/review.yaml",
+            headers=headers,
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            raw = base64.b64decode((resp.json().get("content") or "").encode()).decode("utf-8")
+            config = yaml.safe_load(raw)
+            if isinstance(config, dict):
+                value = bool(config.get("review_drafts", False))
+    except Exception:  # noqa: BLE001 — fail closed to the skip-drafts default
+        logger.warning("could not read .pdlc-agents/review.yaml for %s", repo)
+    _drafts_cfg_cache[repo] = {"value": value, "expires_at": now + _DRAFTS_CFG_TTL}
+    return value
 
 
 def _run_automation(payload: dict) -> None:
@@ -288,12 +342,17 @@ def _run_automation(payload: dict) -> None:
     # Draft PRs are not auto-reviewed by default (reviewer-agent spec §Non-goals:
     # "Review draft PRs unless the repo config opts in"). A draft is work in
     # progress — reviewing it wastes a run and posts premature findings/status.
-    # (Per-repo review_drafts opt-in is a future repo-config knob; until then the
-    # safe default is skip. An @reviewer mention still reviews a draft — that's
+    # The per-repo `review_drafts` opt-in (.pdlc-agents/review.yaml, spec §Repo
+    # config) is honored HERE at the trigger layer — the agent-side config read
+    # happens post-dispatch, too late to matter for this skip. Only consulted
+    # when the PR is actually a draft (never an API call for non-draft PRs),
+    # fail-closed to skip. (An @reviewer mention still reviews a draft — that's
     # explicit human intent on its own path.)
     if pr.get("draft"):
-        logger.info("github webhook: draft PR — no auto-review")
-        return
+        repo = (payload.get("repository") or {}).get("full_name", "")
+        if not _repo_reviews_drafts(repo):
+            logger.info("github webhook: draft PR — no auto-review")
+            return
     facts = automation.github_facts(payload)
     if not facts:
         return  # not an opened/synchronize event we auto-review
