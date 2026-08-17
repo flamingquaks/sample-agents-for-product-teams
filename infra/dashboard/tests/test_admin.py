@@ -74,6 +74,117 @@ def _body(resp):
     return json.loads(resp["body"])
 
 
+# --- proxy-route normalization -----------------------------------------------
+# The admin API is fronted by one API Gateway proxy resource (/admin/{proxy+});
+# admin._normalize_proxy_event reconstructs the concrete resource + path params.
+
+
+def _proxy_event(method, path, body=None):
+    """A proxy-shaped event: resource is the {proxy+} catch-all, path is real,
+    and API Gateway captured the tail into pathParameters.proxy — exactly what
+    the deployed proxy integration hands the Lambda."""
+    tail = path[len("/admin/"):]
+    return {
+        "httpMethod": method,
+        "resource": "/admin/{proxy+}",
+        "path": path,
+        "pathParameters": {"proxy": tail},
+        "queryStringParameters": None,
+        "body": json.dumps(body) if body is not None else None,
+        "requestContext": {"authorizer": {"claims": ADMIN}},
+    }
+
+
+def test_proxy_match_reconstructs_resource_and_params():
+    admin = _load_admin()
+    # literal
+    assert admin._match_admin_route("/admin/repos") == ("/admin/repos", {})
+    # greedy owner/repo → single {repo+} param
+    assert admin._match_admin_route("/admin/repos/acme/web") == (
+        "/admin/repos/{repo+}", {"repo": "acme/web"},
+    )
+    # single-segment param
+    assert admin._match_admin_route("/admin/capabilities/reviewer") == (
+        "/admin/capabilities/{agent_id}", {"agent_id": "reviewer"},
+    )
+    # deeper literal-after-param
+    assert admin._match_admin_route("/admin/capabilities/reviewer/approve") == (
+        "/admin/capabilities/{agent_id}/approve", {"agent_id": "reviewer"},
+    )
+    # two params
+    assert admin._match_admin_route("/admin/slack/channels/T1/C2") == (
+        "/admin/slack/channels/{team_id}/{channel_id}",
+        {"team_id": "T1", "channel_id": "C2"},
+    )
+    # literal beats param at the same depth (connect is a route, not a team_id)
+    assert admin._match_admin_route("/admin/slack/workspaces/connect") == (
+        "/admin/slack/workspaces/connect", {},
+    )
+    # a real team id at that depth falls to the param route
+    assert admin._match_admin_route("/admin/slack/workspaces/T9") == (
+        "/admin/slack/workspaces/{team_id}", {"team_id": "T9"},
+    )
+    # unknown path → no match (caller 404s), never a wrong route
+    assert admin._match_admin_route("/admin/nope/nope") == (None, {})
+
+
+def test_normalize_proxy_event_is_noop_for_concrete_resource():
+    admin = _load_admin()
+    ev = _event("GET", "/admin/repos")
+    assert admin._normalize_proxy_event(ev) is ev  # untouched off the proxy path
+
+
+@mock_aws
+def test_proxy_event_routes_end_to_end():
+    _make_table()
+    admin = _load_admin()
+    # A GET via the proxy must reach the same handler a concrete resource did.
+    direct = admin.handler(_event("GET", "/admin/repos"))
+    proxied = admin.handler(_proxy_event("GET", "/admin/repos"))
+    assert proxied["statusCode"] == direct["statusCode"] == 200
+    assert _body(proxied) == _body(direct)
+
+
+def test_every_shim_template_round_trips_through_matcher():
+    """Each template the shim knows must resolve back to ITSELF from a concrete
+    path — catches an ordering/shadowing bug where one route steals another's
+    paths (e.g. a param route swallowing a literal sibling)."""
+    admin = _load_admin()
+
+    def _instantiate(tmpl):
+        segs = []
+        for s in tmpl.split("/"):
+            if s.endswith("+}"):
+                segs.append("aa/bb")  # greedy → multi-segment tail
+            elif s.startswith("{"):
+                segs.append("x1")
+            else:
+                segs.append(s)
+        return "/".join(segs)
+
+    for tmpl in admin._ADMIN_ROUTE_TEMPLATES:
+        matched, _ = admin._match_admin_route(_instantiate(tmpl))
+        assert matched == tmpl, f"{tmpl!r} resolved to {matched!r}"
+
+
+def test_shim_covers_every_route_dispatched_by_router():
+    """Guard against drift: every /admin resource `_route` dispatches on (via
+    `resource ==` or `resource in (...)`) must be a path-shape the proxy shim
+    can produce — else a proxied request to it 404s. Compared by shape (param
+    NAMES + greedy `+` normalized), since the router accepts {id}/{id+} variants."""
+    import re
+
+    admin = _load_admin()
+    src = (Path(__file__).resolve().parents[1] / "admin.py").read_text()
+    # The _route body only (its dispatch literals), not the shim tuple above it.
+    body = src[src.index("def _route("):]
+    canon = lambda p: re.sub(r"\{[^}]*\}", "{}", p)
+    router_shapes = {canon(m) for m in re.findall(r'"(/admin/[^"]*)"', body)}
+    shim_shapes = {canon(t) for t in admin._ADMIN_ROUTE_TEMPLATES}
+    missing = router_shapes - shim_shapes
+    assert not missing, f"router handles routes the proxy shim can't produce: {sorted(missing)}"
+
+
 # --- authz -------------------------------------------------------------------
 
 

@@ -1558,7 +1558,152 @@ def _remove_automation_grant(rule: dict) -> None:
     config_store.delete_trigger_rule(f"auto-{rule['rule_id']}")
 
 
+# --- proxy-route normalization -----------------------------------------------
+#
+# The admin API is fronted by a SINGLE API Gateway proxy resource
+# (`/admin/{proxy+}`, template.yaml) instead of one resource per route. This is
+# deliberate: API Gateway adds an AWS::Lambda::Permission statement per route,
+# and ~35 admin paths (×methods) blew past Lambda's 20 KB resource-policy hard
+# limit, failing every deploy. The proxy collapses that to 4 permissions
+# (GET/POST/PUT/DELETE) and scales to any number of routes for free.
+#
+# The tradeoff: under a proxy, `event["resource"]` is always `/admin/{proxy+}`
+# and API Gateway no longer parses the named path parameters. So we reconstruct,
+# from the real request path, the SAME `resource` template + `pathParameters`
+# the per-route integration used to hand `_route` — then `_route` (and every
+# handler + test that keys on the concrete template) is UNCHANGED. A direct
+# concrete `resource` (the shape unit tests pass) is left untouched, so the shim
+# is a no-op off the proxy path.
+#
+# The templates below MUST mirror the Path values on DashboardAdminFunction in
+# infra/foundation/template.yaml — the param NAMES are the contract `_route`'s
+# handlers read (repo, team_id, agent_id, …). A `+` suffix is a greedy segment
+# (owner/repo, a skill key with slashes) that captures the rest of the path.
+_ADMIN_ROUTE_TEMPLATES = (
+    # Core fleet config
+    "/admin/repos",
+    "/admin/repos/{repo+}",
+    "/admin/settings",
+    "/admin/tool-catalog",
+    "/admin/capabilities",
+    "/admin/capabilities/{agent_id}",
+    "/admin/capabilities/{agent_id}/approve",
+    "/admin/capabilities/{agent_id}/clone",
+    "/admin/skills",
+    "/admin/skills/{key+}",
+    # GitHub App
+    "/admin/github-app/status",
+    "/admin/github-app/repos",
+    "/admin/github-app/setup/manifest",
+    "/admin/github-app/setup/callback",
+    # Slack
+    "/admin/slack/workspaces",
+    "/admin/slack/workspaces/connect",
+    "/admin/slack/workspaces/{team_id}",
+    "/admin/slack/workspaces/{team_id}/manifest",
+    "/admin/slack/channels",
+    "/admin/slack/channels/{team_id}/{channel_id}",
+    # Trigger authz + access
+    "/admin/trigger-rules",
+    "/admin/trigger-rules/simulate",
+    "/admin/trigger-rules/{rule_id}",
+    "/admin/channel-requests",
+    "/admin/channel-requests/{request_id}/approve",
+    "/admin/channel-requests/{request_id}/deny",
+    "/admin/user-requests",
+    "/admin/user-requests/{request_id}/approve",
+    "/admin/user-requests/{request_id}/deny",
+    "/admin/identities",
+    "/admin/identities/{identity_id}",
+    "/admin/groups",
+    "/admin/groups/{group_id}",
+    "/admin/notif-subs",
+    "/admin/notif-subs/{team_id}/{channel_id}",
+    "/admin/notif-prefs/{identity_id}",
+    # Atlassian connector (§A11)
+    "/admin/atlassian/sites",
+    "/admin/atlassian/sites/connect",
+    "/admin/atlassian/forge-status",
+    "/admin/atlassian/sites/{site_id}",
+    "/admin/atlassian/sites/{site_id}/products",
+    "/admin/atlassian/sites/{site_id}/verify-webhook",
+    "/admin/atlassian/projects",
+    "/admin/atlassian/projects/{site_id}/{key}",
+    "/admin/atlassian/spaces",
+    "/admin/atlassian/spaces/{site_id}/{key}",
+    # Automation rules
+    "/admin/automation-rules",
+    "/admin/automation-rules/{rule_id}",
+    "/admin/automation-rules/{rule_id}/enable",
+    "/admin/automation-rules/{rule_id}/disable",
+)
+
+_PROXY_RESOURCE = "/admin/{proxy+}"
+
+
+def _match_admin_route(path: str) -> tuple[str | None, dict]:
+    """Map a concrete request path to its (resource template, path params).
+
+    Matches segment-by-segment against `_ADMIN_ROUTE_TEMPLATES`, mirroring API
+    Gateway's own precedence: a literal segment beats a `{param}`, and a greedy
+    `{param+}` (rest-of-path) is the last resort. Returns (None, {}) when nothing
+    matches (→ the caller 404s), never a wrong route."""
+    segs = [s for s in (path or "").split("/") if s]
+    best = None  # (literal_score, is_greedy_rank, template, params)
+    for tmpl in _ADMIN_ROUTE_TEMPLATES:
+        tsegs = [s for s in tmpl.split("/") if s]
+        greedy = tsegs and tsegs[-1].endswith("+}")
+        if greedy:
+            # Prefix (all but the greedy tail) must match and there must be at
+            # least one segment left to feed the greedy capture.
+            if len(segs) < len(tsegs):
+                continue
+            fixed, tail = tsegs[:-1], tsegs[-1]
+        else:
+            if len(segs) != len(tsegs):
+                continue
+            fixed, tail = tsegs, None
+        params: dict = {}
+        literal_score = 0
+        ok = True
+        for tseg, seg in zip(fixed, segs):
+            if tseg.startswith("{") and tseg.endswith("}"):
+                params[tseg[1:-1]] = seg
+            elif tseg == seg:
+                literal_score += 1
+            else:
+                ok = False
+                break
+        if not ok:
+            continue
+        if greedy:
+            params[tail[1:-2]] = "/".join(segs[len(fixed):])  # strip "{" and "+}"
+        # Prefer the most-literal match; among ties, a non-greedy route wins.
+        key = (literal_score, 0 if not greedy else -1)
+        if best is None or key > best[0]:
+            best = (key, tmpl, params)
+    return (best[1], best[2]) if best else (None, {})
+
+
+def _normalize_proxy_event(event: dict) -> dict:
+    """When the request arrived via the `/admin/{proxy+}` catch-all, rewrite the
+    event to carry the concrete `resource` template + named `pathParameters`
+    `_route` expects. A no-op for a concrete resource (unit tests / any future
+    direct integration), so existing routing is untouched."""
+    if event.get("resource") != _PROXY_RESOURCE:
+        return event
+    # API Gateway REST proxy: event["path"] is the resource path (no stage).
+    path = event.get("path") or ""
+    template, params = _match_admin_route(path)
+    if not template:
+        return event  # unmatched → _route falls through to its 404
+    merged = {**(event.get("pathParameters") or {}), **params}
+    merged.pop("proxy", None)  # drop the raw {proxy+} capture
+    return {**event, "resource": template, "pathParameters": merged}
+
+
 def _route(event: dict) -> dict:
+    event = _normalize_proxy_event(event)
     resource = event.get("resource", "")
     method = event.get("httpMethod", "")
     path_params = event.get("pathParameters") or {}
