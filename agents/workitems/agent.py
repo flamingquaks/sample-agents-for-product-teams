@@ -31,9 +31,9 @@ from shared.dispatch_context import (
     jira_dispatch_block,
     slack_dispatch_block,
 )
+from shared.memory import memory_tools
 from shared.tools import gateway
 from strands import Agent
-from strands_tools.agent_core_memory import AgentCoreMemoryToolProvider
 from tools.post_results import post_results
 from tools.risk_detection import detect_risks
 from tools.status_report import generate_status_report
@@ -130,13 +130,12 @@ def invoke(payload, context=None):
 
     # Memory — optional until Memory resource is created
     if MEMORY_ID:
-        memory_provider = AgentCoreMemoryToolProvider(
+        tools.extend(memory_tools(
             memory_id=MEMORY_ID,
             actor_id=ACTOR_ID,
             session_id=session_id,
             namespace=f"/agents/workitems/{session_id}",
-        )
-        tools.extend(memory_provider.tools)
+        ))
 
     # The repo to act on comes from the dispatch (multi-repo fleet), not a
     # baked env var. Absent for non-GitHub dispatches — the project context

@@ -23,9 +23,9 @@ from shared.dispatch_context import (
     jira_dispatch_block,
     slack_dispatch_block,
 )
+from shared.memory import memory_tools
 from shared.tools import gateway
 from strands import Agent
-from strands_tools.agent_core_memory import AgentCoreMemoryToolProvider
 from tools.find_linked_issues import find_linked_issues
 from tools.format_rationale import format_pr_review_summary, format_tag_issue_comment
 from tools.index_adrs import index_adrs
@@ -123,13 +123,12 @@ def invoke(payload, context=None):
     ]
 
     if MEMORY_ID:
-        memory_provider = AgentCoreMemoryToolProvider(
+        tools.extend(memory_tools(
             memory_id=MEMORY_ID,
             actor_id=ACTOR_ID,
             session_id=session_id,
             namespace=f"/agents/adr/{session_id}",
-        )
-        tools.extend(memory_provider.tools)
+        ))
 
     # MCP connectivity: one gateway client (SigV4, Cedar-enforced) — the fleet is
     # gateway-only, so all tool calls route through the AgentCore Gateway (policy

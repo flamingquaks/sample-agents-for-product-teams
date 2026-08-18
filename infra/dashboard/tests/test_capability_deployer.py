@@ -317,8 +317,8 @@ def test_memory_id_injected_and_grant_scoped_to_one_memory(monkeypatch):
     """With AGENTCORE_MEMORY_ID set (Memory provisioned by the stack, or a
     pre-existing id supplied), every runtime gets the env var — that's what
     activates the agents' AgentCoreMemoryToolProvider (reviewer ledger) — and
-    the role gets a memory data-plane grant scoped to that ONE Memory ARN,
-    never memory/*."""
+    the role gets a memory data-plane grant scoped to that ONE Memory ARN in the
+    deploy region, never memory/*."""
     import json as _json
 
     cd = _fresh()
@@ -522,9 +522,9 @@ def _install_teardown_fakes(cd, monkeypatch, agentcore, iam, *, cap, ecr=None, s
     monkeypatch.setattr(cd, "_acc", lambda: agentcore)
     monkeypatch.setattr(cd, "_iam_client", lambda: iam)
     store_calls = {"deleted_rows": [], "published": 0}
-    monkeypatch.setattr(cd.config_store, "get_capability", lambda a: cap)
+    monkeypatch.setattr(cd.config_store, "get_capability", lambda a, **kw: cap)
     monkeypatch.setattr(cd.config_store, "list_capabilities",
-                        lambda: [cap, *other_caps])
+                        lambda **kw: [cap, *other_caps])
     monkeypatch.setattr(cd.config_store, "delete_capability",
                         lambda a: store_calls["deleted_rows"].append(a))
     def _pub():

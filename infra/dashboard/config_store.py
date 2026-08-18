@@ -466,19 +466,42 @@ def _capability_pk(agent_id: str) -> str:
     return f"{_CAPABILITY_PK_PREFIX}{agent_id}"
 
 
-def list_capabilities() -> list[dict]:
+def list_capabilities(*, consistent: bool = False) -> list[dict]:
     """All onboarded capability records, newest first (by onboarded_at). A dropped
     row would be silently missing from both the admin listing and the rendered
-    registry, so the kind-index Query drains every page."""
+    registry, so the kind-index Query drains every page.
+
+    ``consistent=True`` re-reads every row from the base table with
+    ``ConsistentRead`` after the index supplies the id set. REQUIRED for any caller
+    that turns an ENFORCEMENT decision on these fields — the kind-index is a GSI, so
+    it is eventually consistent and DynamoDB cannot read it strongly consistent at
+    all. Both the registry publish and the Gateway permit sync run milliseconds
+    after the write that flips ``enabled``/``runtime_arn``, so the index copy they
+    would otherwise see predates it: the agent silently loses routability (see
+    ``render_registry``) or its tool permit (see policy_sync._grants_by_agent, whose
+    stale-permit pass would then DELETE a live permit). Rows the index lists but
+    that no longer exist are dropped, so a lagging index can't resurrect a
+    torn-down agent either. The default stays False for display-only callers (the
+    admin listing), which don't need the extra reads."""
     caps = _query_kind("capability")
+    if consistent:
+        fresh = []
+        for cap in caps:
+            agent_id = cap.get("agent_id")
+            if not agent_id:
+                continue
+            row = get_capability(agent_id, consistent=True)
+            if row:
+                fresh.append(row)
+        caps = fresh
     caps.sort(key=lambda c: c.get("onboarded_at", 0), reverse=True)
     return caps
 
 
 def get_capability(agent_id: str, *, consistent: bool = False) -> dict | None:
     """One capability row. ``consistent=True`` forces a strongly consistent read —
-    used by ``render_registry``, which must not decide routability from a copy that
-    predates the deployer's ``runtime_arn`` write (see that function's docstring)."""
+    required by callers whose decision is an enforcement one (registry routability,
+    Gateway tool permits); see ``list_capabilities``."""
     kwargs: dict = {"Key": {"pk": _capability_pk(agent_id)}}
     if consistent:
         kwargs["ConsistentRead"] = True
@@ -697,25 +720,18 @@ def render_registry() -> dict:
     still-building or failed FIRST onboard is correctly excluded (the router would
     otherwise resolve a mention to a runtime that isn't up).
 
-    Routability is decided on a STRONGLY CONSISTENT re-read of each capability's
-    base-table row, not on the kind-index copy ``list_capabilities`` returns. The
-    index only supplies the SET of agent ids; every field this function branches on
-    (``enabled``/``status``/``runtime_arn``) comes from ``get_item`` with
-    ``ConsistentRead``. DynamoDB cannot serve a strongly consistent read from a GSI
-    at all, and capability_deployer publishes MILLISECONDS after writing
-    ``runtime_arn`` — an index copy that stale renders the row as "no runtime yet"
-    and drops the agent from the registry. That publish then SUCCEEDS, so the
-    "re-publishes on the next capability change" recovery (which only covers publish
-    *errors*) never fires and a freshly deployed agent sits ``active`` but
-    permanently unroutable. A row deleted since the index read comes back None and
-    is skipped, which likewise keeps a torn-down agent from being resurrected by a
-    stale index."""
+    Routability is decided on a STRONGLY CONSISTENT read (``list_capabilities(
+    consistent=True)``), never on the eventually-consistent kind-index copy:
+    capability_deployer publishes MILLISECONDS after writing ``runtime_arn``, and an
+    index copy that stale renders the row as "no runtime yet" and drops the agent.
+    That publish then SUCCEEDS, so the "re-publishes on the next capability change"
+    recovery (which only covers publish *errors*) never fires and a freshly deployed
+    agent sits ``active`` but permanently unroutable."""
     agents = {}
-    for indexed in list_capabilities():
-        agent_id = indexed.get("agent_id")
+    for cap in list_capabilities(consistent=True):
+        agent_id = cap.get("agent_id")
         if not agent_id:
             continue
-        cap = get_capability(agent_id, consistent=True) or {}
         if not cap.get("enabled") or cap.get("status") in (CAP_DISABLED, CAP_DELETING):
             continue
         arn = cap.get("runtime_arn")

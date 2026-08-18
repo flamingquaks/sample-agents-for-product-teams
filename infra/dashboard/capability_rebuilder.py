@@ -58,7 +58,9 @@ def handler(event=None, context=None):
     tag_base = f"weekly-{stamp or 'rebuild'}"
 
     rebuilt, skipped = 0, 0
-    for cap in config_store.list_capabilities():
+    # Consistent read: the pending_review guard below is an approval gate (§7.5),
+    # so it must not clear on a row copy that predates the review flag.
+    for cap in config_store.list_capabilities(consistent=True):
         agent_id = cap.get("agent_id", "")
         if cap.get("status") != config_store.CAP_ACTIVE:
             skipped += 1

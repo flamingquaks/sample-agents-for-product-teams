@@ -356,6 +356,10 @@ def _ensure_runtime_role(agent_id: str) -> str:
     # DeleteMemoryRecord). Scoped to the ONE fleet Memory, never memory/*:
     # the boundary (template FleetMemoryDataPlane) caps it the same way, and a
     # broader grant would let a runtime read every Memory in the account.
+    # The data plane authorizes on the memory ARN itself (per-actor/session/record
+    # paths are request parameters, not resource ARNs), so the bare ARN is the
+    # whole grant — see agents/shared/memory.py for the wrong-region failure this
+    # was once mistaken for.
     # Only attached when the memory feature is deployed (AGENTCORE_MEMORY_ID
     # set on this function by the stack); absent, agents run memory-less as
     # before. Attached to every role even for agents that ignore it — harmless
@@ -631,8 +635,11 @@ def _delete_capability_skills(cap: dict) -> None:
     }
     if not owned:
         return
-    # Keep any prefix another capability still references.
-    for other in config_store.list_capabilities():
+    # Keep any prefix another capability still references. Read consistently: this
+    # decides a DELETE, and an index copy predating another agent's skill write
+    # would make a still-referenced prefix look unshared and delete it out from
+    # under that agent.
+    for other in config_store.list_capabilities(consistent=True):
         if other.get("agent_id") == agent_id:
             continue
         for s in other.get("skills") or []:

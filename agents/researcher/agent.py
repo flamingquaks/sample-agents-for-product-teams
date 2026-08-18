@@ -24,9 +24,9 @@ from shared.dispatch_context import (
     jira_dispatch_block,
     slack_dispatch_block,
 )
+from shared.memory import memory_tools
 from shared.tools import gateway
 from strands import Agent
-from strands_tools.agent_core_memory import AgentCoreMemoryToolProvider
 from tools.analyze_backlog import analyze_backlog
 from tools.competitive_scan import competitive_scan
 from tools.draft_user_stories import draft_user_stories
@@ -121,13 +121,12 @@ def invoke(payload, context=None):
 
     # Memory — optional until Memory resource is created
     if MEMORY_ID:
-        memory_provider = AgentCoreMemoryToolProvider(
+        tools.extend(memory_tools(
             memory_id=MEMORY_ID,
             actor_id=ACTOR_ID,
             session_id=session_id,
             namespace=f"/agents/researcher/{session_id}",
-        )
-        tools.extend(memory_provider.tools)
+        ))
 
     # The origin repo anchors co-repo enforcement: a Slack dispatch carries the
     # first channel-approved repo, and the interceptor scopes researcher's

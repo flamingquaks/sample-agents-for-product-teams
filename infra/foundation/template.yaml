@@ -2152,6 +2152,12 @@ Resources:
                 - bedrock-agentcore:GetMemoryRecord
                 - bedrock-agentcore:ListMemoryRecords
                 - bedrock-agentcore:DeleteMemoryRecord
+              # The data plane authorizes on the Memory ARN itself (actor/session/
+              # record are request parameters, not resource ARNs), so this bare
+              # ARN is the whole grant. IN THIS REGION: the Strands memory tool
+              # provider hard-defaults to us-west-2 unless the region is passed,
+              # which surfaces as an AccessDenied that looks like a missing grant
+              # (agents/shared/memory.py pins it).
               Resource: !If
                 - AgentCoreMemoryEnabled
                 - !GetAtt FleetAgentCoreMemory.MemoryArn

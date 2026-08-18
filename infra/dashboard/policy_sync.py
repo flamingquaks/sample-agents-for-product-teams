@@ -302,7 +302,13 @@ def _grants_by_agent() -> tuple[dict[str, list[str]], bool]:
     transient DynamoDB error would strip all custom agents of tool access."""
     grants = dict(fleet_policy.AGENT_TOOL_GRANTS)  # built-in defaults
     try:
-        caps = config_store.list_capabilities()
+        # STRONGLY CONSISTENT: this decides Gateway tool authorization, and the sync
+        # runs milliseconds after the onboard write that flips ``enabled``. Read via
+        # the eventually-consistent kind-index, a just-enabled agent still looks
+        # disabled → its permit is never rendered AND the stale-permit pass below
+        # deletes any existing one, leaving the agent live with every tool call
+        # denied by default-deny. (Observed on the staging reviewer onboard.)
+        caps = config_store.list_capabilities(consistent=True)
     except Exception:  # noqa: BLE001 — degraded read; keep built-in defaults
         logger.exception("could not read capabilities for tool grants; using built-in defaults")
         return grants, False

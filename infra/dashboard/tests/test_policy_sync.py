@@ -222,7 +222,7 @@ def test_grants_by_agent_merges_custom_over_builtins(monkeypatch):
     import config_store
     import fleet_policy
 
-    monkeypatch.setattr(config_store, "list_capabilities", lambda: [
+    monkeypatch.setattr(config_store, "list_capabilities", lambda **kw: [
         # Custom, enabled → its authored grants are used.
         {"agent_id": "triage", "enabled": True, "status": "active",
          "builtin": False, "tool_grants": ["GitHubTarget___get_issue"]},
@@ -238,6 +238,36 @@ def test_grants_by_agent_merges_custom_over_builtins(monkeypatch):
     assert grants["triage"] == ["GitHubTarget___get_issue"]
     assert grants["workitems"] == fleet_policy.AGENT_TOOL_GRANTS["workitems"]  # fixed
     assert "old" not in grants  # disabled → no permit
+
+
+def test_grants_read_consistently_so_a_just_enabled_agent_keeps_its_permit(monkeypatch):
+    """The permit sync must read capabilities STRONGLY CONSISTENT.
+
+    It runs milliseconds after the onboard write that flips ``enabled`` to True. The
+    kind-index behind ``list_capabilities`` is a GSI — eventually consistent, and
+    unreadable strongly-consistent — so an index copy can still say ``enabled:
+    False``. That drops the agent's grant, renders no permit, and (worse) makes the
+    stale-permit pass DELETE any permit already on the Gateway, leaving a live agent
+    with every tool call denied by default-deny. This is the staging reviewer
+    onboard: sdlc_permit_reviewer was never created and the agent reported all
+    GitHub tools unavailable.
+    """
+    ps = _load(monkeypatch)
+    import config_store
+    import fleet_policy
+
+    def fake_list(*, consistent=False):
+        # The stale index copy vs. the committed row.
+        if not consistent:
+            return [{"agent_id": "reviewer", "enabled": False, "status": "building",
+                     "builtin": True}]
+        return [{"agent_id": "reviewer", "enabled": True, "status": "active",
+                 "builtin": True, "runtime_arn": "arn:runtime/reviewer"}]
+
+    monkeypatch.setattr(config_store, "list_capabilities", fake_list)
+    grants, complete = ps._grants_by_agent()
+    assert complete is True
+    assert grants["reviewer"] == fleet_policy.AGENT_TOOL_GRANTS["reviewer"]
 
 
 def test_grants_by_agent_falls_back_on_read_error(monkeypatch):
@@ -265,7 +295,7 @@ def test_stale_agent_permit_deleted(monkeypatch):
     import config_store
 
     monkeypatch.setenv("AWS_ACCOUNT_ID", "111122223333")
-    monkeypatch.setattr(config_store, "list_capabilities", lambda: [
+    monkeypatch.setattr(config_store, "list_capabilities", lambda **kw: [
         {"agent_id": "gone", "enabled": False, "status": "disabled",
          "builtin": False, "tool_grants": ["GitHubTarget___get_issue"]},
     ])

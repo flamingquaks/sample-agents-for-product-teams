@@ -38,7 +38,7 @@ class _FakeCodeBuild:
 
 def _install(rb, monkeypatch, caps, codebuild):
     os.environ["CAPABILITY_BUILD_PROJECT"] = "sdlc-agent-builder-test"
-    monkeypatch.setattr(rb.config_store, "list_capabilities", lambda: caps)
+    monkeypatch.setattr(rb.config_store, "list_capabilities", lambda **kw: caps)
     status_calls = []
     monkeypatch.setattr(rb.config_store, "set_capability_status",
                         lambda a, s, detail="": status_calls.append((a, s)))
@@ -88,7 +88,7 @@ def test_no_build_project_is_a_noop(monkeypatch):
     rb = _fresh()
     os.environ.pop("CAPABILITY_BUILD_PROJECT", None)
     monkeypatch.setattr(rb.config_store, "list_capabilities",
-                        lambda: [{"agent_id": "triage", "status": rb.config_store.CAP_ACTIVE}])
+                        lambda **kw: [{"agent_id": "triage", "status": rb.config_store.CAP_ACTIVE}])
     out = rb.handler({}, None)
     assert out["rebuilt"] == 0
 

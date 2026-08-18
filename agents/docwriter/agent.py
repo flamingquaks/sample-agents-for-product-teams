@@ -30,9 +30,9 @@ from shared.dispatch_context import (
     jira_dispatch_block,
     slack_dispatch_block,
 )
+from shared.memory import memory_tools
 from shared.tools import gateway, workspace
 from strands import Agent
-from strands_tools.agent_core_memory import AgentCoreMemoryToolProvider
 from tools.check_doc_freshness import check_doc_freshness
 from tools.detect_doc_gaps import detect_doc_gaps
 from tools.generate_api_docs import generate_api_docs
@@ -139,13 +139,12 @@ def invoke(payload, context=None):
 
     # Memory — optional until Memory resource is created
     if MEMORY_ID:
-        memory_provider = AgentCoreMemoryToolProvider(
+        tools.extend(memory_tools(
             memory_id=MEMORY_ID,
             actor_id=ACTOR_ID,
             session_id=session_id,
             namespace=f"/agents/docwriter/{session_id}",
-        )
-        tools.extend(memory_provider.tools)
+        ))
 
     # MCP connectivity: one gateway client (SigV4, Cedar-enforced) — the fleet is
     # gateway-only, so all tool calls route through the AgentCore Gateway (policy

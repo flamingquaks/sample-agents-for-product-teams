@@ -225,7 +225,8 @@ def test_registry_ignores_stale_index_fields_for_routability(monkeypatch):
     those fields it would emit a registry without the agent, the publish would
     SUCCEED, and the agent would sit ``active`` yet permanently unroutable (the
     only recovery is a later capability change). moto's index is immediately
-    consistent, so the staleness is injected directly.
+    consistent, so the staleness is injected at the index layer (``_query_kind``)
+    while the base table holds the committed row.
     """
     _make_table()
     cs = _load_store()
@@ -236,7 +237,7 @@ def test_registry_ignores_stale_index_fields_for_routability(monkeypatch):
     # The index copy as it looked BEFORE the deploy: no runtime_arn, still building.
     stale = {"agent_id": "triage", "kind": "capability", "enabled": True,
              "status": cs.CAP_BUILDING}
-    monkeypatch.setattr(cs, "list_capabilities", lambda: [stale])
+    monkeypatch.setattr(cs, "_query_kind", lambda kind, **kw: [stale])
 
     agents = cs.render_registry()["agents"]
     assert agents["triage"]["runtime_arn"] == "arn:runtime/triage-live"
@@ -249,9 +250,9 @@ def test_registry_drops_agent_the_index_still_lists_after_delete(monkeypatch):
     _make_table()
     cs = _load_store()
     monkeypatch.setattr(
-        cs, "list_capabilities",
-        lambda: [{"agent_id": "ghost", "kind": "capability", "enabled": True,
-                  "status": cs.CAP_ACTIVE, "runtime_arn": "arn:runtime/ghost"}],
+        cs, "_query_kind",
+        lambda kind, **kw: [{"agent_id": "ghost", "kind": "capability", "enabled": True,
+                             "status": cs.CAP_ACTIVE, "runtime_arn": "arn:runtime/ghost"}],
     )
     assert cs.render_registry() == {"agents": {}}
 
