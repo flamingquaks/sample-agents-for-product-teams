@@ -215,6 +215,48 @@ def test_live_agent_stays_routable_while_rebuilding_or_failed():
 
 
 @mock_aws
+def test_registry_ignores_stale_index_fields_for_routability(monkeypatch):
+    """A stale kind-index copy must not decide routability.
+
+    capability_deployer writes ``runtime_arn`` and then publishes the registry
+    milliseconds later. The index feeding ``list_capabilities`` is a GSI — eventually
+    consistent, and DynamoDB cannot read a GSI strongly consistent at all — so that
+    publish can observe the PRE-deploy copy of the row. If render_registry trusted
+    those fields it would emit a registry without the agent, the publish would
+    SUCCEED, and the agent would sit ``active`` yet permanently unroutable (the
+    only recovery is a later capability change). moto's index is immediately
+    consistent, so the staleness is injected directly.
+    """
+    _make_table()
+    cs = _load_store()
+    cs.put_capability("triage")
+    cs.set_capability_deploy_state("triage", runtime_arn="arn:runtime/triage-live")
+    cs.set_capability_status("triage", cs.CAP_ACTIVE)
+
+    # The index copy as it looked BEFORE the deploy: no runtime_arn, still building.
+    stale = {"agent_id": "triage", "kind": "capability", "enabled": True,
+             "status": cs.CAP_BUILDING}
+    monkeypatch.setattr(cs, "list_capabilities", lambda: [stale])
+
+    agents = cs.render_registry()["agents"]
+    assert agents["triage"]["runtime_arn"] == "arn:runtime/triage-live"
+
+
+@mock_aws
+def test_registry_drops_agent_the_index_still_lists_after_delete(monkeypatch):
+    """The same staleness in the other direction: a torn-down agent whose row is
+    already gone must not be resurrected into the registry by a lagging index."""
+    _make_table()
+    cs = _load_store()
+    monkeypatch.setattr(
+        cs, "list_capabilities",
+        lambda: [{"agent_id": "ghost", "kind": "capability", "enabled": True,
+                  "status": cs.CAP_ACTIVE, "runtime_arn": "arn:runtime/ghost"}],
+    )
+    assert cs.render_registry() == {"agents": {}}
+
+
+@mock_aws
 def test_status_write_to_missing_row_fails():
     _make_table()
     cs = _load_store()

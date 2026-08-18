@@ -475,8 +475,14 @@ def list_capabilities() -> list[dict]:
     return caps
 
 
-def get_capability(agent_id: str) -> dict | None:
-    resp = _get_table().get_item(Key={"pk": _capability_pk(agent_id)})
+def get_capability(agent_id: str, *, consistent: bool = False) -> dict | None:
+    """One capability row. ``consistent=True`` forces a strongly consistent read —
+    used by ``render_registry``, which must not decide routability from a copy that
+    predates the deployer's ``runtime_arn`` write (see that function's docstring)."""
+    kwargs: dict = {"Key": {"pk": _capability_pk(agent_id)}}
+    if consistent:
+        kwargs["ConsistentRead"] = True
+    resp = _get_table().get_item(**kwargs)
     return resp.get("Item")
 
 
@@ -689,15 +695,33 @@ def render_registry() -> dict:
     previous runtime is still up and serving, so it stays routable on its existing
     ARN. A brand-new agent that has never deployed has no ``runtime_arn`` yet, so a
     still-building or failed FIRST onboard is correctly excluded (the router would
-    otherwise resolve a mention to a runtime that isn't up)."""
+    otherwise resolve a mention to a runtime that isn't up).
+
+    Routability is decided on a STRONGLY CONSISTENT re-read of each capability's
+    base-table row, not on the kind-index copy ``list_capabilities`` returns. The
+    index only supplies the SET of agent ids; every field this function branches on
+    (``enabled``/``status``/``runtime_arn``) comes from ``get_item`` with
+    ``ConsistentRead``. DynamoDB cannot serve a strongly consistent read from a GSI
+    at all, and capability_deployer publishes MILLISECONDS after writing
+    ``runtime_arn`` — an index copy that stale renders the row as "no runtime yet"
+    and drops the agent from the registry. That publish then SUCCEEDS, so the
+    "re-publishes on the next capability change" recovery (which only covers publish
+    *errors*) never fires and a freshly deployed agent sits ``active`` but
+    permanently unroutable. A row deleted since the index read comes back None and
+    is skipped, which likewise keeps a torn-down agent from being resurrected by a
+    stale index."""
     agents = {}
-    for cap in list_capabilities():
+    for indexed in list_capabilities():
+        agent_id = indexed.get("agent_id")
+        if not agent_id:
+            continue
+        cap = get_capability(agent_id, consistent=True) or {}
         if not cap.get("enabled") or cap.get("status") in (CAP_DISABLED, CAP_DELETING):
             continue
         arn = cap.get("runtime_arn")
         if not arn:
             continue
-        agents[cap["agent_id"]] = {
+        agents[agent_id] = {
             "description": cap.get("description", ""),
             "runtime_arn": arn,
             "aliases": list(cap.get("aliases", [])),
